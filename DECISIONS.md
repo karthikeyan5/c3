@@ -23,3 +23,13 @@
 ## D005: Project Name — C3 (C-cubed)
 **Date:** 2026-04-15
 **Decision:** Project named C3, standing for Claude Code Claw, pronounced "C-cubed".
+
+## D006: Go for Daemon
+**Date:** 2026-04-15
+**Decision:** Write the C3 daemon in Go. MCP stubs may need Bun if no Go MCP SDK exists — research needed.
+**Why:** Python and JS consume too much memory and CPU for a long-running daemon. Go is efficient, compiles to a single binary, and the team has proven it works well with Claude (entire web framework written in Go by Opus). Low resource footprint matters since this runs alongside multiple CLI instances.
+
+## D007: Pluggable Transport Layer
+**Date:** 2026-04-15
+**Decision:** Design the daemon with a pluggable transport interface from the start. Telegram is first, but web chat (magic-link URLs) and voice mode are planned.
+**Why:** Future use cases include browser-based sessions, voice-only mode (driving), and live CLI view. Architecting the transport boundary now avoids rewriting the core later.

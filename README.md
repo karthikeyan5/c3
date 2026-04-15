@@ -122,11 +122,12 @@ We adapt these concepts for C3's Telegram-centric model. We don't need all-platf
 
 ## Tech Stack
 
-- **Daemon**: Python or TypeScript (Bun) — TBD
-- **MCP stubs**: TypeScript (Bun) — must speak MCP stdio protocol
+- **Daemon**: Go — efficient, low memory/CPU, single binary (D006)
+- **MCP stubs**: Go (if Go MCP SDK exists) or TypeScript (Bun) — must speak MCP stdio protocol
 - **IPC**: Unix domain socket
-- **Bot library**: grammy (same as official plugin)
-- **STT**: Existing stt-pkg pipeline (Gemini Flash + Sarvam fallback)
+- **Bot library**: Go Telegram bot library (telebot, gotgbot, or telegram-bot-api)
+- **STT**: Existing stt-pkg pipeline (called from Go via subprocess)
+- **Transport**: Pluggable interface — Telegram first, web chat and voice mode later (D007)
 
 ## Status
 
