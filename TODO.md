@@ -9,6 +9,8 @@
 - [ ] **Routing table** — JSON config file mapping topic_id/chat_id -> stub instance ID. Hot-reloadable.
 - [ ] **Port existing tools** — reply, download_attachment, react, edit_message. Same interface as official plugin.
 - [ ] **Typing indicator** — Show typing indicator in Telegram when the agent is working.
+- [ ] **Message queuing** — Messages must NEVER be lost. If multiple messages arrive while the agent is busy, they must be queued and delivered in order. This is a day-one requirement, not a nice-to-have.
+- [ ] **Reply threading** — When a user replies to a specific message, preserve that context (reply_to message ID and content). The agent should know which message is being replied to.
 - [ ] **Port STT pipeline** — Move STT from patched server.ts into daemon. Use existing stt-pkg.
 - [ ] **Test with 2 CLIs** — One group, two topics, two terminals. Verify bidirectional routing.
 
