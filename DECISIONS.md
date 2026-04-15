@@ -24,10 +24,15 @@
 **Date:** 2026-04-15
 **Decision:** Project named C3, standing for Claude Code Claw, pronounced "C-cubed".
 
-## D006: Go for Daemon
+## D006: Go for Daemon and MCP Stubs
 **Date:** 2026-04-15
-**Decision:** Write the C3 daemon in Go. MCP stubs may need Bun if no Go MCP SDK exists — research needed.
+**Decision:** Write the entire C3 system in Go — daemon and MCP stubs. Official Go MCP SDK exists (Tier 1, v1.0.0).
 **Why:** Python and JS consume too much memory and CPU for a long-running daemon. Go is efficient, compiles to a single binary, and the team has proven it works well with Claude (entire web framework written in Go by Opus). Low resource footprint matters since this runs alongside multiple CLI instances.
+
+## D008: Use Official Go MCP SDK
+**Date:** 2026-04-15
+**Decision:** Use `github.com/modelcontextprotocol/go-sdk` for MCP stub implementation.
+**Why:** Official Tier 1 SDK, maintained by Anthropic/MCP org + Google. Supports stdio transport, tool registration, and custom notifications (needed for `notifications/claude/channel`). Maximum compatibility with Claude Code.
 
 ## D007: Pluggable Transport Layer
 **Date:** 2026-04-15
