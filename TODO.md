@@ -1,5 +1,7 @@
 # TODO
 
+> **⚠ DEVIATION NOTE (2026-04-22)** — This list hasn't been reconciled with reality. A Python wrapper MVP (`mvp/broker.py` + `mvp/stub.py` + `mvp/patch_server.py`) was built instead of the Go rewrite planned in DECISIONS.md (D006/D008). Many Phase 1 items are already done in that implementation; the unchecked boxes below do not reflect current state. See RESUME.md's deviation banner. **Proper refresh deferred.**
+
 ## Phase 1: MVP
 
 - [ ] **Design IPC protocol** — Define the message format between daemon and MCP stubs over unix socket. What gets sent, how routing info is encoded.

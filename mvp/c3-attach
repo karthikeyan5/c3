@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Attach Claude Code to a Telegram topic, auto-resolving by project name.
+
+Flow:
+  - take basename(pwd) as the topic name
+  - write .mcp.json pointing at stub.py with C3_ATTACH_NAME set
+  - exec `claude`
+
+The broker creates the topic in the group if it doesn't exist yet.
+
+Flags:
+  --pick       show interactive picker from topics.json instead of auto-naming
+  --name NAME  override the project name
+  --cwd DIR    target a directory other than pwd
+"""
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+STUB = HERE / "stub.py"
+TOPICS_FILE = HERE / "topics.json"
+
+
+def load_topics():
+    if not TOPICS_FILE.exists():
+        return []
+    try:
+        return json.loads(TOPICS_FILE.read_text())
+    except Exception:
+        return []
+
+
+def pick_interactive():
+    topics = load_topics()
+    if not topics:
+        sys.stderr.write("c3-attach: topics.json is empty; nothing to pick\n")
+        sys.exit(1)
+    for i, t in enumerate(topics, 1):
+        print(f"  {i}. [{t['chat_id']}] topic={t['topic_id']} — {t['name']}")
+    while True:
+        choice = input(f"\npick a topic [1-{len(topics)}]: ").strip()
+        try:
+            idx = int(choice)
+            if 1 <= idx <= len(topics):
+                return topics[idx - 1]
+        except ValueError:
+            pass
+        print("invalid choice")
+
+
+def write_mcp_config(cwd: Path, env: dict):
+    cfg = {
+        "mcpServers": {
+            "telegram": {
+                "command": "python3",
+                "args": [str(STUB)],
+                "env": env,
+            }
+        }
+    }
+    target = cwd / ".mcp.json"
+    target.write_text(json.dumps(cfg, indent=2))
+    return target
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--pick", action="store_true")
+    p.add_argument("--name")
+    p.add_argument("--cwd")
+    args, rest = p.parse_known_args()
+
+    cwd = Path(args.cwd).resolve() if args.cwd else Path.cwd()
+
+    if args.pick:
+        t = pick_interactive()
+        env = {"C3_CHAT_ID": str(t["chat_id"]), "C3_TOPIC_ID": str(t["topic_id"])}
+        label = t["name"]
+    else:
+        name = args.name or cwd.name
+        env = {"C3_ATTACH_NAME": name}
+        label = name
+
+    target = write_mcp_config(cwd, env)
+    print(f"c3-attach: wrote {target}")
+    print(f"c3-attach: attaching to '{label}' (broker will create the topic if needed)")
+    print("c3-attach: launching claude…\n")
+
+    os.chdir(cwd)
+    os.execvp("claude", ["claude"] + rest)
+
+
+if __name__ == "__main__":
+    main()

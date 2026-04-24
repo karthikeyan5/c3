@@ -1,0 +1,30 @@
+# context: Technical discussion about AI agents, software frameworks, DevOps, servers, and an Indian textile company.
+
+# Product names
+Vel != whale, well, veil -- a software framework, V-E-L
+VelGate != whale gate, well gate
+VelOps != whale ops, well ops
+VelBridge != whale bridge, well bridge
+VelBoard != whale board, well board
+VelMetrics != whale metrics
+VelClawBoard != whale claw board
+OpenClaw != open claw, OpenGLAP, open cloth -- an AI agent platform
+
+# Project names
+Vetrivel != vetri well
+HowIconic != how iconic
+Menayra != men IRA, manayra
+Essdee != SD, S.D. -- a company name
+
+# People
+Karthi != Karthik
+Nithin != Nitin
+
+# Tech terms
+tmux != T mux, tea mux
+systemctl != system control, system CTL
+journalctl != journal control
+kubectl != cube control, cube CTL
+nginx != engine X
+Ed25519 != ED 25519
+velgate != whale gate, well gate -- lowercase when referring to the binary

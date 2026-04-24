@@ -1,5 +1,9 @@
 # RESUME
 
+> **⚠ DEVIATION NOTE (2026-04-22)** — The plan in this doc (and TODO.md, DECISIONS.md D006/D008) calls for a Go rewrite from scratch. We did not do that. Instead we shipped a **Python wrapper MVP** (`mvp/broker.py` + `mvp/stub.py` + `mvp/patch_server.py`) that wraps the official bun Telegram plugin rather than reimplementing it. It's running in production and is what this terminal is talking through right now. Phase 1 MVP items are largely done in spirit (topic routing, reply threading via patch P4, STT via the wrapped plugin, typing indicator, the four core tools).
+>
+> We have **not** updated the plan docs to reflect this. Leaving them as-is for now. When we're ready, the refresh needs: add D009 superseding D006/D008 (Python wrapper over Go rewrite), tick off completed Phase 1 items, reassess Phase 2/3/4 against the new architecture. **Handle later.**
+
 ## Current State
 - Project: C3 (Claude Code Claw)
 - Date updated: 2026-04-15

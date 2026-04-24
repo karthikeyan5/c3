@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "telegram": {
+      "command": "python3",
+      "args": ["/home/karthi/arogara/c3/mvp/stub.py"]
+    }
+  }
+}

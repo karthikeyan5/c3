@@ -1,0 +1,14 @@
+{
+  "name": "c3",
+  "owner": {
+    "name": "Karthi"
+  },
+  "plugins": [
+    {
+      "name": "c3-telegram",
+      "description": "C3 Telegram channel — multiplexes one bot across many Claude Code terminals via the C3 broker.",
+      "category": "messaging",
+      "source": "./plugins/c3-telegram"
+    }
+  ]
+}

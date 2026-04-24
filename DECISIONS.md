@@ -1,5 +1,7 @@
 # Decisions
 
+> **⚠ DEVIATION NOTE (2026-04-22)** — D006 (Go for daemon + stubs) and D008 (Go MCP SDK) were not acted on. The Python wrapper MVP under `mvp/` ships today instead: it wraps the official bun Telegram plugin over stdio and routes via a unix socket to per-CLI Python MCP stubs. This decision is effectively superseded but not yet formally recorded as D009 — doc refresh deferred. See RESUME.md's banner for context.
+
 ## D001: Architecture — Daemon + MCP Stubs
 **Date:** 2026-04-15
 **Decision:** Use a single daemon process that owns the bot token and polls Telegram, with thin MCP stubs (one per CLI) connecting via unix socket.
