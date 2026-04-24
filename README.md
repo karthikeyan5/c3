@@ -4,6 +4,28 @@
 
 A Telegram multiplexer that connects multiple Claude Code CLI instances to a single Telegram bot, with routing by group topics, chat IDs, and users. Built entirely on Claude Code's ecosystem — uses its tools, skills, MCPs, and capabilities as-is.
 
+---
+
+> ### Current working version
+>
+> The shipping implementation is a Python wrapper over the official
+> `claude-plugins-official/telegram` plugin, living in [`mvp/`](mvp/). It is
+> in active daily use on the author's machine and is the only thing you need
+> to install/replicate.
+>
+> - **Install on a new machine:** [`INSTALL.md`](INSTALL.md) — step-by-step.
+> - **Day-to-day operations** (add groups, create topics, rename, attach):
+>   [`mvp/README.md`](mvp/README.md) under *Lifecycle: onboarding a new group
+>   or topic*.
+> - **Patch system for the upstream plugin:** [`mvp/PATCH_SPEC.md`](mvp/PATCH_SPEC.md).
+>
+> Everything below this banner — architecture, tech stack, roadmap — is
+> **design history** from before the wrapper MVP landed. It talks about a Go
+> rewrite that did not happen. Keep for context; don't follow for setup.
+> [`RESUME.md`](RESUME.md) has the deviation note explaining the pivot.
+
+---
+
 ## The Big Idea
 
 C3 turns Claude Code into a multi-agent system. One Telegram bot, many CLI terminals, each handling different projects or contexts. A master CLI orchestrates the others. No custom agent framework needed — Claude Code already has everything (tools, file access, code execution, MCP plugins). C3 just adds the messaging layer.

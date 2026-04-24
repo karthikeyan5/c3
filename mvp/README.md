@@ -1,5 +1,8 @@
 # C3 MVP — Telegram multiplexer over the official plugin
 
+**First-time setup on a new machine?** → [`../INSTALL.md`](../INSTALL.md).
+This file documents the running system and day-to-day operations.
+
 C3 is a thin broker that sits between the official Telegram Claude-plugin
 (`bun server.ts`) and N Claude Code terminals, routing by forum topic.
 The plugin is the only thing that talks to Telegram — we wrap it, we don't
