@@ -75,8 +75,12 @@ def _try_connect(timeout=0.5):
         s.close()
         return None
 
-dsock = _try_connect()
-if dsock is None:
+
+def _establish_connection():
+    """Connect to broker, spawning one if missing. Returns sock or None."""
+    s = _try_connect()
+    if s is not None:
+        return s
     import subprocess as _sp
     broker_path = Path(__file__).resolve().parent / "broker.py"
     try:
@@ -90,56 +94,141 @@ if dsock is None:
         sys.stderr.write(f"c3-stub: spawned broker {broker_path}; waiting for socket\n")
     except Exception as e:
         sys.stderr.write(f"c3-stub: failed to spawn broker: {e}\n")
-
-    # Up to ~10s (40 × 0.25s) for the broker to bind and start accepting.
-    for attempt in range(40):
+    for _ in range(40):
         time.sleep(0.25)
-        dsock = _try_connect()
-        if dsock is not None:
-            break
-    else:
-        sys.stderr.write(f"c3-stub: cannot reach broker at {SOCK_PATH}; exiting\n")
-        sys.exit(0)
+        s = _try_connect()
+        if s is not None:
+            return s
+    return None
+
+
+dsock = _establish_connection()
+if dsock is None:
+    sys.stderr.write(f"c3-stub: cannot reach broker at {SOCK_PATH}; exiting\n")
+    sys.exit(0)
 
 dfile = dsock.makefile("rwb", buffering=0)
 dlock = threading.Lock()
+# Connection generation: bumped on each successful reconnect. Callers capture
+# the gen they observed before a failed write/read, so concurrent reconnect
+# attempts don't stack — only the first one wins, the rest see a newer gen
+# and short-circuit.
+_conn_lock = threading.Lock()
+_conn_gen = [0]
 
 # Per-op response routing: {resp_key: threading.Event+holder}
 PENDING = {}
 PENDING_LOCK = threading.Lock()
 
 def dsend(obj):
-    with dlock:
-        dfile.write((json.dumps(obj) + "\n").encode())
+    """Write to broker; on connection failure, reconnect once and retry."""
+    data = (json.dumps(obj) + "\n").encode()
+    for attempt in range(2):
+        observed_gen = _conn_gen[0]
+        with dlock:
+            try:
+                dfile.write(data)
+                return
+            except (OSError, BrokenPipeError, ValueError) as e:
+                last_err = e
+        sys.stderr.write(f"c3-stub: dsend failed ({last_err}); reconnecting\n")
+        if not _reconnect(observed_gen):
+            return
+    sys.stderr.write("c3-stub: dsend failed twice after reconnect; dropping\n")
 
 
 def daemon_reader():
-    for raw in dfile:
+    """Read from broker; on EOF or error, trigger reconnect (which spawns a
+    fresh reader). Each reader thread is bound to one connection generation —
+    when its dfile dies, it requests a reconnect for that gen and exits."""
+    my_gen = _conn_gen[0]
+    local_dfile = dfile  # capture; reconnect may replace the global
+    try:
+        for raw in local_dfile:
+            try:
+                msg = json.loads(raw.decode())
+            except Exception:
+                continue
+            op = msg.get("op")
+            log(f"broker->stub: op={op}")
+            if op == "inbound":
+                mcp_send({"jsonrpc": "2.0", "method": msg["method"], "params": msg["params"]})
+            elif op in ("tool_result",):
+                rid = msg.get("id")
+                with PENDING_LOCK:
+                    ev = PENDING.pop(rid, None)
+                if ev is not None:
+                    ev["resp"] = msg
+                    ev["event"].set()
+            elif op in ("server_info", "tools_list", "attached", "topics_list"):
+                # Synchronous responses during setup — use op as key.
+                key = op
+                with PENDING_LOCK:
+                    ev = PENDING.pop(key, None)
+                if ev is not None:
+                    ev["resp"] = msg
+                    ev["event"].set()
+            elif op == "error":
+                sys.stderr.write(f"c3-stub: broker error: {msg.get('err')}\n")
+    except Exception as e:
+        log(f"daemon_reader gen={my_gen} exception: {e}")
+    log(f"daemon_reader gen={my_gen}: dfile EOF, attempting reconnect")
+    _reconnect(my_gen)
+
+
+def _reconnect(observed_gen: int) -> bool:
+    """Tear down the dead connection, open a new one, re-handshake, re-attach.
+    `observed_gen` is the gen the caller saw when it noticed the failure — if
+    a newer gen exists, someone already reconnected, so we no-op."""
+    global dsock, dfile
+    with _conn_lock:
+        if observed_gen != _conn_gen[0]:
+            return True
+        sys.stderr.write(f"c3-stub: broker connection lost (gen={observed_gen}); reconnecting\n")
+        # Wake any callers blocked on wait_response so the reconnect doesn't deadlock
+        # behind their pending entries (their requests went into the void anyway).
+        with PENDING_LOCK:
+            for k, ev in list(PENDING.items()):
+                ev["resp"] = {"err": "broker reconnect"}
+                ev["event"].set()
+            PENDING.clear()
+        try: dfile.close()
+        except Exception: pass
+        try: dsock.close()
+        except Exception: pass
+        new_sock = _establish_connection()
+        if new_sock is None:
+            sys.stderr.write("c3-stub: reconnect failed — broker unreachable\n")
+            return False
+        dsock = new_sock
+        dfile = dsock.makefile("rwb", buffering=0)
+        _conn_gen[0] += 1
+        new_gen = _conn_gen[0]
+        sys.stderr.write(f"c3-stub: reconnected (gen={new_gen}); re-handshaking\n")
+        # Spawn a fresh reader for the new dfile. The old reader (which called
+        # us) is about to return after this _reconnect, so won't double up.
+        threading.Thread(target=daemon_reader, daemon=True).start()
+        # Re-handshake server_info — broker won't honor anything else first.
         try:
-            msg = json.loads(raw.decode())
-        except Exception:
-            continue
-        op = msg.get("op")
-        log(f"broker->stub: op={op}")
-        if op == "inbound":
-            mcp_send({"jsonrpc": "2.0", "method": msg["method"], "params": msg["params"]})
-        elif op in ("tool_result",):
-            rid = msg.get("id")
-            with PENDING_LOCK:
-                ev = PENDING.pop(rid, None)
-            if ev is not None:
-                ev["resp"] = msg
-                ev["event"].set()
-        elif op in ("server_info", "tools_list", "attached"):
-            # Synchronous responses during setup — use op as key.
-            key = op
-            with PENDING_LOCK:
-                ev = PENDING.pop(key, None)
-            if ev is not None:
-                ev["resp"] = msg
-                ev["event"].set()
-        elif op == "error":
-            sys.stderr.write(f"c3-stub: broker error: {msg.get('err')}\n")
+            with dlock:
+                dfile.write((json.dumps({"op": "server_info"}) + "\n").encode())
+            wait_response("server_info", timeout=5)
+        except Exception as e:
+            sys.stderr.write(f"c3-stub: re-handshake server_info failed: {e}\n")
+        # Re-claim the topic we held before the disconnect, if any.
+        if BOUND.get("name") or BOUND.get("chat_id") is not None:
+            try:
+                if BOUND.get("name"):
+                    payload = {"op": "attach_auto", "name": BOUND["name"]}
+                else:
+                    payload = {"op": "attach", "chat_id": int(BOUND["chat_id"]),
+                               "topic_id": int(BOUND["topic_id"] or 0)}
+                with dlock:
+                    dfile.write((json.dumps(payload) + "\n").encode())
+                wait_response("attached", timeout=5)
+            except Exception as e:
+                sys.stderr.write(f"c3-stub: re-attach failed: {e}\n")
+        return True
 
 
 def wait_response(key, timeout=30):

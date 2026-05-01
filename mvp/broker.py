@@ -173,26 +173,39 @@ class Bun:
             sys.stderr.write(f"[bun] {line.decode(errors='replace')}")
 
     def _stdout_pump(self):
+        # This thread is the ONLY reader of bun's stdout. If it dies, the broker
+        # goes deaf to bun (every tool call times out). Catch every exception
+        # — including failures inside our own stderr.write — so it never exits
+        # except on bun EOF.
+        def _safe_log(s):
+            try:
+                sys.stderr.write(s)
+            except Exception:
+                pass
+
         for raw in self.proc.stdout:
             try:
                 msg = json.loads(raw.decode())
             except Exception:
-                sys.stderr.write(f"c3-broker: bun emitted non-JSON: {raw[:120]!r}\n")
+                _safe_log(f"c3-broker: bun emitted non-JSON: {raw[:120]!r}\n")
                 continue
-            if "id" in msg and ("result" in msg or "error" in msg):
-                cb = None
-                with self.pending_lock:
-                    cb = self.pending.pop(msg["id"], None)
-                if cb:
-                    cb(msg)
-                else:
-                    sys.stderr.write(f"c3-broker: orphan response id={msg['id']}\n")
-            elif "method" in msg:
-                if self.notify_handler:
-                    try:
-                        self.notify_handler(msg)
-                    except Exception as e:
-                        sys.stderr.write(f"c3-broker: notify_handler error: {e}\n")
+            try:
+                if "id" in msg and ("result" in msg or "error" in msg):
+                    cb = None
+                    with self.pending_lock:
+                        cb = self.pending.pop(msg["id"], None)
+                    if cb:
+                        cb(msg)
+                    else:
+                        _safe_log(f"c3-broker: orphan response id={msg['id']}\n")
+                elif "method" in msg:
+                    if self.notify_handler:
+                        try:
+                            self.notify_handler(msg)
+                        except Exception as e:
+                            _safe_log(f"c3-broker: notify_handler error: {e}\n")
+            except Exception as e:
+                _safe_log(f"c3-broker: stdout_pump dispatch error: {e}\n")
 
     def _raw_send(self, obj):
         data = (json.dumps(obj) + "\n").encode()
@@ -276,6 +289,12 @@ class StubConn:
                 self.file.write((json.dumps(obj) + "\n").encode())
         except Exception:
             self.alive = False
+            # Drop dead stubs from the routing table so notify_handler stops
+            # hammering them on every inbound message.
+            try:
+                release_stub(self)
+            except Exception:
+                pass
 
 
 ROUTES_LOCK = threading.Lock()
