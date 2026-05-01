@@ -203,29 +203,41 @@ fidelity matters more than context size, and Telegram caps single messages at
 
 ## P5_voice_handler_thread_id
 
-**Purpose** — `stt-handler.py` echoes the voice transcript back to Telegram
-as a bot message. When the transcript exceeds Telegram's 4096-char cap it
-gets chunked into N messages. Only chunk 0 carries `reply_parameters`, so
-chunks 1..N-1 have no thread anchor and Telegram posts them to the group's
-General topic instead of the topic the voice came from. The handler needs
-to know the `message_thread_id` so every chunk can address the right topic
-explicitly.
+**Purpose** — Upstream 0.0.6 refactored the voice handler into a thin
+"forward voice as an attachment" path and removed the Python STT
+shell-out entirely. C3 still wants every inbound voice to be transcribed
+server-side so (a) the user sees the transcript echoed back in Telegram
+and (b) Claude receives real text instead of `(voice message)` plus a
+file_id it has to transcribe itself. This patch reintroduces the
+shell-out. While we're at it, we include `message_thread_id` in the argv
+so `stt-handler.py`'s own `sendMessage` chunks stay in the right forum
+topic — the original reason for P5's existence.
 
-**Final behavior** — The `bot.on('message:voice', ...)` handler's
-`Bun.spawnSync` call to `stt-handler.py` passes the current message's
-`message_thread_id` (stringified; empty string when undefined) as a 5th
-positional argument after `file_id`. DMs and non-forum groups pass the
-empty string; `stt-handler.py` treats that as "no thread" and omits the
-field from its `sendMessage` calls.
+**Final behavior** — The `bot.on('message:voice', ...)` handler:
 
-**Detection** — Grep the `message:voice` handler's `Bun.spawnSync` argv
-array. It should include `String(ctx.message?.message_thread_id ?? '')`
-(or equivalent) after `voice.file_id`.
+1. Spawns `python3 ~/.claude/channels/telegram/stt-handler.py` with argv
+   `[bot_token, chat_id, msg_id, file_id, message_thread_id_or_empty]`.
+2. If the process exits 0 and stdout is non-empty, treats stdout as the
+   transcript and uses it as the inbound message text.
+3. Otherwise falls back to `ctx.message.caption ?? '(voice message)'`
+   (the pristine upstream behavior).
 
-**Region** — `bot.on('message:voice', async ctx => { ... })` body near the
-top of the voice-handling block.
+Either way, `handleInbound` is called once with a `kind: 'voice'`
+attachment meta — the MCP client still receives the voice file_id so it
+can download the audio if the transcript is ambiguous.
 
-**Notes** — Paired with the matching `thread_id` parameter handling in
-`mvp/stt/stt-handler.py`. If upstream ever rewrites the voice handler to
-pass full message context to the handler (e.g. as JSON on stdin), delete
-this patch and update the handler's arg parsing to match.
+**Detection** — Grep the `message:voice` handler body. A patched file
+contains the marker `/* C3_STT_HANDLER */` and a `Bun.spawnSync` call
+whose first arg is `'python3'` and whose second arg points at
+`stt-handler.py`. An unpatched file has neither.
+
+**Region** — `bot.on('message:voice', async ctx => { ... })` body,
+between `const voice = ctx.message.voice` and the `handleInbound(...)`
+call.
+
+**Notes** — Paired with `mvp/stt/stt-handler.py`'s argv contract
+(`<bot_token> <chat_id> <reply_msg_id> <file_id> [<message_thread_id>]`)
+and the `c3-stt` symlink the broker installs at
+`~/.claude/channels/telegram/stt-handler.py`. If upstream ever reintroduces
+a structurally different voice hook (e.g. JSON on stdin, or a plugin-level
+extension point), delete this patch and adapt `stt-handler.py` to match.

@@ -152,18 +152,24 @@ PATCHES = [
     {
         "id": "P5_voice_handler_thread_id",
         "purpose": (
-            "stt-handler.py echoes the transcript back to Telegram. When the "
-            "transcript exceeds Telegram's 4096-char cap it's split into "
-            "chunks; only chunk 0 gets reply_parameters, so chunks 1+ lose "
-            "the forum topic and land in General. Pass message_thread_id to "
-            "the handler so every chunk can address the right topic."
+            "Upstream 0.0.6 removed the voice STT shell-out entirely — the "
+            "handler just forwards voice as an attachment. This patch "
+            "reintroduces the Bun.spawnSync call to stt-handler.py (passing "
+            "bot_token, chat_id, msg_id, file_id, message_thread_id), uses "
+            "the transcript as the inbound text when STT succeeds, and "
+            "falls back to caption / '(voice message)' when it fails."
         ),
-        "marker": "String(ctx.message?.message_thread_id ?? '')",
+        "marker": "/* C3_STT_HANDLER */",
         "anchor": (
-            "  const proc = Bun.spawnSync(['python3', handler, TOKEN!, chat_id, String(msgId), voice.file_id])\n"
+            "  const voice = ctx.message.voice\n"
+            "  const text = ctx.message.caption ?? '(voice message)'\n"
         ),
         "replacement": (
-            "  const proc = Bun.spawnSync(['python3', handler, TOKEN!, chat_id, String(msgId), voice.file_id, String(ctx.message?.message_thread_id ?? '')])\n"
+            "  const voice = ctx.message.voice\n"
+            "  /* C3_STT_HANDLER */\n"
+            "  const _sttProc = Bun.spawnSync(['python3', `${process.env.HOME}/.claude/channels/telegram/stt-handler.py`, TOKEN!, String(ctx.chat.id), String(ctx.message.message_id), voice.file_id, String(ctx.message?.message_thread_id ?? '')])\n"
+            "  const _sttText = _sttProc.success && _sttProc.stdout?.length ? new TextDecoder().decode(_sttProc.stdout).trim() : null\n"
+            "  const text = _sttText || (ctx.message.caption ?? '(voice message)')\n"
         ),
     },
 ]
