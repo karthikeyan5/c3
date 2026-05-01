@@ -8,3 +8,10 @@ build/
 dist/
 .DS_Store
 *.swp
+
+# Install-specific runtime state (must NOT be committed — contains real
+# Telegram chat ids, user ids, and absolute paths). Each install copies the
+# matching `.example` file and edits in their own values. See INSTALL.md.
+mvp/config.json
+mvp/topics.json
+plugin/plugins/c3-telegram/.mcp.json

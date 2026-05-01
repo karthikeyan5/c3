@@ -15,7 +15,10 @@ if os.path.exists(env_path):
 sys.path.insert(0, os.path.dirname(__file__))
 from providers import elevenlabs_scribe_v2 as provider
 
-SAMPLES_DIR = "/home/claw/.openclaw/workspace/archive/tests/stt-quality"
+SAMPLES_DIR = os.environ.get(
+    "STT_SAMPLES_DIR",
+    os.path.expanduser("~/.openclaw/workspace/archive/tests/stt-quality"),
+)
 
 samples = [
     "sample-01-audit.ogg",

@@ -27,8 +27,9 @@ fork it, so features and updates flow through automatically.
 - `PATCH_SPEC.md`  — per-patch purpose, final behavior, and detection rules. Read this first if `patch_server.py` reports `PATCH BROKEN — <id>` on startup.
 - `stt/`            — bundled voice-STT handler (`stt-handler.py` + `stt-pkg/` with pluggable providers). The official plugin spawns this on voice messages at the hardcoded path `~/.claude/channels/telegram/stt-handler.py`.
 - `install_stt.py`  — symlinks `stt/stt-handler.py` and `stt/stt-pkg` into `~/.claude/channels/telegram/` on broker startup. Any pre-existing real files at the destination are backed up to `.pre-c3/<timestamp>/` once. Idempotent.
-- `topics.json`     — auto-written registry of every `(chat_id, topic_id, name)` the broker has seen or created.
-- `config.json`     — optional. `{"group_chat_id": -100…}` to pre-seed which group new topics go in. If absent, the broker uses the first negative chat_id it sees.
+- `topics.json`     — **install-specific (gitignored).** Auto-written registry of every `(chat_id, topic_id, name)` the broker has seen or created. Created on first use; no template needed.
+- `config.json`     — **install-specific (gitignored).** Required. `{"group_chat_id": -100…}` pinning which group new topics go in. Copy `config.json.example` and fill in the Bot API id of your group. Without it the broker falls back to "the first negative chat_id seen", which silently routes to the wrong group as soon as a second group ever appears (see "Pin the active group" below).
+- `config.json.example` — committed template for `config.json`.
 - `approve_group.py` — CLI. Adds a Telegram group to `~/.claude/channels/telegram/access.json`. Accepts a `t.me/c/...` URL, internal id, or Bot API id and writes a permissive policy by default. No broker restart needed.
 - `rename_topic.py` — CLI. Renames an entry in `topics.json` (e.g. the placeholder `topic-0` → `general`). Does NOT rename the Telegram forum topic itself.
 
@@ -54,11 +55,11 @@ Net effect: one long-lived broker per machine, started by whichever session happ
 
 # Any Claude Code session — first one brings up the broker, rest reuse it.
 cd ~/arogara/forge-on-forge
-/home/karthi/arogara/c3/mvp/c3-attach
+~/arogara/c3/mvp/c3-attach
 # -> attaches to topic "forge-on-forge" (creates it in the group if missing)
 
 cd ~/arogara/sthapati
-/home/karthi/arogara/c3/mvp/c3-attach
+~/arogara/c3/mvp/c3-attach
 # -> attaches to topic "sthapati"
 ```
 
@@ -80,14 +81,34 @@ so nothing reaches the broker until you approve the group.
    `t.me/c/<internal>/...` — the script parses internal-id → Bot API form).
 2. Run:
    ```
-   python3 /home/karthi/arogara/c3/mvp/approve_group.py 'https://t.me/c/3990699908/1'
+   python3 ~/arogara/c3/mvp/approve_group.py '<your-group-t.me-url>'
    ```
    Flags:
    - `--require-mention` — only route messages that @-mention the bot.
    - `--allow-from <userid> ...` — restrict senders (default: any group member).
-3. Send a message in the group. The broker log (`/tmp/c3b.log`) should show
+3. **Pin the group in `config.json`** (one-time, strongly recommended — see "Pin the active group" below). Skip this and `attach_auto` will pick "any negative chat_id seen in `topics.json`" as the group for new topics, which silently routes to the wrong group the moment a second group ever appears.
+4. Send a message in the group. The broker log (`/tmp/c3b.log`) should show
    `notifications/claude/channel` with the group's chat id and (for the
    general topic) `thread=0`.
+
+### Pin the active group (`config.json`)
+
+`config.json` lives next to `broker.py` and looks like:
+
+```json
+{ "group_chat_id": -100XXXXXXXXXX }
+```
+
+`default_group_chat_id()` reads it on every `attach_auto` call, so edits are
+picked up live without a broker restart. **Treat this file as required, not
+optional** — without it the broker falls back to "the first group with a
+negative chat_id in `topics.json`", which is whatever group happened to send
+a message first historically. That fallback is silent: `attach()` returns
+`ok=true` and the topic gets created in the wrong group, with no warning.
+
+The `attach()` tool response includes `chat_id` — when you create a new
+topic, glance at the returned chat id and confirm it matches the group you
+intended. If it doesn't, see "Switching to a new group" below.
 
 ### Create a new topic in an approved group
 
@@ -103,6 +124,31 @@ attach(target='c3')
 (The upstream plugin's `createForumTopic` API call rejects reserved names
 like `general`, so use any other name for new topics.)
 
+### Switching to a new group (or recovering from a wrong-group attach)
+
+Symptom: you ask for a topic by name, `attach()` reports success, but the
+topic doesn't appear in the group you're looking at. Almost always this
+means the broker created it in a different group — `default_group_chat_id()`
+returned a stale `chat_id` from `topics.json` because `config.json` was
+absent or pointed elsewhere.
+
+To migrate (or fix):
+
+1. **Update `config.json`** to the new `group_chat_id` (Bot API form, with
+   `-100` prefix). Live-read; no restart.
+2. **Approve the new group** via `approve_group.py` if you haven't already.
+3. **Prune `topics.json`** of the topic name you want to recreate — leave it
+   in place and `attach_auto` finds the old entry first and skips creation.
+   Removing a row here only affects the broker's name → topic lookup; the
+   forum topic still exists in the old group (orphaned, harmless). Other
+   names from the old group can stay or go; if the old group is fully
+   abandoned, prune them all in one pass.
+4. **Re-attach.** `attach()` releases the previous claim automatically, the
+   broker calls `createForumTopic` against the new `group_chat_id`, and
+   `topics.json` is upserted with the fresh `(chat_id, topic_id, name)`.
+5. **Verify.** The `attach()` response now shows the new chat id; confirm
+   the topic is visible in the intended group on Telegram.
+
 ### Register the group's built-in "General" topic under a useful name
 
 When the first inbound message arrives from a group's general thread, the
@@ -110,13 +156,13 @@ broker inserts `{chat_id, topic_id: 0, name: 'topic-0'}` as a placeholder.
 Rename it so `attach(target='…')` can find it:
 
 ```
-python3 /home/karthi/arogara/c3/mvp/rename_topic.py topic-0 general
+python3 ~/arogara/c3/mvp/rename_topic.py topic-0 general
 ```
 
 Or by id:
 
 ```
-python3 /home/karthi/arogara/c3/mvp/rename_topic.py --chat-id -1003990699908 --topic-id 0 general
+python3 ~/arogara/c3/mvp/rename_topic.py --chat-id <your-group-chat-id> --topic-id 0 general
 ```
 
 ### Auto-attach on project start

@@ -20,7 +20,7 @@ The rest of this repo (`README.md`, `TODO.md`, `DECISIONS.md`, and the Go rewrit
 
 ### 1. Clone the repo
 
-Pick a stable path — C3 stores absolute paths in `topics.json` and the plugin's `.mcp.json`, so moving the tree later means re-patching them.
+Pick a stable path — `topics.json` and the plugin's `.mcp.json` (both install-specific, gitignored, see steps 5 and 5b) bake in absolute paths derived from this clone location, so moving the tree later means re-editing them.
 
 ```
 mkdir -p ~/arogara
@@ -66,23 +66,35 @@ chmod 600 ~/.claude/channels/telegram/access.json
 
 Group approvals come later via `mvp/approve_group.py`.
 
-### 5. Fix the stub path in the C3 plugin's `.mcp.json`
+### 5. Create the C3 plugin's `.mcp.json` from the template
 
-The plugin's MCP config ships with an author-specific absolute path. Edit it to match your clone:
+The plugin's MCP config is install-specific (it bakes in an absolute path
+to your clone) and is gitignored. Copy the template and edit:
 
 ```
-# file: ~/arogara/c3/plugin/plugins/c3-telegram/.mcp.json
-{
-  "mcpServers": {
-    "telegram": {
-      "command": "python3",
-      "args": ["<ABSOLUTE-PATH>/c3/mvp/stub.py"]
-    }
-  }
-}
+cp ~/arogara/c3/plugin/plugins/c3-telegram/.mcp.json.example \
+   ~/arogara/c3/plugin/plugins/c3-telegram/.mcp.json
 ```
 
-Replace `<ABSOLUTE-PATH>` with the full path to your clone — e.g. `/home/you/arogara`. `~` does not expand in `.mcp.json`.
+Then open `.mcp.json` and replace `<ABSOLUTE-PATH-TO-c3-CLONE>` with the
+full path to your clone — e.g. `/home/you/arogara/c3`. `~` does not expand
+in `.mcp.json`.
+
+### 5b. Create `mvp/config.json` from the template
+
+`config.json` pins the Telegram group new topics get created in. Required
+on every install — without it the broker silently creates topics in the
+wrong group as soon as it has ever seen more than one. Gitignored.
+
+```
+cp ~/arogara/c3/mvp/config.json.example ~/arogara/c3/mvp/config.json
+```
+
+You can leave the placeholder `-100XXXXXXXXXX` in place for now; you'll
+fill in the real `group_chat_id` after you approve your first group (see
+`mvp/README.md` → **Pin the active group**). The broker re-reads
+`config.json` on every `attach_auto` call, so no restart is needed when
+you edit it.
 
 ### 6. Install the C3 plugin from this repo's marketplace
 
@@ -93,7 +105,56 @@ Inside Claude Code:
 /plugin install c3-telegram@c3
 ```
 
-### 7. (Optional) Add STT keys for voice transcription
+### 7. Disable the upstream Telegram plugin
+
+C3 needs the upstream plugin's `server.ts` *file* (the broker spawns it
+directly and applies patches to it on every startup) — but it must not
+also have the upstream plugin's MCP server registered in Claude Code.
+Both polling `getUpdates` against the same bot token at once gives you
+the `409 Conflict` error from the troubleshooting section; it's the
+single most common way a fresh install silently half-works.
+
+Inside Claude Code, open `/plugin`, pick `telegram@claude-plugins-official`,
+and disable it. Leave `c3-telegram@c3` enabled — that's the one that
+routes through the broker.
+
+**Make sure the disable persists.** `/plugin` sometimes only flips state
+in-memory for the current session. Check `~/.claude/settings.json` —
+`enabledPlugins` should read:
+
+```json
+"enabledPlugins": {
+  "telegram@claude-plugins-official": false,
+  "c3-telegram@c3": true
+}
+```
+
+If the upstream line is still `true` or missing, edit it by hand. A
+session that re-enables it on next launch will immediately start racing
+the broker again.
+
+Verify: `/mcp` should list exactly one Telegram-related MCP server
+(from `c3-telegram`) once plugins reload. The upstream plugin's cached
+files under `~/.claude/plugins/cache/claude-plugins-official/telegram/`
+stay on disk — that's intentional; the broker still reads `server.ts`
+from there.
+
+### 7b. Opt in to channel notifications
+
+Inbound Telegram messages arrive in your session as `<channel>` blocks
+via the MCP `notifications/claude/channel` mechanism. Claude Code gates
+this behind an off-by-default setting. Add to `~/.claude/settings.json`:
+
+```json
+"channelsEnabled": true
+```
+
+Without this, the broker still receives messages and the stub still
+forwards the JSON-RPC notifications — but Claude Code drops them on the
+floor instead of rendering them. Symptom: `/tmp/c3-stub.log` shows
+`op=inbound` entries, yet your session stays silent.
+
+### 8. (Optional) Add STT keys for voice transcription
 
 ```
 # file: ~/.claude/stt.env
@@ -104,7 +165,7 @@ SARVAM_API_KEY=...
 
 Providers chain in order — default is `gemini,sarvam`. See `mvp/stt/stt-pkg/README.md`.
 
-### 8. First run
+### 9. First run
 
 ```
 cd ~/arogara/c3 && claude

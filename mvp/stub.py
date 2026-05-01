@@ -224,7 +224,7 @@ def build_instructions() -> str:
             "This terminal is UNATTACHED — Karthi opened the shared root ~/arogara without picking a project. "
             "Wait for him to name one (e.g. 'work on sthapati'):\n"
             "  1. Call the `attach` tool with target='<project-name>'. For the root DM, call attach(target='dm').\n"
-            "  2. After attach, read /home/karthi/arogara/<project>/CLAUDE.md if it exists — use absolute paths, don't cd.\n"
+            "  2. After attach, read ~/arogara/<project>/CLAUDE.md if it exists — use absolute paths, don't cd.\n"
             "  3. If `attach` returns 'topic held by another terminal', tell Karthi; don't steal it. Offer `topics` to see what's free.\n"
         )
     else:
