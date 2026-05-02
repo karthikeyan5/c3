@@ -119,11 +119,20 @@ def upsert_topic(chat_id: int, topic_id: int, name: str | None):
         save_topics(topics)
 
 
-def find_topic_by_name(name: str):
-    for t in load_topics():
-        if t["name"] == name:
-            return t
-    return None
+def find_topic_by_name(name: str, group_chat_id: int | None = None):
+    """Look up a topic by name. When `group_chat_id` is provided, only entries
+    in that group match — entries with the same name in other groups are
+    invisible (treated as stale orphans from a prior group migration). The
+    caller's `attach_auto` path then falls through to `createForumTopic` in
+    the pinned group, auto-healing the stale entry.
+    """
+    matches = [t for t in load_topics() if t["name"] == name]
+    if group_chat_id is not None:
+        for t in matches:
+            if t["chat_id"] == group_chat_id:
+                return t
+        return None
+    return matches[0] if matches else None
 
 
 def default_group_chat_id() -> int | None:
@@ -324,14 +333,20 @@ def release_stub(stub: StubConn):
 
 
 def snapshot_topics_with_claims() -> list:
-    """Return all known topics with who (if anyone) claims each."""
+    """Return all known topics with who (if anyone) claims each, plus a
+    `stale` flag for entries whose group doesn't match the pinned
+    `config.json:group_chat_id`. Stale entries are no longer reachable via
+    `attach_auto` (find_topic_by_name skips them), but stay visible in the
+    listing for diagnostic purposes."""
     out = []
+    pinned = default_group_chat_id()
     with ROUTES_LOCK:
         for t in load_topics():
             key = (t["chat_id"], t["topic_id"])
             stub = ROUTES.get(key)
             claimed_by = stub.pid if (stub is not None and stub.alive) else None
-            out.append({**t, "claimed_by": claimed_by})
+            stale = pinned is not None and t["chat_id"] != pinned
+            out.append({**t, "claimed_by": claimed_by, "stale": stale})
     return out
 
 
@@ -435,12 +450,16 @@ def handle_stub(bun: Bun, sock: socket.socket):
                 stub.send({"op": "attached", "ok": ok, "chat_id": chat_id, "topic_id": topic_id, "name": name})
 
             elif op == "attach_auto":
-                # Attach by topic name. Create if missing.
+                # Attach by topic name. Create if missing in the pinned group.
+                # When config.json's `group_chat_id` is set, find_topic_by_name
+                # only matches entries in that group — same-named entries in
+                # other groups are stale orphans and we fall through to create
+                # a fresh topic in the pinned group.
                 name = req["name"]
-                t = find_topic_by_name(name)
-                sys.stderr.write(f"c3-broker: attach_auto name={name!r} found={t!r}\n")
+                group_id = default_group_chat_id()
+                t = find_topic_by_name(name, group_chat_id=group_id)
+                sys.stderr.write(f"c3-broker: attach_auto name={name!r} pinned_group={group_id} found={t!r}\n")
                 if t is None:
-                    group_id = default_group_chat_id()
                     if group_id is None:
                         stub.send({"op": "attached", "ok": False, "err":
                                    "no known group chat_id; send one message in the target group first, or set group_chat_id in config.json"})

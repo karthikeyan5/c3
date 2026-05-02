@@ -127,27 +127,33 @@ like `general`, so use any other name for new topics.)
 ### Switching to a new group (or recovering from a wrong-group attach)
 
 Symptom: you ask for a topic by name, `attach()` reports success, but the
-topic doesn't appear in the group you're looking at. Almost always this
-means the broker created it in a different group — `default_group_chat_id()`
-returned a stale `chat_id` from `topics.json` because `config.json` was
-absent or pointed elsewhere.
+topic doesn't appear in the group you're looking at. Historically this meant
+the broker reused a stale `topics.json` entry from a prior group.
 
-To migrate (or fix):
+**This now auto-heals.** `attach_auto` is group-aware: when `config.json`
+pins a `group_chat_id`, the broker only matches topic names within that
+group. Same-named entries in other groups are treated as stale orphans
+(visible in `topics` output with a `[stale group]` tag), so `attach_auto`
+falls through to `createForumTopic` in the pinned group.
+
+Migrate or fix:
 
 1. **Update `config.json`** to the new `group_chat_id` (Bot API form, with
-   `-100` prefix). Live-read; no restart.
+   `-100` prefix). Live-read; no restart needed.
 2. **Approve the new group** via `approve_group.py` if you haven't already.
-3. **Prune `topics.json`** of the topic name you want to recreate — leave it
-   in place and `attach_auto` finds the old entry first and skips creation.
-   Removing a row here only affects the broker's name → topic lookup; the
-   forum topic still exists in the old group (orphaned, harmless). Other
-   names from the old group can stay or go; if the old group is fully
-   abandoned, prune them all in one pass.
-4. **Re-attach.** `attach()` releases the previous claim automatically, the
+3. **Re-attach.** `attach()` releases the previous claim automatically, the
    broker calls `createForumTopic` against the new `group_chat_id`, and
    `topics.json` is upserted with the fresh `(chat_id, topic_id, name)`.
-5. **Verify.** The `attach()` response now shows the new chat id; confirm
+   The stale entry stays in `topics.json` (orphaned, harmless) and shows
+   up tagged in `topics` output.
+4. **Verify.** The `attach()` response now shows the new chat id; confirm
    the topic is visible in the intended group on Telegram.
+
+To prune stale entries entirely (only needed if you want them gone from
+`topics` output): edit `topics.json` and remove the rows whose `chat_id`
+no longer matches `config.json`'s `group_chat_id`. The forum topics in the
+abandoned group still exist on Telegram but are no longer addressable via
+the broker.
 
 ### Register the group's built-in "General" topic under a useful name
 

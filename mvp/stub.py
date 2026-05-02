@@ -436,7 +436,8 @@ def handle_mcp(req):
                 for t in topics:
                     claimer = t.get("claimed_by")
                     state = f"claimed by pid {claimer}" if claimer else "free"
-                    lines.append(f"  • {t['name']}  (chat {t['chat_id']}, thread {t['topic_id']}) — {state}")
+                    stale_tag = " [stale group — not in config.json]" if t.get("stale") else ""
+                    lines.append(f"  • {t['name']}  (chat {t['chat_id']}, thread {t['topic_id']}) — {state}{stale_tag}")
                 text = "\n".join(lines)
             respond(req_id, {"content": [{"type": "text", "text": text}]})
             return
