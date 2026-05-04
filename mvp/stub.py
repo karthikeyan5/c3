@@ -34,6 +34,20 @@ CHAT_ID     = os.environ.get("C3_CHAT_ID")
 ATTACH_NAME = os.environ.get("C3_ATTACH_NAME")
 SOCK_PATH   = os.environ.get("C3_SOCK", "/tmp/c3.sock")
 
+# DM chat_id from config.json — used to resolve target='dm' to the user's actual
+# 1-on-1 chat (positive chat_id, thread 0), not a forum topic in the C3 group.
+def _load_dm_chat_id():
+    try:
+        cfg_path = Path(__file__).resolve().parent / "config.json"
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        v = cfg.get("dm_chat_id")
+        return int(v) if v is not None else None
+    except Exception:
+        return None
+
+DM_CHAT_ID = _load_dm_chat_id()
+
 # The "shared root" — its CLAUDE.md is a persona/common-instructions file, NOT
 # a project identity. Terminals opened here should start unattached and let
 # Karthi pick a topic via the `attach` tool.
@@ -339,12 +353,13 @@ LOCAL_TOOLS = [
         "name": "attach",
         "description": "Attach this terminal to a Telegram topic so inbound messages route here. "
                        "Pass target='<topic-name>' (creates the forum topic if missing), or "
-                       "target='dm' for the root DM (only one terminal can own it). "
+                       "target='dm' for the user's personal 1-on-1 chat (resolves via "
+                       "dm_chat_id in config.json — only one terminal can own it). "
                        "Re-attaching releases the previous claim automatically.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "target": {"type": "string", "description": "Topic name (e.g. 'sthapati'), or 'dm' for the root DM."},
+                "target": {"type": "string", "description": "Topic name (e.g. 'sthapati'), or 'dm' for the user's personal 1-on-1 Telegram chat."},
             },
             "required": ["target"],
         },
@@ -415,7 +430,12 @@ def handle_mcp(req):
                 respond(req_id, error={"code": -32602, "message": "attach: 'target' is required"})
                 return
             if target.lower() == "dm":
-                ok, resp = do_attach(name="arogara")
+                if DM_CHAT_ID is None:
+                    respond(req_id, {"content": [{"type": "text", "text":
+                        "attach failed: 'dm' requires dm_chat_id in c3/mvp/config.json. "
+                        "Set it to your personal Telegram user id (positive integer) and restart."}]})
+                    return
+                ok, resp = do_attach(chat_id=DM_CHAT_ID, topic_id=0)
             else:
                 ok, resp = do_attach(name=target)
             if ok:

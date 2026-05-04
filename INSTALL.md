@@ -96,6 +96,13 @@ fill in the real `group_chat_id` after you approve your first group (see
 `config.json` on every `attach_auto` call, so no restart is needed when
 you edit it.
 
+`dm_chat_id` is optional but lets `attach(target='dm')` resolve to your
+personal 1-on-1 Telegram chat. Set it to your own Telegram user id
+(positive integer — DM @userinfobot to find it). Without it,
+`attach(target='dm')` returns an error asking you to set it. The stub
+reads `dm_chat_id` once at startup, so a Claude Code restart is needed
+after changing it.
+
 ### 6. Install the C3 plugin from this repo's marketplace
 
 Inside Claude Code:
