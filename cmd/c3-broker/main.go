@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/karthikeyan5/c3/internal/broker"
+	"github.com/karthikeyan5/c3/internal/channel/telegram"
 	"github.com/karthikeyan5/c3/internal/mappings"
 )
 
@@ -65,6 +66,19 @@ func run() error {
 	}
 
 	br := broker.New(mf)
+
+	// Register the Telegram channel only if a bot token is configured.
+	// First-install case (no_config): broker still runs, just without inbound
+	// transport, so /c3-setup can write the config and the next session
+	// reconnects to a fully-wired broker.
+	if cc, ok := mf.Channels["telegram"]; ok && cc.BotToken != "" {
+		if err := br.RegisterChannel(telegram.New()); err != nil {
+			return fmt.Errorf("register telegram channel: %w", err)
+		}
+	} else {
+		fmt.Fprintln(os.Stderr, "c3-broker: no telegram bot_token in mappings.json — running without inbound transport")
+	}
+
 	srv, err := broker.Listen(broker.SocketPath(), br)
 	if err != nil {
 		return fmt.Errorf("listen on socket: %w", err)
