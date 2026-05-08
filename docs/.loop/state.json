@@ -16,9 +16,14 @@
       "wiring": {"status": "done", "commit": "261cca0"},
       "attach_proposal_flow": {"status": "done", "commit": "be43397", "details": "8 unit tests with fakeChannel: DM, name in default group (silent claim), name in other group (proposes use_existing_other_group + Alternative), unknown name (proposes create), create=true (calls channel.CreateTopic + persists), topic_id (validates + registers placeholder), saved mapping (silent claim regardless of name search), already-claimed (returns holder-identifying error). Persists mappings.json atomically on every successful attach via SaveMappings()."},
       "remaining": [
-        "Debounce window: per-route 1.5s default, max 50 messages. Lives in worker.dispatchInbound. Last item in Plan 4B.",
-        "Plugin chain wiring: STT prefix substitution + OnInbound chain. Plan 5."
+        "Debounce window (small).",
+        "Plugin chain (Plan 5)."
       ]
+    },
+    "phase_6_claude_adapter": {
+      "status": "DONE — END-TO-END WORKING",
+      "commit": "72b893c",
+      "details": "internal/mcp/ minimal stdio server with writer mutex (3 tests). cmd/c3-claude-adapter/ with broker auto-spawn, hello handshake, brokerReader goroutine, full MCP dispatch (initialize/tools/list/tools/call), 7 tools, notifications/claude/channel manual JSON-RPC framing per spec §4.4.4 + §6.1 all-strings meta convention, adapter-local attach/topics + broker-forwarded reply/react/edit_message/send_typing/download_attachment. Live MCP exchange verified: adapter responds to initialize with proper claude/channel capability + per-cwd instructions; tools/list surfaces 7 tools; broker auto-spawned via flock; @OCDWaterBot connection live."
     },
     "phase_4a_complete": {
       "summary": "Channel/Host interfaces + per-route worker substrate. c3types/channel/plugin packages, RouteWorker, WorkerPool, Broker.Shutdown.",
