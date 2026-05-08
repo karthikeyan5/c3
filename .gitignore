@@ -15,3 +15,13 @@ dist/
 mvp/config.json
 mvp/topics.json
 plugin/plugins/c3-telegram/.mcp.json
+
+# Go
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/bin/
+/coverage.out
