@@ -24,3 +24,7 @@ mvp/topics.json
 *.out
 /bin/
 /coverage.out
+/c3-broker
+/c3-claude-adapter
+/c3-codex-adapter
+/migrate-legacy
