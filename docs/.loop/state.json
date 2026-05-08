@@ -1,43 +1,49 @@
 {
-  "phase": "review-r3-pending",
+  "phase": "build-phase-1-pending",
+  "spec_locked": true,
+  "spec_locked_at": "2026-05-09T00:30:00Z",
   "review": {
     "round": 3,
-    "rounds_completed": 2,
+    "rounds_completed": 3,
     "max_rounds": 3
   },
   "rounds": {
     "r1": {
-      "verdicts": "all yes-with-fixes; ~30 issues",
-      "files": ["review-r1-architecture.md", "review-r1-feasibility.md", "review-r1-ux.md", "r1-synthesis.md"]
+      "verdicts": "all yes-with-fixes; ~30 issues found",
+      "outcome": "applied cross-cutting consensus + critical single-reviewer items"
     },
     "r2": {
       "verdicts": "all yes-with-fixes/clarifications/gaps; ~20 new issues + leftover drift",
-      "files": ["review-r2-architecture.md", "review-r2-feasibility.md", "review-r2-ux.md"],
-      "fixes_applied": [
-        "RouteKey value-type introduced — fixes *int64 map-key pointer-identity bug",
-        "Per-route serial executor mandate — eliminates typing/edit_progress/STT/debounce race class",
-        "Stub, StateDir, ToolRegistry types declared in §4.5.1; Session is alias for Stub",
-        "AttachReq.Confirm carries the proposal echoed back — anti-race for sibling-stub mid-confirm topic creation",
-        "Schema example now includes fallback_cooldown_s, debounce_max_messages, stt_prefix, codex.shared_root, codex.app_server_meta_path; semantics documented",
-        "InboundEvent leftover in §5.7 fixed",
-        "USAGE.md c3_attach/c3_reply/c3_topics → attach/reply/topics (3 replace_all sweeps)",
-        "USAGE.md release path: c3-broker release subcommand from any shell, no need to /exit",
-        "USAGE.md reply-recovery: documented for both Claude and Codex (cross-CLI symmetry)",
-        "§4.4.5 c3_codex_forward → codex_forward (consistent with §4.4.2 harmonization)",
-        "§6.1 notifications/claude/channel payload schema documented with full example, all-strings rule, omitted-vs-null convention",
-        "§6.2 STT plugin distribution: //go:embed handler.py + write-to-XDG_DATA on first run + sha256 update path; user-override sentinel; whisper Python package is system dependency (POC posture)",
-        "/tmp/c3-codex-app-server.json → /tmp/c3-codex-app-server-${UID}.json with flock; configurable via codex.app_server_meta_path",
-        "mappings.json backup-on-write to .bak (one generation, mode 0600)",
-        "Corruption recovery on boot: log+exit, no silent skeleton fallback",
-        "inbox buffer policy: 100-msg ring, oldest dropped on overflow with log line, flushes on adapter disconnect",
-        "/c3-setup: validate Telegram token via getMe BEFORE writing mappings.json"
+      "outcome": "applied RouteKey value-type fix, per-route serial executor mandate, type declarations, schema completeness, tool-name harmonization, multi-user paths, STT distribution, etc."
+    },
+    "r3": {
+      "verdicts": {
+        "architecture": "ready with 4 lock-blockers + 6 tighten-ups",
+        "feasibility": "READY TO LOCK — zero lock-blockers (only plan-phase tighten-ups)",
+        "ux": "ready with 2 lock-blockers + 5 tighten-ups"
+      },
+      "lock_blockers_resolved": [
+        "Stub.ConnID lifecycle pinned: assign on hello, bump on reconnect, compared on every route-worker job; stale ConnID jobs discarded",
+        "Release-vs-in-flight ordering: route worker drains queue before release; jobs after release hit cooldown-fallback; ConnID guards against late results from prior claims",
+        "OnInbound/OnVoiceReceived/OnOutbound signatures harmonized: all take ctx.Context; priority direction documented (lower runs first)",
+        "OnAttach signature uses *Stub (was *Session)",
+        "Foundation plan out-of-scope updated: Plan 7 is now Codex-bridge-in-Go (not no-rewrite); aligns with spec v5 §11.D",
+        "INSTALL.md adds re-bind path for existing Telegram topics post-migration: attach --topic=<n>"
+      ],
+      "tighten_ups_addressed": [
+        "ADAPTERS.md drift: c3_attach/c3_inbox → attach/inbox",
+        "USAGE.md health-check ls and pkill commands now use ${XDG_RUNTIME_DIR:-/tmp}/c3.sock and /tmp/c3-$UID.sock fallback",
+        "INSTALL.md uninstall command updated for new socket path",
+        "USAGE.md gains pointer to c3-broker status / release / reload-config subcommands as the operational path",
+        "INSTALL.md prerequisites: pip install openai-whisper documented",
+        "INSTALL.md /c3-setup: token validation via getMe documented (refuses to write on 401/timeout)"
       ]
     }
   },
   "build": {
-    "current_phase": null,
-    "phases_completed": [],
-    "spec_locked": false
+    "current_phase": 1,
+    "current_task": "1.1: Initialize Go module",
+    "phases_completed": []
   },
-  "notes": "R2 fixes applied. Spec now ~1300 lines. R3 spawned to validate the cumulative fix passes; this is the final review round before the spec locks. If R3 returns clean (no critical structural issues), lock spec and start build phase 1."
+  "notes": "Spec locked 2026-05-09. Three independent review rounds done; final round had zero structural blockers from feasibility, only small fixes from arch and UX (all applied). Spec is committed at this state. Next: execute foundation plan tasks 1.1 → 1.2 → 1.3 (Phase 1 skeleton), self-review, proceed to Phase 2."
 }

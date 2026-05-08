@@ -266,7 +266,7 @@ Claims are in-memory only — `map[RouteKey]*Stub` in the broker. They are NOT p
 | Adapter crashes / loses socket | Broker detects via `EPIPE` on next write and releases. The next inbound for that route triggers the cooldown-fallback reply (§4.4.x). |
 | `release` op (explicit) | Release claim. Adapter stays connected, just gives up the route. New `attach` reclaims. |
 | Broker restart | All claims gone. Adapters re-claim on reconnect. The `mappings.json` cwd→topic mapping is the durable state; live claims are not. |
-| In-flight inbound when claim releases | The current message (already mid-deliver) completes if possible; the next one hits cooldown-fallback. No buffer is held across release. |
+| In-flight inbound when claim releases | **The route worker drains its queue before releasing.** Jobs already enqueued at release-time complete and the worker drives them through the channel; jobs that arrive AFTER the release op (still in transit at the network layer or sitting in OS pipe buffers) hit cooldown-fallback. The worker, not the network, is the mutator. ConnID-stamped late results from a previous claim are discarded by the new worker — they never mutate placeholder/typing state for the new claim. |
 
 Single-claim-per-route invariant: only one stub at a time owns `(channel, chat_id, *topic_id)`. The broker rejects a second `attach` to the same route with `claim_holder` populated; adapter surfaces "already held by `<cli>` pid `<pid>`".
 
@@ -632,10 +632,17 @@ package plugin
 
 type Host interface {
     // Hook subscriptions. Calling these registers the plugin for that hook.
-    OnInbound(fn func(*Inbound) (*Inbound, bool /*drop*/))
-    OnVoiceReceived(fn func(VoicePayload) (string, error))  // returns transcript or "" + err
-    OnOutbound(fn func(*Outbound) (*Outbound, bool /*drop*/))
-    OnAttach(fn func(*Session, *Mapping))
+    // All hook callbacks receive a context.Context the broker can cancel —
+    // honor it and return promptly when ctx.Done() fires (broker shutdown
+    // or per-route timeout).
+    //
+    // Hook chaining order: lower priority runs FIRST. (Plugin priority is
+    // an int with default 100; STT defaults to 10 so it runs before
+    // OnInbound transforms see the post-STT text.)
+    OnInbound(fn func(ctx context.Context, msg *Inbound) (*Inbound, bool /*drop*/))
+    OnVoiceReceived(fn func(ctx context.Context, payload VoicePayload) (string, error)) // returns transcript or "" + err
+    OnOutbound(fn func(ctx context.Context, msg *Outbound) (*Outbound, bool /*drop*/))
+    OnAttach(fn func(*Stub, *Mapping))
 
     // Tool registration. RegisterTools is called once during plugin Register().
     RegisterTools(fn func(*ToolRegistry))
@@ -660,9 +667,17 @@ type Stub struct {
     CLI string  // "claude" | "codex" | future
     PID int
     CWD string
-    // ConnID is the broker-assigned connection generation. Held by route
-    // workers when they accept a job, used to detect "claim moved while my job
-    // was in flight" — late results land on /dev/null instead of the new claim.
+    // ConnID is the broker-assigned connection generation. Lifecycle:
+    //   1. Assigned by broker when an adapter completes hello — broker holds
+    //      a monotonic uint64 counter, increments, hands the value back in
+    //      hello_ack. Adapter does not see the counter; it just knows its own.
+    //   2. Bumped on every reconnect. The adapter's reconnect-once flow
+    //      causes the broker to assign a new ConnID; the old ConnID is dead.
+    //   3. Compared on every route-worker job: workers stamp ConnID into
+    //      jobs they enqueue. When a job's ConnID no longer matches the
+    //      currently-claimed Stub's ConnID, the worker discards the job —
+    //      a late EditMessage 200 from a prior claim cannot mutate the
+    //      current placeholder map. ConnID is the late-result-discard token.
     ConnID uint64
 }
 

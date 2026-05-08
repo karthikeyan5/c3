@@ -127,14 +127,14 @@ C3 doesn't auto-delete. From your phone (Telegram), long-press the topic in the 
 Quick sanity sweep when something feels off:
 
 ```
-ls -la /tmp/c3.sock           # broker socket; should exist + 0o600
+ls -la "${XDG_RUNTIME_DIR:-/tmp}/c3.sock" 2>/dev/null || ls -la /tmp/c3-$UID.sock   # broker socket; should exist + 0o600
 cat /tmp/c3-broker.pid        # the running broker's pid
 tail /tmp/c3-broker.log       # recent activity
 tail /tmp/c3-codex-supervisor.log  # last codex launcher invocation (if Codex installed)
 cat /tmp/c3-codex-app-server.json  # current app-server signature (cwd, topic, adapter path)
 ```
 
-If the socket is missing or the pid file points at a nonexistent process, the next CLI session will spawn a fresh broker. If something looks corrupted, `pkill c3-broker; rm /tmp/c3.sock /tmp/c3-broker.pid` resets the world.
+If the socket is missing or the pid file points at a nonexistent process, the next CLI session will spawn a fresh broker. If something looks corrupted, `pkill c3-broker; rm -f "${XDG_RUNTIME_DIR:-/tmp}/c3.sock" /tmp/c3-$UID.sock "${XDG_RUNTIME_DIR:-$HOME/.cache/c3}/c3-broker.pid"` resets the world. Or use the operational subcommands instead — `c3-broker status` prints liveness, `c3-broker release <cwd>` drops a stuck claim, `c3-broker reload-config` re-reads `mappings.json` after hand-edits without dropping live claims.
 
 ## Privacy and safety
 

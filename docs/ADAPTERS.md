@@ -64,7 +64,7 @@ On the broker dropping the connection:
 
 Most tools forward through to the broker. Two are conventionally adapter-local because they involve the adapter's own state:
 
-- `attach` (or `c3_attach`, `c3_codex_attach`, etc.) — wraps the broker's attach op. The adapter inspects the response and either returns a "claimed" success or surfaces the proposal to the agent. Adapter-local because the wording of the surfaced text differs by CLI (Claude Code natively renders `<channel>` blocks; Codex sees `notifications/message` log entries).
+- `attach` — wraps the broker's attach op. The adapter inspects the response and either returns a "claimed" success or surfaces the proposal to the agent. Adapter-local because the wording of the surfaced text differs by CLI (Claude Code natively renders `<channel>` blocks; Codex sees `notifications/message` log entries). Tool name is unprefixed across all adapters per spec §4.4.2 — the MCP server name (`c3` or `c3_codex` in `mcp_servers.<key>`) provides the namespace; per-tool prefixing is redundant.
 - `topics` — wraps the broker's `list_topics` op. Adapter-local for the same reason — formatting.
 
 Don't forward these through `tool_call`. Implement them in the adapter, hit the broker with the corresponding op directly.
@@ -77,7 +77,7 @@ The broker emits a normalized `Inbound{}` payload. Your adapter has to convert i
 
 **Codex** doesn't render unsolicited MCP notifications in the TUI today (open issues #18056, #17543, #15299). The Codex adapter therefore does three things in parallel:
 
-1. Buffer the inbound for a `c3_inbox(limit, ack)` poll tool the agent can call to drain.
+1. Buffer the inbound for an `inbox(limit, ack)` poll tool the agent can call to drain.
 2. Emit a `notifications/message` log notification (cheap, future-proofs for when Codex starts surfacing them).
 3. **If `C3_CODEX_REMOTE_BRIDGE=1`** is set in env (the C3 launcher sets it), forward the inbound as a real `turn/start` to the running Codex app-server via WebSocket. This is the only path that makes a Telegram message appear as a normal turn in the user's TUI.
 

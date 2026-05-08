@@ -12,6 +12,7 @@ You need:
 - **Your Telegram user id** for DMs. Message `@userinfobot` from your phone; it replies with your user id (a positive integer).
 - **The supergroup's chat id.** Send any message in the group; the bot now sees it. Or use `@username_to_id_bot`-style helpers. Group chat ids are negative integers starting with `-100`.
 - **For Codex integration:** Codex CLI installed (typically via `npm install -g @openai/codex` or similar). The C3 launcher will detect it. NVM users: take note — long-running shells hash `codex` to your NVM path, so the install step below symlinks both `~/.local/bin/codex` and the NVM bin path.
+- **For voice transcription (STT plugin):** Python whisper installed once: `pip install openai-whisper`. The STT plugin's Go shim subprocesses `python3` to run whisper; the Python package is a system dependency, not bundled. If you don't need voice, set `mappings.json:plugins.stt.enabled=false` and skip the install. First-time whisper invocation downloads the model weights (a few hundred MB depending on `plugins.stt.model`); allow that to complete before sending your first voice message.
 
 ## Step 1: Install the Claude Code plugin
 
@@ -59,6 +60,8 @@ The slash command interactively gathers:
 - Your DM chat id (positive integer, your own user id).
 - At least one group and its chat id (e.g. `main` → `-1003990699908`). You can add more groups later by editing `~/.config/c3/mappings.json`.
 - (Optional) `master_user_id` for the future access-control feature; default is your DM id.
+
+**Token validation.** Before writing the file, `/c3-setup` calls Telegram's `getMe` with the token. If it 401s (bad token) or times out (no network), the command refuses to write `mappings.json` and prints the actual Telegram error. Re-run `/c3-setup` after fixing the token. This avoids the failure mode where a typo in the token gets silently saved and surfaces only on the next inbound poll.
 
 It writes `~/.config/c3/mappings.json` at mode 600 with this skeleton:
 
@@ -135,7 +138,14 @@ Migrate them to the new location with:
 migrate-legacy
 ```
 
-It reads both files, writes `~/.config/c3/mappings.json`, and refuses to overwrite if the file already exists. Existing topic registrations from the old `mvp/topics.json` are NOT migrated — by design, you'll re-attach as you go in each project. Karthi's preference: start clean.
+It reads both files, writes `~/.config/c3/mappings.json`, and refuses to overwrite if the file already exists. Existing topic registrations from the old `mvp/topics.json` are NOT migrated — by design, you start clean.
+
+**Re-binding existing Telegram topics post-migration.** If you have Telegram topics that were created by the old MVP and still exist in your supergroup, you have two options for each project:
+
+1. **`cd` into the project and `attach`** — broker proposes creating a topic with that cwd's basename. If the name matches the existing Telegram topic, the cross-group search finds it; if not, you can decline the create proposal and use option 2.
+2. **`attach --topic=<id>`** — pass the existing Telegram thread id directly. Broker validates against Telegram (lightweight `sendChatAction` call), accepts on success, and persists the cwd→topic mapping. No duplicate topic gets created.
+
+Either way, after the first successful attach the cwd→topic mapping is persistent and future sessions auto-attach.
 
 After verifying the new broker works end-to-end, you can delete `mvp/`. Don't `rm -rf` until you've confirmed at least one round-trip on the new stack.
 
@@ -160,7 +170,7 @@ For Codex side, re-run `c3-broker install-codex-shim` after `/c3-build` to refre
 codex plugin uninstall c3-codex         # removes from Codex
 rm ~/.local/bin/codex                   # restore your real codex
 find ~/.nvm/versions/node -name codex -type l -delete   # remove NVM-side symlinks (CAUTION: only if they pointed at the C3 launcher)
-rm -f /tmp/c3.sock /tmp/c3-broker.pid   # broker scratch files
+rm -f "${XDG_RUNTIME_DIR:-/tmp}/c3.sock" /tmp/c3-$UID.sock "${XDG_RUNTIME_DIR:-$HOME/.cache/c3}/c3-broker.pid"   # broker scratch files
 rm -f /tmp/c3-codex-app-server.json     # codex launcher scratch
 rm -rf ~/.config/c3                     # CONFIG; remove only if you don't want to keep mappings/topics
 $GOBIN/c3-broker --uninstall-binaries   # removes binaries from $GOBIN (or just `rm $GOBIN/c3-* $GOBIN/codex` manually)
