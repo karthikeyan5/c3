@@ -14,7 +14,6 @@ dist/
 # matching `.example` file and edits in their own values. See INSTALL.md.
 mvp/config.json
 mvp/topics.json
-plugin/plugins/c3-telegram/.mcp.json
 
 # Go
 *.exe

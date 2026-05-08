@@ -65,6 +65,65 @@ cd ~/arogara/sthapati
 
 Run the broker manually (`python3 broker.py`) only when debugging — e.g. to watch stderr live.
 
+## Codex integration
+
+Detailed design and operational notes live in
+[`CODEX_BRIDGE_SPEC.md`](CODEX_BRIDGE_SPEC.md).
+
+Codex uses a separate MCP stub and launcher:
+
+- `codex` — thin launcher shim. Starts/reuses a local Codex app-server,
+  injects the C3 MCP server config for this launch, and then starts the real
+  Codex TUI with `--remote`.
+- `codex_supervisor.py` — launcher implementation.
+- `codex_stub.py` — Codex MCP server. It connects to the same `/tmp/c3.sock`
+  broker, auto-attaches from `C3_ATTACH_NAME`, exposes Telegram tools, and
+  forwards inbound Telegram text into the active Codex app-server thread.
+
+The intended day-to-day command is just:
+
+```
+cd ~/arogara/<project>
+codex
+```
+
+`codex resume ...` and `codex fork ...` are wrapped the same way, so continuing
+an existing interactive session keeps the Telegram bridge active. From
+`~/arogara` itself, the launcher attaches to the `arogara` topic; from a child
+project with its own `CLAUDE.md`, it attaches to that project name.
+
+The shim is installed at:
+
+```
+~/.local/bin/codex -> ~/arogara/c3/mvp/codex
+```
+
+It bypasses ordinary Codex subcommands such as `codex mcp`, `codex exec`,
+`codex app-server`, `codex --help`, and `codex --version`, forwarding them
+directly to the real Codex binary. Set `C3_CODEX_DISABLE=1` to bypass the C3
+launcher for one command.
+
+Do not enable `c3_codex_forward` manually from a stock `codex resume` process.
+That creates a split-brain: Telegram turns are accepted by the background
+app-server and persisted to the session, but the visible non-remote TUI does
+not render them. The stub refuses forwarding unless it was launched by this
+wrapper, which sets `C3_CODEX_REMOTE_BRIDGE=1`.
+
+When the TUI starts, the shim passes per-launch config equivalent to registering
+this MCP server:
+
+- `c3_attach(target)` — attach this Codex session to a C3 topic.
+- `c3_topics()` — list known topics and current claims.
+- `c3_inbox(limit, ack)` — poll buffered inbound Telegram messages as a fallback.
+- `c3_reply(text, files, parse_mode)` — reply through the attached topic.
+
+Unlike Claude Code, Codex does not render `notifications/claude/channel` or
+generic MCP log notifications as chat turns. The Codex stub therefore uses the
+app-server API internally: when inbound Telegram arrives, it discovers the
+loaded Codex thread and submits the message with `turn/start`. The app-server
+is an implementation detail owned by the launcher, not a separate terminal the
+user has to manage.
+
 ## Lifecycle: onboarding a new group or topic
 
 The golden rule: prefer the tool / CLI over hand-editing `access.json` or

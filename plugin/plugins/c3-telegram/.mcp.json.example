@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "telegram": {
-      "command": "python3",
-      "args": ["<ABSOLUTE-PATH-TO-c3-CLONE>/mvp/stub.py"]
-    }
-  }
-}

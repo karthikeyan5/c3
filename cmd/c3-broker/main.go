@@ -1,5 +1,11 @@
-// c3-broker is the C3 daemon. It owns the unix socket, the in-memory
-// routes/stubs registries, and (in subsequent phases) the channel modules.
+// c3-broker is the C3 daemon and operational tool. Subcommands:
+//
+//	c3-broker             (default) — run as daemon
+//	c3-broker setup       — interactive config; calls Telegram getMe; writes mappings.json
+//	c3-broker status      — read-only health check
+//	c3-broker validate    — parse + validate mappings.json
+//	c3-broker release CWD — drop the claim on a route bound to CWD
+//	c3-broker reload-config — re-read mappings.json without dropping live claims (running broker only)
 //
 // Singleton-per-machine via flock on $XDG_RUNTIME_DIR/c3-broker.pid (or
 // fallback). Spawned by adapters via exec.Command + setsid; runs until its
@@ -19,13 +25,63 @@ import (
 )
 
 func main() {
-	if err := run(); err != nil {
+	if len(os.Args) >= 2 {
+		switch os.Args[1] {
+		case "setup":
+			if err := runSetup(); err != nil {
+				fmt.Fprintf(os.Stderr, "c3-broker setup: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		case "status":
+			if err := runStatus(); err != nil {
+				fmt.Fprintf(os.Stderr, "c3-broker status: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		case "validate":
+			if err := runValidate(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "c3-broker validate: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		case "release":
+			if err := runRelease(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "c3-broker release: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		case "--help", "-h", "help":
+			fmt.Println(usage)
+			return
+		}
+	}
+
+	if err := runDaemon(); err != nil {
 		fmt.Fprintf(os.Stderr, "c3-broker: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
+const usage = `c3-broker — C3 daemon and operational tool.
+
+Usage:
+  c3-broker             Run as daemon (singleton-per-machine).
+  c3-broker setup       Interactive config — gather bot token, DM chat id,
+                        group chat id; validate against Telegram; write
+                        ~/.config/c3/mappings.json (mode 0600).
+  c3-broker status      Read-only health check (broker, socket, mappings,
+                        channels, claims).
+  c3-broker validate [path]
+                        Parse + validate mappings.json. Defaults to default
+                        path. Exits 0 on valid, 1 on invalid.
+  c3-broker release <cwd>
+                        Drop the claim on a route bound to <cwd>.
+                        (Runtime op against a running broker.)
+  c3-broker --help      This text.
+`
+
+func runDaemon() error {
 	pidFile := broker.PidFilePath()
 	lock, err := broker.AcquireSingleton(pidFile)
 	if err != nil {
@@ -43,7 +99,6 @@ func run() error {
 	mf, err = mappings.Read(mfPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Spec §5.1 first-install path: write a minimal skeleton, keep running.
 			mf = &mappings.MappingsFile{
 				SchemaVersion: 1,
 				Channels:      map[string]mappings.ChannelConfig{},
@@ -55,9 +110,8 @@ func run() error {
 			if err := mappings.Write(mfPath, mf); err != nil {
 				return fmt.Errorf("write skeleton mappings: %w", err)
 			}
-			fmt.Fprintf(os.Stderr, "c3-broker: wrote skeleton %s — run /c3-setup to configure\n", mfPath)
+			fmt.Fprintf(os.Stderr, "c3-broker: wrote skeleton %s — run `c3-broker setup` to configure\n", mfPath)
 		} else {
-			// Corruption recovery (spec §4.3): log and exit. No silent fallback.
 			return fmt.Errorf("read mappings %s: %w", mfPath, err)
 		}
 	}
@@ -67,10 +121,6 @@ func run() error {
 
 	br := broker.New(mf)
 
-	// Register the Telegram channel only if a bot token is configured.
-	// First-install case (no_config): broker still runs, just without inbound
-	// transport, so /c3-setup can write the config and the next session
-	// reconnects to a fully-wired broker.
 	if cc, ok := mf.Channels["telegram"]; ok && cc.BotToken != "" {
 		if err := br.RegisterChannel(telegram.New()); err != nil {
 			return fmt.Errorf("register telegram channel: %w", err)

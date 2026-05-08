@@ -1,6 +1,0 @@
-{
-  "name": "c3-telegram",
-  "description": "C3 Telegram channel — per-terminal stdio stub that proxies one topic to the shared C3 broker (bot polling, STT, routing).",
-  "version": "0.0.1",
-  "keywords": ["telegram", "messaging", "channel", "mcp", "c3"]
-}
