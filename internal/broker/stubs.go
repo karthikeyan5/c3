@@ -18,6 +18,35 @@ type Stub struct {
 	// adapter. Type is *ipc.Conn but kept as any here to avoid the import
 	// cycle in the registry file.
 	Conn any
+
+	// Route is the currently-claimed route for this stub (one per connection
+	// in v1; re-attach replaces). nil when unclaimed. Set/cleared by the
+	// broker handler under stubMu.
+	stubMu sync.Mutex
+	Route  *RouteKey
+}
+
+// SetRoute atomically sets the stub's current claim.
+func (s *Stub) SetRoute(key *RouteKey) {
+	s.stubMu.Lock()
+	defer s.stubMu.Unlock()
+	if key == nil {
+		s.Route = nil
+		return
+	}
+	k := *key
+	s.Route = &k
+}
+
+// CurrentRoute returns a copy of the stub's current claim, or nil.
+func (s *Stub) CurrentRoute() *RouteKey {
+	s.stubMu.Lock()
+	defer s.stubMu.Unlock()
+	if s.Route == nil {
+		return nil
+	}
+	k := *s.Route
+	return &k
 }
 
 // StubRegistry holds connected adapters keyed by ConnID. Concurrent-safe.

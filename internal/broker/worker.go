@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/karthikeyan5/c3/internal/c3types"
+	"github.com/karthikeyan5/c3/internal/ipc"
 )
 
 // JobKind tags route-worker jobs.
@@ -43,6 +44,7 @@ type RouteWorker struct {
 	key     RouteKey
 	queue   chan Job
 	idle    time.Duration
+	broker  *Broker
 	cancel  context.CancelFunc
 	done    chan struct{}
 	mu      sync.Mutex
@@ -51,12 +53,16 @@ type RouteWorker struct {
 
 // newRouteWorker starts a worker that runs until ctx is canceled OR no jobs
 // arrive within `idle`. Caller observes Done() for completion.
-func newRouteWorker(parent context.Context, key RouteKey, idle time.Duration) *RouteWorker {
+//
+// broker may be nil for unit tests that exercise idle/stop/release behavior
+// without depending on broker state.
+func newRouteWorker(parent context.Context, key RouteKey, idle time.Duration, broker *Broker) *RouteWorker {
 	ctx, cancel := context.WithCancel(parent)
 	w := &RouteWorker{
 		key:    key,
 		queue:  make(chan Job, 64),
 		idle:   idle,
+		broker: broker,
 		cancel: cancel,
 		done:   make(chan struct{}),
 	}
@@ -95,21 +101,79 @@ func (w *RouteWorker) run(ctx context.Context) {
 	}
 }
 
-// dispatch is the per-job handler. Phase 4A: no plugin chain, no real channel
-// hookup. Inbound jobs no-op; outbound jobs return a stub error result.
-// Plan 4B/5 wire the real implementations.
+// dispatch is the per-job handler. Implements the per-route serial
+// invariant from spec §4.2.0.
 func (w *RouteWorker) dispatch(ctx context.Context, job Job) {
 	switch job.Kind {
 	case JobInbound:
-		// Plan 4B/5: STT (OnVoiceReceived), OnInbound chain, debounce window,
-		// forward to claimed stub via ipc.OpInbound.
+		w.dispatchInbound(ctx, job.Inbound)
 	case JobOutbound:
-		if job.Outbound != nil && job.Outbound.ResultCh != nil {
-			job.Outbound.ResultCh <- OutboundResult{Err: errOutboundNotImpl}
-		}
+		w.dispatchOutbound(ctx, job.Outbound)
 	case JobRelease:
 		// Run loop sees JobRelease and returns; nothing to dispatch here.
 	}
+}
+
+// dispatchInbound forwards a normalized inbound to the claimed stub, or fires
+// the cooldown-fallback reply if the route is unclaimed.
+//
+// Phase 4B scope: no plugin chain (Plan 5). The inbound flows directly from
+// the channel into the claimed adapter, or into the fallback reply.
+func (w *RouteWorker) dispatchInbound(ctx context.Context, in *c3types.Inbound) {
+	if w.broker == nil || in == nil {
+		return
+	}
+
+	holder, claimed := w.broker.Routes.Holder(w.key)
+	if claimed {
+		// Forward to the claimed stub.
+		conn, ok := holder.Conn.(*ipc.Conn)
+		if !ok {
+			return // stub didn't store an *ipc.Conn — shouldn't happen
+		}
+		_ = conn.WriteJSON(ipc.InboundMsg{Op: ipc.OpInbound, Inbound: *in})
+		return
+	}
+
+	// No claim → cooldown-fallback.
+	if !w.broker.Fallbacks.ShouldSend(w.key) {
+		return
+	}
+	ch, err := w.broker.Channel(in.Channel)
+	if err != nil {
+		return
+	}
+	args := c3types.ReplyArgs{
+		Channel: in.Channel,
+		ChatID:  in.ChatID,
+		TopicID: in.TopicID,
+		Text:    fallbackText,
+	}
+	if _, err := ch.SendReply(args); err != nil {
+		// Don't reset the cooldown on failure — Telegram could be down. Just
+		// drop and let the next inbound try again after the window.
+		return
+	}
+}
+
+// dispatchOutbound translates an OutboundJob into a channel call, returning
+// the result via job.ResultCh. The channel is resolved from the worker's
+// route key (which carries the channel name).
+func (w *RouteWorker) dispatchOutbound(ctx context.Context, job *OutboundJob) {
+	if job == nil || job.ResultCh == nil {
+		return
+	}
+	if w.broker == nil {
+		job.ResultCh <- OutboundResult{Err: errOutboundNotImpl}
+		return
+	}
+	ch, err := w.broker.Channel(w.key.Channel)
+	if err != nil {
+		job.ResultCh <- OutboundResult{Err: err}
+		return
+	}
+	result, err := dispatchTool(ch, w.key, job.Tool, job.Args)
+	job.ResultCh <- OutboundResult{Result: result, Err: err}
 }
 
 // Submit enqueues a job. Returns false if the worker is stopped or the
@@ -124,8 +188,6 @@ func (w *RouteWorker) Submit(job Job) bool {
 	case w.queue <- job:
 		return true
 	default:
-		// Queue full — drop. Spec §4.4.3: cooldown-fallback handles inbound;
-		// for outbound the caller sees no response from ResultCh.
 		return false
 	}
 }
@@ -146,8 +208,8 @@ func (w *RouteWorker) Stop() {
 // Done returns a channel that closes when the worker has exited.
 func (w *RouteWorker) Done() <-chan struct{} { return w.done }
 
-// errOutboundNotImpl is the sentinel returned from Phase 4A's stub dispatch.
-var errOutboundNotImpl = workerErr("outbound not yet wired (Plan 4B)")
+// errOutboundNotImpl is returned when the worker has no broker (test-only path).
+var errOutboundNotImpl = workerErr("worker has no broker reference")
 
 type workerErr string
 

@@ -64,12 +64,60 @@ func (b *Broker) HandleConn(nc net.Conn) {
 			b.handleListTopics(conn)
 		case ipc.OpRelease:
 			b.Routes.ReleaseAllByConnID(stub.ConnID)
+			stub.SetRoute(nil)
+		case ipc.OpToolCall:
+			b.handleToolCall(conn, stub, raw)
 		case ipc.OpBye:
 			return
 		default:
-			_ = conn.WriteJSON(ipc.ErrorMsg{Op: ipc.OpError, Err: "op not implemented in phase 3: " + string(op)})
+			_ = conn.WriteJSON(ipc.ErrorMsg{Op: ipc.OpError, Err: "op not implemented yet: " + string(op)})
 		}
 	}
+}
+
+// handleToolCall dispatches a tool-call to the worker for the stub's
+// currently-claimed route. The result returns asynchronously via the worker's
+// OutboundJob.ResultCh; we block this connection's read loop on it (which is
+// fine because the writer mutex on the Conn allows other goroutines —
+// inbound forwarding — to write concurrently).
+func (b *Broker) handleToolCall(conn *ipc.Conn, stub *Stub, raw []byte) {
+	var req ipc.ToolCallReq
+	if err := json.Unmarshal(raw, &req); err != nil {
+		_ = conn.WriteJSON(ipc.ErrorMsg{Op: ipc.OpError, Err: "malformed tool_call: " + err.Error()})
+		return
+	}
+
+	route := stub.CurrentRoute()
+	if route == nil {
+		_ = conn.WriteJSON(ipc.ToolResultMsg{
+			Op: ipc.OpToolResult, ID: req.ID,
+			Error: &ipc.ErrorPayload{Code: -32000, Message: "tool_call before attach: no route claimed"},
+		})
+		return
+	}
+
+	resultCh := make(chan OutboundResult, 1)
+	job := Job{Kind: JobOutbound, Outbound: &OutboundJob{
+		Tool:     req.Name,
+		Args:     req.Args,
+		ResultCh: resultCh,
+	}}
+	if !b.Workers.Submit(*route, job) {
+		_ = conn.WriteJSON(ipc.ToolResultMsg{
+			Op: ipc.OpToolResult, ID: req.ID,
+			Error: &ipc.ErrorPayload{Code: -32000, Message: "worker queue full or stopped"},
+		})
+		return
+	}
+
+	res := <-resultCh
+	resp := ipc.ToolResultMsg{Op: ipc.OpToolResult, ID: req.ID}
+	if res.Err != nil {
+		resp.Error = &ipc.ErrorPayload{Code: -32000, Message: res.Err.Error()}
+	} else {
+		resp.Result = res.Result
+	}
+	_ = conn.WriteJSON(resp)
 }
 
 func (b *Broker) handleListTopics(conn *ipc.Conn) {

@@ -11,16 +11,14 @@ import (
 )
 
 // Broker holds the in-memory state shared by all connections: stubs registry,
-// routes table, worker pool, channel registry, and a snapshot of the
-// mappings.json config.
-//
-// Phase 3 scope: read-only mappings. Phase 4A: per-route worker pool +
-// channel/Host interfaces. Phase 4B: Telegram channel implementation.
+// routes table, worker pool, channel registry, fallback tracker, and a
+// snapshot of the mappings.json config.
 type Broker struct {
-	Mappings *mappings.MappingsFile
-	Stubs    *StubRegistry
-	Routes   *Routes
-	Workers  *WorkerPool
+	Mappings  *mappings.MappingsFile
+	Stubs     *StubRegistry
+	Routes    *Routes
+	Workers   *WorkerPool
+	Fallbacks *fallbackTracker
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -34,23 +32,22 @@ const defaultWorkerIdle = 60 * time.Second
 // New returns a Broker with empty registries and the given mappings config.
 func New(mf *mappings.MappingsFile) *Broker {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Broker{
-		Mappings: mf,
-		Stubs:    NewStubRegistry(),
-		Routes:   NewRoutes(),
-		Workers:  NewWorkerPool(ctx, defaultWorkerIdle),
-		ctx:      ctx,
-		cancel:   cancel,
-		channels: map[string]*channelRegistration{},
+	b := &Broker{
+		Mappings:  mf,
+		Stubs:     NewStubRegistry(),
+		Routes:    NewRoutes(),
+		Fallbacks: newFallbackTracker(defaultFallbackCooldown),
+		ctx:       ctx,
+		cancel:    cancel,
+		channels:  map[string]*channelRegistration{},
 	}
+	b.Workers = NewWorkerPool(ctx, defaultWorkerIdle, b)
+	return b
 }
 
 // RegisterChannel adds a channel to the broker. The channel is started
 // (which validates config and connects to the upstream API) before the
 // registration is recorded — if Start fails, no registration happens.
-//
-// Channels are typically registered once at broker boot; calling
-// RegisterChannel after the broker is running is allowed but unusual.
 func (b *Broker) RegisterChannel(ch channel.Channel) error {
 	host := NewBrokerHost(b, ch.Name())
 	if err := ch.Start(b.ctx, host); err != nil {
@@ -63,7 +60,6 @@ func (b *Broker) RegisterChannel(ch channel.Channel) error {
 }
 
 // Channel returns the registered channel implementation by name.
-// Returns nil, error if not registered.
 func (b *Broker) Channel(name string) (channel.Channel, error) {
 	b.chMu.RLock()
 	defer b.chMu.RUnlock()

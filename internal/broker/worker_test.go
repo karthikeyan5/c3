@@ -7,7 +7,7 @@ import (
 )
 
 func TestWorker_IdleShutdown(t *testing.T) {
-	w := newRouteWorker(context.Background(), RouteKey{Channel: "x"}, 50*time.Millisecond)
+	w := newRouteWorker(context.Background(), RouteKey{Channel: "x"}, 50*time.Millisecond, nil)
 	select {
 	case <-w.Done():
 	case <-time.After(500 * time.Millisecond):
@@ -16,7 +16,7 @@ func TestWorker_IdleShutdown(t *testing.T) {
 }
 
 func TestWorker_StopExits(t *testing.T) {
-	w := newRouteWorker(context.Background(), RouteKey{Channel: "x"}, time.Hour)
+	w := newRouteWorker(context.Background(), RouteKey{Channel: "x"}, time.Hour, nil)
 	go w.Stop()
 	select {
 	case <-w.Done():
@@ -26,7 +26,7 @@ func TestWorker_StopExits(t *testing.T) {
 }
 
 func TestWorker_ReleaseJobExits(t *testing.T) {
-	w := newRouteWorker(context.Background(), RouteKey{Channel: "x"}, time.Hour)
+	w := newRouteWorker(context.Background(), RouteKey{Channel: "x"}, time.Hour, nil)
 	if !w.Submit(Job{Kind: JobRelease}) {
 		t.Fatal("Submit should succeed before stop")
 	}
@@ -38,7 +38,7 @@ func TestWorker_ReleaseJobExits(t *testing.T) {
 }
 
 func TestWorker_SubmitAfterStopReturnsFalse(t *testing.T) {
-	w := newRouteWorker(context.Background(), RouteKey{Channel: "x"}, time.Hour)
+	w := newRouteWorker(context.Background(), RouteKey{Channel: "x"}, time.Hour, nil)
 	w.Stop()
 	if w.Submit(Job{Kind: JobInbound}) {
 		t.Error("Submit after Stop should return false")
@@ -46,7 +46,7 @@ func TestWorker_SubmitAfterStopReturnsFalse(t *testing.T) {
 }
 
 func TestWorker_OutboundStubReturnsErr(t *testing.T) {
-	w := newRouteWorker(context.Background(), RouteKey{Channel: "x"}, time.Hour)
+	w := newRouteWorker(context.Background(), RouteKey{Channel: "x"}, time.Hour, nil)
 	defer w.Stop()
 
 	resultCh := make(chan OutboundResult, 1)

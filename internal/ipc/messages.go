@@ -3,7 +3,40 @@ package ipc
 import (
 	"encoding/json"
 	"fmt"
+
+	"github.com/karthikeyan5/c3/internal/c3types"
 )
+
+// InboundMsg is the broker → adapter push for a single normalized inbound
+// message. The adapter translates this into its host CLI's notification
+// dialect (Claude Code: notifications/claude/channel; Codex: log + inbox).
+type InboundMsg struct {
+	Op      Op              `json:"op"` // = OpInbound
+	Inbound c3types.Inbound `json:"inbound"`
+}
+
+// ToolCallReq is the adapter → broker forward of an MCP tool call. The broker
+// dispatches to the channel module identified by Inbound.Channel-or-claim.
+type ToolCallReq struct {
+	Op   Op             `json:"op"` // = OpToolCall
+	ID   string         `json:"id"`
+	Name string         `json:"name"`
+	Args map[string]any `json:"args"`
+}
+
+// ToolResultMsg is the broker → adapter response to a ToolCallReq.
+type ToolResultMsg struct {
+	Op     Op             `json:"op"` // = OpToolResult
+	ID     string         `json:"id"`
+	Result map[string]any `json:"result,omitempty"`
+	Error  *ErrorPayload  `json:"error,omitempty"`
+}
+
+// ErrorPayload carries a tool call's error.
+type ErrorPayload struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
 
 // HelloMsg is sent by the adapter on connect.
 type HelloMsg struct {

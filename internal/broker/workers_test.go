@@ -7,7 +7,7 @@ import (
 )
 
 func TestWorkerPool_LazySpawnAndReap(t *testing.T) {
-	pool := NewWorkerPool(context.Background(), 30*time.Millisecond)
+	pool := NewWorkerPool(context.Background(), 30*time.Millisecond, nil)
 	defer pool.Stop()
 
 	if pool.Active() != 0 {
@@ -30,7 +30,7 @@ func TestWorkerPool_LazySpawnAndReap(t *testing.T) {
 }
 
 func TestWorkerPool_StopDrains(t *testing.T) {
-	pool := NewWorkerPool(context.Background(), time.Hour)
+	pool := NewWorkerPool(context.Background(), time.Hour, nil)
 	for i := 0; i < 5; i++ {
 		pool.Submit(RouteKey{Channel: "telegram", ChatID: int64(i)}, Job{Kind: JobInbound})
 	}
