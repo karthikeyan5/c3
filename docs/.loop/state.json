@@ -1,37 +1,27 @@
 {
-  "phase": "plan-3-pending",
+  "phase": "phase-4-pending",
   "spec_locked": true,
   "spec_locked_at": "2026-05-09T00:30:00Z",
-  "review": {
-    "round": 3,
-    "rounds_completed": 3,
-    "max_rounds": 3
-  },
   "build": {
     "current_phase": null,
     "phases_completed": [
       {
         "phase": 1,
-        "summary": "Repo skeleton: go.mod, .gitignore, cmd/ layout (4 binaries), internal/mappings/ scaffold, Makefile.",
+        "summary": "Repo skeleton: go.mod, .gitignore, cmd/ layout, internal/mappings/ scaffold, Makefile.",
         "commits": ["61551e5", "830ede0", "6af2de4"]
       },
       {
         "phase": 2,
-        "summary": "Mappings registry + migration tool. internal/mappings package with types/io/lookup/mutate/validate/path. cmd/migrate-legacy with read-env/read-legacy-cfg/write logic. 27 tests passing. Live smoke test on real legacy files works.",
-        "commits": ["68b55e0", "80a552a", "e311187", "0a4e5e6", "88379b1", "8939f80"],
-        "self_review": "Aligned with locked spec v6. Atomic Write + backup-on-rewrite (.bak one generation, mode 0600). DefaultPath uses os.UserHomeDir() per R1 fix. Validate covers schema_version + group/channel integrity. migrate-legacy refuses to overwrite."
-      }
+        "summary": "Mappings registry + migration tool. internal/mappings package: types/io/lookup/mutate/validate/path. cmd/migrate-legacy. 27 tests.",
+        "commits": ["68b55e0", "80a552a", "e311187", "0a4e5e6", "88379b1", "8939f80"]
+      },
+      {
+        "phase": 3,
+        "summary": "Broker core + IPC. internal/ipc (Op constants, message structs, Conn with writer mutex). internal/broker (paths, flock singleton, RouteKey, StubRegistry, Routes, handler, server). cmd/c3-broker main with mappings load + skeleton write + signal handling. 27 broker/ipc tests + previous tests; live smoke test confirmed: broker spawns, writes skeleton, accepts socket connection, responds to hello with hello_ack carrying ConnID, responds to list_topics, clean shutdown removes socket+pid files.",
+        "commits": ["88cf087 (plan)", "ad26a41", "4c4defd", "286fb40", "391ad4f", "05b0304", "8a7bc50", "d997cda", "c204873"],
+        "self_review": "Aligned with locked spec v6. RouteKey solves the *int64 map-key bug per spec §4.2 (test TestRouteKey_MapKeyEqualityForGeneralTopic confirms two separate &1 collide as expected). flock singleton handles stale-pid recovery per §4.2.2. Multi-user socket path uses $XDG_RUNTIME_DIR/c3.sock with /tmp/c3-$UID.sock fallback. Per-route serial executor pattern is plumbed (Routes table) but the actual goroutine-per-route worker comes in Phase 4 alongside channels (which generate the inbound jobs that need serializing). hello/hello_ack/list_topics/release/bye ops work; attach/tool_call/inbound deferred to Phase 4 (need channel layer)."
     ],
-    "phase_3_plan": "docs/plans/2026-05-09-c3-v3-broker-ipc.md",
-    "phase_3_progress": [
-      {"task": "3.1", "status": "done", "commit": "ad26a41", "note": "internal/ipc/ops.go with Op constants"},
-      {"task": "3.2", "status": "done", "commit": "4c4defd", "note": "ipc message structs + PeekOp"},
-      {"task": "3.3", "status": "done", "commit": "286fb40", "note": "ipc.Conn newline-JSON + writer mutex"}
-    ],
-    "phase_3_remaining": ["3.4 paths", "3.5 flock singleton", "3.6 RouteKey", "3.7 StubRegistry", "3.8 Routes", "3.9 Broker handler", "3.10 Server", "3.11 cmd/c3-broker main", "3.12 integration check"]
+    "phase_4_blocked_on": "Plan 4 not yet written. Plan 4 covers spec §4.1 + §6: Telegram channel cleanroom Go implementation using gotgbot/v2. Channel interface, getUpdates loop, inbound emission, outbound tools, attach proposal flow with createForumTopic + cross-group search + validate-by-id, debounce window, cooldown-fallback, OnInbound plugin chain plumbing, manual JSON-RPC framing for notifications/claude/channel."
   },
-  "drift_log": [
-    "Foundation plan Task 2.1 type definitions were written before spec R2/R3 fixes. Actual types in internal/mappings/types.go follow locked spec v6 (Codex top-level field, channel-level debounce_max_messages/fallback_cooldown_s/stt_prefix). Plan tasks 2.2+ followed locked spec — minor signature divergence from plan text, semantics align."
-  ],
-  "notes": "Phase 1 + Phase 2 done. Next: write Plan 3 covering broker core + IPC (spec §4.2 + §4.4.1 + §4.2.2). After Plan 3 is written and reviewed, execute. Per Karthi's loop instruction, review codebase + direction at each phase boundary before proceeding."
+  "notes": "Phase 1+2+3 complete: repo skeleton, mappings registry, broker core/IPC. Live broker daemon works end-to-end. Next plan (Plan 4) covers the Telegram channel + per-route worker integration."
 }
