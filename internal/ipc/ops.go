@@ -1,0 +1,29 @@
+// Package ipc defines the wire types for broker ↔ adapter communication
+// over the unix socket at $XDG_RUNTIME_DIR/c3.sock (or /tmp/c3-$UID.sock).
+//
+// Schema reference: docs/specs/2026-05-08-c3-rearch-design.md §4.4.1.
+package ipc
+
+// Op is the op-code present on every IPC message. Adapters and broker
+// dispatch on Op.
+type Op string
+
+const (
+	// adapter → broker
+	OpHello      Op = "hello"
+	OpServerInfo Op = "server_info"
+	OpToolsList  Op = "tools_list"
+	OpAttach     Op = "attach"
+	OpRelease    Op = "release"
+	OpListTopics Op = "list_topics"
+	OpToolCall   Op = "tool_call"
+	OpBye        Op = "bye"
+
+	// broker → adapter
+	OpHelloAck   Op = "hello_ack"
+	OpAttached   Op = "attached"
+	OpToolResult Op = "tool_result"
+	OpInbound    Op = "inbound"
+	OpTopicsList Op = "topics_list"
+	OpError      Op = "error"
+)
