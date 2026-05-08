@@ -1,27 +1,15 @@
 {
-  "phase": "phase-4-pending",
+  "phase": "phase-4b-pending",
   "spec_locked": true,
   "spec_locked_at": "2026-05-09T00:30:00Z",
   "build": {
-    "current_phase": null,
     "phases_completed": [
-      {
-        "phase": 1,
-        "summary": "Repo skeleton: go.mod, .gitignore, cmd/ layout, internal/mappings/ scaffold, Makefile.",
-        "commits": ["61551e5", "830ede0", "6af2de4"]
-      },
-      {
-        "phase": 2,
-        "summary": "Mappings registry + migration tool. internal/mappings package: types/io/lookup/mutate/validate/path. cmd/migrate-legacy. 27 tests.",
-        "commits": ["68b55e0", "80a552a", "e311187", "0a4e5e6", "88379b1", "8939f80"]
-      },
-      {
-        "phase": 3,
-        "summary": "Broker core + IPC. internal/ipc (Op constants, message structs, Conn with writer mutex). internal/broker (paths, flock singleton, RouteKey, StubRegistry, Routes, handler, server). cmd/c3-broker main with mappings load + skeleton write + signal handling. 27 broker/ipc tests + previous tests; live smoke test confirmed: broker spawns, writes skeleton, accepts socket connection, responds to hello with hello_ack carrying ConnID, responds to list_topics, clean shutdown removes socket+pid files.",
-        "commits": ["88cf087 (plan)", "ad26a41", "4c4defd", "286fb40", "391ad4f", "05b0304", "8a7bc50", "d997cda", "c204873"],
-        "self_review": "Aligned with locked spec v6. RouteKey solves the *int64 map-key bug per spec §4.2 (test TestRouteKey_MapKeyEqualityForGeneralTopic confirms two separate &1 collide as expected). flock singleton handles stale-pid recovery per §4.2.2. Multi-user socket path uses $XDG_RUNTIME_DIR/c3.sock with /tmp/c3-$UID.sock fallback. Per-route serial executor pattern is plumbed (Routes table) but the actual goroutine-per-route worker comes in Phase 4 alongside channels (which generate the inbound jobs that need serializing). hello/hello_ack/list_topics/release/bye ops work; attach/tool_call/inbound deferred to Phase 4 (need channel layer)."
+      {"phase": 1, "summary": "Repo skeleton", "commits": ["61551e5", "830ede0", "6af2de4"]},
+      {"phase": 2, "summary": "Mappings registry + migration", "commits": ["68b55e0", "80a552a", "e311187", "0a4e5e6", "88379b1", "8939f80"]},
+      {"phase": 3, "summary": "Broker core + IPC; live broker daemon works", "commits": ["88cf087", "ad26a41", "4c4defd", "286fb40", "391ad4f", "05b0304", "8a7bc50", "d997cda", "c204873"]},
+      {"phase": "4A", "summary": "Channel + plugin.Host interfaces + per-route worker substrate. c3types/channel/plugin packages, RouteWorker, WorkerPool, Broker.Shutdown.", "commits": ["f4aafa9 (plan)", "4d8b8f9", "9e16b45", "76bd5b2"], "self_review": "Substrate for Plan 4B (Telegram) and Plan 5 (plugin host concrete impl) in place. Channel interface and plugin.Host interface declared. RouteWorker idle-timeout/stop/release-exit all tested. WorkerPool lazy-spawn + reap. Worker dispatch stubbed; real wiring deferred. 72 tests pass."}
     ],
-    "phase_4_blocked_on": "Plan 4 not yet written. Plan 4 covers spec §4.1 + §6: Telegram channel cleanroom Go implementation using gotgbot/v2. Channel interface, getUpdates loop, inbound emission, outbound tools, attach proposal flow with createForumTopic + cross-group search + validate-by-id, debounce window, cooldown-fallback, OnInbound plugin chain plumbing, manual JSON-RPC framing for notifications/claude/channel."
+    "phase_4b_blocked_on": "Plan 4B not yet written. Plan 4B covers spec §6 — Telegram channel cleanroom Go implementation: gotgbot/v2 wiring, getUpdates polling loop, allowed_updates opt-in, inbound conversion (Update → c3types.Inbound) including reply_to + voice attachments, outbound tools (reply/react/edit_message/download_attachment/send_typing/edit_progress) backed by Bot API, createForumTopic with rate-limit retry, sendChatAction-as-validate, channel-side debounce window with cap, cooldown-fallback reply when no claim. Substantial — ~12-15 tasks expected. Adds gotgbot/v2 to go.mod (rc.34 pin)."
   },
-  "notes": "Phase 1+2+3 complete: repo skeleton, mappings registry, broker core/IPC. Live broker daemon works end-to-end. Next plan (Plan 4) covers the Telegram channel + per-route worker integration."
+  "notes": "Phase 1+2+3+4A complete. Plan 4B is the Telegram channel implementation — first plan that adds an external dependency and significant integration with a third-party API. Will need careful TDD given the live Bot API surface."
 }
