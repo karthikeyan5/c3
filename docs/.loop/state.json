@@ -13,11 +13,11 @@
       "scaffold": {"status": "done", "commit": "22fbcc6"},
       "outbound_tools": {"status": "done", "commit": "433311a", "tools": ["SendReply", "SendTyping", "EditMessage", "React", "DownloadAttachment", "CreateTopic", "ValidateTopic"]},
       "polling_and_inbound": {"status": "done", "commit": "c356984", "details": "getUpdates loop with allowed_updates and exponential backoff; inbound conversion for text/voice/photo/document/audio/video/video_note/sticker; ReplyContext from reply_to_message; service messages dropped (forum_topic_*, chat metadata events); 7 unit tests."},
-      "wiring": {"status": "done", "commit": "261cca0", "details": "OpToolCall handler → worker.dispatchOutbound → channel method → result. Inbound forwarding via worker.dispatchInbound → claimed stub's ipc.Conn or cooldown-fallback. dispatch.go has tool name → channel method mapping for reply/react/edit_message/send_typing/download_attachment. fallbackTracker enforces 300s dedup per RouteKey."},
+      "wiring": {"status": "done", "commit": "261cca0"},
+      "attach_proposal_flow": {"status": "done", "commit": "be43397", "details": "8 unit tests with fakeChannel: DM, name in default group (silent claim), name in other group (proposes use_existing_other_group + Alternative), unknown name (proposes create), create=true (calls channel.CreateTopic + persists), topic_id (validates + registers placeholder), saved mapping (silent claim regardless of name search), already-claimed (returns holder-identifying error). Persists mappings.json atomically on every successful attach via SaveMappings()."},
       "remaining": [
-        "ATTACH PROPOSAL FLOW (broker handles AttachReq with cwd-keyed lookup, basename-of-cwd default-group search, cross-group search with disambiguation, validate-by-id, create+register + persist mappings.json). Without this OpToolCall always returns 'before attach'. Critical blocker for end-to-end first-build.",
-        "Debounce window: per-route 1.5s default, max 50 messages, latest message_id wins. Lives in worker.dispatchInbound — buffers Inbounds for window then forwards merged.",
-        "Plugin chain wiring: STT prefix substitution + OnInbound chain (Plan 5 — depends on plugin host concrete impl)"
+        "Debounce window: per-route 1.5s default, max 50 messages. Lives in worker.dispatchInbound. Last item in Plan 4B.",
+        "Plugin chain wiring: STT prefix substitution + OnInbound chain. Plan 5."
       ]
     },
     "phase_4a_complete": {
