@@ -23,7 +23,12 @@
     "phase_6_claude_adapter": {
       "status": "DONE — END-TO-END WORKING",
       "commit": "72b893c",
-      "details": "internal/mcp/ minimal stdio server with writer mutex (3 tests). cmd/c3-claude-adapter/ with broker auto-spawn, hello handshake, brokerReader goroutine, full MCP dispatch (initialize/tools/list/tools/call), 7 tools, notifications/claude/channel manual JSON-RPC framing per spec §4.4.4 + §6.1 all-strings meta convention, adapter-local attach/topics + broker-forwarded reply/react/edit_message/send_typing/download_attachment. Live MCP exchange verified: adapter responds to initialize with proper claude/channel capability + per-cwd instructions; tools/list surfaces 7 tools; broker auto-spawned via flock; @OCDWaterBot connection live."
+      "details": "MCP stdio server, broker auto-spawn, full dispatch, 7 tools, notifications/claude/channel manual framing per spec §4.4.4. Live MCP exchange verified."
+    },
+    "phase_9_install_plumbing": {
+      "status": "DONE",
+      "commit": "d2ed3e1",
+      "details": "Plugin manifest at .claude-plugin/marketplace.json + plugins/c3/{plugin.json, .mcp.json, commands/c3-build.md, c3-setup.md, c3-status.md}. Broker subcommands: setup (token-validates via getMe before writing), status (read-only health check), validate (parse + Validate). Full first-install flow: /plugin marketplace add karthikeyan5/c3 → /plugin install c3@c3 → /reload-plugins → /c3-build → /c3-setup → restart → attach."
     },
     "phase_4a_complete": {
       "summary": "Channel/Host interfaces + per-route worker substrate. c3types/channel/plugin packages, RouteWorker, WorkerPool, Broker.Shutdown.",
