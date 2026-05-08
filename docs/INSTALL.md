@@ -1,0 +1,178 @@
+# Installing C3
+
+Set-up steps for someone who has never run C3 before. Five minutes if everything goes well. If you've already used C3 and you're upgrading, skip to the bottom.
+
+## Prerequisites
+
+You need:
+
+- **Go ≥1.22** on your `PATH`. C3 is built from source on first install. `go version` should print `go1.22` or newer.
+- **A Telegram bot token.** Open Telegram, message `@BotFather`, send `/newbot`, follow prompts. You'll get a token shaped like `1234567:abcdefg...`. Keep it private.
+- **A Telegram supergroup** where your bot will create forum topics. Make a new one (or repurpose one). Convert it to a supergroup if needed (Telegram does this automatically when you give it more than ~200 members or enable topics). Enable topics in group settings. Add your bot. Make the bot **an admin with `Manage Topics`** permission.
+- **Your Telegram user id** for DMs. Message `@userinfobot` from your phone; it replies with your user id (a positive integer).
+- **The supergroup's chat id.** Send any message in the group; the bot now sees it. Or use `@username_to_id_bot`-style helpers. Group chat ids are negative integers starting with `-100`.
+- **For Codex integration:** Codex CLI installed (typically via `npm install -g @openai/codex` or similar). The C3 launcher will detect it. NVM users: take note — long-running shells hash `codex` to your NVM path, so the install step below symlinks both `~/.local/bin/codex` and the NVM bin path.
+
+## Step 1: Install the Claude Code plugin
+
+Inside Claude Code:
+
+```
+/plugin marketplace add karthikeyan5/c3
+/plugin install c3@c3
+/reload-plugins
+```
+
+This clones the repo into `~/.claude/plugins/cache/c3/c3/<version>/`. Nothing's compiled yet.
+
+## Step 2: Build the binaries
+
+Still inside Claude Code, run:
+
+```
+/c3-build
+```
+
+This is a slash command shipped by the plugin. It runs `go install ./cmd/...` from the plugin source dir. Five binaries land in `$GOBIN` (default `~/go/bin/`):
+
+- `c3-broker` — the daemon
+- `c3-claude-adapter` — Claude Code MCP server
+- `codex` — the C3 launcher (will replace `which codex`)
+- `c3-codex-adapter` — Codex MCP server
+- `migrate-legacy` — one-shot config migration if you used the old Python MVP
+
+Confirm `$GOBIN` is on your `PATH`. If `$GOBIN` is unset, Go installs to `$(go env GOPATH)/bin`. Add it:
+
+```bash
+export PATH="$(go env GOPATH)/bin:$PATH"
+```
+
+## Step 3: Configure C3
+
+```
+/c3-setup
+```
+
+The slash command interactively gathers:
+
+- Your bot token (the `1234567:abc...` string).
+- Your DM chat id (positive integer, your own user id).
+- At least one group and its chat id (e.g. `main` → `-1003990699908`). You can add more groups later by editing `~/.config/c3/mappings.json`.
+- (Optional) `master_user_id` for the future access-control feature; default is your DM id.
+
+It writes `~/.config/c3/mappings.json` at mode 600 with this skeleton:
+
+```json
+{
+  "schema_version": 1,
+  "channels": {
+    "telegram": {
+      "bot_token": "1234567:abc...",
+      "default_group": "main",
+      "groups": {"main": {"chat_id": -1003990699908, "title": "Karthi C3"}},
+      "dm_chat_id": 85720317,
+      "master_user_id": 85720317,
+      "topics": [],
+      "debounce_ms": 1500
+    }
+  },
+  "mappings": {},
+  "plugins": {"stt": {"enabled": true}}
+}
+```
+
+Restart your Claude Code session. The first new session spawns the broker daemon and you're ready.
+
+## Step 4 (optional): Enable Codex integration
+
+Inside Codex:
+
+```
+codex plugin marketplace add github:karthikeyan5/c3
+codex plugin install c3-codex
+```
+
+Then read the `SETUP.md` the plugin ships, or just have the agent run:
+
+```
+c3-broker install-codex-shim
+```
+
+This is a Go subcommand that idempotently:
+
+1. Symlinks `~/.local/bin/codex` to `$GOBIN/codex`.
+2. Walks `~/.nvm/versions/node/*/bin/` and creates the same symlink in each version's bin dir. **This is required, not optional** — long-running shells hash `codex` to the NVM path; without these symlinks, your existing terminals bypass the C3 bridge entirely.
+3. Verifies `~/.config/c3/mappings.json` exists (it does if you ran `/c3-setup`).
+4. Verifies the broker is reachable.
+5. Prints a one-line audit of every symlink it created or confirmed.
+
+Open a fresh terminal (or `hash -r` your existing one) and run `which codex`. It should resolve to `~/.local/bin/codex`. From now on every `codex` invocation goes through the C3 launcher → app-server → adapter chain. Use Codex normally.
+
+## Step 5: Verify
+
+In a fresh Claude Code session in some project directory:
+
+```
+attach
+```
+
+The agent should respond with a proposal: "I'd create a topic '<dirname>' in group 'main'. Confirm?"
+
+Confirm. The topic appears in your Telegram supergroup. Send a message into it from your phone. It should appear in the CLI as a `<channel>` block. Reply via the agent's `reply` tool. The reply lands in the topic.
+
+If voice messages are working: send a voice note from your phone. After a couple of seconds it should arrive in the CLI as `[Transcribed voice]: <text>`. STT can take 1-3 seconds depending on length.
+
+## Migrating from the Python MVP
+
+If you previously ran the Python MVP (`mvp/broker.py` etc.) and have a working bot token + chat ids in:
+
+- `~/.claude/channels/telegram/.env` (bot token)
+- `<repo>/mvp/config.json` (group + DM chat ids)
+
+Migrate them to the new location with:
+
+```
+migrate-legacy
+```
+
+It reads both files, writes `~/.config/c3/mappings.json`, and refuses to overwrite if the file already exists. Existing topic registrations from the old `mvp/topics.json` are NOT migrated — by design, you'll re-attach as you go in each project. Karthi's preference: start clean.
+
+After verifying the new broker works end-to-end, you can delete `mvp/`. Don't `rm -rf` until you've confirmed at least one round-trip on the new stack.
+
+## Upgrading
+
+Inside Claude Code:
+
+```
+/plugin marketplace update
+/plugin upgrade c3@c3
+/c3-build
+```
+
+State (`~/.config/c3/mappings.json`) is in XDG, not the plugin cache, so upgrades don't touch it.
+
+For Codex side, re-run `c3-broker install-codex-shim` after `/c3-build` to refresh the symlinks against the new binary.
+
+## Uninstalling
+
+```
+/plugin uninstall c3@c3                # removes the plugin from Claude Code
+codex plugin uninstall c3-codex         # removes from Codex
+rm ~/.local/bin/codex                   # restore your real codex
+find ~/.nvm/versions/node -name codex -type l -delete   # remove NVM-side symlinks (CAUTION: only if they pointed at the C3 launcher)
+rm -f /tmp/c3.sock /tmp/c3-broker.pid   # broker scratch files
+rm -f /tmp/c3-codex-app-server.json     # codex launcher scratch
+rm -rf ~/.config/c3                     # CONFIG; remove only if you don't want to keep mappings/topics
+$GOBIN/c3-broker --uninstall-binaries   # removes binaries from $GOBIN (or just `rm $GOBIN/c3-* $GOBIN/codex` manually)
+```
+
+The `~/.config/c3/mappings.json` lives outside both plugins; uninstalling the plugins doesn't touch it. Decide separately whether to keep it (you might reinstall later).
+
+## Troubleshooting first-install issues
+
+- **`/c3-build` fails with `command not found: go`** — install Go ≥1.22.
+- **Build succeeds but `c3-broker` not on PATH** — `$GOBIN` isn't on `PATH`. See Step 2.
+- **`/c3-setup` says it can't reach Telegram** — check the bot token. Try `curl https://api.telegram.org/bot<TOKEN>/getMe`; should return your bot's info.
+- **Topic creation fails** — the bot isn't an admin with `Manage Topics` in the supergroup. Group settings → Administrators → your bot → toggle "Manage Topics" on.
+- **`which codex` still resolves to NVM** — re-run `c3-broker install-codex-shim`, then `hash -r` (bash/zsh) or open a new terminal. Verify with `readlink $(which codex)`; it should point at `$GOBIN/codex`.
+- **Voice transcription doesn't fire** — STT plugin needs Python whisper installed. Check `~/.config/c3/mappings.json:plugins.stt.enabled` is `true` and the whisper command resolves on the broker's PATH. STT plugin is the only Python in C3; if you don't need voice, set `enabled: false`.

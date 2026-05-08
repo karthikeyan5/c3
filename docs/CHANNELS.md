@@ -1,0 +1,186 @@
+# Writing C3 Channels
+
+A C3 channel is a transport — the thing that carries messages between users and the broker. Telegram is the v1 channel. The architecture admits more (web chat with magic-link sessions, voice mode, IRC, Slack, Matrix); each one is a Go package implementing a small interface.
+
+Channels are not plugins. Plugins extend the broker with capabilities orthogonal to transport (transcription, summarization, OCR). Channels move bytes. If you're adding "Slack support" you want a channel; if you're adding "auto-translate every inbound" you want a plugin.
+
+## Where channels live
+
+```
+internal/
+├── channel/
+│   ├── channel.go          # the Channel interface + helpers
+│   ├── registry.go         # Channels list (similar to plugin registry)
+│   └── telegram/
+│       ├── telegram.go     # implements Channel
+│       ├── grammy_shim.go  # gotgbot wiring
+│       ├── reply.go        # outbound tool implementations
+│       └── ...
+```
+
+A new channel adds a sibling package under `internal/channel/<name>/` and registers itself in `internal/channel/registry.go`.
+
+## The Channel interface
+
+```go
+package channel
+
+import (
+	"context"
+	"time"
+)
+
+// Channel is the contract every transport implements. Methods are called by
+// the broker on its own goroutine — implementations must be safe for
+// concurrent use, except Start/Stop which are sequenced.
+type Channel interface {
+	// Name is the stable identifier ("telegram", "web", "voice"). Must match
+	// the key under mappings.json:channels.<name>.
+	Name() string
+
+	// Start brings the channel up. The implementation reads its config from
+	// host.Config(name, &cfg), opens its transport (long-poll, websocket,
+	// whatever), and begins emitting Inbound events to host.Inbound(). Returns
+	// when the channel is operational; long-running work goes in goroutines.
+	// host.Done() returns a channel closed at shutdown; the channel must
+	// observe it and stop cleanly.
+	Start(ctx context.Context, host *Host) error
+
+	// Stop tears down the transport. Called once, may be called concurrently
+	// with in-flight Send* calls — implementations finish the in-flight call
+	// first, then close.
+	Stop() error
+
+	// Outbound primitives. These are the tools the broker exposes to adapters,
+	// which in turn surface them as MCP tools (reply, react, edit_message,
+	// download_attachment, …). Channels can add channel-specific tools by
+	// implementing additional methods AND registering them via host.RegisterTool.
+
+	SendReply(args ReplyArgs) (*ReplyResult, error)
+	SendTyping(chatID int64, threadID *int64) error
+	EditMessage(args EditArgs) (*EditResult, error)
+	React(args ReactArgs) error
+	DownloadAttachment(fileID string) (path string, err error)
+
+	// Topic management.
+	CreateTopic(chatID int64, name string) (topicID int64, err error)
+	ValidateTopic(chatID int64, threadID int64) error
+}
+```
+
+The exact set of outbound methods is debatable — channels not based on Telegram-style topics may not have `CreateTopic` semantics at all. The interface in v1 reflects what the Telegram channel needs; new channels either implement no-op stubs or we refactor the interface as the second channel lands. The latter is preferred when it's clear the interface is generalizing too eagerly.
+
+## Inbound events
+
+A channel emits one normalized struct for every user-originated message:
+
+```go
+type Inbound struct {
+	Channel    string             // your channel's name
+	ChatID     int64
+	TopicID    *int64             // nil for non-topic chats; 1 for Telegram General; >1 for custom
+	MessageID  int64
+	Sender     Sender
+	Text       string             // plain text after channel-side preprocessing
+	Attachments []Attachment
+	ReplyTo    *ReplyContext      // present iff the user quote-replied
+	Timestamp  time.Time
+	Raw        map[string]any     // channel-specific fields the broker might pass through
+}
+```
+
+Emit via `host.Inbound(&Inbound{...})`. The broker handles plugin pipeline, debounce, dedup, routing, and CLI delivery from there.
+
+For voice messages, set `Attachments[0].Kind = "voice"` and `.FileID = "..."`. The broker will fan the event through `OnVoiceReceived` plugins (STT) before substituting the returned transcript into `.Text`.
+
+## Configuration
+
+Channel config lives at `mappings.json:channels.<name>`. The Telegram channel uses:
+
+```json
+{
+  "channels": {
+    "telegram": {
+      "bot_token": "...",
+      "default_group": "main",
+      "groups": {"main": {"chat_id": -100..., "title": "..."}},
+      "dm_chat_id": ...,
+      "topics": [...],
+      "debounce_ms": 1500
+    }
+  }
+}
+```
+
+Your channel defines its own subkey schema. Common fields by convention:
+
+- `enabled: bool` — broker skips disabled channels at boot.
+- Auth (token, key, oauth) — channel-specific names; document them.
+- `topics` — only relevant if your transport has the topic concept. The broker reads/writes this; channels don't need to manage it.
+- `debounce_ms` — defaults to 1500 if absent. Channels can override.
+
+The broker doesn't introspect anything beyond `enabled`. Your channel reads what it needs via `host.Config(name, &cfg)`.
+
+## Channel lifecycle
+
+```
+boot:
+  for each channel in mappings.json:channels:
+    construct (just calls New<Name>())
+    Start(ctx, host)        # runs in a goroutine
+    block until ready or err
+
+shutdown (broker SIGTERM/SIGINT):
+  cancel ctx (each channel's Start should observe and unwind)
+  Stop()                    # in parallel for all channels
+  wait up to 5s for clean exit, then force kill
+```
+
+The host gives the channel:
+
+- `host.Config(name, &cfg)` — read your config.
+- `host.Inbound(*Inbound)` — emit a normalized inbound message.
+- `host.RegisterTool(Tool)` — add a channel-specific tool to the broker's tool registry. The broker exposes it to adapters automatically.
+- `host.Logf` — structured logging.
+- `host.Done()` — channel closed on shutdown.
+
+## Error handling
+
+Transient transport errors (network blips, rate limits) → log, back off, keep going. Don't return from `Start`.
+
+Fatal errors (bad credentials, unsupported API version) → return from `Start`. The broker logs and continues with other channels; your channel's tools become unusable until config is fixed and the broker is restarted.
+
+For `Send*` calls, return errors verbatim — the broker forwards them back to the adapter, which surfaces them to the CLI/user. Don't swallow.
+
+For rate limits specifically, **respect provider-supplied retry-after**: Telegram's `parameters.retry_after` (in `Bad Request` responses), Slack's `Retry-After` header, etc. Sleep for that long and retry once before giving up.
+
+## Testing
+
+A channel ships with Go tests under the package. The host exposes `channel.MockHost(t)` that captures emitted inbound events and lets your test drive synthetic transport responses.
+
+For Telegram specifically, mock at the `gotgbot` boundary: don't hit the real Bot API in tests. Use `httptest.Server` for the HTTP layer and a fake getUpdates loop. The Telegram channel's existing tests demonstrate the pattern.
+
+## Adding a new channel — checklist
+
+- [ ] Package under `internal/channel/<name>/`
+- [ ] Type implements the `Channel` interface
+- [ ] `New<Name>()` constructor exported
+- [ ] Registered in `internal/channel/registry.go` (the broker iterates this at boot)
+- [ ] Config schema documented (under `mappings.json:channels.<name>`) — add an example to the spec
+- [ ] Inbound emission tested (mock-host captures `Inbound{}` for known transport input)
+- [ ] All `Send*` methods return errors, don't swallow
+- [ ] Rate limit handling honors provider conventions
+- [ ] No `fmt.Println` — use `host.Logf`
+- [ ] Channel-specific tools registered via `host.RegisterTool` with name prefix `<channel>_<verb>` (e.g. `telegram_pin_message`)
+
+## Telegram channel: what's there
+
+The Telegram channel implementation lives at `internal/channel/telegram/`. Key things it does that future channels may want to reference:
+
+- **Long-polling getUpdates loop** with `allowed_updates` opt-in for `message`, `edited_message`, `callback_query`, `message_reaction`. Service-message types (`forum_topic_created`/`forum_topic_edited`/etc) are received but ignored in v1 — plumbed for future use.
+- **General topic id is `1`, not `0`.** A common confusion — topic_id 0 means "no topic" (DM, non-forum group); General is a real topic with id 1.
+- **Bot API has no `getForumTopics`.** The local `topics` registry under `mappings.json:channels.telegram.topics` is the source of truth. Topics are added when a session attaches and creates one (or claims an explicit topic_id), never opportunistically from inbound traffic.
+- **Reply threading**: when an inbound has `reply_to_message`, the channel populates `ReplyContext` with `MessageID`, `User`, `Text`. The Claude adapter renders this as `<channel reply_to_message_id="..." reply_to_text="...">` attributes.
+- **Voice handling**: voice messages emit an inbound with `Attachments[0].Kind="voice"`, `FileID=...`, and empty `Text`. The STT plugin's `OnVoiceReceived` fills in `Text`. The voice attachment is preserved so a CLI can re-download the audio if a transcript is ambiguous.
+
+Use these as patterns, not copy-paste templates — your transport probably has its own quirks that rate higher than Telegram's idioms.
