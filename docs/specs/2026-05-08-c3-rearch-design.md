@@ -1,7 +1,7 @@
 # C3 Re-Architecture — Design Spec
 
 **Date:** 2026-05-08 (revised after second review)
-**Status:** Proposed v3 — pending Karthi sign-off on the small remaining questions in §11
+**Status:** Approved (all §11 calls resolved). Ready to move to implementation plan.
 **Reaffirms:** D006 (Go for daemon), D007 (pluggable transport — promoted to v1), D008 (official Go MCP SDK)
 **Supersedes:** the deviation banners across `RESUME.md` / `TODO.md` / `DECISIONS.md` (Python wrapper MVP). A formal D009 will record the v1-MVP-superseded note when implementation starts.
 
@@ -508,19 +508,9 @@ Old Python broker stays runnable alongside the new Go broker — flock prevents 
 - Inter-CLI messaging, master-CLI admin commands, pairing flow, monitoring dashboard.
 - Cleanroom STT rewrite (Go shim → Python pipeline; the working pipeline keeps working).
 
-## 11. Remaining open questions
+## 11. Resolved questions (no opens left)
 
-After Karthi's two reviews, three small calls left:
-
-1. **§11.A — Telegram Go library: gotgbot vs telegram-bot-api.** Both maintained, both Bot API. gotgbot is more idiomatic Go and strongly typed; telegram-bot-api is more popular (more StackOverflow). My lean: gotgbot. Open to override.
-2. **§11.B — Binary distribution mechanism.** Three options:
-   - (a) Bundle pre-built binaries for all OS/arch in the GitHub release tarball that the plugin installer pulls down. ~50MB tarball.
-   - (b) Build from source on first install via `go install` — requires Go on user's machine.
-   - (c) Download the right binary on first run from a GitHub release URL. Plugin scaffold ships a small bootstrap script.
-   My lean: **(a)** for the smallest install friction. Modern users handle ~50MB.
-3. **§11.C — Adapter binary location inside the plugin.** Convention I'm proposing: `bin/<os>-<arch>/c3-broker` and `bin/<os>-<arch>/c3-claude-adapter` and `bin/<os>-<arch>/c3-codex-adapter`, with the `.mcp.json` `command` resolving to the right one via a tiny shell wrapper or via `${CLAUDE_PLUGIN_ROOT}/bin/${OS}-${ARCH}/...`. Confirm this is fine.
-
-Resolved in v3 (Karthi's calls):
+All Karthi calls:
 
 - §11.1 ⇒ cleanroom; no upstream baseline file.
 - §11.2 ⇒ one cwd → one mapping.
@@ -528,10 +518,13 @@ Resolved in v3 (Karthi's calls):
 - §11.4 ⇒ validate via Bot API call; accept if valid; refuse with actual error if not. No `force=true` flag.
 - §11.5 ⇒ Codex setup is agent-driven via `SETUP.md` + a Go helper binary.
 - §11.6 ⇒ STT is a v1 plugin, not built-in. Plugin architecture pulled into v1.
+- §11.A ⇒ `github.com/PaulSonOfLars/gotgbot/v2`.
+- §11.B ⇒ Build from source on first install. Distribution is github-only — users `git clone` the plugin source into the Claude Code plugin cache and we compile locally. Go ≥1.22 is a documented prereq in INSTALL.md.
+- §11.C ⇒ Resolved by §11.B's choice. With `go install` / `go build`, binaries land at `$GOBIN` (or wherever the build outputs). The `.mcp.json` `command` references binaries by name (e.g. `c3-claude-adapter`), assuming the user's PATH includes `$GOBIN`. A `/c3-build` slash command (Claude Code) runs `go install ./cmd/...` from the plugin source. Codex's `SETUP.md` instructs the agent to do the same. First-session friction: user installs plugin → runs `/c3-build` once → restart. Acceptable for v1.
 
 ## 12. Implementation phases
 
-This spec produces an implementation plan via the `writing-plans` skill once §11 A/B/C are answered. Rough phases:
+This spec produces an implementation plan via the `writing-plans` skill. Rough phases:
 
 1. **Repo skeleton + Go modules.** `go mod init`, broker / adapters / channels / plugins package layout. `Makefile` for cross-compile.
 2. **Mappings registry.** Read/write/validate `~/.config/c3/mappings.json`. Migration tool. Atomic rewrite.
