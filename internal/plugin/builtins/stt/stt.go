@@ -1,0 +1,132 @@
+// Package stt is the v1 STT plugin for C3. It's a thin Go shim that
+// subprocesses an external Python handler when a voice attachment arrives.
+//
+// Spec §6.2 (revised): the existing Python POC's stt-handler.py is mature
+// (multi-provider chain with vocabulary support) and lives at the path the
+// Python broker installs symlink to. The Go shim defaults to that same path
+// and lets the user override via mappings.json:plugins.stt.handler_path.
+//
+// The handler's argv contract (preserved from the POC):
+//
+//	python3 stt-handler.py <bot_token> <chat_id> <reply_msg_id> <file_id> [<message_thread_id>]
+//
+// On success: prints transcript to stdout (and may also echo back to Telegram
+// itself — that's POC-side behavior we don't override). On failure: empty
+// stdout. The Go shim returns the trimmed stdout as the transcript.
+package stt
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"time"
+
+	"github.com/karthikeyan5/c3/internal/c3types"
+	"github.com/karthikeyan5/c3/internal/plugin"
+)
+
+// Name is the plugin identifier and the mappings.json:plugins key.
+const Name = "stt"
+
+// Config is the plugin's slice of mappings.json:plugins.stt.
+type Config struct {
+	Enabled     bool   `json:"enabled"`
+	Priority    int    `json:"priority"`
+	HandlerPath string `json:"handler_path"`     // path to Python script
+	Timeout     int    `json:"timeout_seconds"`  // subprocess timeout (default 60s)
+}
+
+// Register subscribes the plugin's OnVoiceReceived callback. Called once at
+// broker startup if mappings.json:plugins.stt.enabled (default true).
+func Register(host plugin.Host) error {
+	cfg := Config{Enabled: true, Timeout: 60}
+	if err := host.Config(Name, &cfg); err != nil {
+		return fmt.Errorf("stt: read config: %w", err)
+	}
+	if !cfg.Enabled {
+		host.Logf("stt: plugin disabled via mappings.json:plugins.stt.enabled=false")
+		return nil
+	}
+	if cfg.HandlerPath == "" {
+		cfg.HandlerPath = defaultHandlerPath()
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = 60
+	}
+	if _, err := os.Stat(cfg.HandlerPath); err != nil {
+		host.Logf("stt: handler %s not found (%v); voice transcription disabled", cfg.HandlerPath, err)
+		return nil
+	}
+	host.Logf("stt: registered with handler=%s timeout=%ds", cfg.HandlerPath, cfg.Timeout)
+
+	// Resolve telegram channel for the bot token. We need the token because
+	// the POC handler shells out to Telegram's getFile API itself; the channel
+	// owns the only authoritative copy of the token.
+	host.OnVoiceReceived(func(ctx context.Context, p c3types.VoicePayload) (string, error) {
+		token, err := readTelegramToken(host)
+		if err != nil {
+			return "", err
+		}
+		return runHandler(ctx, cfg, token, p)
+	})
+	return nil
+}
+
+func runHandler(ctx context.Context, cfg Config, token string, p c3types.VoicePayload) (string, error) {
+	// argv: <bot_token> <chat_id> <msg_id> <file_id> [<thread_id>]
+	args := []string{
+		cfg.HandlerPath,
+		token,
+		strconv.FormatInt(p.ChatID, 10),
+		strconv.FormatInt(p.MessageID, 10),
+		p.FileID,
+	}
+	if p.TopicID != nil {
+		args = append(args, strconv.FormatInt(*p.TopicID, 10))
+	} else {
+		args = append(args, "")
+	}
+
+	tctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.Timeout)*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(tctx, "python3", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		// Failure → empty transcript so the caller falls through to caption /
+		// "(voice message)" default. Don't propagate as an error.
+		return "", nil
+	}
+	transcript := bytes.TrimSpace(stdout.Bytes())
+	return string(transcript), nil
+}
+
+// readTelegramToken pulls the bot token from mappings.json via the host's
+// ChannelConfig helper. The plugin doesn't store its own copy.
+func readTelegramToken(host plugin.Host) (string, error) {
+	var cc struct {
+		BotToken string `json:"bot_token"`
+	}
+	if err := host.ChannelConfig("telegram", &cc); err != nil {
+		return "", fmt.Errorf("stt: read telegram channel config: %w", err)
+	}
+	if cc.BotToken == "" {
+		return "", fmt.Errorf("stt: bot_token is empty in mappings.json:channels.telegram")
+	}
+	return cc.BotToken, nil
+}
+
+// defaultHandlerPath matches the Python POC's installed-symlink convention.
+func defaultHandlerPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".claude", "channels", "telegram", "stt-handler.py")
+}

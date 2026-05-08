@@ -115,13 +115,38 @@ func (w *RouteWorker) dispatch(ctx context.Context, job Job) {
 }
 
 // dispatchInbound forwards a normalized inbound to the claimed stub, or fires
-// the cooldown-fallback reply if the route is unclaimed.
-//
-// Phase 4B scope: no plugin chain (Plan 5). The inbound flows directly from
-// the channel into the claimed adapter, or into the fallback reply.
+// the cooldown-fallback reply if the route is unclaimed. Plugin chain runs
+// per spec §4.5.1: OnVoiceReceived (substitutes Inbound.Text) before
+// OnInbound (transforms / drops).
 func (w *RouteWorker) dispatchInbound(ctx context.Context, in *c3types.Inbound) {
 	if w.broker == nil || in == nil {
 		return
+	}
+
+	// Plugin pipeline.
+	if w.broker.Plugins != nil {
+		// 1. STT for voice attachments.
+		if hasVoice(in) {
+			payload := c3types.VoicePayload{
+				Channel:   in.Channel,
+				ChatID:    in.ChatID,
+				TopicID:   in.TopicID,
+				MessageID: in.MessageID,
+				FileID:    in.Attachments[0].FileID,
+				MIME:      in.Attachments[0].MIME,
+				Size:      in.Attachments[0].Size,
+			}
+			if transcript := w.broker.Plugins.FireOnVoiceReceived(ctx, payload); transcript != "" {
+				prefix := w.sttPrefix(in.Channel)
+				in.Text = prefix + transcript
+			}
+		}
+		// 2. OnInbound chain.
+		next := w.broker.Plugins.FireOnInbound(ctx, in)
+		if next == nil {
+			return // a plugin dropped the inbound
+		}
+		in = next
 	}
 
 	holder, claimed := w.broker.Routes.Holder(w.key)
@@ -214,3 +239,21 @@ var errOutboundNotImpl = workerErr("worker has no broker reference")
 type workerErr string
 
 func (e workerErr) Error() string { return string(e) }
+
+// hasVoice returns true when the inbound's first attachment is a voice clip.
+func hasVoice(in *c3types.Inbound) bool {
+	return len(in.Attachments) > 0 && in.Attachments[0].Kind == "voice"
+}
+
+// sttPrefix returns the configured STT prefix for the channel, falling back
+// to "[Transcribed voice]: " (the spec §4.3 default).
+func (w *RouteWorker) sttPrefix(chanName string) string {
+	if w.broker == nil || w.broker.Mappings == nil {
+		return "[Transcribed voice]: "
+	}
+	cc, ok := w.broker.Mappings.Channels[chanName]
+	if !ok || cc.STTPrefix == "" {
+		return "[Transcribed voice]: "
+	}
+	return cc.STTPrefix
+}

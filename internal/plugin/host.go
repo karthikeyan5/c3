@@ -18,7 +18,8 @@ type Host interface {
 
 	RegisterTools(fn func(*ToolRegistry))
 
-	Config(name string, target any) error
+	Config(name string, target any) error          // mappings.json:plugins.<name>
+	ChannelConfig(name string, target any) error    // mappings.json:channels.<name>
 	State(name string) StateDir
 	CacheDir(name string) string
 

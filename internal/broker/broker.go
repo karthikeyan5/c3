@@ -8,6 +8,7 @@ import (
 
 	"github.com/karthikeyan5/c3/internal/channel"
 	"github.com/karthikeyan5/c3/internal/mappings"
+	"github.com/karthikeyan5/c3/internal/plugin"
 )
 
 // Broker holds the in-memory state shared by all connections: stubs registry,
@@ -19,6 +20,7 @@ type Broker struct {
 	Routes    *Routes
 	Workers   *WorkerPool
 	Fallbacks *fallbackTracker
+	Plugins   *PluginHost
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -42,7 +44,26 @@ func New(mf *mappings.MappingsFile) *Broker {
 		channels:  map[string]*channelRegistration{},
 	}
 	b.Workers = NewWorkerPool(ctx, defaultWorkerIdle, b)
+	b.Plugins = newPluginHost(b)
 	return b
+}
+
+// RegisterBuiltinPlugins calls each builtin plugin's Register with the
+// broker's plugin host. Should be called by main() after the broker is
+// constructed but BEFORE channels are registered (so plugins are subscribed
+// before any inbound flows).
+type BuiltinPlugin struct {
+	Name     string
+	Register func(plugin.Host) error
+}
+
+func (b *Broker) RegisterBuiltinPlugins(builtins []BuiltinPlugin) error {
+	for _, bp := range builtins {
+		if err := bp.Register(b.Plugins); err != nil {
+			return fmt.Errorf("plugin %s: %w", bp.Name, err)
+		}
+	}
+	return nil
 }
 
 // RegisterChannel adds a channel to the broker. The channel is started

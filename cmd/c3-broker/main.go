@@ -22,7 +22,16 @@ import (
 	"github.com/karthikeyan5/c3/internal/broker"
 	"github.com/karthikeyan5/c3/internal/channel/telegram"
 	"github.com/karthikeyan5/c3/internal/mappings"
+	"github.com/karthikeyan5/c3/internal/plugin"
+	"github.com/karthikeyan5/c3/internal/plugin/builtins/stt"
 )
+
+// builtinPlugins lists the plugins compiled into the broker. Order matters
+// for chain hooks (lower priority runs first); broker.RegisterBuiltinPlugins
+// runs them in slice order.
+var builtinPlugins = []broker.BuiltinPlugin{
+	{Name: stt.Name, Register: func(h plugin.Host) error { return stt.Register(h) }},
+}
 
 func main() {
 	if len(os.Args) >= 2 {
@@ -52,7 +61,7 @@ func main() {
 			}
 			return
 		case "--help", "-h", "help":
-			fmt.Println(usage)
+			fmt.Print(usage)
 			return
 		}
 	}
@@ -120,6 +129,12 @@ func runDaemon() error {
 	}
 
 	br := broker.New(mf)
+
+	// Register builtin plugins BEFORE channels start emitting inbound, so the
+	// plugin pipeline is ready when first messages arrive.
+	if err := br.RegisterBuiltinPlugins(builtinPlugins); err != nil {
+		return fmt.Errorf("register plugins: %w", err)
+	}
 
 	if cc, ok := mf.Channels["telegram"]; ok && cc.BotToken != "" {
 		if err := br.RegisterChannel(telegram.New()); err != nil {
