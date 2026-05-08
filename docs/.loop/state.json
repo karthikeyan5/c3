@@ -9,7 +9,33 @@
       {"phase": 3, "summary": "Broker core + IPC; live broker daemon works", "commits": ["88cf087", "ad26a41", "4c4defd", "286fb40", "391ad4f", "05b0304", "8a7bc50", "d997cda", "c204873"]},
       {"phase": "4A", "summary": "Channel + plugin.Host interfaces + per-route worker substrate. c3types/channel/plugin packages, RouteWorker, WorkerPool, Broker.Shutdown.", "commits": ["f4aafa9 (plan)", "4d8b8f9", "9e16b45", "76bd5b2"], "self_review": "Substrate for Plan 4B (Telegram) and Plan 5 (plugin host concrete impl) in place. Channel interface and plugin.Host interface declared. RouteWorker idle-timeout/stop/release-exit all tested. WorkerPool lazy-spawn + reap. Worker dispatch stubbed; real wiring deferred. 72 tests pass."}
     ],
-    "phase_4b_blocked_on": "Plan 4B not yet written. Plan 4B covers spec §6 — Telegram channel cleanroom Go implementation: gotgbot/v2 wiring, getUpdates polling loop, allowed_updates opt-in, inbound conversion (Update → c3types.Inbound) including reply_to + voice attachments, outbound tools (reply/react/edit_message/download_attachment/send_typing/edit_progress) backed by Bot API, createForumTopic with rate-limit retry, sendChatAction-as-validate, channel-side debounce window with cap, cooldown-fallback reply when no claim. Substantial — ~12-15 tasks expected. Adds gotgbot/v2 to go.mod (rc.34 pin)."
+    "phase_4b_progress": {
+      "scaffold": {
+        "status": "done",
+        "commit": "22fbcc6",
+        "summary": "gotgbot/v2 rc.34 added; internal/channel/telegram package with Channel struct that connects to Bot API on Start; internal/broker/host.go implements channel.Host (Config/Emit/Logf/Done); Broker gains channel registry (RegisterChannel/Channel/Channels/Shutdown order: channels → workers → ctx); cmd/c3-broker registers telegram only when bot_token present, otherwise runs without inbound transport (first-install path). Live smoke test confirmed bot connects as @OCDWaterBot."
+      },
+      "remaining": [
+        "SendReply implementation (gotgbot Bot.SendMessage with message_thread_id, reply_parameters, parse_mode)",
+        "SendTyping (Bot.SendChatAction with action=typing, message_thread_id)",
+        "EditMessage (Bot.EditMessageText)",
+        "React (Bot.SetMessageReaction)",
+        "DownloadAttachment (Bot.GetFile + HTTP download to local path)",
+        "CreateTopic (Bot.CreateForumTopic with rate-limit retry honoring parameters.retry_after)",
+        "ValidateTopic (Bot.SendChatAction with thread_id; spec §6 typing-action approach)",
+        "getUpdates polling loop with allowed_updates=[message,edited_message,callback_query,message_reaction]",
+        "Inbound conversion: Update→c3types.Inbound for text, voice (with attachment meta), photo, document, sticker, video, video_note",
+        "reply_to_message metadata: ReplyContext with message_id/user/text",
+        "STT prefix: channel writes [Transcribed voice]: prefix when STT plugin returns transcript (Plan 5 dependency)",
+        "Debounce window: per-route 1.5s default, max 50 messages, latest message_id wins",
+        "Cooldown-fallback reply: broker-side detect no-claim, send 'No CLI is currently attached' once per (channel,chat,topic) per 300s",
+        "Wire OutboundJob.ResultCh back through ipc.OpToolResult so tool calls return results to adapters"
+      ]
+    },
+    "phase_4a_complete": {
+      "summary": "Channel/Host interfaces + per-route worker substrate. c3types/channel/plugin packages, RouteWorker, WorkerPool, Broker.Shutdown.",
+      "commits": ["f4aafa9 (plan)", "4d8b8f9", "9e16b45", "76bd5b2", "1fc48aa"]
+    }
   },
   "notes": "Phase 1+2+3+4A complete. Plan 4B is the Telegram channel implementation — first plan that adds an external dependency and significant integration with a third-party API. Will need careful TDD given the live Bot API surface."
 }
