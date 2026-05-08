@@ -13,10 +13,10 @@
       "scaffold": {"status": "done", "commit": "22fbcc6"},
       "outbound_tools": {"status": "done", "commit": "433311a", "tools": ["SendReply", "SendTyping", "EditMessage", "React", "DownloadAttachment", "CreateTopic", "ValidateTopic"]},
       "polling_and_inbound": {"status": "done", "commit": "c356984", "details": "getUpdates loop with allowed_updates and exponential backoff; inbound conversion for text/voice/photo/document/audio/video/video_note/sticker; ReplyContext from reply_to_message; service messages dropped (forum_topic_*, chat metadata events); 7 unit tests."},
+      "wiring": {"status": "done", "commit": "261cca0", "details": "OpToolCall handler → worker.dispatchOutbound → channel method → result. Inbound forwarding via worker.dispatchInbound → claimed stub's ipc.Conn or cooldown-fallback. dispatch.go has tool name → channel method mapping for reply/react/edit_message/send_typing/download_attachment. fallbackTracker enforces 300s dedup per RouteKey."},
       "remaining": [
-        "Cooldown-fallback reply: broker-side detect no-claim, send 'No CLI is currently attached' once per (channel,chat,topic) per 300s, dedup map",
-        "Wire OutboundJob.ResultCh back through ipc.OpToolResult so tool calls return results to adapters (worker.dispatch hooks into channel.SendReply etc., result flows back to ipc.HandleConn dispatch)",
-        "Debounce window: per-route 1.5s default, max 50 messages, latest message_id wins (lives in worker.dispatch JobInbound path)",
+        "ATTACH PROPOSAL FLOW (broker handles AttachReq with cwd-keyed lookup, basename-of-cwd default-group search, cross-group search with disambiguation, validate-by-id, create+register + persist mappings.json). Without this OpToolCall always returns 'before attach'. Critical blocker for end-to-end first-build.",
+        "Debounce window: per-route 1.5s default, max 50 messages, latest message_id wins. Lives in worker.dispatchInbound — buffers Inbounds for window then forwards merged.",
         "Plugin chain wiring: STT prefix substitution + OnInbound chain (Plan 5 — depends on plugin host concrete impl)"
       ]
     },
