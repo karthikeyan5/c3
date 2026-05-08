@@ -10,26 +10,14 @@
       {"phase": "4A", "summary": "Channel + plugin.Host interfaces + per-route worker substrate. c3types/channel/plugin packages, RouteWorker, WorkerPool, Broker.Shutdown.", "commits": ["f4aafa9 (plan)", "4d8b8f9", "9e16b45", "76bd5b2"], "self_review": "Substrate for Plan 4B (Telegram) and Plan 5 (plugin host concrete impl) in place. Channel interface and plugin.Host interface declared. RouteWorker idle-timeout/stop/release-exit all tested. WorkerPool lazy-spawn + reap. Worker dispatch stubbed; real wiring deferred. 72 tests pass."}
     ],
     "phase_4b_progress": {
-      "scaffold": {
-        "status": "done",
-        "commit": "22fbcc6",
-        "summary": "gotgbot/v2 rc.34 added; internal/channel/telegram package with Channel struct that connects to Bot API on Start; internal/broker/host.go implements channel.Host (Config/Emit/Logf/Done); Broker gains channel registry (RegisterChannel/Channel/Channels/Shutdown order: channels → workers → ctx); cmd/c3-broker registers telegram only when bot_token present, otherwise runs without inbound transport (first-install path). Live smoke test confirmed bot connects as @OCDWaterBot."
-      },
+      "scaffold": {"status": "done", "commit": "22fbcc6"},
+      "outbound_tools": {"status": "done", "commit": "433311a", "tools": ["SendReply", "SendTyping", "EditMessage", "React", "DownloadAttachment", "CreateTopic", "ValidateTopic"]},
+      "polling_and_inbound": {"status": "done", "commit": "c356984", "details": "getUpdates loop with allowed_updates and exponential backoff; inbound conversion for text/voice/photo/document/audio/video/video_note/sticker; ReplyContext from reply_to_message; service messages dropped (forum_topic_*, chat metadata events); 7 unit tests."},
       "remaining": [
-        "SendReply implementation (gotgbot Bot.SendMessage with message_thread_id, reply_parameters, parse_mode)",
-        "SendTyping (Bot.SendChatAction with action=typing, message_thread_id)",
-        "EditMessage (Bot.EditMessageText)",
-        "React (Bot.SetMessageReaction)",
-        "DownloadAttachment (Bot.GetFile + HTTP download to local path)",
-        "CreateTopic (Bot.CreateForumTopic with rate-limit retry honoring parameters.retry_after)",
-        "ValidateTopic (Bot.SendChatAction with thread_id; spec §6 typing-action approach)",
-        "getUpdates polling loop with allowed_updates=[message,edited_message,callback_query,message_reaction]",
-        "Inbound conversion: Update→c3types.Inbound for text, voice (with attachment meta), photo, document, sticker, video, video_note",
-        "reply_to_message metadata: ReplyContext with message_id/user/text",
-        "STT prefix: channel writes [Transcribed voice]: prefix when STT plugin returns transcript (Plan 5 dependency)",
-        "Debounce window: per-route 1.5s default, max 50 messages, latest message_id wins",
-        "Cooldown-fallback reply: broker-side detect no-claim, send 'No CLI is currently attached' once per (channel,chat,topic) per 300s",
-        "Wire OutboundJob.ResultCh back through ipc.OpToolResult so tool calls return results to adapters"
+        "Cooldown-fallback reply: broker-side detect no-claim, send 'No CLI is currently attached' once per (channel,chat,topic) per 300s, dedup map",
+        "Wire OutboundJob.ResultCh back through ipc.OpToolResult so tool calls return results to adapters (worker.dispatch hooks into channel.SendReply etc., result flows back to ipc.HandleConn dispatch)",
+        "Debounce window: per-route 1.5s default, max 50 messages, latest message_id wins (lives in worker.dispatch JobInbound path)",
+        "Plugin chain wiring: STT prefix substitution + OnInbound chain (Plan 5 — depends on plugin host concrete impl)"
       ]
     },
     "phase_4a_complete": {
