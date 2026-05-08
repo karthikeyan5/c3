@@ -16,9 +16,13 @@
       "wiring": {"status": "done", "commit": "261cca0"},
       "attach_proposal_flow": {"status": "done", "commit": "be43397", "details": "8 unit tests with fakeChannel: DM, name in default group (silent claim), name in other group (proposes use_existing_other_group + Alternative), unknown name (proposes create), create=true (calls channel.CreateTopic + persists), topic_id (validates + registers placeholder), saved mapping (silent claim regardless of name search), already-claimed (returns holder-identifying error). Persists mappings.json atomically on every successful attach via SaveMappings()."},
       "remaining": [
-        "Debounce window (small).",
-        "Plugin chain (Plan 5)."
+        "Debounce window (small)."
       ]
+    },
+    "phase_5_stt_plugin": {
+      "status": "DONE",
+      "commit": "3f60e6c",
+      "details": "PluginHost concrete impl in broker package; FireOnVoiceReceived runs BEFORE FireOnInbound in worker.dispatchInbound. STT plugin shells out to existing ~/.claude/channels/telegram/stt-handler.py (configurable). Voice messages now get [Transcribed voice]: <text> prefix per spec. Live broker boot logs '[plugin] stt: registered'."
     },
     "phase_6_claude_adapter": {
       "status": "DONE — END-TO-END WORKING",
