@@ -97,7 +97,8 @@ type TopicsListMsg struct {
 	Topics []TopicEntry `json:"topics"`
 }
 
-// TopicEntry is one row in TopicsListMsg.Topics.
+// TopicEntry is one row in TopicsListMsg.Topics. Also reused by Proposal.Existing
+// to describe a found-but-not-claimed topic (in which case ClaimedBy is nil).
 type TopicEntry struct {
 	Channel   string  `json:"channel"`
 	ChatID    int64   `json:"chat_id"`
@@ -105,6 +106,48 @@ type TopicEntry struct {
 	Name      string  `json:"name"`
 	Group     string  `json:"group,omitempty"`
 	ClaimedBy *Holder `json:"claimed_by,omitempty"`
+}
+
+// AttachReq is the adapter → broker attach request. Spec §4.4.1.
+type AttachReq struct {
+	Op      Op     `json:"op"` // = OpAttach
+	CWD     string `json:"cwd,omitempty"`
+	Name    string `json:"name,omitempty"`
+	Target  string `json:"target,omitempty"`
+	TopicID *int64 `json:"topic_id,omitempty"`
+	Group   string `json:"group,omitempty"`
+	Channel string `json:"channel,omitempty"`
+	Create  bool   `json:"create,omitempty"`
+
+	// Confirm carries the prior proposal for sibling-stub race detection
+	// (spec §4.4.1). Optional; v1 broker doesn't yet validate it but the
+	// field is plumbed for forward-compat.
+	Confirm *Proposal `json:"confirm,omitempty"`
+}
+
+// AttachedMsg is the broker → adapter response.
+type AttachedMsg struct {
+	Op                Op        `json:"op"` // = OpAttached
+	OK                bool      `json:"ok"`
+	Channel           string    `json:"channel,omitempty"`
+	ChatID            int64     `json:"chat_id,omitempty"`
+	TopicID           *int64    `json:"topic_id,omitempty"`
+	Name              string    `json:"name,omitempty"`
+	Group             string    `json:"group,omitempty"`
+	NeedsConfirmation bool      `json:"needs_confirmation,omitempty"`
+	Proposal          *Proposal `json:"proposal,omitempty"`
+	Err               string    `json:"err,omitempty"`
+}
+
+// Proposal describes what the broker would do if the agent confirms.
+// Action is one of: "create", "use_existing_other_group", "claim_existing".
+type Proposal struct {
+	Action      string      `json:"action"`
+	Channel     string      `json:"channel"`
+	Group       string      `json:"group"`
+	Name        string      `json:"name"`
+	Existing    *TopicEntry `json:"existing,omitempty"`    // populated for use_existing_*
+	Alternative *Proposal   `json:"alternative,omitempty"` // recursion: e.g. "or create new in default group"
 }
 
 // ErrorMsg is sent by either side on an unrecoverable error.

@@ -60,6 +60,8 @@ func (b *Broker) HandleConn(nc net.Conn) {
 			continue
 		}
 		switch op {
+		case ipc.OpAttach:
+			b.handleAttach(conn, stub, raw)
 		case ipc.OpListTopics:
 			b.handleListTopics(conn)
 		case ipc.OpRelease:
