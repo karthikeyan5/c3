@@ -1,16 +1,16 @@
 # C3 Re-Architecture — Design Spec
 
-**Date:** 2026-05-08 (revised after second review)
-**Status:** Approved (all §11 calls resolved). Ready to move to implementation plan.
-**Reaffirms:** D006 (Go for daemon), D007 (pluggable transport — promoted to v1), D008 (official Go MCP SDK)
-**Supersedes:** the deviation banners across `RESUME.md` / `TODO.md` / `DECISIONS.md` (Python wrapper MVP). A formal D009 will record the v1-MVP-superseded note when implementation starts.
+**Date:** 2026-05-08 (revised after Codex POC review — v4)
+**Status:** Approved. Polyglot stack: Go for the new core (broker, Telegram channel, Claude adapter); Python for the working Codex bridge whose spec lives at `c3/mvp/CODEX_BRIDGE_SPEC.md`.
+**Reaffirms:** D006 (Go for daemon), D007 (pluggable transport — promoted to v1), D008 (official Go MCP SDK), with a pragmatic deviation: D006's "Go for daemon AND MCP stubs" applies to the Claude adapter; the Codex side keeps its tested Python POC (shim + supervisor + stub).
+**Supersedes:** the deviation banners across `RESUME.md` / `TODO.md` / `DECISIONS.md` (Python wrapper MVP). A formal D009 will record the v1-MVP-superseded note when implementation starts. A separate D010 will document the Codex-side Python preservation.
 
 ## 1. Goal
 
 Take C3 from a hand-tuned Python MVP into a **distributable, multi-channel, multi-CLI** plugin set, written in **Go**, with a **plugin extension system** so STT and future capabilities slot in cleanly.
 
 - **Distributable** — one public github URL, anyone can install via Claude Code or Codex plugin marketplace.
-- **Go everywhere** — broker, channels, adapters all in Go. Cross-compiled binaries shipped via GitHub releases. STT pipeline stays Python and is subprocess'd from Go (proven code, don't rewrite).
+- **Go for new code, Python where the working POC lives** — broker, Telegram channel, Claude Code adapter, migration tool, and STT shim are all Go. The **Codex bridge** (shim wrapper, app-server supervisor, MCP stub) stays Python — there's a tested POC at `c3/mvp/codex`, `c3/mvp/codex_supervisor.py`, `c3/mvp/codex_stub.py` whose operational truth is documented in `c3/mvp/CODEX_BRIDGE_SPEC.md`. STT pipeline (Python whisper) is subprocess'd from Go (proven code, don't rewrite). Polyglot is fine because the broker IPC protocol is the cross-language contract.
 - **Multi-channel** — Telegram is the only channel today; web chat and voice mode were always D007's destination, now plumbed into v1's data model and code paths.
 - **Multi-CLI** — Claude Code first, Codex parity, future CLIs through a documented adapter contract.
 - **Multi-group** — multiple Telegram supergroups can host C3 topics simultaneously, addressed by name.
@@ -92,17 +92,21 @@ Five planes. Each has one job.
                   ┌────────▼─────────┐
                   │ /tmp/c3.sock     │
                   └──┬─────┬─────┬───┘
-              ┌─────▼┐  ┌──▼──┐ ┌▼─────────┐
-              │Claude│  │Codex│ │Future CLI│
-              │adapter│ │adapter│ │adapter │
-              │(Go)   │ │(Go) │ │           │
-              └──┬───┘  └─┬──┘ └─┬───────┘
-                 │ stdio  │      │
-              ┌──▼───┐  ┌▼───┐
-              │ CC   │  │Codex│
-              │ CLI  │  │ CLI │
-              └──────┘  └─────┘
+              ┌──────┐  ┌─────────────┐  ┌──────────┐
+              │Claude│  │Codex bridge │  │Future CLI│
+              │adapter  │(Python POC) │  │adapter   │
+              │(Go)   │ │ shim →       │ │           │
+              │       │ │ supervisor → │ │           │
+              │       │ │ stub.py      │ │           │
+              └──┬───┘  └─┬──────────┘  └─┬────────┘
+                 │ stdio  │ stdio + WS    │
+              ┌──▼───┐  ┌─▼─────────────┐
+              │ CC   │  │ Codex TUI     │
+              │ CLI  │  │ (--remote)    │
+              └──────┘  └───────────────┘
 ```
+
+The Codex bridge is a three-piece chain (shim → supervisor → stub) speaking to the broker over the same `/tmp/c3.sock` IPC; the contract is identical to the Claude adapter's, the implementation language is just Python because the POC works.
 
 ### 4.1 Channels plane (Go)
 
@@ -233,8 +237,14 @@ Common IPC protocol (newline-delimited JSON over the unix socket):
 Host-specific translations:
 
 - **Claude Code adapter** forwards inbound as `notifications/claude/channel` (preserves rich `<channel>` rendering). Tools list is broker tools + adapter-local `attach` and `topics`. Inbound `<channel>` blocks are rendered natively.
-- **Codex adapter** forwards inbound as `notifications/message` log + buffers into `c3_inbox` poll tool + optional WS forwarder to Codex app-server. Tools: `c3_attach`, `c3_topics`, `c3_inbox`, `c3_reply`, `c3_codex_forward`. Designed so the inbox tool is a clean deletion when Codex ships native unsolicited-notification rendering (issues #18056/#17543/#15299 still open).
-- **Future CLI adapters** implement the protocol; broker doesn't care.
+- **Codex bridge** is the **tested Python POC** under `c3/mvp/` whose operational spec is `c3/mvp/CODEX_BRIDGE_SPEC.md` — read that file as the source of truth for the bridge's behavior and ops checks. Three pieces:
+  - **`codex` shim** (executable wrapper installed on PATH at `~/.local/bin/codex`; **also a symlink in the user's NVM bin dir** because long-running shells hash the NVM path — installing only `~/.local/bin/codex` is not sufficient).
+  - **`codex_supervisor.py`** — launcher + app-server lifecycle manager. Starts or reuses an app-server on `ws://127.0.0.1:8766` (falls forward to `8767+` if `/tmp/c3-codex-app-server.json`'s C3 signature `(cwd, topic, stub-path)` doesn't match). Critically, the **app-server owns MCP startup**, not the visible TUI, so the supervisor is the one that injects the C3 MCP config (`mcp_servers.c3_codex.command`/`args`/`env`) into the app-server, then launches the TUI with `--remote <ws-url>`.
+  - **`codex_stub.py`** — Codex MCP server connecting to the C3 broker over `/tmp/c3.sock`, exposing `c3_attach`, `c3_topics`, `c3_inbox`, `c3_reply`, `c3_codex_forward`. Forwards inbound to Codex via WebSocket `initialize → thread/list → thread/resume → turn/start` with `suppress_origin=True` (otherwise app-server rejects with 403). Forwarding is gated by `C3_CODEX_REMOTE_BRIDGE=1` (set by the wrapper) — split-brain guard against `codex resume` running stock-mode and turning the bridge into a one-way ghost.
+  - Bypassed commands (full set in `codex_supervisor.CODEX_SUBCOMMANDS`: `exec`, `e`, `review`, `login`, `logout`, `mcp`, `plugin`, `mcp-server`, `app-server`, `completion`, `update`, `sandbox`, `debug`, `apply`, `a`, `cloud`, `exec-server`, `features`, `help`) plus `-h`/`--help`/`-V`/`--version` and any invocation already containing `--remote` (anti-recursion guard) skip the wrapper. `codex resume`, `codex fork`, and bare `codex` all go through it.
+  - Environment contract from wrapper to stub: `C3_ATTACH_NAME`, `C3_CODEX_REMOTE_BRIDGE=1`, `C3_CODEX_CWD`, `C3_CODEX_APP_SERVER_WS`. Health checks are in the bridge spec's "Operational Checks" section.
+  - This bridge is preserved as-is in v3; no Go rewrite. The interaction surface against the broker is the same IPC the Claude adapter uses, so the Go broker doesn't need any Codex-aware logic.
+- **Future CLI adapters** implement the protocol; broker doesn't care about the language.
 
 ### 4.5 Plugin host plane (broker, Go)
 
@@ -263,32 +273,27 @@ Plugins are configured under `mappings.json:plugins.<name>`. Each plugin defines
 
 ### 5.1 First install on a fresh machine
 
+**Claude Code side:**
+
 1. User runs `/plugin marketplace add karthikeyan5/c3`, then `/plugin install c3@c3`, then `/reload-plugins`.
-2. The plugin manifest's `.mcp.json` references a wrapper script at `${CLAUDE_PLUGIN_ROOT}/adapter/claude-c3` (the Go binary, picked from `bin/<os>-<arch>/`).
-3. On the next session, the Go adapter starts, tries `/tmp/c3.sock`, fails, spawns the broker binary (`${CLAUDE_PLUGIN_ROOT}/bin/<os>-<arch>/c3-broker`).
-4. Broker starts, looks for `~/.config/c3/mappings.json`, doesn't find it. Writes a stub skeleton (mode 600), keeps running.
-5. Adapter's `hello_ack` says `no_config: true`. Adapter's `instructions` text: *"C3 not yet configured. Run `/c3-setup` to provide your Telegram bot token, DM chat id, and at least one group chat id."*
-6. User runs `/c3-setup`. The slash command (Claude Code) uses `AskUserQuestion` to gather: bot token, DM chat id, group chat id (named, e.g. "main"). Writes `mappings.json:channels.telegram.*`. Tells user to restart the session.
-7. After restart, auto-attach (or proposal) works.
+2. User runs `/c3-build` (slash command shipped by the plugin) once. It runs `go install ./cmd/...` in the plugin source dir; binaries land in `$GOBIN`.
+3. The plugin's `.mcp.json` references the adapter by name (e.g. `command: "c3-claude-adapter"`), assuming `$GOBIN` is on `$PATH`.
+4. On the next session, the Go adapter starts, tries `/tmp/c3.sock`, fails, spawns `c3-broker` (also via `$PATH`).
+5. Broker starts, looks for `~/.config/c3/mappings.json`, doesn't find it. Writes a stub skeleton (mode 600), keeps running.
+6. Adapter's `hello_ack` says `no_config: true`. Adapter's `instructions` text: *"C3 not yet configured. Run `/c3-setup` to provide your Telegram bot token, DM chat id, and at least one group chat id."*
+7. User runs `/c3-setup`. Slash command uses `AskUserQuestion` to gather: bot token, DM chat id, group chat id (named, e.g. "main"). Writes `mappings.json:channels.telegram.*`. Tells user to restart the session.
+8. After restart, auto-attach (or proposal) works.
 
-For Codex install: `codex plugin marketplace add github:karthikeyan5/c3` then `codex plugin install c3-codex`. If `~/.config/c3/mappings.json` exists, reused. If not, the Codex plugin ships **`SETUP.md`** that the agent reads and executes (per Karthi's call in §11.5):
+**Codex side** (per `c3/mvp/CODEX_BRIDGE_SPEC.md`):
 
-```
-# C3 Codex Setup
-
-Hi agent — this is your setup checklist. Run these in order. The user
-can also run them manually if they'd rather.
-
-1. Verify ~/.config/c3/mappings.json exists. If not, ask the user for:
-   - Telegram bot token (sensitive; from @BotFather)
-   - DM chat id (their Telegram user id, positive integer)
-   - At least one group chat id with a name they'll remember
-   Then write the skeleton file at mode 600.
-2. Run `bin/<os>-<arch>/c3-broker --check-config` — exits 0 if config is valid.
-3. Tell the user setup is complete and they should restart the Codex session.
-```
-
-Plus a Go helper `bin/<os>-<arch>/c3-setup-codex --bot-token=… --dm-chat-id=…` that the agent can call to do the file write idempotently.
+1. User runs `codex plugin marketplace add github:karthikeyan5/c3`, then `codex plugin install c3-codex`. The Codex marketplace plugin is essentially a thin manifest pointing at `codex/SETUP.md` and `codex/install.sh` in the cloned repo.
+2. User reads `SETUP.md` (or asks the agent to). The agent runs `codex/install.sh`, which:
+   a. Symlinks `codex/codex` (the shim wrapper) to `~/.local/bin/codex` (idempotent — checks if it already points at our shim).
+   b. **Also** symlinks the same shim into the user's NVM bin dir (e.g. `~/.nvm/versions/node/<v>/bin/codex`) — long-running shells hash `codex` to that path; without this symlink, the user's existing terminal sessions bypass the bridge entirely.
+   c. Verifies `~/.config/c3/mappings.json` exists (created by Claude-side `/c3-setup`, or runs the equivalent setup interactively if missing).
+   d. Verifies the broker is reachable at `/tmp/c3.sock` (or starts it if not).
+3. From now on, running `codex` (from any shell) goes through the shim → supervisor → app-server → stub chain. Inbound Telegram messages route to Codex turns automatically; outbound `c3_reply` calls go to Telegram.
+4. The Codex side reuses `~/.config/c3/mappings.json` from the Claude-side setup. If neither side has run setup yet, `install.sh` prompts the user (or agent) for the same fields the `/c3-setup` slash command would.
 
 ### 5.2 Fresh project — `attach` proposal flow
 
@@ -507,6 +512,7 @@ Old Python broker stays runnable alongside the new Go broker — flock prevents 
 - Auto-spawn of CLIs (TODO Phase 2 — adapter plane is ready, no code yet).
 - Inter-CLI messaging, master-CLI admin commands, pairing flow, monitoring dashboard.
 - Cleanroom STT rewrite (Go shim → Python pipeline; the working pipeline keeps working).
+- Cleanroom Codex adapter rewrite. The working POC at `c3/mvp/codex` + `codex_supervisor.py` + `codex_stub.py` (spec: `c3/mvp/CODEX_BRIDGE_SPEC.md`) stays Python in v1. A Go port is possible later if maintenance pain warrants — there is no planned rewrite.
 
 ## 11. Resolved questions (no opens left)
 
@@ -521,6 +527,7 @@ All Karthi calls:
 - §11.A ⇒ `github.com/PaulSonOfLars/gotgbot/v2`.
 - §11.B ⇒ Build from source on first install. Distribution is github-only — users `git clone` the plugin source into the Claude Code plugin cache and we compile locally. Go ≥1.22 is a documented prereq in INSTALL.md.
 - §11.C ⇒ Resolved by §11.B's choice. With `go install` / `go build`, binaries land at `$GOBIN` (or wherever the build outputs). The `.mcp.json` `command` references binaries by name (e.g. `c3-claude-adapter`), assuming the user's PATH includes `$GOBIN`. A `/c3-build` slash command (Claude Code) runs `go install ./cmd/...` from the plugin source. Codex's `SETUP.md` instructs the agent to do the same. First-session friction: user installs plugin → runs `/c3-build` once → restart. Acceptable for v1.
+- §11.D (added v4) ⇒ Codex side stays Python POC (`c3/mvp/codex`, `codex_supervisor.py`, `codex_stub.py`, plus their tests under `c3/mvp/tests/`). Operational truth lives in `c3/mvp/CODEX_BRIDGE_SPEC.md`. Polyglot stack accepted; broker IPC is the cross-language contract. v4 acknowledges this deviation from D006's "Go for daemon and stubs" — the daemon is Go, the Claude stub is Go, but the Codex stub stays Python because it works.
 
 ## 12. Implementation phases
 
@@ -533,8 +540,8 @@ This spec produces an implementation plan via the `writing-plans` skill. Rough p
 5. **Plugin host + STT plugin.** Hook system, `OnVoiceReceived`, Python subprocess shim.
 6. **Claude Code adapter.** MCP stdio server, claim-per-cwd, attach proposal flow, all attach modes (no-args, name, dm, topic-id, group-override).
 7. **Debounce + dedup, typing indicator, edit_progress.**
-8. **Codex adapter.** Same protocol, different host translation. SETUP.md + helper binary.
-9. **`/c3-setup` (Claude) and Codex SETUP flow.**
+8. **Codex bridge integration (no rewrite).** Move the Python POC files (`codex`, `codex_supervisor.py`, `codex_stub.py`, tests) from `mvp/` to a top-level `codex/` directory. Update their broker IPC calls to match the new IPC v2 protocol where it has changed (specifically: the new `attach` proposal flow vs the old `attach_auto` semantic). Add `codex/install.sh` for symlink installation (PATH + NVM). Author the Codex marketplace plugin manifest pointing at `SETUP.md` + `install.sh`.
+9. **`/c3-setup`, `/c3-build`, `/c3-status` slash commands (Claude) and Codex `SETUP.md` flow.**
 10. **Documentation + release.** README rewrite, INSTALL rewrite, retire deviation banners with formal D009. Tag v0.1.0.
 
 Phases 1-7 unblock Karthi's daily use. 8-10 are about shippability to others.
@@ -548,7 +555,9 @@ Phases 1-7 unblock Karthi's daily use. 8-10 are about shippability to others.
 - Telegram Bot API: core.telegram.org/bots/api, /api-changelog.
 - Telegram forums constraint: tdlib/telegram-bot-api#356 (no `getForumTopics`).
 - OpenClaw messaging features: c3/README.md §"Inspiration: OpenClaw's Message Tool".
-- Existing Python MVP: `mvp/broker.py`, `mvp/stub.py`, `mvp/codex_stub.py`, `mvp/PATCH_SPEC.md` (reference; spec-level only).
+- Existing Python MVP: `mvp/broker.py`, `mvp/stub.py` (reference; spec-level only — Go rewrite supersedes).
+- **Codex bridge POC (preserved as-is, not rewritten):** `mvp/codex` (shim), `mvp/codex_supervisor.py`, `mvp/codex_stub.py`, `mvp/tests/test_codex_launcher.py`, `mvp/tests/test_codex_stub.py`, and the **operational source of truth: `mvp/CODEX_BRIDGE_SPEC.md`**. Read that spec for wrapper flow, app-server ownership, port selection, inbound forwarding, split-brain guard, MCP tools, ops checks, known failure modes.
+- `mvp/PATCH_SPEC.md` (reference for what behaviors the cleanroom Telegram channel must replicate).
 - Existing plugin scaffold: `plugin/.claude-plugin/marketplace.json`, `plugin/plugins/c3-telegram/`.
 - C3 stated direction: README.md §"Key Features (Full Vision)", TODO.md Phases 1-4, DECISIONS.md D001-D008.
 - Go MCP SDK: github.com/modelcontextprotocol/go-sdk v1.0.0+ (per `research/go-mcp-sdk.md`).

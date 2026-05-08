@@ -1751,11 +1751,11 @@ The following come in subsequent plans, in order:
 - **Plan 4 (Phase 5):** Plugin host + STT plugin (Go shim → existing Python whisper).
 - **Plan 5 (Phase 6):** Claude Code adapter, `.mcp.json`, `${CLAUDE_PLUGIN_ROOT}` resolution, attach proposal flow surfacing.
 - **Plan 6 (Phase 7):** Debounce, dedup, typing indicator, edit_progress.
-- **Plan 7 (Phase 8):** Codex adapter + SETUP.md flow.
-- **Plan 8 (Phase 9):** /c3-setup, /c3-build, /c3-status slash commands.
-- **Plan 9 (Phase 10):** Documentation pass, deviation banner retirement, D009 entry, public release tag.
+- **Plan 7 (Phase 8):** **Codex bridge integration — no rewrite.** Move the existing Python POC (`mvp/codex` shim, `codex_supervisor.py`, `codex_stub.py`, related tests) to a top-level `codex/` directory. Update its broker IPC calls to match the new IPC v2 protocol (particularly the `attach` proposal flow vs the old `attach_auto`). Add `codex/install.sh` (idempotent PATH + NVM symlink installer). Author the Codex marketplace plugin manifest pointing at `SETUP.md` + `install.sh`. Operational truth for the bridge stays in `mvp/CODEX_BRIDGE_SPEC.md` — keep that file as the source for behavior, ports, env contract, ops checks. Do NOT rewrite this in Go.
+- **Plan 8 (Phase 9):** `/c3-setup`, `/c3-build`, `/c3-status` slash commands (Claude) + Codex `SETUP.md` author.
+- **Plan 9 (Phase 10):** Documentation pass, deviation banner retirement, D009 + D010 entries, public release tag.
 
-After this plan, the broker doesn't exist yet — but the data layer is complete, tested, and the migration tool works against the real Python MVP files.
+After this plan, the broker doesn't exist yet — but the data layer is complete, tested, and the migration tool works against the real Python MVP files. The Codex POC files under `mvp/` remain untouched and continue to function on Karthi's machine; their migration to top-level `codex/` is part of Plan 7 (Phase 8), not this plan.
 
 ---
 
