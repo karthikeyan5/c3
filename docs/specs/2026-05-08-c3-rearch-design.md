@@ -89,24 +89,24 @@ Five planes. Each has one job.
                 │  <future plugins>    │
                 └──────────┬───────────┘
                            │
-                  ┌────────▼─────────┐
-                  │ /tmp/c3.sock     │
-                  └──┬─────┬─────┬───┘
-              ┌──────┐  ┌─────────────┐  ┌──────────┐
-              │Claude│  │Codex bridge │  │Future CLI│
-              │adapter  │(Python POC) │  │adapter   │
-              │(Go)   │ │ shim →       │ │           │
-              │       │ │ supervisor → │ │           │
-              │       │ │ stub.py      │ │           │
-              └──┬───┘  └─┬──────────┘  └─┬────────┘
-                 │ stdio  │ stdio + WS    │
+                  ┌────────────────────────┐
+                  │ $XDG_RUNTIME_DIR/c3.sock│
+                  │ (fallback: /tmp/c3-$UID.sock) │
+                  └──┬─────┬─────┬─────────┘
+              ┌──────┐  ┌──────────────┐  ┌──────────┐
+              │Claude│  │Codex bridge  │  │Future CLI│
+              │adapter  │(Go)          │  │adapter   │
+              │(Go)   │ │ launcher →   │ │           │
+              │       │ │ adapter      │ │           │
+              └──┬───┘  └─┬────────────┘  └─┬────────┘
+                 │ stdio  │ stdio + WS      │
               ┌──▼───┐  ┌─▼─────────────┐
               │ CC   │  │ Codex TUI     │
               │ CLI  │  │ (--remote)    │
               └──────┘  └───────────────┘
 ```
 
-The Codex bridge is a three-piece chain (shim → supervisor → stub) speaking to the broker over the same `/tmp/c3.sock` IPC; the contract is identical to the Claude adapter's, the implementation language is just Python because the POC works.
+The Codex bridge is two Go binaries (`codex` launcher + `c3-codex-adapter` MCP server) speaking the same broker IPC the Claude adapter uses. The contract is CLI-agnostic.
 
 ### 4.1 Channels plane (Go)
 
@@ -128,19 +128,81 @@ type Channel interface {
 }
 ```
 
-Inbound messages flow from the channel into the broker via a normalized event:
+Inbound messages flow from the channel into the broker via a normalized event. **Canonical name: `Inbound`** (drop any other names like `InboundEvent` or `*Inbound` from earlier drafts):
 
 ```go
-type InboundEvent struct {
-    Channel    string  // "telegram"
-    ChatID     int64
-    TopicID    *int64  // nil for non-forum, 1 for General, >1 for custom topic
-    MessageID  int64
-    Sender     Sender
-    Text       string
+type Inbound struct {
+    Channel     string  // "telegram"
+    ChatID      int64
+    TopicID     *int64  // nil = non-forum chat (DM, plain group); int64(1) = General forum topic;
+                        //  >1 = custom forum topic. NEVER 0 — the Telegram-0 sentinel from the
+                        //  Python MVP is gone end-to-end. The routing key uses *int64 so nil and
+                        //  &(1) are distinct.
+    MessageID   int64
+    Sender      Sender
+    Text        string
     Attachments []Attachment
-    ReplyTo    *ReplyContext
-    Timestamp  time.Time
+    ReplyTo     *ReplyContext
+    Timestamp   time.Time
+}
+
+type Sender struct {
+    UserID   int64  // positive Telegram user id
+    Username string // optional; empty if user has no public username
+}
+
+type Attachment struct {
+    Kind   string // "voice", "audio", "video", "video_note", "document", "photo", "sticker"
+    FileID string // Telegram file_id, downloadable via channel.DownloadAttachment
+    Size   int64  // bytes; 0 if unknown
+    MIME   string // optional
+    Name   string // filename (documents) or caption-derived label
+}
+
+type ReplyContext struct {
+    MessageID int64
+    User      Sender
+    Text      string // text or caption of the replied-to message
+}
+
+type Outbound struct {
+    Channel   string  // routes to that channel's SendReply
+    ChatID    int64
+    TopicID   *int64  // same encoding rules as Inbound
+    Text      string
+    Files     []string  // absolute paths the channel will upload
+    ParseMode string    // optional, channel-specific (Telegram: "MarkdownV2" etc.)
+    ReplyTo   *int64    // optional — original message_id to thread under
+}
+
+type ReplyArgs   = Outbound // alias; Outbound is the canonical name
+type EditArgs struct {
+    Channel   string
+    ChatID    int64
+    MessageID int64
+    Text      string
+    ParseMode string
+}
+type EditResult struct{ MessageID int64 }
+type ReactArgs struct {
+    Channel   string
+    ChatID    int64
+    MessageID int64
+    Emoji     string  // single emoji per Telegram's setMessageReaction contract
+}
+
+type VoicePayload struct {
+    Channel   string
+    ChatID    int64
+    TopicID   *int64
+    MessageID int64
+    FileID    string
+    MIME      string
+    Size      int64
+    // The plugin gets file_id rather than the audio bytes; it calls
+    // host.Channel(channel).DownloadAttachment(FileID) if it needs the file.
+    // STT plugin currently shells out to a Python subprocess that does the
+    // download itself via Telegram Bot API — see internal/plugin/builtins/stt.
 }
 ```
 
@@ -155,7 +217,44 @@ Future channels (web, voice) implement the same interface; adapters don't change
 
 ### 4.2 Routing plane
 
-Routing key: `(channel, chat_id, message_thread_id)`. `message_thread_id` is `*int64` — `nil` means "no topic / non-forum chat", `1` is the General forum topic, `>1` is custom topic. Telegram General topic id confusion (where some code treats 0 as General) is fixed end-to-end.
+Routing key: `(channel, chat_id, *message_thread_id)`. The pointer-int64 encoding makes "no topic" (nil) distinct from "General topic" (`&1`) at the type level — there is no integer sentinel for "no topic". This forces every channel and adapter to be explicit. Telegram General topic id confusion (Python MVP code that treated 0 as General) is fixed end-to-end.
+
+#### 4.2.1 Claim lifecycle
+
+Claims are in-memory only — `map[RouteKey]*Stub` in the broker. They are NOT persisted; on broker restart the map is empty and adapters re-claim on their next `hello`.
+
+| Event | Effect on claim |
+|---|---|
+| Adapter sends `attach` and broker grants | Insert claim. Inbound for the route now flows to this stub. |
+| Adapter cleanly disconnects (stdin EOF, `bye` op) | Release claim. Broker sweeps the route from `ROUTES`. |
+| Adapter crashes / loses socket | Broker detects via `EPIPE` on next write and releases. The next inbound for that route triggers the cooldown-fallback reply (§4.4.x). |
+| `release` op (explicit) | Release claim. Adapter stays connected, just gives up the route. New `attach` reclaims. |
+| Broker restart | All claims gone. Adapters re-claim on reconnect. The `mappings.json` cwd→topic mapping is the durable state; live claims are not. |
+| In-flight inbound when claim releases | The current message (already mid-deliver) completes if possible; the next one hits cooldown-fallback. No buffer is held across release. |
+
+Single-claim-per-route invariant: only one stub at a time owns `(channel, chat_id, *topic_id)`. The broker rejects a second `attach` to the same route with `claim_holder` populated; adapter surfaces "already held by `<cli>` pid `<pid>`".
+
+#### 4.2.2 Broker process model
+
+Singleton-per-machine via `flock`. The lock file path:
+
+```
+$XDG_RUNTIME_DIR/c3-broker.pid    (preferred — created mode 0600 in user-private tmpfs)
+$HOME/.cache/c3/c3-broker.pid     (fallback if XDG_RUNTIME_DIR unset)
+```
+
+Spawn protocol:
+
+1. Adapter calls `connect(socket_path)` (§4.4 socket path resolution: `$XDG_RUNTIME_DIR/c3.sock` → `/tmp/c3-$UID.sock` fallback, never bare `/tmp/c3.sock` to avoid multi-user clobbering).
+2. On `ECONNREFUSED` / `ENOENT`, adapter calls `exec.Command("c3-broker")` in a detached process group (`setsid`), then retries `connect` with exponential backoff up to 10 seconds.
+3. Broker on startup:
+   - Calls `flock(fd, LOCK_EX | LOCK_NB)` on the pid file.
+   - On `EWOULDBLOCK`: read the pid, check if the process is alive (`kill(pid, 0)`). If alive → exit 0 silently (sibling won the race). If dead → unlink the stale pid file and retry the lock once.
+   - On success: write own pid into the locked file (do NOT close the fd; closing releases the flock). Bind the socket.
+4. Concurrent-spawn race: two adapters spawning simultaneously is safe — `flock` ensures exactly one broker survives. The losing broker exits silently. Both adapters' connect-with-backoff succeeds against the surviving broker.
+5. Stale-lock recovery: a broker that crashed without releasing the lock leaves the pid file stale. Step 3's pid-liveness check handles this. The crashed broker's socket file is unlinked by the new broker before binding.
+
+Daemonization: the broker does not double-fork or detach further than `setsid` puts it. It runs as a child of the spawning adapter's process group's session, but is reparented to init when the spawning adapter exits — standard Go `exec.Command` + `Setsid: true` behavior. No PID 1 needed.
 
 Live routes are in-memory only (`map[RouteKey]*Stub`). Persistence is for mappings, not for live claims.
 
@@ -199,12 +298,15 @@ Schema:
   "plugins": {
     "stt": {
       "enabled": true,
+      "priority": 10,
       "language": "en",
       "vocabulary_file": ""
     }
   }
 }
 ```
+
+Reserved plugin keys: `enabled` (bool, default true) skips subscriptions when false; `priority` (int, default 100) orders chained hooks (lower runs first). Other keys are plugin-defined.
 
 `plugins` is added so plugins keep their config alongside everything else (per the "everything in mappings.json" rule). Each plugin owns its own subkey.
 
@@ -214,25 +316,173 @@ Why one file: explicit Karthi request. Operator's view in one place. Mode 600 pr
 
 Each adapter is a small Go binary that:
 1. Speaks its host CLI's MCP protocol over stdio (using `github.com/modelcontextprotocol/go-sdk`).
-2. Connects to the broker over `/tmp/c3.sock`.
+2. Connects to the broker over the unix socket (path resolution: `$XDG_RUNTIME_DIR/c3.sock` → `/tmp/c3-$UID.sock` fallback; never bare `/tmp/c3.sock`).
 3. Translates inbound notifications into whatever the host CLI can render.
 
-Common IPC protocol (newline-delimited JSON over the unix socket):
+#### 4.4.1 IPC types (Go, JSON-tagged)
 
-| Direction | Op | Purpose |
-|---|---|---|
-| stub → broker | `hello` | `{cli, pid, cwd}`. Broker responds with auto-attach state. |
-| stub → broker | `server_info` | Get serverInfo + capabilities + instructions. |
-| stub → broker | `tools_list` | Get the broker's tool list (channel-specific + universal). |
-| stub → broker | `attach` | `{cwd?, name?, target?, topic_id?, group?, channel?, create?}`. Semantics in §5. |
-| stub → broker | `list_topics` | All known topics across channels + claim state. |
-| stub → broker | `tool_call` | Forward tool invocation to the channel module. |
-| broker → stub | `hello_ack` | `{auto_attached, mapping?, claim_holder?, no_config?}`. |
-| broker → stub | `attached` | `{ok, channel, chat_id, topic_id, name, group?, needs_confirmation?, proposal?, err?}`. |
-| broker → stub | `tool_result` | Result of forwarded tool call. |
-| broker → stub | `inbound` | Normalized inbound message routed to this stub. |
-| broker → stub | `topics_list` | Listing response. |
-| broker → stub | `error` | Generic error. |
+The newline-delimited JSON IPC over the unix socket. Concrete Go structs — every adapter and the broker import these from `internal/ipc/messages.go`:
+
+```go
+package ipc
+
+// Op is the op-code on every message. Adapters and broker dispatch on this.
+type Op string
+
+const (
+    OpHello       Op = "hello"        // adapter → broker
+    OpHelloAck    Op = "hello_ack"    // broker  → adapter
+    OpServerInfo  Op = "server_info"
+    OpToolsList   Op = "tools_list"
+    OpAttach      Op = "attach"
+    OpAttached    Op = "attached"
+    OpRelease     Op = "release"      // adapter → broker, explicit detach
+    OpListTopics  Op = "list_topics"
+    OpTopicsList  Op = "topics_list"
+    OpToolCall    Op = "tool_call"
+    OpToolResult  Op = "tool_result"
+    OpInbound     Op = "inbound"      // broker → adapter
+    OpError       Op = "error"
+    OpBye         Op = "bye"          // adapter → broker, clean disconnect
+)
+
+type HelloMsg struct {
+    Op   Op     `json:"op"`            // = OpHello
+    CLI  string `json:"cli"`           // "claude", "codex", "<future>"
+    PID  int    `json:"pid"`
+    CWD  string `json:"cwd"`           // absolute, resolved
+    // Capabilities the adapter has for surfacing inbound. Used by the broker to
+    // pick the cheapest delivery path (push vs poll vs WS forwarder) when more
+    // than one is available. Optional; broker assumes the conservative default
+    // ("inbox") if absent.
+    Capabilities []string `json:"capabilities,omitempty"` // e.g. ["claude/channel", "log-notification", "inbox", "ws-forwarder"]
+}
+
+type HelloAckMsg struct {
+    Op             Op       `json:"op"`             // = OpHelloAck
+    AutoAttached   bool     `json:"auto_attached"`
+    Mapping        *Mapping `json:"mapping,omitempty"`
+    ClaimHolder    *Holder  `json:"claim_holder,omitempty"`
+    NoConfig       bool     `json:"no_config,omitempty"`
+    NoMapping      bool     `json:"no_mapping,omitempty"`
+}
+
+type Holder struct {
+    CLI string `json:"cli"`
+    PID int    `json:"pid"`
+    CWD string `json:"cwd"`
+}
+
+type AttachReq struct {
+    Op       Op      `json:"op"`               // = OpAttach
+    CWD      string  `json:"cwd,omitempty"`    // absolute; required for cwd-keyed semantics
+    Name     string  `json:"name,omitempty"`   // explicit topic name
+    Target   string  `json:"target,omitempty"` // "dm" for DM, else empty
+    TopicID  *int64  `json:"topic_id,omitempty"`
+    Group    string  `json:"group,omitempty"`  // override default group
+    Channel  string  `json:"channel,omitempty"`// defaults to default channel
+    Create   bool    `json:"create,omitempty"` // confirmation flag
+}
+
+type AttachedMsg struct {
+    Op                Op           `json:"op"`              // = OpAttached
+    OK                bool         `json:"ok"`
+    Channel           string       `json:"channel,omitempty"`
+    ChatID            int64        `json:"chat_id,omitempty"`
+    TopicID           *int64       `json:"topic_id,omitempty"`
+    Name              string       `json:"name,omitempty"`
+    Group             string       `json:"group,omitempty"`
+    NeedsConfirmation bool         `json:"needs_confirmation,omitempty"`
+    Proposal          *Proposal    `json:"proposal,omitempty"`
+    Err               string       `json:"err,omitempty"`
+}
+
+type Proposal struct {
+    Action  string `json:"action"`        // "create" | "use_existing_other_group" | "claim_existing"
+    Channel string `json:"channel"`
+    Group   string `json:"group"`
+    Name    string `json:"name"`         // proposed topic name (echoed for the agent to surface)
+    Existing *Topic `json:"existing,omitempty"` // populated when action="use_existing_other_group" or "claim_existing"
+    Alternative *Proposal `json:"alternative,omitempty"` // recursion: e.g. "you could create new in default group instead"
+}
+
+type InboundMsg struct {
+    Op      Op      `json:"op"`            // = OpInbound
+    Inbound Inbound `json:"inbound"`       // normalized payload defined in §4.1
+}
+
+type ToolCallMsg struct {
+    Op    Op             `json:"op"`        // = OpToolCall
+    ID    string         `json:"id"`        // adapter-generated; broker echoes in result
+    Name  string         `json:"name"`      // tool name (e.g. "reply", "edit_progress")
+    Args  map[string]any `json:"args"`
+}
+
+type ToolResultMsg struct {
+    Op     Op             `json:"op"`       // = OpToolResult
+    ID     string         `json:"id"`
+    Result map[string]any `json:"result,omitempty"`
+    Error  *ErrorPayload  `json:"error,omitempty"`
+}
+
+type ErrorPayload struct {
+    Code    int    `json:"code"`
+    Message string `json:"message"`
+}
+
+type ErrorMsg struct {
+    Op  Op     `json:"op"`                 // = OpError
+    Err string `json:"err"`
+}
+```
+
+**Writer mutex:** the IPC socket is duplex and a single connection carries both request/response (synchronous tool calls) and unsolicited push (broker → adapter inbound). Both sides use a single `bufio.Writer` guarded by a `sync.Mutex`; line-by-line frames are atomic, so a `Write` of a complete `\n`-terminated JSON encoding cannot interleave with another writer's frame. Reader uses `bufio.Scanner` with `ScanLines`. Mandatory in every adapter and the broker.
+
+#### 4.4.2 Tool surface — harmonized
+
+Drop the `c3_` prefix on Codex-side tools. The Codex adapter exposes the same base names as the Claude adapter (`attach`, `topics`, `reply`, `react`, `edit_message`, `edit_progress`, `download_attachment`, `send_typing`), plus Codex-only additions for the inbox-poll fallback and WS forwarder (`inbox`, `codex_forward`). The MCP server name (`c3` in Claude's `.mcp.json`, `c3` or `c3_codex` in Codex's `mcp_servers.<key>`) provides the namespace; per-tool prefixing is redundant.
+
+This is a breaking change vs the Python POC's tool surface. The Codex adapter rewrite already requires updating callers, so the rename rides along.
+
+#### 4.4.3 Cooldown-fallback reply
+
+When an inbound for `(channel, chat_id, *topic_id)` arrives but no stub holds the claim, the broker sends a single fallback reply on the channel. Spec:
+
+- **Text:** `"No CLI is currently attached to this topic. Run `c3-broker status` to see attached terminals, or open a CLI in the project directory and `attach`."`
+- **Dedup key:** `(channel, chat_id, *topic_id)`. One fallback per key per cooldown window.
+- **Cooldown:** 300 seconds (5 minutes). Configurable per channel via `mappings.json:channels.<chan>.fallback_cooldown_s`.
+- **Implementation:** broker holds an in-memory `map[RouteKey]time.Time` of last-fallback times. On inbound with no claim, check map; if `now - last >= cooldown`, send via channel's `SendReply` and update map. The fallback skips plugin pipeline (no debounce, no `OnInbound`/`OnOutbound`) — it's an operator-level message, not a user message.
+- The fallback survives broker restarts as "first-inbound-after-restart wins": map is reset, next inbound triggers a fresh fallback.
+
+#### 4.4.4 Manual JSON-RPC framing for `notifications/claude/channel`
+
+The named `modelcontextprotocol/go-sdk` (v1.6.0) does not expose a public API to send arbitrary custom JSON-RPC notifications. Its `ServerSession` only knows `NotifyProgress`, `Log`, `ResourceUpdated`, and list-changed. Claude Code's rich `<channel>` rendering depends on the broker emitting `notifications/claude/channel` over MCP stdio.
+
+**Decision: manually frame the notification.** The MCP stdio protocol is JSON-RPC 2.0 newline-framed over the same stdout the SDK writes to. The Claude adapter:
+
+1. Builds a JSON-RPC envelope `{"jsonrpc":"2.0","method":"notifications/claude/channel","params":{...}}` directly.
+2. Acquires the same writer mutex the SDK uses internally (the adapter installs a custom writer wrapper around `os.Stdout` with a `sync.Mutex`; both the SDK and the manual framer go through it).
+3. Writes one frame as `<json>\n`.
+
+**Why this is safe:** newline-JSON frames are atomic at the OS level (`write()` of a single buffer is atomic for unix pipes up to `PIPE_BUF` = 4096 bytes, and the stdout-to-Claude pipe falls under that for typical channel meta). For longer frames, the writer mutex is the actual safety net.
+
+**What to monitor:** if/when go-sdk adds a public `ServerSession.Notify(method, params)` method, drop the custom framer and use it. Track the upstream PR; this is a v1.x cleanup, not a v1 blocker.
+
+#### 4.4.5 Codex bridge env-var contract
+
+Consolidated table; previously scattered across §4.4 prose:
+
+| Env var | Set by | Read by | Required | Default | Purpose |
+|---|---|---|:---:|---|---|
+| `C3_ATTACH_NAME` | `codex` launcher | adapter | ★ | — | Topic name inferred from cwd; adapter auto-attaches if mapped, surfaces proposal otherwise |
+| `C3_CODEX_REMOTE_BRIDGE` | `codex` launcher | adapter | ★ | — | Must be `"1"` to enable WebSocket forwarding. Split-brain guard against stock `codex resume` running stub manually |
+| `C3_CODEX_CWD` | `codex` launcher | adapter | ★ | — | Absolute cwd; used for `thread/list` filtering when multiple Codex threads are loaded |
+| `C3_CODEX_APP_SERVER_WS` | `codex` launcher | adapter | ★ | — | The selected app-server WebSocket URL (port may be `8766+` per fallback) |
+| `C3_CODEX_REAL` | user (manual override) | launcher | — | (PATH search + NVM glob) | Force a specific real-codex path; used for testing |
+| `C3_CODEX_DISABLE` | user | launcher | — | unset | When `"1"`, launcher exec's real codex unmodified — full bypass |
+| `C3_CODEX_ALLOW_MANUAL_FORWARD` | user (debug) | adapter | — | unset | Bypass the split-brain guard for `c3_codex_forward` tool. Use only for debugging the forwarder |
+
+★ = set automatically by the C3 launcher. User never sets these by hand in normal operation.
 
 Host-specific translations:
 
@@ -242,7 +492,7 @@ Host-specific translations:
   - **`codex`** (built from `cmd/codex/main.go`, installed on the user's `PATH` ahead of the real `codex` binary). This is the launcher. It does five things in order on every invocation:
     1. **Find the real Codex executable.** Walk `PATH` skipping `os.Args[0]` (so we don't recurse into ourselves). If nothing matches, glob `~/.nvm/versions/node/*/lib/node_modules/@openai/codex/bin/codex.js`. Honor `C3_CODEX_REAL` env override for testing.
     2. **Decide whether to bypass.** A defined set of subcommands (`exec`, `e`, `review`, `login`, `logout`, `mcp`, `plugin`, `mcp-server`, `app-server`, `completion`, `update`, `sandbox`, `debug`, `apply`, `a`, `cloud`, `exec-server`, `features`, `help`) plus `-h`/`--help`/`-V`/`--version` plus any argv already containing `--remote` (anti-recursion guard) → exec real codex with the user's argv unchanged. `codex resume`, `codex fork`, and bare `codex` go through the bridge.
-    3. **Infer the topic.** Walk from cwd up to the nearest `CLAUDE.md`; the basename of that directory is the topic name. Fallback to `basename(cwd)` if no `CLAUDE.md` is found. `C3_ATTACH_NAME` env overrides.
+    3. **Infer the topic.** Walk from cwd up to the nearest `CLAUDE.md`; the basename of that directory is the topic name. **Shared-root guard:** if the nearest `CLAUDE.md` is at a configured shared-root (default `~/arogara`, configurable via `mappings.json:codex.shared_root`), return empty — let the user attach explicitly rather than silently bind a "shared-root" topic. Fallback to `basename(cwd)` only when no `CLAUDE.md` is found AND cwd is not under a shared-root. `C3_ATTACH_NAME` env always overrides.
     4. **Start or reuse a Codex app-server.** Default URL `ws://127.0.0.1:8766`. Maintain a metadata file at `/tmp/c3-codex-app-server.json` with the **C3 signature** `(cwd, topic, adapter_path)` of the running app-server. If port 8766 is reachable AND the metadata signature matches, reuse it. If reachable but signature mismatches (stale app-server from a different cwd or topic), **fall forward** to the next free port in `[8767, 8767+50)`. If unreachable, start a new app-server: `<real-codex> <mcp-config-args> app-server --listen <ws-url>`, redirect stdout/stderr to `/tmp/c3-codex-app-server.log`, wait for the TCP port to open (15s timeout), write the metadata file with our signature.
     5. **Launch the visible TUI** with `<real-codex> <mcp-config-args> --remote <ws-url> -C <cwd> <user-argv>` and exit with the TUI's exit code.
 
@@ -260,16 +510,16 @@ Host-specific translations:
        The app-server-side config is the load-bearing one — under `--remote`, the **app-server owns MCP server startup**, not the visible TUI. Passing the config only to the TUI is too late; the adapter spawns inside the app-server's environment, which would have no `C3_*` envs without this step.
 
   - **`c3-codex-adapter`** (built from `cmd/c3-codex-adapter/main.go`). MCP stdio server, spawned by the Codex app-server per the `mcp_servers.c3_codex` config above. On startup it:
-    1. Connects to the broker at `/tmp/c3.sock` (spawning the broker if missing, same flock pattern the Claude adapter uses).
+    1. Connects to the broker at the resolved socket path (`$XDG_RUNTIME_DIR/c3.sock` or `/tmp/c3-$UID.sock`); spawns the broker if missing, same flock pattern the Claude adapter uses.
     2. Sends `hello{cli="codex", pid, cwd: $C3_CODEX_CWD}`. If the broker has a mapping for that cwd, claims it. If not, reads `C3_ATTACH_NAME` and either auto-attaches (if the topic exists in the default group) or surfaces a proposal in `instructions` for the agent.
     3. Exposes five MCP tools to Codex:
-       - `c3_attach(target?)` — attach this Codex session to a topic. Same proposal-flow semantics as the Claude adapter's `attach`.
-       - `c3_topics()` — list known topics + claim state.
-       - `c3_inbox(limit, ack)` — drain buffered inbound messages. The fallback path for environments where the WS forwarder isn't viable.
-       - `c3_reply(text, files?, parse_mode?)` — send a reply through the attached topic. If local `bound` state was lost (stub restarted while broker held the claim), recover it from the broker's claim before erroring out.
-       - `c3_codex_forward(app_server_ws, thread_id?)` — debugging/manual override; gated by either `C3_CODEX_REMOTE_BRIDGE=1` (set by the launcher) or `C3_CODEX_ALLOW_MANUAL_FORWARD=1` (deliberate-debug). Refused otherwise — split-brain guard against attaching forwarding to a stock `codex resume` whose visible TUI isn't `--remote`-bound.
+       - `attach(target?)` — attach this Codex session to a topic. Same proposal-flow semantics as the Claude adapter's `attach`. Tool names are unprefixed; the MCP server name (`c3` or `c3_codex` in `mcp_servers.<key>`) provides the namespace.
+       - `topics()` — list known topics + claim state.
+       - `inbox(limit, ack)` — Codex-only fallback path. Drain buffered inbound messages when WS forwarding is unavailable.
+       - `reply(text, files?, parse_mode?)` — send a reply through the attached topic. If local `bound` state was lost (stub restarted while broker held the claim), recover it from the broker's claim before erroring out — same recovery the Claude adapter does (cross-CLI symmetry).
+       - `codex_forward(app_server_ws, thread_id?)` — Codex-only debugging/manual override; gated by either `C3_CODEX_REMOTE_BRIDGE=1` (set by the launcher) or `C3_CODEX_ALLOW_MANUAL_FORWARD=1` (deliberate-debug). Refused otherwise — split-brain guard against attaching forwarding to a stock `codex resume` whose visible TUI isn't `--remote`-bound.
 
-  - **Inbound forwarding** (the path that delivers Telegram messages into the Codex turn stream): every inbound from the broker is buffered for `c3_inbox` AND, when forwarding is enabled, also pushed to the Codex app-server via WebSocket. The flow:
+  - **Inbound forwarding** (the path that delivers Telegram messages into the Codex turn stream): every inbound from the broker is buffered for `inbox` AND, when forwarding is enabled, also pushed to the Codex app-server via WebSocket. The flow:
     1. `websocket.Dial(ws_url, nil)` — Go's `gorilla/websocket` (or stdlib equivalent) does **not** set `Origin` by default, which is what the app-server needs (rejects with 403 if Origin is set to a non-localhost value).
     2. Send `initialize` JSON-RPC with `clientInfo` (`c3-codex-bridge`, version) and capabilities including `optOutNotificationMethods` for `item/agentMessage/delta`, `item/reasoning/textDelta`, `item/reasoning/summaryTextDelta` (we don't render these, the user's TUI does).
     3. Send `notifications/initialized`.
@@ -305,6 +555,114 @@ Not all hooks are used in v1 (STT only uses `OnVoiceReceived`). They're plumbed 
 
 Plugins are configured under `mappings.json:plugins.<name>`. Each plugin defines its own subkey schema. `enabled: false` skips the plugin without uninstalling.
 
+#### 4.5.1 Plugin host interface
+
+Plugins receive a `*plugin.Host` from the broker. Concrete Go interface — every plugin imports this from `internal/plugin/host.go`:
+
+```go
+package plugin
+
+type Host interface {
+    // Hook subscriptions. Calling these registers the plugin for that hook.
+    OnInbound(fn func(*Inbound) (*Inbound, bool /*drop*/))
+    OnVoiceReceived(fn func(VoicePayload) (string, error))  // returns transcript or "" + err
+    OnOutbound(fn func(*Outbound) (*Outbound, bool /*drop*/))
+    OnAttach(fn func(*Session, *Mapping))
+
+    // Tool registration. RegisterTools is called once during plugin Register().
+    RegisterTools(fn func(*ToolRegistry))
+
+    // Config / state.
+    Config(name string, target any) error  // unmarshal mappings.json:plugins.<name> into target
+    State(name string) StateDir             // ~/.config/c3/state/<name>/
+    CacheDir(name string) string            // $XDG_CACHE_HOME/c3/<name>/
+
+    // Channel access (for plugins that need to send/edit/react).
+    Channel(name string) (Channel, error)   // returns the live Channel impl by name, or error if unknown
+
+    // Logging.
+    Logf(format string, args ...any)
+    // Done is closed when the broker is shutting down. Plugins should observe.
+    Done() <-chan struct{}
+}
+
+type Session struct {
+    CLI string
+    PID int
+    CWD string
+}
+
+type Mapping struct {
+    Channel string
+    ChatID  int64
+    TopicID *int64
+    Name    string
+    Group   string
+}
+
+type Topic struct {
+    ChatID  int64
+    TopicID int64
+    Name    string
+    Group   string
+}
+
+type ToolRegistry interface {
+    Add(t Tool)
+}
+
+type Tool struct {
+    Name        string
+    Description string
+    InputSchema map[string]any
+    Handler     func(ctx context.Context, args map[string]any) (any, error)
+}
+```
+
+**Hook ordering and the OnInbound vs OnVoiceReceived race:**
+
+The broker fires hooks in a fixed sequence per inbound event:
+
+1. Channel emits `*Inbound` (with `Attachments[0].Kind="voice"` for voice messages, `Text=""`).
+2. **`OnVoiceReceived` first** for voice payloads — chained by `priority`; first plugin to return a non-empty transcript wins. The broker substitutes the transcript into `Inbound.Text` (preserving `Attachments`) before continuing.
+3. **`OnInbound` second** — chained by `priority`; sees the (possibly STT-substituted) inbound. First plugin to set `drop=true` short-circuits.
+4. Debounce window (per-route) collapses bursts.
+5. Route lookup → `OpInbound` to the claimed stub. Or cooldown-fallback if no claim.
+
+This order means `OnInbound` plugins see the post-STT text, never raw voice payloads. Plugins that want raw voice access should use `OnVoiceReceived` (one shot) or hook into the channel directly via `host.Channel("telegram")`.
+
+**`edit_progress` placeholder lifecycle:**
+
+A "session" for placeholder tracking is `(stub_pid, claim_route)` — the placeholder belongs to the currently-claimed stub for the route. The broker holds `map[(claim_route)]ProgressPlaceholder{MessageID, CreatedAt}`.
+
+- First `edit_progress(text)` call from a stub: broker calls `channel.SendReply` to create a placeholder, stores `MessageID`. Subsequent calls in the same stub session: broker calls `channel.EditMessage(MessageID, text)`.
+- On stub `release` / disconnect: broker clears the placeholder entry. The placeholder message stays in Telegram (no auto-delete).
+- On broker restart: placeholder map is gone; the next `edit_progress` from a re-attached stub creates a fresh placeholder. Old placeholder messages remain in the topic. This is acceptable — they're scoped to a single agent turn and aren't expected to outlive a session anyway.
+- Final `reply` always creates a new message (not edit) so the user's device pings.
+
+**Confirmation-proposal expiry:**
+
+The `attach` proposal flow is **stateless on the broker side**. Every `attach` call recomputes the proposal from current `mappings.json` + claim state. The broker does NOT remember "I proposed `widget-foo` to this stub". `attach(create=true)` is interpreted in light of the *current* search result, not a captured proposal. This means:
+
+- If the user takes 5 minutes to confirm, the proposal is still valid (assuming no one else attached the topic in between).
+- If a sibling stub creates `widget-foo` in the work group between the proposal and `attach(create=true)`, the second call sees the new topic and proposes "use_existing_other_group" instead of silently creating a duplicate. The agent surfaces the change to the user.
+
+#### 4.5.2 Operational subcommands of `c3-broker`
+
+The broker binary doubles as the operational tool. Subcommands beyond the default daemon mode:
+
+| Subcommand | Purpose |
+|---|---|
+| `c3-broker` | (default) Run as daemon. Spawned automatically by adapters; rarely run by hand. |
+| `c3-broker setup` | Interactive setup — gather bot token, DM chat id, group(s); write `~/.config/c3/mappings.json`. Equivalent to `/c3-setup`. |
+| `c3-broker validate [path]` | Parse and validate `mappings.json` (defaults to default path). Prints structural errors. Exits 0 on valid, 1 on invalid. Use to lint hand-edits before saving. |
+| `c3-broker status` | Print broker liveness, socket path, pid, mappings.json path + parses, channel reachability (`getMe` for telegram), claimed topics with holder pid+cwd, plugin enabled-states. Read-only. |
+| `c3-broker release <cwd>` | Release the claim on a route bound to `<cwd>` if any. Safe to run from any shell — broker hangs up the holding stub's claim, the next `attach` from any session reclaims. |
+| `c3-broker install-codex-shim` | Symlink installer (PATH + every Node-manager bin dir). Idempotent. See §5.1 Codex side. |
+| `c3-broker reload-config` | Re-read `mappings.json` without restarting (handles the `/c3-setup` race where broker started before config was written). Rebuilds in-memory channel configs. Live claims are preserved. |
+
+The status / validate / release subcommands are diagnostic-only — they don't write to `mappings.json` and don't restart the broker.
+
 ## 5. Key flows
 
 ### 5.1 First install on a fresh machine
@@ -314,7 +672,7 @@ Plugins are configured under `mappings.json:plugins.<name>`. Each plugin defines
 1. User runs `/plugin marketplace add karthikeyan5/c3`, then `/plugin install c3@c3`, then `/reload-plugins`.
 2. User runs `/c3-build` (slash command shipped by the plugin) once. It runs `go install ./cmd/...` in the plugin source dir; binaries land in `$GOBIN`.
 3. The plugin's `.mcp.json` references the adapter by name (e.g. `command: "c3-claude-adapter"`), assuming `$GOBIN` is on `$PATH`.
-4. On the next session, the Go adapter starts, tries `/tmp/c3.sock`, fails, spawns `c3-broker` (also via `$PATH`).
+4. On the next session, the Go adapter starts, tries the resolved socket path, fails, spawns `c3-broker` via `$PATH` (process detached via `setsid` per §4.2.2).
 5. Broker starts, looks for `~/.config/c3/mappings.json`, doesn't find it. Writes a stub skeleton (mode 600), keeps running.
 6. Adapter's `hello_ack` says `no_config: true`. Adapter's `instructions` text: *"C3 not yet configured. Run `/c3-setup` to provide your Telegram bot token, DM chat id, and at least one group chat id."*
 7. User runs `/c3-setup`. Slash command uses `AskUserQuestion` to gather: bot token, DM chat id, group chat id (named, e.g. "main"). Writes `mappings.json:channels.telegram.*`. Tells user to restart the session.
@@ -328,7 +686,7 @@ Plugins are configured under `mappings.json:plugins.<name>`. Each plugin defines
    b. Creates `~/.local/bin/codex` as a symlink to it (replacing only if the existing target is already our binary).
    c. Walks `~/.nvm/versions/node/*/bin/` and creates the same symlink in each version's bin dir. Long-running shells hash `codex` to the NVM path — without this, existing terminals bypass the bridge entirely.
    d. Verifies `~/.config/c3/mappings.json` exists (created by Claude-side `/c3-setup`, or runs the equivalent gather-and-write flow if missing).
-   e. Verifies the broker is reachable at `/tmp/c3.sock`, starts it if not.
+   e. Verifies the broker is reachable at the resolved socket path; starts it if not.
    f. Prints a one-line status with each symlink's path so the user can audit.
 3. From now on, running `codex` (from any shell — old or new) routes through the C3 launcher, which manages the app-server, spawns the adapter, and bridges inbound Telegram into Codex turns. The user types `codex` exactly as they always have; nothing else changes about their workflow.
 4. The Codex side reuses `~/.config/c3/mappings.json` from the Claude-side setup. If neither side has run setup yet, `c3-broker install-codex-shim` prompts (interactively or via the agent) for the same fields the `/c3-setup` slash command would gather.
@@ -354,7 +712,7 @@ $ claude
    - Search other groups (`work`) for topic named `widget-foo` → not found.
    - Action: propose creation in `main`.
 8. Broker replies `{ok: false, needs_confirmation: true, proposal: {channel: "telegram", group: "main", name: "widget-foo", action: "create"}}`.
-9. Adapter returns to Claude: *"No mapping for this directory. I'd create a new topic 'widget-foo' in the 'main' Telegram group. Reply yes to create, or pass an existing topic id with `attach(topic_id=<n>)`."*
+9. Adapter returns to Claude: *"No mapping for this directory. I'd create a new topic 'widget-foo' in the 'main' Telegram group. To proceed, call `attach(create=true)`. To use an existing topic instead, call `attach(topic_id=<n>)` (broker validates against Telegram). To use a different name, call `attach(name='<other>', create=true)`."*
 10. Claude relays. User says "yes".
 11. Claude calls `attach(create=true)`.
 12. Broker calls `createForumTopic(group=main, name="widget-foo")`. Gets `topic_id=917`. Inserts into `topics`, inserts into `mappings`, atomic-rewrites file, claims for this stub. Replies `attached`.
@@ -401,7 +759,7 @@ Session 1 (Claude in `~/arogara/c3`) auto-attached to topic 281. User opens Code
 1. Codex stub `hello` with same cwd.
 2. Broker finds mapping → topic 281. ROUTES already claims it for Claude pid 12345.
 3. Replies `{auto_attached: false, mapping: {…}, claim_holder: {cli: "claude", pid: 12345}}`.
-4. Codex instructions: *"Saved mapping points to 'c3' topic but it's currently held by Claude Code (pid 12345). Use `c3_attach(target='<other>')` to claim a different topic, or wait."*
+4. Codex instructions: *"Saved mapping points to 'c3' topic but it's currently held by Claude Code (pid 12345). Either run `release` from that Claude session, then `attach` here; or `attach(target='<other>')` to claim a different topic; or wait for it to detach."*
 5. No silent topic creation, no claim theft.
 
 ### 5.7 Inbound message routing
@@ -432,10 +790,16 @@ New first-class tools (not in upstream):
 
 - `send_typing(chat_id, topic_id?)` — sends Telegram chat action.
 - `edit_progress(chat_id, topic_id?, text, message_id?)` — creates a progress placeholder on first call, edits on subsequent. Broker tracks the placeholder per `(chat_id, topic_id, session)`.
-- `validate_topic(chat_id, topic_id)` — test call for §5.4 attach-by-id.
-- `create_topic(chat_id, name)` — wraps `createForumTopic` with rate-limit handling.
+- `validate_topic(chat_id, topic_id)` — test call for §5.4 attach-by-id. Implementation: `sendChatAction(chat_id, "typing", message_thread_id=topic_id)`. Side effect: a transient typing indicator fires in the topic — visible but harmless. Alternative considered: `editForumTopic` (would be silent but requires `can_manage_topics` admin right). Picked typing-action because the bot already needs to send messages to the topic; visibility is a non-issue.
+- `create_topic(chat_id, name)` — wraps `createForumTopic` with retry logic. Telegram throttles this aggressively (~20/min observed; spec assumes 10/min as the safe rate). On 429, honor `parameters.retry_after` (capped at 60s); on consecutive 429s within a single session, fail fast and surface to the user — bulk topic creation is not a supported flow.
 
-Telegram library: `github.com/PaulSonOfLars/gotgbot/v2` (recommended; pending §11.A confirmation).
+**Topic-name collision:** when `attach --topic=N` validates an unknown id, the broker stores it as `topic-N` in `topics` (placeholder name). If the user later runs `attach topic-N --create=true` with that exact placeholder name, broker treats it as a name collision and returns an error: *"`topic-N` is a placeholder for an existing thread; use `attach --topic=N` to claim it, or pick a different name to create."* This prevents two entries with the same name in the same group.
+
+**Debounce buffer cap:** the per-route inbound debounce window collapses up to **50 messages** before forcing a flush. Beyond that, a flush fires immediately and a new window opens. This prevents memory growth if a user accidentally pastes a long message that Telegram chunks into many ~4KB segments.
+
+**Typing-indicator counter cleanup:** when an adapter disconnects (claim release), the broker decrements its in-flight-tool-call counter for the claimed route to 0 and stops the typing ticker. No leak.
+
+Telegram library: `github.com/PaulSonOfLars/gotgbot/v2`. Pin to a specific rc version in `go.mod` (the stable v2.0.0 has not yet been tagged at time of writing; track the rc series). Bumping requires a pass to verify forum-topic + message-reaction support hasn't regressed.
 
 ## 7. OpenClaw-inspired UX features (top 3, in v1)
 

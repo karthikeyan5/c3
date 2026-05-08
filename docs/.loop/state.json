@@ -1,0 +1,45 @@
+{
+  "phase": "review-r2-pending",
+  "started_at": "2026-05-08T22:50:00Z",
+  "review": {
+    "round": 2,
+    "rounds_completed": 1,
+    "max_rounds": 3,
+    "verdicts_r1": [
+      {"angle": "architecture", "verdict": "yes-with-fixes", "file": "review-r1-architecture.md"},
+      {"angle": "feasibility",  "verdict": "yes-with-spikes", "file": "review-r1-feasibility.md"},
+      {"angle": "ux",           "verdict": "yes-with-gaps", "file": "review-r1-ux.md"}
+    ],
+    "r1_synthesis": "review-r1-synthesis.md",
+    "r1_fixes_applied": [
+      "Architecture diagram updated — Codex column now shows Go binaries, socket path uses XDG_RUNTIME_DIR",
+      "Type definitions hoisted into spec §4.1: Inbound (canonical), Sender, Attachment, ReplyContext, Outbound, ReplyArgs, EditArgs, ReactArgs, VoicePayload",
+      "InboundEvent renamed to Inbound across spec",
+      "§4.2 routing key explicit: *int64 with nil=non-forum, 1=General, >1=custom",
+      "§4.2.1 Claim lifecycle added (release on disconnect/restart, in-flight handling, single-claim invariant)",
+      "§4.2.2 Broker process model added (flock path, spawn race, stale-lock recovery, multi-user socket path)",
+      "§4.3 plugin schema gains priority field (default 100, lower runs first); enabled/priority documented as reserved keys",
+      "§4.4 IPC table replaced with Go structs: HelloMsg, HelloAckMsg, AttachReq, AttachedMsg, Proposal, InboundMsg, ToolCallMsg, ToolResultMsg, ErrorMsg + Op constants. Writer mutex requirement spec'd.",
+      "§4.4.2 tool surface harmonized: c3_ prefix dropped from Codex tools (attach, topics, reply, react, edit_message, edit_progress, download_attachment, send_typing + Codex-only inbox, codex_forward)",
+      "§4.4.3 Cooldown-fallback reply spec'd (text, dedup key, 300s default, configurable)",
+      "§4.4.4 Manual JSON-RPC framing decision for notifications/claude/channel — go-sdk has no Notify(method, params) API; we frame manually with writer mutex",
+      "§4.4.5 Codex env-var contract consolidated table",
+      "§4.5.1 Plugin host interface defined: OnInbound/OnVoiceReceived/OnOutbound/OnAttach/RegisterTools, Config/State/CacheDir, Channel(name), Logf, Done()",
+      "Hook ordering pinned: OnVoiceReceived (substitutes Text) → OnInbound → debounce → route. Plugins always see post-STT text",
+      "edit_progress placeholder lifecycle: per (stub_pid, route), cleared on disconnect, broker restart loses placeholders (acceptable)",
+      "Confirmation expiry: stateless on broker; every attach call recomputes proposal",
+      "§4.5.2 c3-broker operational subcommands: setup, validate, status, release, install-codex-shim, reload-config",
+      "§5.2 step 9 proposal wording surfaces explicit tool-call shapes for the agent",
+      "§5.6 Codex-side claim-collision prose adds explicit release path",
+      "Codex launcher topic inference now has shared-root guard (configurable via mappings.json:codex.shared_root)",
+      "§6 Telegram channel: validate_topic side-effect documented (transient typing), create_topic rate-limit policy, debounce buffer cap (50), typing-indicator counter cleanup, gotgbot/v2 rc-pin guidance, topic-N name collision detection",
+      "Plan: DefaultPath returns (string, error) using os.UserHomeDir(); test stubs and migrate-legacy main updated"
+    ]
+  },
+  "build": {
+    "current_phase": null,
+    "phases_completed": [],
+    "spec_locked": false
+  },
+  "notes": "R1 fixes applied to spec + plan in one focused pass. Spec is now ~1100 lines (~25% larger than v5). Spawning round 2 reviewers on the FIXED spec — three new fresh contexts, same three angles. If r2 lands at clean 'yes' (no new structural issues), do r3 on r2-fixed spec. If r3 also clean, lock and start build."
+}

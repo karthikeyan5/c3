@@ -1365,7 +1365,10 @@ func TestDefaultPath_UsesXDGConfig(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", dir)
 	t.Setenv("HOME", "/tmp/should-not-be-used")
 
-	got := DefaultPath()
+	got, err := DefaultPath()
+	if err != nil {
+		t.Fatalf("DefaultPath: %v", err)
+	}
 	want := filepath.Join(dir, "c3", "mappings.json")
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -1377,10 +1380,22 @@ func TestDefaultPath_FallsBackToHome(t *testing.T) {
 	os.Unsetenv("XDG_CONFIG_HOME")
 	t.Setenv("HOME", dir)
 
-	got := DefaultPath()
+	got, err := DefaultPath()
+	if err != nil {
+		t.Fatalf("DefaultPath: %v", err)
+	}
 	want := filepath.Join(dir, ".config", "c3", "mappings.json")
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestDefaultPath_NoHomeNoXDG(t *testing.T) {
+	os.Unsetenv("XDG_CONFIG_HOME")
+	t.Setenv("HOME", "")
+	// On most CI Unix, os.UserHomeDir() with HOME unset returns an error.
+	if _, err := DefaultPath(); err == nil {
+		t.Skip("os.UserHomeDir resolved without HOME (platform-specific) — test not applicable here")
 	}
 }
 ```
@@ -1408,12 +1423,21 @@ import (
 
 // DefaultPath returns the canonical mappings.json location:
 //   $XDG_CONFIG_HOME/c3/mappings.json  (if set)
-//   $HOME/.config/c3/mappings.json     (otherwise)
-func DefaultPath() string {
+//   <UserHomeDir>/.config/c3/mappings.json  (otherwise)
+//
+// Uses os.UserHomeDir() instead of os.Getenv("HOME") so an unset HOME does not
+// produce "/.config/c3/mappings.json". Returns ("", err) if neither is
+// resolvable — the caller surfaces the error to the user rather than producing
+// a path under "/" by accident.
+func DefaultPath() (string, error) {
 	if x := os.Getenv("XDG_CONFIG_HOME"); x != "" {
-		return filepath.Join(x, "c3", "mappings.json")
+		return filepath.Join(x, "c3", "mappings.json"), nil
 	}
-	return filepath.Join(os.Getenv("HOME"), ".config", "c3", "mappings.json")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".config", "c3", "mappings.json"), nil
 }
 ```
 
@@ -1568,7 +1592,12 @@ import (
 func main() {
 	envPath := flag.String("env", os.Getenv("HOME")+"/.claude/channels/telegram/.env", "path to legacy .env")
 	cfgPath := flag.String("config", "mvp/config.json", "path to legacy mvp/config.json")
-	outPath := flag.String("out", mappings.DefaultPath(), "path to write new mappings.json")
+	defaultOut, err := mappings.DefaultPath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "migrate-legacy: cannot resolve default mappings path: %v\n", err)
+		os.Exit(1)
+	}
+	outPath := flag.String("out", defaultOut, "path to write new mappings.json")
 	flag.Parse()
 
 	if err := migrate(*envPath, *cfgPath, *outPath); err != nil {
