@@ -201,43 +201,35 @@ fidelity matters more than context size, and Telegram caps single messages at
 
 ---
 
-## P5_voice_handler_thread_id
+## P5_voice_handler_attachment_meta
 
-**Purpose** — Upstream 0.0.6 refactored the voice handler into a thin
-"forward voice as an attachment" path and removed the Python STT
-shell-out entirely. C3 still wants every inbound voice to be transcribed
-server-side so (a) the user sees the transcript echoed back in Telegram
-and (b) Claude receives real text instead of `(voice message)` plus a
-file_id it has to transcribe itself. This patch reintroduces the
-shell-out. While we're at it, we include `message_thread_id` in the argv
-so `stt-handler.py`'s own `sendMessage` chunks stay in the right forum
-topic — the original reason for P5's existence.
+**Purpose** — Upstream 0.0.6 (current) already wires the STT shell-out
+in `bot.on('message:voice', ...)` and uses the transcript as inbound
+text when non-empty — what was historically P5's "reintroduce the
+shell-out" job is now native upstream behavior. The remaining gap:
+when STT succeeds, upstream calls `handleInbound(ctx, transcript, undefined)`
+**without** any attachment meta. The CLI loses access to the voice
+`file_id`, so if the transcript is ambiguous there's no way to
+re-download the audio. This patch adds the voice attachment meta to
+the transcript-success branch so the CLI can always re-listen.
 
-**Final behavior** — The `bot.on('message:voice', ...)` handler:
+**Final behavior** — Inside the `if (transcript) { ... }` branch of the
+`message:voice` handler, `handleInbound` is called with a fourth
+argument `{ kind: 'voice', file_id, size, mime }` matching the shape
+already used by upstream's else-branch fallback. The else-branch is
+unchanged.
 
-1. Spawns `python3 ~/.claude/channels/telegram/stt-handler.py` with argv
-   `[bot_token, chat_id, msg_id, file_id, message_thread_id_or_empty]`.
-2. If the process exits 0 and stdout is non-empty, treats stdout as the
-   transcript and uses it as the inbound message text.
-3. Otherwise falls back to `ctx.message.caption ?? '(voice message)'`
-   (the pristine upstream behavior).
-
-Either way, `handleInbound` is called once with a `kind: 'voice'`
-attachment meta — the MCP client still receives the voice file_id so it
-can download the audio if the transcript is ambiguous.
-
-**Detection** — Grep the `message:voice` handler body. A patched file
-contains the marker `/* C3_STT_HANDLER */` and a `Bun.spawnSync` call
-whose first arg is `'python3'` and whose second arg points at
-`stt-handler.py`. An unpatched file has neither.
+**Detection** — Grep the `message:voice` handler body for the marker
+`/* C3_STT_META */` immediately preceding the success-branch
+`handleInbound` call.
 
 **Region** — `bot.on('message:voice', async ctx => { ... })` body,
-between `const voice = ctx.message.voice` and the `handleInbound(...)`
-call.
+the `if (transcript) {` block.
 
 **Notes** — Paired with `mvp/stt/stt-handler.py`'s argv contract
 (`<bot_token> <chat_id> <reply_msg_id> <file_id> [<message_thread_id>]`)
 and the `c3-stt` symlink the broker installs at
-`~/.claude/channels/telegram/stt-handler.py`. If upstream ever reintroduces
-a structurally different voice hook (e.g. JSON on stdin, or a plugin-level
-extension point), delete this patch and adapt `stt-handler.py` to match.
+`~/.claude/channels/telegram/stt-handler.py`. If upstream ever
+restructures the voice handler (e.g. removes the success branch's
+`handleInbound` call, or already passes attachment meta natively),
+update the marker so this patch skips silently.

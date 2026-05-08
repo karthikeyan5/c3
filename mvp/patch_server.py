@@ -150,26 +150,31 @@ PATCHES = [
         ),
     },
     {
-        "id": "P5_voice_handler_thread_id",
+        "id": "P5_voice_handler_attachment_meta",
         "purpose": (
-            "Upstream 0.0.6 removed the voice STT shell-out entirely — the "
-            "handler just forwards voice as an attachment. This patch "
-            "reintroduces the Bun.spawnSync call to stt-handler.py (passing "
-            "bot_token, chat_id, msg_id, file_id, message_thread_id), uses "
-            "the transcript as the inbound text when STT succeeds, and "
-            "falls back to caption / '(voice message)' when it fails."
+            "Upstream 0.0.6 (current) wires the STT shell-out and uses the "
+            "transcript when non-empty, but drops the voice attachment meta "
+            "in the transcript-success branch — leaving the CLI with no way "
+            "to re-listen if STT is ambiguous. This patch adds the voice "
+            "attachment meta to the success branch so handleInbound always "
+            "carries the voice file_id alongside the transcript."
         ),
-        "marker": "/* C3_STT_HANDLER */",
+        "marker": "/* C3_STT_META */",
         "anchor": (
-            "  const voice = ctx.message.voice\n"
-            "  const text = ctx.message.caption ?? '(voice message)'\n"
+            "  if (transcript) {\n"
+            "    await handleInbound(ctx, `[Transcribed voice]: ${transcript}`, undefined)\n"
+            "  } else {\n"
         ),
         "replacement": (
-            "  const voice = ctx.message.voice\n"
-            "  /* C3_STT_HANDLER */\n"
-            "  const _sttProc = Bun.spawnSync(['python3', `${process.env.HOME}/.claude/channels/telegram/stt-handler.py`, TOKEN!, String(ctx.chat.id), String(ctx.message.message_id), voice.file_id, String(ctx.message?.message_thread_id ?? '')])\n"
-            "  const _sttText = _sttProc.success && _sttProc.stdout?.length ? new TextDecoder().decode(_sttProc.stdout).trim() : null\n"
-            "  const text = _sttText || (ctx.message.caption ?? '(voice message)')\n"
+            "  if (transcript) {\n"
+            "    /* C3_STT_META */\n"
+            "    await handleInbound(ctx, `[Transcribed voice]: ${transcript}`, undefined, {\n"
+            "      kind: 'voice',\n"
+            "      file_id: voice.file_id,\n"
+            "      size: voice.file_size,\n"
+            "      mime: voice.mime_type,\n"
+            "    })\n"
+            "  } else {\n"
         ),
     },
 ]
