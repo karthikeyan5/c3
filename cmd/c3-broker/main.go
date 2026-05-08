@@ -76,5 +76,6 @@ func run() error {
 	<-sigC
 
 	srv.Stop()
+	br.Shutdown()
 	return nil
 }
