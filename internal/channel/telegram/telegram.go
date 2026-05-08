@@ -78,6 +78,11 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 	c.ctx, c.cancel = context.WithCancel(ctx)
 
 	host.Logf("telegram: connected as @%s", bot.Username)
+
+	// Start the long-poll loop in a goroutine. Returns immediately after
+	// kicking off — Telegram-side processing is async from the broker's
+	// startup path.
+	go c.pollLoop()
 	return nil
 }
 
