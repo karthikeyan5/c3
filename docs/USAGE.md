@@ -95,9 +95,9 @@ $ cd ~/arogara/sthapati
 $ codex
 ```
 
-The `codex` command goes through the C3 launcher, which spawns a Codex app-server, registers the C3 MCP adapter, and launches the visible TUI bound to that app-server. The adapter sees the cwd has a mapping but it's already claimed by Claude Code — so Codex stays unattached and tells you. To take over, detach Claude (`/exit` it, or use the broker's release tool), then `c3_attach` from Codex.
+The `codex` command goes through the C3 launcher, which spawns a Codex app-server, registers the C3 MCP adapter, and launches the visible TUI bound to that app-server. The adapter sees the cwd has a mapping but it's already claimed by Claude Code — so Codex stays unattached and tells you. To take over, either `/exit` the Claude session, or run `c3-broker release ~/arogara/sthapati` from any shell to drop the claim without quitting Claude. Then `attach` from Codex.
 
-If you want Claude and Codex on different topics in the same group, attach Codex to a different topic explicitly: `c3_attach(target="sthapati-codex")`. The broker creates that as a sibling topic in the group; future Codex sessions in this dir will need the same explicit override (or you switch the dir's default mapping).
+If you want Claude and Codex on different topics in the same group, attach Codex to a different topic explicitly: `attach(target="sthapati-codex")`. The broker creates that as a sibling topic in the group; future Codex sessions in this dir will need the same explicit override (or you switch the dir's default mapping).
 
 ## Editing mappings.json by hand
 
@@ -120,7 +120,7 @@ C3 doesn't auto-delete. From your phone (Telegram), long-press the topic in the 
 - **`attach` says the topic is held** — `topics` lists who. If it's a stale claim (the holder crashed), restart the broker (`pkill c3-broker`; the next session spawns a fresh one).
 - **Voice transcription is wrong** — re-record (Telegram preserves the original audio; the CLI can `download_attachment` to re-listen). The STT plugin's confidence isn't surfaced in v1; treat the transcript as a hint when accuracy matters.
 - **`codex` doesn't seem to be using C3** — check `which codex` returns the C3 launcher (`$GOBIN/codex` after install). Long-running shells hash; open a new terminal or `hash -r`. The launcher logs to `/tmp/c3-codex-supervisor.log` — `tail` it during a `codex` invocation to see what it thinks it's doing.
-- **`c3_reply` says to attach first** — your adapter lost local state but the broker may still hold your claim. Try `c3_attach` again with the same target; the adapter recovers from the broker's claim. If that fails, `c3_topics` shows who's holding what.
+- **`reply` says to attach first** — your adapter lost local state but the broker may still hold your claim. Try `attach` again with the same target; the adapter recovers from the broker's claim (both Claude and Codex adapters do this). If that fails, `topics` shows who's holding what; `c3-broker status` from a separate shell tells you the same with more detail.
 
 ## Health checks
 
