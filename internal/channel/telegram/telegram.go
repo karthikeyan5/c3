@@ -11,7 +11,6 @@ import (
 
 	"github.com/PaulSonOfLars/gotgbot/v2"
 
-	"github.com/karthikeyan5/c3/internal/c3types"
 	"github.com/karthikeyan5/c3/internal/channel"
 )
 
@@ -90,38 +89,4 @@ func (c *Channel) Stop() error {
 	return nil
 }
 
-// SendReply / SendTyping / EditMessage / React / DownloadAttachment /
-// CreateTopic / ValidateTopic — implementations land in subsequent commits.
-// Phase 4B-scaffolding leaves them stubbed so the package compiles against
-// the channel.Channel interface.
-
-// errNotImpl is returned from stubbed methods until they're wired.
-var errNotImpl = errors.New("telegram: tool not yet implemented (Phase 4B-followup)")
-
-func (c *Channel) SendReply(args c3types.ReplyArgs) (int64, error) {
-	return 0, errNotImpl
-}
-
-func (c *Channel) SendTyping(chatID int64, threadID *int64) error {
-	return errNotImpl
-}
-
-func (c *Channel) EditMessage(args c3types.EditArgs) (*c3types.EditResult, error) {
-	return nil, errNotImpl
-}
-
-func (c *Channel) React(args c3types.ReactArgs) error {
-	return errNotImpl
-}
-
-func (c *Channel) DownloadAttachment(fileID string) (string, error) {
-	return "", errNotImpl
-}
-
-func (c *Channel) CreateTopic(chatID int64, name string) (int64, error) {
-	return 0, errNotImpl
-}
-
-func (c *Channel) ValidateTopic(chatID int64, threadID int64) error {
-	return errNotImpl
-}
+// Outbound tool implementations live in outbound.go.
