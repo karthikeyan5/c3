@@ -22,7 +22,13 @@
         "self_review": "Aligned with locked spec v6. Atomic Write + backup-on-rewrite (.bak one generation, mode 0600). DefaultPath uses os.UserHomeDir() per R1 fix. Validate covers schema_version + group/channel integrity. migrate-legacy refuses to overwrite."
       }
     ],
-    "phase_3_blocked_on": "Plan 3 not yet written. Plan 3 covers spec §4.2 (RouteKey + per-route serial executor + ROUTES map + claim lifecycle) and §4.4.1 (IPC types + writer-mutex + Op constants) and §4.2.2 (broker process model: flock + spawn race + multi-user socket path). Substantial chunk; ~15-20 tasks expected."
+    "phase_3_plan": "docs/plans/2026-05-09-c3-v3-broker-ipc.md",
+    "phase_3_progress": [
+      {"task": "3.1", "status": "done", "commit": "ad26a41", "note": "internal/ipc/ops.go with Op constants"},
+      {"task": "3.2", "status": "done", "commit": "4c4defd", "note": "ipc message structs + PeekOp"},
+      {"task": "3.3", "status": "done", "commit": "286fb40", "note": "ipc.Conn newline-JSON + writer mutex"}
+    ],
+    "phase_3_remaining": ["3.4 paths", "3.5 flock singleton", "3.6 RouteKey", "3.7 StubRegistry", "3.8 Routes", "3.9 Broker handler", "3.10 Server", "3.11 cmd/c3-broker main", "3.12 integration check"]
   },
   "drift_log": [
     "Foundation plan Task 2.1 type definitions were written before spec R2/R3 fixes. Actual types in internal/mappings/types.go follow locked spec v6 (Codex top-level field, channel-level debounce_max_messages/fallback_cooldown_s/stt_prefix). Plan tasks 2.2+ followed locked spec — minor signature divergence from plan text, semantics align."
