@@ -1,5 +1,5 @@
 {
-  "phase": "build-phase-1-pending",
+  "phase": "plan-3-pending",
   "spec_locked": true,
   "spec_locked_at": "2026-05-09T00:30:00Z",
   "review": {
@@ -7,56 +7,25 @@
     "rounds_completed": 3,
     "max_rounds": 3
   },
-  "rounds": {
-    "r1": {
-      "verdicts": "all yes-with-fixes; ~30 issues found",
-      "outcome": "applied cross-cutting consensus + critical single-reviewer items"
-    },
-    "r2": {
-      "verdicts": "all yes-with-fixes/clarifications/gaps; ~20 new issues + leftover drift",
-      "outcome": "applied RouteKey value-type fix, per-route serial executor mandate, type declarations, schema completeness, tool-name harmonization, multi-user paths, STT distribution, etc."
-    },
-    "r3": {
-      "verdicts": {
-        "architecture": "ready with 4 lock-blockers + 6 tighten-ups",
-        "feasibility": "READY TO LOCK — zero lock-blockers (only plan-phase tighten-ups)",
-        "ux": "ready with 2 lock-blockers + 5 tighten-ups"
-      },
-      "lock_blockers_resolved": [
-        "Stub.ConnID lifecycle pinned: assign on hello, bump on reconnect, compared on every route-worker job; stale ConnID jobs discarded",
-        "Release-vs-in-flight ordering: route worker drains queue before release; jobs after release hit cooldown-fallback; ConnID guards against late results from prior claims",
-        "OnInbound/OnVoiceReceived/OnOutbound signatures harmonized: all take ctx.Context; priority direction documented (lower runs first)",
-        "OnAttach signature uses *Stub (was *Session)",
-        "Foundation plan out-of-scope updated: Plan 7 is now Codex-bridge-in-Go (not no-rewrite); aligns with spec v5 §11.D",
-        "INSTALL.md adds re-bind path for existing Telegram topics post-migration: attach --topic=<n>"
-      ],
-      "tighten_ups_addressed": [
-        "ADAPTERS.md drift: c3_attach/c3_inbox → attach/inbox",
-        "USAGE.md health-check ls and pkill commands now use ${XDG_RUNTIME_DIR:-/tmp}/c3.sock and /tmp/c3-$UID.sock fallback",
-        "INSTALL.md uninstall command updated for new socket path",
-        "USAGE.md gains pointer to c3-broker status / release / reload-config subcommands as the operational path",
-        "INSTALL.md prerequisites: pip install openai-whisper documented",
-        "INSTALL.md /c3-setup: token validation via getMe documented (refuses to write on 401/timeout)"
-      ]
-    }
-  },
   "build": {
-    "current_phase": 2,
-    "current_task": "2.2: Read function (TDD)",
+    "current_phase": null,
     "phases_completed": [
       {
         "phase": 1,
-        "summary": "Repo skeleton: go.mod, .gitignore, cmd/ layout (4 binaries), internal/mappings/ scaffold, Makefile. Build + test pass.",
-        "commits": ["61551e5", "830ede0", "6af2de4"],
-        "self_review": "Aligned with spec §4.5. cmd/codex/ deferred to Phase 7 per foundation plan scope. No deviations."
+        "summary": "Repo skeleton: go.mod, .gitignore, cmd/ layout (4 binaries), internal/mappings/ scaffold, Makefile.",
+        "commits": ["61551e5", "830ede0", "6af2de4"]
+      },
+      {
+        "phase": 2,
+        "summary": "Mappings registry + migration tool. internal/mappings package with types/io/lookup/mutate/validate/path. cmd/migrate-legacy with read-env/read-legacy-cfg/write logic. 27 tests passing. Live smoke test on real legacy files works.",
+        "commits": ["68b55e0", "80a552a", "e311187", "0a4e5e6", "88379b1", "8939f80"],
+        "self_review": "Aligned with locked spec v6. Atomic Write + backup-on-rewrite (.bak one generation, mode 0600). DefaultPath uses os.UserHomeDir() per R1 fix. Validate covers schema_version + group/channel integrity. migrate-legacy refuses to overwrite."
       }
     ],
-    "phase_2_progress": [
-      {"task": "2.1", "status": "done", "commit": "68b55e0", "note": "Types match spec v6 (added Codex section, debounce_max_messages, fallback_cooldown_s, stt_prefix)."}
-    ]
+    "phase_3_blocked_on": "Plan 3 not yet written. Plan 3 covers spec §4.2 (RouteKey + per-route serial executor + ROUTES map + claim lifecycle) and §4.4.1 (IPC types + writer-mutex + Op constants) and §4.2.2 (broker process model: flock + spawn race + multi-user socket path). Substantial chunk; ~15-20 tasks expected."
   },
   "drift_log": [
-    "Foundation plan Task 2.1 type definitions were written before spec R2/R3 fixes. Actual types implemented per locked spec v6: includes Codex top-level field, channel-level debounce_max_messages/fallback_cooldown_s/stt_prefix. Plan tasks 2.2+ should follow current types — minor signature divergence from plan text but semantics align."
+    "Foundation plan Task 2.1 type definitions were written before spec R2/R3 fixes. Actual types in internal/mappings/types.go follow locked spec v6 (Codex top-level field, channel-level debounce_max_messages/fallback_cooldown_s/stt_prefix). Plan tasks 2.2+ followed locked spec — minor signature divergence from plan text, semantics align."
   ],
-  "notes": "Spec locked 2026-05-09. Three independent review rounds done; final round had zero structural blockers from feasibility, only small fixes from arch and UX (all applied). Spec is committed at this state. Next: execute foundation plan tasks 1.1 → 1.2 → 1.3 (Phase 1 skeleton), self-review, proceed to Phase 2."
+  "notes": "Phase 1 + Phase 2 done. Next: write Plan 3 covering broker core + IPC (spec §4.2 + §4.4.1 + §4.2.2). After Plan 3 is written and reviewed, execute. Per Karthi's loop instruction, review codebase + direction at each phase boundary before proceeding."
 }
