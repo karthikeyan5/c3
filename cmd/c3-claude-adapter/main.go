@@ -516,6 +516,13 @@ func (a *adapter) dispatchTopicsList(raw []byte) {
 
 // Dispatch implements mcp.Handler.
 func (a *adapter) Dispatch(ctx context.Context, req *mcp.Request) *mcp.Response {
+	// Log every method Claude Code sends — diagnosing "channel notification
+	// silently dropped" requires knowing whether Claude Code is invoking some
+	// method we reject. tools/call and tools/list are noisy but useful for
+	// confirming basic flow.
+	if req.Method != "ping" {
+		log.Printf("mcp recv: method=%s id=%s notif=%v", req.Method, string(req.ID), req.IsNotification())
+	}
 	switch req.Method {
 	case "initialize":
 		return a.initializeResponse(req)
@@ -529,8 +536,10 @@ func (a *adapter) Dispatch(ctx context.Context, req *mcp.Request) *mcp.Response 
 		return &mcp.Response{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{}}
 	default:
 		if req.IsNotification() {
+			log.Printf("mcp recv: UNKNOWN notification method=%s (ignored)", req.Method)
 			return nil
 		}
+		log.Printf("mcp recv: UNKNOWN request method=%s (returning -32601)", req.Method)
 		return &mcp.Response{
 			JSONRPC: "2.0", ID: req.ID,
 			Error: &mcp.Error{Code: -32601, Message: "method not found: " + req.Method},
