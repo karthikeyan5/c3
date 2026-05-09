@@ -14,6 +14,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -170,6 +171,13 @@ func runDaemon() error {
 
 	srv, err := broker.Listen(broker.SocketPath(), br)
 	if err != nil {
+		// Sibling broker already serving the socket — same silent exit as
+		// flock collision. Karthi 2026-05-09: prevents the
+		// two-brokers-overlapping-on-the-socket bug after a restart race.
+		if errors.Is(err, broker.ErrSiblingListening) {
+			fmt.Fprintf(os.Stderr, "c3-broker: %v — exiting silently\n", err)
+			return nil
+		}
 		return fmt.Errorf("listen on socket: %w", err)
 	}
 	fmt.Fprintf(os.Stderr, "c3-broker: listening on %s (pid %d)\n", broker.SocketPath(), os.Getpid())
