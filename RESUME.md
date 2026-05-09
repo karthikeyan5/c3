@@ -1,13 +1,17 @@
 # RESUME
 
-> **⚠ DEVIATION NOTE (2026-04-22)** — The plan in this doc (and TODO.md, DECISIONS.md D006/D008) calls for a Go rewrite from scratch. We did not do that. Instead we shipped a **Python wrapper MVP** (`mvp/broker.py` + `mvp/stub.py` + `mvp/patch_server.py`) that wraps the official bun Telegram plugin rather than reimplementing it. It's running in production and is what this terminal is talking through right now. Phase 1 MVP items are largely done in spirit (topic routing, reply threading via patch P4, STT via the wrapped plugin, typing indicator, the four core tools).
->
-> We have **not** updated the plan docs to reflect this. Leaving them as-is for now. When we're ready, the refresh needs: add D009 superseding D006/D008 (Python wrapper over Go rewrite), tick off completed Phase 1 items, reassess Phase 2/3/4 against the new architecture. **Handle later.**
+> **2026-04-22 deviation note RETIRED 2026-05-09 by D009.** The Python wrapper
+> MVP did its job (validated the architecture, ran in production for ~3 weeks)
+> and has been superseded by the Go rewrite that landed during 2026-05-08–05-09.
+> The text below is preserved as historical context; the active spec is
+> [`docs/specs/2026-05-08-c3-rearch-design.md`](docs/specs/2026-05-08-c3-rearch-design.md)
+> (v5, locked) and the implementation plans live in [`docs/plans/`](docs/plans/).
 
 ## Current State
-- Project: C3 (Claude Code Claw)
-- Date updated: 2026-04-15
-- Phase: Pre-build — research and planning complete, ready to code MVP
+- Project: C3 (Claude Code Claw) — Go rewrite shipping
+- Date updated: 2026-05-09
+- Phase: v0.1.0 — Plans 1–6 + 9 + 5 done. Plan 7 (Codex bridge) deferred (D010). Plan 4B closeout (debounce + reconnect-once) done.
+- Live broker connects to @OCDWaterBot, MCP exchange verified, voice STT plugin loads handler.
 
 ## Session 2026-04-15 — What Happened
 

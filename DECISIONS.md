@@ -1,6 +1,11 @@
 # Decisions
 
-> **⚠ DEVIATION NOTE (2026-04-22)** — D006 (Go for daemon + stubs) and D008 (Go MCP SDK) were not acted on. The Python wrapper MVP under `mvp/` ships today instead: it wraps the official bun Telegram plugin over stdio and routes via a unix socket to per-CLI Python MCP stubs. This decision is effectively superseded but not yet formally recorded as D009 — doc refresh deferred. See RESUME.md's banner for context.
+> **2026-04-22 deviation note RETIRED 2026-05-09 by D009.** The April Python
+> wrapper served its purpose (validated the architecture end-to-end) and is
+> now superseded by the Go rewrite that landed during 2026-05-08–05-09. The
+> Python POC under `mvp/` is preserved for reference until the user is
+> satisfied with the Go binaries; eventual cleanup is at the user's
+> discretion.
 
 ## D001: Architecture — Daemon + MCP Stubs
 **Date:** 2026-04-15
@@ -40,3 +45,27 @@
 **Date:** 2026-04-15
 **Decision:** Design the daemon with a pluggable transport interface from the start. Telegram is first, but web chat (magic-link URLs) and voice mode are planned.
 **Why:** Future use cases include browser-based sessions, voice-only mode (driving), and live CLI view. Architecting the transport boundary now avoids rewriting the core later.
+
+## D009: Go rewrite landed — supersedes April Python wrapper MVP
+**Date:** 2026-05-09
+**Decision:** The full v3 Go implementation per `docs/specs/2026-05-08-c3-rearch-design.md` is the active C3 codebase. It honors D006 (Go for daemon and stubs) and D008 (official Go MCP SDK), reactivates D007 (pluggable transport — multi-channel from day one in the data model), and adds a plugin extension system (D009-extension) the original direction implied but didn't formalize.
+
+**What changed structurally vs the April MVP:**
+- Single Go module. Four binaries: `c3-broker`, `c3-claude-adapter`, `c3-codex-adapter` (Plan 7 deferred), `migrate-legacy`.
+- Telegram channel: cleanroom Go via `gotgbot/v2` rc.34. No more bun-plugin-wrapping or `patch_server.py` machinery.
+- IPC: typed Go structs + Op constants + writer-mutex'd `*ipc.Conn`. Replaces the prose dispatch table the Python broker carried.
+- Routing: value-typed `RouteKey` (fixes the `*int64` map-key pointer-identity bug the Python version dodged by treating 0 as General).
+- Per-route serial executor: one goroutine per `(channel, chat_id, *topic_id)` owns inbound pipeline + outbound + placeholder/typing state.
+- Mappings file: single XDG path `~/.config/c3/mappings.json` (mode 0600, atomic-rewrite with one-generation `.bak`). Replaces the old `mvp/config.json` + `mvp/topics.json` + `~/.claude/channels/telegram/.env` triplet.
+- Multi-group, attach proposal flow with cross-group disambiguation, cooldown-fallback, debounce + cap, manual JSON-RPC framing for `notifications/claude/channel`.
+- Plugin host with five hook points; STT is the only built-in plugin in v1, shelling out to the user's existing `~/.claude/channels/telegram/stt-handler.py`.
+
+**Why now:** the wrapper was always a temporary scaffold. The April-through-May 2026 cycle proved the architecture; the Go rewrite is the distributable form.
+
+## D010: Codex bridge deferred to a follow-up release
+**Date:** 2026-05-09
+**Decision:** The Codex bridge (`cmd/c3-codex-adapter/main.go` + `cmd/codex/main.go` launcher + `c3-broker install-codex-shim`) is left at scaffold-stub for v0.1.0. The Python POC at `mvp/codex` + `mvp/codex_supervisor.py` + `mvp/codex_stub.py` continues to work (it talks to the OLD Python broker, not the new Go broker; switching to Go means losing Codex temporarily).
+
+**Why:** Karthi explicitly deferred the Codex piece during the rearch ("Codex adapter, we'll come back to it"). Plan 7 in the spec describes the full Go reimplementation; landing it is one focused multi-day effort, not a rounding-error addition to v0.1.0.
+
+**What this means in practice:** until Plan 7 ships, a user installing C3 Go-side gets Claude Code integration only. The Python POC is untouched and continues to function for whoever wants Codex routing — they just can't have both Go-Claude AND Python-Codex on the same machine because of Telegram's one-poller-per-token constraint.

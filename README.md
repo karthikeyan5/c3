@@ -8,21 +8,27 @@ A Telegram multiplexer that connects multiple Claude Code CLI instances to a sin
 
 > ### Current working version
 >
-> The shipping implementation is a Python wrapper over the official
-> `claude-plugins-official/telegram` plugin, living in [`mvp/`](mvp/). It is
-> in active daily use on the author's machine and is the only thing you need
-> to install/replicate.
+> **The shipping implementation is the Go rewrite landed in this repo.** Source
+> at [`cmd/`](cmd/) (binaries) + [`internal/`](internal/) (packages). The
+> Telegram channel uses [`gotgbot/v2`](https://pkg.go.dev/github.com/PaulSonOfLars/gotgbot/v2);
+> the only Python in the stack is the optional STT plugin shim that subprocesses
+> a user-provided whisper handler.
 >
-> - **Install on a new machine:** [`INSTALL.md`](INSTALL.md) — step-by-step.
-> - **Day-to-day operations** (add groups, create topics, rename, attach):
->   [`mvp/README.md`](mvp/README.md) under *Lifecycle: onboarding a new group
->   or topic*.
-> - **Patch system for the upstream plugin:** [`mvp/PATCH_SPEC.md`](mvp/PATCH_SPEC.md).
+> - **Spec:** [`docs/specs/2026-05-08-c3-rearch-design.md`](docs/specs/2026-05-08-c3-rearch-design.md)
+>   (v5, locked).
+> - **Install on a new machine:** [`docs/INSTALL.md`](docs/INSTALL.md). Short
+>   form: `/plugin marketplace add karthikeyan5/c3`, `/plugin install c3@c3`,
+>   `/c3-build`, `/c3-setup`, restart.
+> - **Daily-use guide:** [`docs/USAGE.md`](docs/USAGE.md).
+> - **Authoring extensions:** [`docs/PLUGINS.md`](docs/PLUGINS.md),
+>   [`docs/CHANNELS.md`](docs/CHANNELS.md), [`docs/ADAPTERS.md`](docs/ADAPTERS.md).
 >
-> Everything below this banner — architecture, tech stack, roadmap — is
-> **design history** from before the wrapper MVP landed. It talks about a Go
-> rewrite that did not happen. Keep for context; don't follow for setup.
-> [`RESUME.md`](RESUME.md) has the deviation note explaining the pivot.
+> The original Python wrapper MVP lives in [`mvp/`](mvp/) — it ran in production
+> from April through May 2026 and is what bootstrapped the spec. Once you've
+> verified the Go broker works end-to-end on your machine, you can delete
+> `mvp/` (or keep it for reference). The previous deviation banners in
+> `RESUME.md` / `TODO.md` / `DECISIONS.md` are now retired; D009 records the
+> Go rewrite as the active implementation.
 
 ---
 

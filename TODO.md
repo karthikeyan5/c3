@@ -1,6 +1,18 @@
 # TODO
 
-> **⚠ DEVIATION NOTE (2026-04-22)** — This list hasn't been reconciled with reality. A Python wrapper MVP (`mvp/broker.py` + `mvp/stub.py` + `mvp/patch_server.py`) was built instead of the Go rewrite planned in DECISIONS.md (D006/D008). Many Phase 1 items are already done in that implementation; the unchecked boxes below do not reflect current state. See RESUME.md's deviation banner. **Proper refresh deferred.**
+> **2026-04-22 deviation note RETIRED 2026-05-09 by D009.** This list is
+> historical — most Phase 1/2 items are done in the Go rewrite. What remains:
+> - **Plan 7 (deferred per D010):** Codex bridge in Go (cmd/codex launcher +
+>   c3-codex-adapter MCP server + c3-broker install-codex-shim).
+> - **Phase 3 (User & Access Management):** access control, pairing flow,
+>   master Telegram user ID enforcement.
+> - **Phase 4 (Advanced):** inter-CLI messaging, monitoring dashboard,
+>   persistent message history, slash commands handled in the daemon, web
+>   chat interface, voice mode, live CLI view.
+>
+> The list below is preserved verbatim. Re-prioritize against the locked
+> spec at [`docs/specs/2026-05-08-c3-rearch-design.md`](docs/specs/2026-05-08-c3-rearch-design.md)
+> when picking next work.
 
 ## Phase 1: MVP
 
