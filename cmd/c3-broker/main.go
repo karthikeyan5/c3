@@ -100,6 +100,12 @@ func runDaemon() error {
 	}
 	defer lock.Release()
 
+	logFile, logPath := broker.SetupLogging()
+	if logFile != nil {
+		defer logFile.Close()
+		fmt.Fprintf(os.Stderr, "c3-broker: log file %s\n", logPath)
+	}
+
 	mfPath, err := mappings.DefaultPath()
 	if err != nil {
 		return fmt.Errorf("resolve mappings path: %w", err)

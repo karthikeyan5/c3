@@ -52,7 +52,10 @@ func (h *BrokerHost) Emit(in *c3types.Inbound) {
 		return
 	}
 	key := MakeRouteKey(in.Channel, in.ChatID, in.TopicID)
-	h.broker.Workers.Submit(key, Job{Kind: JobInbound, Inbound: in})
+	if !h.broker.Workers.Submit(key, Job{Kind: JobInbound, Inbound: in}) {
+		log.Printf("emit DROP chan=%s chat=%d topic=%s msg=%d: worker queue full or stopped",
+			in.Channel, in.ChatID, TopicPtrStr(in.TopicID), in.MessageID)
+	}
 }
 
 // Logf writes to the broker's structured log (currently stdlib log).

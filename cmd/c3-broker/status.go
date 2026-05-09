@@ -31,6 +31,7 @@ func runStatus() error {
 	} else {
 		fmt.Fprintln(&b, "  pid:       (not running — no pid file)")
 	}
+	fmt.Fprintf(&b, "  log file:  %s\n", broker.LogPath())
 
 	// Socket.
 	sockPath := broker.SocketPath()

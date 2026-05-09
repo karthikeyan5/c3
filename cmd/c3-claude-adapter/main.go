@@ -234,13 +234,33 @@ func (a *adapter) currentConn() *ipc.Conn {
 }
 
 // handleInbound translates an ipc.OpInbound into notifications/claude/channel.
+//
+// Logging policy: log delivery metadata only (chan / chat / topic / msg /
+// kind / outcome). NEVER content, NEVER sender username. See DEBUGGING.md.
 func (a *adapter) handleInbound(raw []byte) {
 	var in ipc.InboundMsg
 	if err := json.Unmarshal(raw, &in); err != nil {
+		fmt.Fprintf(os.Stderr, "c3-claude-adapter: handleInbound unmarshal: %v\n", err)
 		return
 	}
+	kind := "text"
+	if len(in.Inbound.Attachments) > 0 && in.Inbound.Attachments[0].Kind != "" {
+		kind = in.Inbound.Attachments[0].Kind
+	}
+	topic := "-"
+	if in.Inbound.TopicID != nil {
+		topic = strconv.FormatInt(*in.Inbound.TopicID, 10)
+	}
 	frame := buildClaudeChannelFrame(&in.Inbound)
-	_ = a.mcp.Notify("notifications/claude/channel", frame)
+	if err := a.mcp.Notify("notifications/claude/channel", frame); err != nil {
+		fmt.Fprintf(os.Stderr,
+			"c3-claude-adapter: notify FAIL chan=%s chat=%d topic=%s msg=%d kind=%s: %v\n",
+			in.Inbound.Channel, in.Inbound.ChatID, topic, in.Inbound.MessageID, kind, err)
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"c3-claude-adapter: notified chan=%s chat=%d topic=%s msg=%d kind=%s\n",
+		in.Inbound.Channel, in.Inbound.ChatID, topic, in.Inbound.MessageID, kind)
 }
 
 // buildClaudeChannelFrame converts a c3types.Inbound into the params for

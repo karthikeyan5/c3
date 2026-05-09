@@ -2,161 +2,102 @@
 
 **C3** (pronounced "C-cubed") = **C**laude **C**ode **C**law
 
-A Telegram multiplexer that connects multiple Claude Code CLI instances to a single Telegram bot, with routing by group topics, chat IDs, and users. Built entirely on Claude Code's ecosystem — uses its tools, skills, MCPs, and capabilities as-is.
+A Telegram multiplexer that connects multiple Claude Code CLI instances to a
+single Telegram bot. One broker, many adapters, routing by group / topic /
+DM. Distributed as a Claude Code plugin; written in Go.
 
----
+## Install
 
-> ### Current working version
->
-> **The shipping implementation is the Go rewrite landed in this repo.** Source
-> at [`cmd/`](cmd/) (binaries) + [`internal/`](internal/) (packages). The
-> Telegram channel uses [`gotgbot/v2`](https://pkg.go.dev/github.com/PaulSonOfLars/gotgbot/v2);
-> the only Python in the stack is the optional STT plugin shim that subprocesses
-> a user-provided whisper handler.
->
-> - **Spec:** [`docs/specs/2026-05-08-c3-rearch-design.md`](docs/specs/2026-05-08-c3-rearch-design.md)
->   (v5, locked).
-> - **Install on a new machine:** [`docs/INSTALL.md`](docs/INSTALL.md). Short
->   form: `/plugin marketplace add karthikeyan5/c3`, `/plugin install c3@c3`,
->   `/c3-build`, `/c3-setup`, restart.
-> - **Daily-use guide:** [`docs/USAGE.md`](docs/USAGE.md).
-> - **Authoring extensions:** [`docs/PLUGINS.md`](docs/PLUGINS.md),
->   [`docs/CHANNELS.md`](docs/CHANNELS.md), [`docs/ADAPTERS.md`](docs/ADAPTERS.md).
->
-> The original Python wrapper MVP lives in [`mvp/`](mvp/) — it ran in production
-> from April through May 2026 and is what bootstrapped the spec. Once you've
-> verified the Go broker works end-to-end on your machine, you can delete
-> `mvp/` (or keep it for reference). The previous deviation banners in
-> `RESUME.md` / `TODO.md` / `DECISIONS.md` are now retired; D009 records the
-> Go rewrite as the active implementation.
+In any Claude Code session, paste:
 
----
+```
+follow https://github.com/karthikeyan5/c3/blob/main/INSTALL.md to install c3
+```
 
-## The Big Idea
+The agent runs the playbook end-to-end. You'll only be asked for your bot
+token and chat ids during configuration. See [`INSTALL.md`](INSTALL.md) for
+the full agent script and [`docs/INSTALL.md`](docs/INSTALL.md) for the
+human-readable walkthrough.
 
-C3 turns Claude Code into a multi-agent system. One Telegram bot, many CLI terminals, each handling different projects or contexts. A master CLI orchestrates the others. No custom agent framework needed — Claude Code already has everything (tools, file access, code execution, MCP plugins). C3 just adds the messaging layer.
+## What's in the repo
 
-Think of it as OpenClaw-like behavior, but running entirely on Claude Code CLIs.
+| Path | What |
+|---|---|
+| [`cmd/c3-broker`](cmd/c3-broker) | The broker daemon + `setup` / `status` / `validate` subcommands. |
+| [`cmd/c3-claude-adapter`](cmd/c3-claude-adapter) | MCP stdio adapter for Claude Code. |
+| [`cmd/c3-codex-adapter`](cmd/c3-codex-adapter) | Codex MCP adapter (scaffold; full impl deferred per D010). |
+| [`cmd/migrate-legacy`](cmd/migrate-legacy) | One-shot migrator from the Python POC config. |
+| [`internal/`](internal) | broker, channel/telegram, plugin host, mappings, IPC, MCP server. |
+| [`plugins/c3/`](plugins/c3) | Plugin manifest + slash commands shipped to users. |
+| [`docs/specs/2026-05-08-c3-rearch-design.md`](docs/specs/2026-05-08-c3-rearch-design.md) | **Locked spec (v5).** Source of truth. |
+| [`docs/plans/`](docs/plans) | Phase-by-phase implementation plans. |
+| [`docs/USAGE.md`](docs/USAGE.md) | Day-to-day user guide. |
+| [`DEBUGGING.md`](DEBUGGING.md) | Where the logs live and how to read them. |
+| [`docs/PLUGINS.md`](docs/PLUGINS.md), [`CHANNELS.md`](docs/CHANNELS.md), [`ADAPTERS.md`](docs/ADAPTERS.md) | Authoring docs for extension points. |
+| [`mvp/`](mvp) | Original Python wrapper. Superseded by the Go rewrite (D009); kept for Codex POC and reference. |
 
 ## Architecture
 
 ```
-Telegram Bot API
-       |
-  C3 Daemon
-  (single process, owns bot token, polls Telegram, runs STT)
-       |                |                |
-  MCP-stub-1      MCP-stub-2      MCP-stub-3
-  (stdio)         (stdio)         (stdio)
-       |                |                |
-  CLI-1            CLI-2            CLI-3
-  (forge-on-forge) (project-Y)     (admin)
+   Telegram Bot API
+          │
+   ┌──────┴───────┐
+   │  c3-broker   │   single daemon, owns bot token, polls Telegram,
+   │  (Go)        │   runs plugin host (STT), holds routing table,
+   └──────┬───────┘   listens on $XDG_RUNTIME_DIR/c3.sock
+          │
+   ┌──────┼──────────────────┐
+   │      │                  │
+   ▼      ▼                  ▼
+ adapter  adapter            adapter
+ (Claude) (Claude)           (Codex — deferred)
+   │      │                  │
+   ▼      ▼                  ▼
+  CLI-1  CLI-2              codex
 ```
 
-### Components
+**Broker.** Single long-running process. One Telegram poller (Bot API
+constraint), N MCP adapters connected over a unix socket. Per-route serial
+executor (one goroutine per `RouteKey = {channel, chat_id, topic_id?}`)
+owns the inbound pipeline, outbound calls, placeholder + typing state, and
+debounce/merge. flock singleton with stale-pid recovery.
 
-1. **C3 Daemon** — Single long-running process. Owns the bot token, polls Telegram (one poller per token — Telegram constraint). Holds the routing table. Runs STT pipeline for voice messages. Listens on a unix socket for MCP stub connections.
+**Adapters.** Thin MCP stdio servers. Each looks like a normal MCP plugin
+to its CLI. Receives only messages routed to its attached topics/chats.
+Tools: `attach`, `reply`, `react`, `edit_message`, `download_attachment`,
+`topics`. Reconnect-once on broker drop with pending-tool-call wake-with-error.
 
-2. **MCP Stubs** — Thin stdio adapters, one per CLI instance. Each stub looks like a normal Telegram MCP plugin to Claude Code. Connects to the daemon via unix socket. Receives only messages routed to its assigned topics/chats.
+**Channels.** Pluggable transport. v1 ships Telegram only
+(`internal/channel/telegram`, cleanroom Go via `gotgbot/v2` rc.34).
 
-3. **Routing Table** — Maps Telegram destinations to CLI instances:
-   - Group topic -> CLI instance
-   - Chat ID (DM) -> CLI instance
-   - User ID -> CLI instance
+**Plugins.** Five hook points: `OnInbound`, `OnVoiceReceived`, `OnOutbound`,
+`OnAttach`, `RegisterTools`. Built-in: STT (subprocesses the user's existing
+`~/.claude/channels/telegram/stt-handler.py`).
 
-### Message Flow
+**Config.** `~/.config/c3/mappings.json` (mode 0600, atomic-rewrite with one
+`.bak`). Replaces the April triplet (`mvp/config.json` +
+`mvp/topics.json` + `.env`).
 
-**Inbound (Telegram -> CLI):**
-1. User sends message in a group topic or DM
-2. Daemon receives it via bot polling
-3. If voice: run STT pipeline, get transcript
-4. Look up routing table: which MCP stub owns this topic/chat?
-5. Forward to that stub via unix socket
-6. Stub delivers to Claude Code as MCP channel notification
+## Routing
 
-**Outbound (CLI -> Telegram):**
-1. Claude Code calls the reply tool on its MCP stub
-2. Stub forwards to daemon with chat_id/topic_id
-3. Daemon sends via Telegram Bot API
-
-## Routing Modes
-
-- **Topic-based**: Create a Telegram group, enable topics. Each topic maps to one CLI instance. Most useful mode.
-- **DM-based**: Route by user ID. User X's DMs go to CLI-1, User Y's to CLI-2.
-- **Group-based**: Entire group (no topics) maps to one CLI.
-
-## Key Features (Full Vision)
-
-### Messaging
-- Bidirectional routing (Telegram <-> CLI)
-- STT built into daemon (not patched into plugin)
-- Voice transcription with custom vocabulary
-- Message deduplication and debouncing
-- Attachment forwarding (photos, documents, audio)
-
-### CLI Management
-- Auto-spawn CLI terminals (tmux sessions or background processes)
-- Manual CLI connection with ID-based registration
-- Foreground any background CLI on demand
-- Master/admin CLI that can configure and spawn others
-
-### Topic Management
-- Create topics via Telegram Bot API
-- Auto-assign new topics to CLI instances
-- List and manage topic-to-CLI mappings
-
-### User Management
-- Per-user access control
-- Pairing flow for new users
-- Master Telegram user ID for admin operations
-
-## Inspiration: OpenClaw's Message Tool
-
-Key features from OpenClaw's messaging system to consider:
-
-- **Session-based routing** — deterministic routing by peer/channel/thread
-- **Fire-and-forget vs wait modes** — configurable timeout for inter-agent messages
-- **Multi-turn ping-pong** — controlled conversation depth between agents
-- **Message deduplication** — prevents redundant processing from reconnects
-- **Debouncing** — batches rapid messages (1.5-5s configurable)
-- **Access control** — agents isolated by default, explicit opt-in for inter-agent communication
-- **Thread-bound sessions** — agents post directly to threads without double-posting to parent
-- **Sender identification** — cross-channel messages arrive with source prefix
-
-We adapt these concepts for C3's Telegram-centric model. We don't need all-platform support — just Telegram done well.
-
-## MVP Scope
-
-**Build first:**
-1. C3 daemon — polls Telegram, holds routing table, listens on unix socket
-2. MCP stub — stdio adapter per CLI, connects to daemon
-3. Route by topic_id within one group
-4. Manual routing config (JSON file)
-5. STT built into daemon
-6. Basic tools: reply, download_attachment, react, edit_message
-
-**Build next:**
-- Topic creation via API
-- CLI auto-spawn (tmux)
-- Master CLI commands
-- User access management
-- Inter-CLI messaging (CLI-1 talks to CLI-2)
-
-**Build later:**
-- Auto-spawning with appropriate permissions
-- Full user management system
-- Dashboard/monitoring
-- Persistent message history
-
-## Tech Stack
-
-- **Daemon**: Go — efficient, low memory/CPU, single binary (D006)
-- **MCP stubs**: Go (if Go MCP SDK exists) or TypeScript (Bun) — must speak MCP stdio protocol
-- **IPC**: Unix domain socket
-- **Bot library**: Go Telegram bot library (telebot, gotgbot, or telegram-bot-api)
-- **STT**: Existing stt-pkg pipeline (called from Go via subprocess)
-- **Transport**: Pluggable interface — Telegram first, web chat and voice mode later (D007)
+- **Topic-based** (primary) — Telegram group with topics enabled. Each topic
+  binds to one CLI session. The natural way to start work is `cd
+  ~/arogara/<project> && claude` — the adapter auto-attaches to a topic
+  named after the project, creating it via the attach proposal flow if it
+  doesn't exist.
+- **DM-based** — User X's DMs route to CLI-1.
+- **Group-based** — Whole group (no topics) maps to one CLI.
 
 ## Status
 
-**2026-04-15**: Project created. Architecture designed. MVP scope defined.
+**v0.1.0 functionally complete (2026-05-09).** Plans 1–6 + 9 done. Live
+broker verified against `@OCDWaterBot`; MCP exchange round-trip confirmed;
+voice STT plugin loads its handler on boot. ~7100 lines of Go, all tests
+green.
+
+What's next: see [`RESUME.md`](RESUME.md) and [`TODO.md`](TODO.md). The
+Codex adapter is deferred per D010 — until Plan 7 ships, Go-side install
+gives Claude Code integration only; the Python POC continues to work for
+Codex on machines that haven't switched.
+
+See [`DECISIONS.md`](DECISIONS.md) for the full decision log.

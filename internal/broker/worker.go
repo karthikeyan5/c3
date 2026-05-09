@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -238,21 +239,39 @@ func mergeBatch(batch []*c3types.Inbound) *c3types.Inbound {
 
 // forwardOrFallback is the post-pipeline delivery: claimed stub or
 // cooldown-fallback reply.
+//
+// Logging policy (DEBUGGING.md): every delivery outcome is logged with
+// route metadata only — chan / chat_id / topic_id / msg_id / outcome. No
+// content. Successful deliveries get one terse line.
 func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound) {
 	holder, claimed := w.broker.Routes.Holder(w.key)
 	if claimed {
 		conn, ok := holder.Conn.(*ipc.Conn)
 		if !ok {
+			log.Printf("deliver FAIL chan=%s chat=%d topic=%s msg=%d: holder.Conn is not *ipc.Conn",
+				w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID)
 			return
 		}
-		_ = conn.WriteJSON(ipc.InboundMsg{Op: ipc.OpInbound, Inbound: *in})
+		if err := conn.WriteJSON(ipc.InboundMsg{Op: ipc.OpInbound, Inbound: *in}); err != nil {
+			log.Printf("deliver FAIL chan=%s chat=%d topic=%s msg=%d to cli=%s pid=%d: %v",
+				w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID,
+				holder.CLI, holder.PID, err)
+			return
+		}
+		log.Printf("delivered chan=%s chat=%d topic=%s msg=%d to cli=%s pid=%d conn=%d",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID,
+			holder.CLI, holder.PID, holder.ConnID)
 		return
 	}
 	if !w.broker.Fallbacks.ShouldSend(w.key) {
+		log.Printf("drop chan=%s chat=%d topic=%s msg=%d: no claim, fallback in cooldown",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID)
 		return
 	}
 	ch, err := w.broker.Channel(in.Channel)
 	if err != nil {
+		log.Printf("fallback FAIL chan=%s chat=%d topic=%s msg=%d: channel lookup: %v",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, err)
 		return
 	}
 	args := c3types.ReplyArgs{
@@ -261,7 +280,13 @@ func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound) 
 		TopicID: in.TopicID,
 		Text:    fallbackText,
 	}
-	_, _ = ch.SendReply(args)
+	if _, err := ch.SendReply(args); err != nil {
+		log.Printf("fallback FAIL chan=%s chat=%d topic=%s msg=%d: send: %v",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, err)
+		return
+	}
+	log.Printf("fallback chan=%s chat=%d topic=%s msg=%d: no claim, sent fallback reply",
+		w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID)
 }
 
 // dispatchOutbound translates an OutboundJob into a channel call, returning

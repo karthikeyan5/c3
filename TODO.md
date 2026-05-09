@@ -1,64 +1,147 @@
 # TODO
 
-> **2026-04-22 deviation note RETIRED 2026-05-09 by D009.** This list is
-> historical — most Phase 1/2 items are done in the Go rewrite. What remains:
-> - **Plan 7 (deferred per D010):** Codex bridge in Go (cmd/codex launcher +
->   c3-codex-adapter MCP server + c3-broker install-codex-shim).
-> - **Phase 3 (User & Access Management):** access control, pairing flow,
->   master Telegram user ID enforcement.
-> - **Phase 4 (Advanced):** inter-CLI messaging, monitoring dashboard,
->   persistent message history, slash commands handled in the daemon, web
->   chat interface, voice mode, live CLI view.
->
-> The list below is preserved verbatim. Re-prioritize against the locked
-> spec at [`docs/specs/2026-05-08-c3-rearch-design.md`](docs/specs/2026-05-08-c3-rearch-design.md)
-> when picking next work.
+Status as of 2026-05-09. Locked spec is
+[`docs/specs/2026-05-08-c3-rearch-design.md`](docs/specs/2026-05-08-c3-rearch-design.md).
+Re-prioritize against the spec when picking next work.
 
-## Phase 1: MVP
+## In flight (user-driven)
 
-- [ ] **Design IPC protocol** — Define the message format between daemon and MCP stubs over unix socket. What gets sent, how routing info is encoded.
-- [ ] **Decide tech stack** — Go for daemon (D006). MCP stubs need to speak MCP stdio protocol — check if Go MCP SDK exists or if Bun is needed for stubs only.
-- [ ] **Build C3 daemon** — Single process: poll Telegram, run STT, route messages, listen on unix socket.
-- [ ] **Build MCP stub** — Thin stdio adapter. Registers with daemon, receives routed messages, forwards outbound replies.
-- [ ] **Routing table** — JSON config file mapping topic_id/chat_id -> stub instance ID. Hot-reloadable.
-- [ ] **Port existing tools** — reply, download_attachment, react, edit_message. Same interface as official plugin.
-- [ ] **Typing indicator** — Show typing indicator in Telegram when the agent is working.
-- [ ] **Message queuing** — Messages must NEVER be lost. If multiple messages arrive while the agent is busy, they must be queued and delivered in order. This is a day-one requirement, not a nice-to-have.
-- [ ] **Reply threading** — When a user replies to a specific message, preserve that context (reply_to message ID and content). The agent should know which message is being replied to.
-- [ ] **Port STT pipeline** — Move STT from patched server.ts into daemon. Use existing stt-pkg.
-- [ ] **Test with 2 CLIs** — One group, two topics, two terminals. Verify bidirectional routing.
+- [ ] **First-run validation of the Go broker.** Paste the install
+  one-liner into a fresh Claude Code session, walk through `INSTALL.md`,
+  then `cd` into a project, `attach`, and confirm a real Telegram
+  round-trip. Surfaces any rough edges before public GitHub push.
 
-## Phase 2: CLI Management
+## Deferred (D010 — Plan 7: Codex bridge in Go)
 
-- [ ] **CLI auto-spawn** — Spawn Claude Code in tmux sessions. Daemon creates session, starts CLI with MCP stub config.
-- [ ] **CLI registration** — Manual CLI connects and registers with an instance ID. Daemon assigns routing.
-- [ ] **Master CLI** — One CLI designated as admin. Can list instances, create topics, modify routing, spawn new CLIs.
-- [ ] **Foreground/background** — Attach to any tmux session from terminal.
+Until this lands, the Go broker supports Claude Code only. The Python POC
+keeps working standalone for Codex but can't coexist with the Go broker
+(Telegram one-poller-per-token).
 
-## Phase 3: User & Access Management
+- [ ] **`cmd/c3-codex-adapter`** — finish the WS forwarder. Scaffold +
+  9 tool definitions are in place; the actual codex websocket bridge is
+  stubbed.
+- [ ] **`cmd/codex/main.go`** — launcher binary that intercepts the `codex`
+  command and shims to the adapter (parallels how the Claude adapter is
+  loaded as an MCP server).
+- [ ] **`c3-broker install-codex-shim`** — subcommand that symlinks the
+  launcher into the user's PATH.
 
-- [ ] **User access control** — Per-user permissions. Who can talk to which CLI.
-- [ ] **Pairing flow** — New users get a pairing code, approved by master CLI or admin.
-- [ ] **Master Telegram user** — Admin user who can configure the system via Telegram itself.
+## Broker — small follow-ups
 
-## Phase 4: Advanced
+- [ ] **`c3-broker release <cwd>` runtime IPC op.** Currently stubbed. Lets
+  a project free its attached topic without restarting the broker.
+- [ ] **Adapter auto-recover beyond reconnect-once.** Today, after one failed
+  reconnect, the adapter is dead until the CLI session restarts. Background
+  reconnect with backoff would let a long-running session survive a broker
+  cycle without restarting Claude Code. Surfaced live during the 2026-05-09
+  polling-bug debug — when the broker was killed for the rebuild, both
+  attached sessions became permanently disconnected.
 
-- [ ] **Inter-CLI messaging** — CLI-1 sends a message to CLI-2 through the daemon.
-- [ ] **Topic creation via API** — Create topics programmatically, auto-assign to new CLI instances.
-- [ ] **Monitoring dashboard** — Which CLIs are connected, message counts, STT stats.
-- [ ] **Persistent message history** — Store messages for context recovery after CLI restart.
-- [ ] **Slash commands** — Handle commands in the daemon without sending to the LLM. E.g. /status, /list, /route, /read <file>. Some run shell commands or read filesystem and return formatted output. Like OpenClaw's slash commands that bypass the LLM for fast operations.
-- [ ] **Stream thinking/tool calls** — Stream agent's thinking and background tool calls to Telegram. Research what others are doing, find the best UX.
-- [ ] **Web chat interface** — Magic-link URL to attach to a CLI session via browser. Pluggable transport layer so Telegram and web coexist.
-- [ ] **Voice mode** — Continuous voice interaction (record -> send -> read aloud response). For driving/hands-free use.
-- [ ] **Live CLI view** — See what's happening in the CLI terminal from the remote interface.
+## Telegram resilience — OpenClaw parity
 
-## Research
+Surfaced 2026-05-09 after the polling-timeout bug fix
+(`internal/channel/telegram/poll.go`). Source: OpenClaw's `extensions/telegram/`
+(grammy-based). Priority order — small/medium-effort items first.
 
-- [ ] **MCP stdio protocol** — Understand the exact protocol for channel notifications, tool calls, tool results. Need to replicate what the official Telegram plugin does.
-- [ ] **Go MCP SDK** — Check if there's a Go implementation of MCP server (stdio transport). If not, evaluate Bun for stubs only.
-- [ ] **grammy topics API** — How to create/manage topics in Telegram groups via Bot API.
-- [ ] **tmux scripting** — Programmatic session creation, window management, attach/detach.
-- [ ] **Claude Code CLI flags** — What flags/env vars control plugin loading, MCP server config, channel wiring.
-- [ ] **Thinking/tool streaming UX** — Research what other Claude Code Telegram setups do. Find best patterns for streaming agent activity.
-- [ ] **Pluggable transport design** — Architecture for swappable frontends (Telegram, web, voice). Define the interface between daemon core and transport adapters.
+- [ ] **Honor `parameters.retry_after` on Telegram 429.** Parse the error,
+  sleep that many seconds (cap 60s), then retry — instead of our generic
+  exponential backoff. Telegram explicitly tells us the cooldown; ignoring
+  it earns more 429s and risks bot deletion. (Small.)
+- [ ] **401 circuit-breaker.** After N (e.g. 10) consecutive 401s on
+  getUpdates / send, suspend polling globally and surface a clear
+  "token invalid, fix it" error. Reset on any success. Today we'd
+  retry-storm a revoked token. Ref:
+  `extensions/telegram/src/sendchataction-401-backoff.ts`. (Small.)
+- [ ] **409 Conflict detection.** Telegram returns 409 when two pollers
+  race the same bot token. Detect specifically, log "another poller holds
+  this token", and exit (don't backoff-retry — that just fights the other
+  process). Real footgun for C3 because adapter auto-attach can spawn
+  racing pollers. OpenClaw doesn't handle this either; we add ourselves.
+  (Small.)
+- [ ] **Per-method timeout policy.** Today our fix bumped *all* gotgbot
+  calls to a 35s HTTP timeout. Right answer: getUpdates gets `pollTimeout +
+  10s`; control calls (`getMe`, `setMyCommands`) get ~10s; sends get ~20s.
+  Faster failure detection on the hot path. Ref: `bot-core.ts`
+  `resolveTelegramRequestTimeoutMs`. (Medium.)
+- [ ] **Error classification: transient-network vs permanent-API.** Walk
+  the error chain collecting codes; only ETIMEDOUT / ENETUNREACH /
+  EHOSTUNREACH / connection-refused trigger backoff. Permanent errors
+  (HTTP 401, chat-not-found, etc.) propagate immediately instead of
+  retry-storming. Ref: `fetch.ts` `FALLBACK_RETRY_ERROR_CODES`,
+  `collectErrorCodes`. (Medium.)
+- [ ] **Persisted update-id watermark.** Persist
+  `highestCompletedUpdateId` to disk; on restart set
+  `offset = persisted+1`. Today we either re-process or drop updates if
+  the broker dies between "received" and "completed". Ref:
+  `bot-update-tracker.ts` `highestAcceptedUpdateId` /
+  `highestCompletedUpdateId` / `safeCompletedUpdateId`. (Medium.)
+- [ ] **Sequentialize per-chat handler dispatch.** Per-chat-id mutex so
+  two updates from the same chat run in-order, but different chats run in
+  parallel. Already-partial in our per-route worker (which serializes per
+  RouteKey); compare against grammy's `sequentialize(getKey)`. (Medium.)
+- [ ] **Outbound rate-limiting** (`golang.org/x/time/rate` token bucket):
+  30 req/s global, 20/min per group, 1/sec per private chat. Most 429s
+  come from outbound storms (typing indicators, edit cascades). Ref:
+  `@grammyjs/transformer-throttler`. (Medium.)
+- [ ] **Per-update semantic dedup** (5-min TTL LRU on
+  `update_id+chat+message_id+media_group_id`). Defense-in-depth on top of
+  the watermark; catches Telegram's occasional repeat deliveries. (Small.)
+
+Skipped:
+- Transport-level fallback chain (IPv4-sticky / pinned IP) — almost
+  certainly overkill for our deployment shape.
+- Media-group debounce (500ms hold-and-merge) — only matters for
+  multi-photo album sends.
+
+## Phase 3 — User & Access Management (not started)
+
+- [ ] **Per-user access control** — who can talk to which CLI.
+- [ ] **Pairing flow** — new users get a pairing code, approved by master
+  CLI or admin.
+- [ ] **Master Telegram user** — admin who can configure the system from
+  Telegram itself.
+
+## Phase 4 — Advanced (not started)
+
+- [ ] **Inter-CLI messaging** — CLI-1 sends a message to CLI-2 through the
+  broker.
+- [ ] **Topic creation via API** beyond the attach proposal flow —
+  programmatic topic management for admins.
+- [ ] **Monitoring dashboard** — connected adapters, message counts, STT
+  stats.
+- [ ] **Persistent message history** — context recovery across CLI
+  restarts.
+- [ ] **Slash commands handled in the broker** — `/status`, `/list`,
+  `/route`, etc. without round-tripping to the LLM. OpenClaw-style fast
+  ops.
+- [ ] **Stream thinking / tool calls to Telegram** — research best UX
+  first.
+- [ ] **Web chat channel** — second `Channel` impl alongside Telegram.
+  Magic-link URL flow. The pluggable channel layer is already in place
+  (D007).
+- [ ] **Voice mode channel** — continuous voice (record → send → read aloud).
+  Driving / hands-free.
+- [ ] **Live CLI view** — see what's happening in the CLI from the remote
+  interface.
+
+## Done — v0.1.0
+
+Kept short for reference; full detail in
+[`docs/.loop/state.json`](docs/.loop/state.json) and the c3-v3 git history.
+
+- Plan 1: repo skeleton (go.mod, cmd/, internal/, Makefile)
+- Plan 2: mappings registry + `migrate-legacy` (27 tests)
+- Plan 3: broker core + IPC; live daemon (27 broker/ipc tests)
+- Plan 4A: Channel/Host interfaces + RouteWorker + WorkerPool
+- Plan 4B: Telegram channel cleanroom Go (`gotgbot/v2` rc.34) — outbound
+  tools, getUpdates, inbound conversion, OpToolCall + cooldown-fallback,
+  attach proposal flow (8 tests), debounce + mergeBatch (7 tests),
+  reconnect-once on adapter
+- Plan 5: plugin host + STT plugin
+- Plan 6: Claude Code MCP adapter — end-to-end live, 7 tools, manual
+  framing for `notifications/claude/channel`
+- Plan 9: install plumbing — marketplace.json, plugin.json, .mcp.json,
+  `/c3-build`/`/c3-setup`/`/c3-status` slash commands, `c3-broker setup` /
+  `status` / `validate` subcommands, root `INSTALL.md` single-line install
+- Plan 10: doc pass — D009/D010 added, deviation banners retired, README +
+  RESUME + TODO rewritten to current state
