@@ -30,6 +30,13 @@ func (c *Channel) SendReply(args c3types.ReplyArgs) (int64, error) {
 		return 0, errors.New("telegram: file attachments not yet implemented (Phase 4B-followup)")
 	}
 
+	// Markdown rendering: when the caller didn't pin a ParseMode, treat the
+	// text as standard markdown and convert to Telegram HTML. Without this,
+	// `**bold**` and `` `code` `` show as literal characters in Telegram
+	// (Karthi 2026-05-09 photo report). We chunk the RAW text first, then
+	// convert each chunk independently so a 4096-char split never bisects an
+	// opened tag.
+	autoHTML := args.ParseMode == ""
 	chunks := chunkText(args.Text, 4096)
 	var firstID int64
 	for i, chunk := range chunks {
@@ -37,7 +44,10 @@ func (c *Channel) SendReply(args c3types.ReplyArgs) (int64, error) {
 		if args.TopicID != nil {
 			opts.MessageThreadId = *args.TopicID
 		}
-		if args.ParseMode != "" {
+		if autoHTML {
+			chunk = mdToTelegramHTML(chunk)
+			opts.ParseMode = "HTML"
+		} else if args.ParseMode != "" {
 			opts.ParseMode = args.ParseMode
 		}
 		// Reply-to applies only to the first chunk; subsequent chunks chain
