@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/karthikeyan5/c3/internal/c3types"
@@ -36,14 +37,22 @@ const Name = "stt"
 type Config struct {
 	Enabled     bool   `json:"enabled"`
 	Priority    int    `json:"priority"`
-	HandlerPath string `json:"handler_path"`     // path to Python script
-	Timeout     int    `json:"timeout_seconds"`  // subprocess timeout (default 60s)
+	HandlerPath string `json:"handler_path"`    // path to Python script
+	Timeout     int    `json:"timeout_seconds"` // subprocess budget (default 300s — long voice notes
+	//                                              need download + Gemini + Sarvam fallback time)
 }
+
+// defaultTimeoutSeconds is the broker's hard deadline for the STT subprocess.
+// 60s was too short — Karthi 2026-05-09: a 6m25s voice note (7.9 MB) ate
+// 45s on download alone, leaving only 15s for the gemini/sarvam chain →
+// SIGKILL'd before either provider returned. 300s gives room for slow
+// downloads + a long-audio transcription cycle without surprising the user.
+const defaultTimeoutSeconds = 300
 
 // Register subscribes the plugin's OnVoiceReceived callback. Called once at
 // broker startup if mappings.json:plugins.stt.enabled (default true).
 func Register(host plugin.Host) error {
-	cfg := Config{Enabled: true, Timeout: 60}
+	cfg := Config{Enabled: true, Timeout: defaultTimeoutSeconds}
 	if err := host.Config(Name, &cfg); err != nil {
 		return fmt.Errorf("stt: read config: %w", err)
 	}
@@ -55,7 +64,7 @@ func Register(host plugin.Host) error {
 		cfg.HandlerPath = defaultHandlerPath()
 	}
 	if cfg.Timeout <= 0 {
-		cfg.Timeout = 60
+		cfg.Timeout = defaultTimeoutSeconds
 	}
 	if _, err := os.Stat(cfg.HandlerPath); err != nil {
 		host.Logf("stt: handler %s not found (%v); voice transcription disabled", cfg.HandlerPath, err)
@@ -69,14 +78,24 @@ func Register(host plugin.Host) error {
 	host.OnVoiceReceived(func(ctx context.Context, p c3types.VoicePayload) (string, error) {
 		token, err := readTelegramToken(host)
 		if err != nil {
-			return "", err
+			host.Logf("stt: token read failed for msg=%d: %v", p.MessageID, err)
+			return sttFailureMarker("token_unavailable"), nil
 		}
-		return runHandler(ctx, cfg, token, p)
+		return runHandler(ctx, host, cfg, token, p)
 	})
 	return nil
 }
 
-func runHandler(ctx context.Context, cfg Config, token string, p c3types.VoicePayload) (string, error) {
+// sttFailureMarker is the stand-in transcript text the broker forwards when
+// the STT chain fails. It replaces the previous silent (voice message)
+// fallback so the receiver knows transcription didn't run and can resend.
+// Karthi 2026-05-09: "if it's not delivered, you can log it"; equivalent
+// principle for STT failure — surface, don't swallow.
+func sttFailureMarker(reason string) string {
+	return "[STT FAILED: " + reason + "]"
+}
+
+func runHandler(ctx context.Context, host plugin.Host, cfg Config, token string, p c3types.VoicePayload) (string, error) {
 	// argv: <bot_token> <chat_id> <msg_id> <file_id> [<thread_id>]
 	args := []string{
 		cfg.HandlerPath,
@@ -91,20 +110,48 @@ func runHandler(ctx context.Context, cfg Config, token string, p c3types.VoicePa
 		args = append(args, "")
 	}
 
-	tctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.Timeout)*time.Second)
+	timeout := time.Duration(cfg.Timeout) * time.Second
+	tctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	start := time.Now()
 	cmd := exec.CommandContext(tctx, "python3", args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		// Failure → empty transcript so the caller falls through to caption /
-		// "(voice message)" default. Don't propagate as an error.
-		return "", nil
+	err := cmd.Run()
+	elapsed := time.Since(start)
+
+	if err != nil {
+		// Distinguish timeout from other errors — the caller (and the user)
+		// benefit from knowing which.
+		reason := "error"
+		if tctx.Err() == context.DeadlineExceeded {
+			reason = "timeout"
+		} else if strings.Contains(err.Error(), "signal: killed") {
+			reason = "killed"
+		}
+		// stderr tail (last 240 chars) helps diagnose without dumping the
+		// full provider output. Audio bytes etc. never appear here.
+		serr := bytes.TrimSpace(stderr.Bytes())
+		if len(serr) > 240 {
+			serr = serr[len(serr)-240:]
+		}
+		host.Logf("stt: msg=%d %s after %v (timeout=%v, file_size=%d): %v | stderr-tail=%q",
+			p.MessageID, reason, elapsed.Round(time.Millisecond), timeout,
+			p.Size, err, string(serr))
+		return sttFailureMarker(reason), nil
 	}
-	transcript := bytes.TrimSpace(stdout.Bytes())
-	return string(transcript), nil
+
+	transcript := string(bytes.TrimSpace(stdout.Bytes()))
+	if transcript == "" {
+		host.Logf("stt: msg=%d empty transcript after %v (no provider returned text)",
+			p.MessageID, elapsed.Round(time.Millisecond))
+		return sttFailureMarker("empty"), nil
+	}
+	host.Logf("stt: msg=%d transcribed in %v (chars=%d)",
+		p.MessageID, elapsed.Round(time.Millisecond), len(transcript))
+	return transcript, nil
 }
 
 // readTelegramToken pulls the bot token from mappings.json via the host's
