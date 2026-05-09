@@ -43,8 +43,16 @@ import (
 
 const (
 	mcpProtocolVersion = "2024-11-05"
-	adapterName        = "c3-claude-adapter"
-	adapterVersion     = "0.1.0"
+	// adapterName MUST match the .mcp.json key so Claude Code's channel
+	// dispatch recognises this server as the same one it spawned. Reference
+	// implementations (~/.claude/plugins/.../fakechat/server.ts:60,
+	// .../telegram/0.0.6/server.ts:371) all set serverInfo.name == .mcp.json
+	// key. Using the binary name here was a guess that broke channel
+	// notification surfacing in 2026-05-09 testing — broker delivered, this
+	// frame went out correctly, but Claude Code never injected it as a
+	// channel event.
+	adapterName    = "c3"
+	adapterVersion = "0.1.0"
 )
 
 func main() {
@@ -342,7 +350,6 @@ func (a *adapter) handleInbound(raw []byte) {
 //     attachment / reply_to fields.
 func buildClaudeChannelFrame(in *c3types.Inbound) map[string]any {
 	meta := map[string]any{
-		"source":  in.Channel,
 		"chat_id": in.ChatID, // raw int — matches official plugin
 		"ts":      in.Timestamp.Format("2006-01-02T15:04:05.000Z"),
 	}
