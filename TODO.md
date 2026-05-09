@@ -30,68 +30,53 @@ keeps working standalone for Codex but can't coexist with the Go broker
 
 - [ ] **`c3-broker release <cwd>` runtime IPC op.** Currently stubbed. Lets
   a project free its attached topic without restarting the broker.
-- [ ] **Adapter auto-recover beyond reconnect-once.** Today, after one failed
-  reconnect, the adapter is dead until the CLI session restarts. Background
-  reconnect with backoff would let a long-running session survive a broker
-  cycle without restarting Claude Code. Surfaced live during the 2026-05-09
-  polling-bug debug — when the broker was killed for the rebuild, both
-  attached sessions became permanently disconnected.
+- [x] **Adapter auto-recover beyond reconnect-once.** Done 2026-05-09.
+  `recoverBroker` (exponential backoff 0.5s → 30s, no give-up) +
+  `replayLastAttach` (re-issues the last successful attach on reconnect)
+  in `cmd/c3-claude-adapter/main.go`. A long-running session now survives
+  a broker bounce without restarting Claude Code.
 
 ## Telegram resilience — OpenClaw parity
 
-Surfaced 2026-05-09 after the polling-timeout bug fix
-(`internal/channel/telegram/poll.go`). Source: OpenClaw's `extensions/telegram/`
-(grammy-based). Priority order — small/medium-effort items first.
+Surfaced 2026-05-09 after the polling-timeout bug fix. Source: OpenClaw's
+`extensions/telegram/` (grammy-based). Most items landed 2026-05-09 in the
+same session.
 
-- [ ] **Honor `parameters.retry_after` on Telegram 429.** Parse the error,
-  sleep that many seconds (cap 60s), then retry — instead of our generic
-  exponential backoff. Telegram explicitly tells us the cooldown; ignoring
-  it earns more 429s and risks bot deletion. (Small.)
-- [ ] **401 circuit-breaker.** After N (e.g. 10) consecutive 401s on
-  getUpdates / send, suspend polling globally and surface a clear
-  "token invalid, fix it" error. Reset on any success. Today we'd
-  retry-storm a revoked token. Ref:
-  `extensions/telegram/src/sendchataction-401-backoff.ts`. (Small.)
-- [ ] **409 Conflict detection.** Telegram returns 409 when two pollers
-  race the same bot token. Detect specifically, log "another poller holds
-  this token", and exit (don't backoff-retry — that just fights the other
-  process). Real footgun for C3 because adapter auto-attach can spawn
-  racing pollers. OpenClaw doesn't handle this either; we add ourselves.
-  (Small.)
-- [ ] **Per-method timeout policy.** Today our fix bumped *all* gotgbot
-  calls to a 35s HTTP timeout. Right answer: getUpdates gets `pollTimeout +
-  10s`; control calls (`getMe`, `setMyCommands`) get ~10s; sends get ~20s.
-  Faster failure detection on the hot path. Ref: `bot-core.ts`
-  `resolveTelegramRequestTimeoutMs`. (Medium.)
-- [ ] **Error classification: transient-network vs permanent-API.** Walk
-  the error chain collecting codes; only ETIMEDOUT / ENETUNREACH /
-  EHOSTUNREACH / connection-refused trigger backoff. Permanent errors
-  (HTTP 401, chat-not-found, etc.) propagate immediately instead of
-  retry-storming. Ref: `fetch.ts` `FALLBACK_RETRY_ERROR_CODES`,
-  `collectErrorCodes`. (Medium.)
-- [ ] **Persisted update-id watermark.** Persist
-  `highestCompletedUpdateId` to disk; on restart set
-  `offset = persisted+1`. Today we either re-process or drop updates if
-  the broker dies between "received" and "completed". Ref:
-  `bot-update-tracker.ts` `highestAcceptedUpdateId` /
-  `highestCompletedUpdateId` / `safeCompletedUpdateId`. (Medium.)
-- [ ] **Sequentialize per-chat handler dispatch.** Per-chat-id mutex so
-  two updates from the same chat run in-order, but different chats run in
-  parallel. Already-partial in our per-route worker (which serializes per
-  RouteKey); compare against grammy's `sequentialize(getKey)`. (Medium.)
-- [ ] **Outbound rate-limiting** (`golang.org/x/time/rate` token bucket):
-  30 req/s global, 20/min per group, 1/sec per private chat. Most 429s
-  come from outbound storms (typing indicators, edit cascades). Ref:
-  `@grammyjs/transformer-throttler`. (Medium.)
-- [ ] **Per-update semantic dedup** (5-min TTL LRU on
-  `update_id+chat+message_id+media_group_id`). Defense-in-depth on top of
-  the watermark; catches Telegram's occasional repeat deliveries. (Small.)
+- [x] **Honor `parameters.retry_after` on Telegram 429.** Done in
+  `internal/channel/telegram/poll.go` pollLoop (cap 60s).
+- [x] **401 circuit-breaker.** Done — `authBreaker` in
+  `internal/channel/telegram/resilience.go`; trips after 10 consecutive
+  401s, sleeps 5min between probes, clears on any success.
+- [x] **409 Conflict detection.** Done — pollLoop logs loud and `return`s
+  when classifyError returns `errClassConflict`.
+- [x] **Per-method timeout policy.** Done — `timeoutFor(method, longPoll)`
+  in resilience.go, used via `requestOptsFor()` from every gotgbot call
+  site. Long-poll budget is now `25s + 30s = 55s`.
+- [x] **Error classification: transient-network vs permanent-API.** Done —
+  `classifyError` + `isTransientNetworkError` in resilience.go. Permanent
+  errors (other 4xx) feed the auth breaker; transient errors get the
+  exponential backoff path; conflict and rate-limited get their own paths.
+- [x] **Persisted update-id watermark.** Done — `offsetStore` in
+  `internal/channel/telegram/offset_store.go` writes
+  `$XDG_STATE_HOME/c3/telegram-offset.json` after each successful
+  GetUpdates. pollLoop seeds `offset` from this on startup.
+- [x] **Outbound rate-limiting.** Done — `rateLimiter` in
+  `internal/channel/telegram/rate.go` using `golang.org/x/time/rate`.
+  Global 30/sec, group 20/min, private 1/sec (burst 5). Wired into every
+  outbound call in `outbound.go`.
+- [x] **Per-update semantic dedup.** Done — `updateDedup` LRU in
+  `internal/channel/telegram/dedup.go` (capacity 2000, TTL 5min).
+- [ ] **Sequentialize per-chat handler dispatch.** **Already provided** by
+  the per-route worker pool — `internal/broker/worker.go` runs one
+  goroutine per `RouteKey = (channel, chat_id, *topic_id)`, serializing
+  inbound + outbound for that route. Worth a tighter test (concurrent
+  inbound interleaving) but no new code needed. Marked done.
 
-Skipped:
-- Transport-level fallback chain (IPv4-sticky / pinned IP) — almost
-  certainly overkill for our deployment shape.
+Skipped (intentional):
+- Transport-level fallback chain (IPv4-sticky / pinned IP) — overkill for
+  our deployment shape.
 - Media-group debounce (500ms hold-and-merge) — only matters for
-  multi-photo album sends.
+  multi-photo album sends, not in any current flow.
 
 ## Phase 3 — User & Access Management (not started)
 

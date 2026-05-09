@@ -85,6 +85,12 @@ type adapter struct {
 
 	// Hello-ack response state, captured on connect.
 	helloAck ipc.HelloAckMsg
+
+	// Last successful attach request — replayed on broker reconnect so a
+	// session that survives a broker restart auto-reclaims its route. Nil
+	// if the user hasn't attached yet (or detached).
+	amu        sync.Mutex
+	lastAttach *ipc.AttachReq
 }
 
 func newAdapter() *adapter {
@@ -146,12 +152,16 @@ func (a *adapter) hello() error {
 	return nil
 }
 
-// brokerReader runs in a goroutine, draining frames from the broker. On
-// read error, attempts ONE reconnect before giving up. Pending tool calls
-// are woken with an error during the reconnect window so callers don't
-// hang. Spec §4.4 "reconnect once" semantics.
+// brokerReader runs in a goroutine, draining frames from the broker. On any
+// read error, runs the recovery loop (exponential backoff, no give-up) until
+// either ctx is canceled or we re-establish a usable connection. After
+// recovery, replays the last successful attach so the route claim is
+// re-established without user intervention.
+//
+// Reconnect-once semantics from spec §4.4 are upgraded to reconnect-forever
+// (with backoff) — the original behavior turned a 30-second broker rebuild
+// into a permanently dead adapter that required restarting the CLI session.
 func (a *adapter) brokerReader() {
-	reconnected := false
 	for {
 		conn := a.currentConn()
 		if conn == nil {
@@ -159,19 +169,12 @@ func (a *adapter) brokerReader() {
 		}
 		raw, err := conn.ReadFrame()
 		if err != nil {
-			if !reconnected {
-				reconnected = true
-				fmt.Fprintf(os.Stderr, "c3-claude-adapter: broker read err: %v — reconnecting once\n", err)
-				if rerr := a.reconnectBroker(); rerr != nil {
-					fmt.Fprintf(os.Stderr, "c3-claude-adapter: reconnect failed: %v\n", rerr)
-					a.wakePendingWithErr("broker disconnected: " + err.Error())
-					return
-				}
-				continue
+			fmt.Fprintf(os.Stderr, "c3-claude-adapter: broker read err: %v — recovering\n", err)
+			if !a.recoverBroker() {
+				fmt.Fprintf(os.Stderr, "c3-claude-adapter: recovery aborted\n")
+				return
 			}
-			fmt.Fprintf(os.Stderr, "c3-claude-adapter: broker read err after reconnect: %v\n", err)
-			a.wakePendingWithErr("broker disconnected after retry")
-			return
+			continue
 		}
 		op, err := ipc.PeekOp(raw)
 		if err != nil {
@@ -196,7 +199,8 @@ func (a *adapter) brokerReader() {
 
 // reconnectBroker tears down the dead conn, dials a fresh one, sends hello.
 // Pending tool calls are woken with an error so callers don't hang during
-// the reconnect window.
+// the reconnect window. Single attempt; recoverBroker is the retry-loop
+// wrapper.
 func (a *adapter) reconnectBroker() error {
 	a.wakePendingWithErr("broker reconnect — request canceled")
 
@@ -211,6 +215,66 @@ func (a *adapter) reconnectBroker() error {
 		return err
 	}
 	return a.hello()
+}
+
+// recoverBroker loops with exponential backoff until reconnectBroker
+// succeeds (or returns false on persistent ctx-cancel — currently unused
+// since the adapter has no top-level ctx). After a successful reconnect,
+// replays the last successful attach (best-effort) so the route claim is
+// restored. Returns true on success, false if recovery is impossible.
+func (a *adapter) recoverBroker() bool {
+	const (
+		base = 500 * time.Millisecond
+		cap  = 30 * time.Second
+	)
+	backoff := base
+	for attempt := 1; ; attempt++ {
+		err := a.reconnectBroker()
+		if err == nil {
+			fmt.Fprintf(os.Stderr, "c3-claude-adapter: reconnected (attempt %d)\n", attempt)
+			a.replayLastAttach()
+			return true
+		}
+		fmt.Fprintf(os.Stderr, "c3-claude-adapter: reconnect attempt %d failed: %v (retry in %v)\n",
+			attempt, err, backoff)
+		time.Sleep(backoff)
+		backoff *= 2
+		if backoff > cap {
+			backoff = cap
+		}
+	}
+}
+
+// rememberAttach stores the last successful attach request for replay on
+// reconnect. The pointer captures all dimensions (target/name/topic_id/
+// group/create) the user originally chose.
+func (a *adapter) rememberAttach(req ipc.AttachReq) {
+	a.amu.Lock()
+	defer a.amu.Unlock()
+	cp := req
+	a.lastAttach = &cp
+}
+
+// replayLastAttach sends the saved attach request to the (just-reconnected)
+// broker. Best-effort — failures are logged to stderr and not surfaced.
+// The broker will respond with AttachedMsg which brokerReader processes
+// (no pending channel registered, so the response is discarded). The point
+// is to re-establish the route claim, not to confirm.
+func (a *adapter) replayLastAttach() {
+	a.amu.Lock()
+	req := a.lastAttach
+	a.amu.Unlock()
+	if req == nil {
+		return
+	}
+	if conn := a.currentConn(); conn != nil {
+		if err := conn.WriteJSON(*req); err != nil {
+			fmt.Fprintf(os.Stderr, "c3-claude-adapter: replay attach failed: %v\n", err)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "c3-claude-adapter: replayed attach (target=%q name=%q)\n",
+			req.Target, req.Name)
+	}
 }
 
 // wakePendingWithErr resolves every pending entry with an error.
@@ -582,6 +646,9 @@ func (a *adapter) handleAttachLocal(ctx context.Context, req *mcp.Request, args 
 		return errResp(req.ID, -32000, "canceled")
 	case res := <-ch:
 		attached, _ := res.Result["_attached"].(ipc.AttachedMsg)
+		if attached.OK {
+			a.rememberAttach(attachReq)
+		}
 		return mcpTextResp(req.ID, formatAttached(&attached))
 	}
 }

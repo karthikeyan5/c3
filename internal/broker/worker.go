@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -240,22 +241,32 @@ func mergeBatch(batch []*c3types.Inbound) *c3types.Inbound {
 // forwardOrFallback is the post-pipeline delivery: claimed stub or
 // cooldown-fallback reply.
 //
-// Logging policy (DEBUGGING.md): every delivery outcome is logged with
-// route metadata only — chan / chat_id / topic_id / msg_id / outcome. No
-// content. Successful deliveries get one terse line.
+// Logging policy (DEBUGGING.md):
+//   - Successful delivery to an adapter → one terse line, NO content.
+//   - Any failure path where the CLI never saw the message → log line
+//     INCLUDES content (sender, text [200-char cap], attachment summary).
+//     This is the explicit "don't lose undelivered content" rule from
+//     2026-05-09 — Karthi: "I don't want you to lose the content without
+//     delivering it anywhere".
+//
+// "Failure paths" here means anything that ends without a `delivered` line:
+// holder-conn-bad, write-error, fallback-cooldown-drop, fallback-send-fail,
+// AND fallback-sent (the user's message was bounced back to Telegram with a
+// boilerplate; no CLI processed it).
 func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound) {
 	holder, claimed := w.broker.Routes.Holder(w.key)
 	if claimed {
 		conn, ok := holder.Conn.(*ipc.Conn)
 		if !ok {
-			log.Printf("deliver FAIL chan=%s chat=%d topic=%s msg=%d: holder.Conn is not *ipc.Conn",
-				w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID)
+			log.Printf("deliver FAIL chan=%s chat=%d topic=%s msg=%d: holder.Conn is not *ipc.Conn — %s",
+				w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID,
+				fallbackSummary(in))
 			return
 		}
 		if err := conn.WriteJSON(ipc.InboundMsg{Op: ipc.OpInbound, Inbound: *in}); err != nil {
-			log.Printf("deliver FAIL chan=%s chat=%d topic=%s msg=%d to cli=%s pid=%d: %v",
+			log.Printf("deliver FAIL chan=%s chat=%d topic=%s msg=%d to cli=%s pid=%d: %v — %s",
 				w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID,
-				holder.CLI, holder.PID, err)
+				holder.CLI, holder.PID, err, fallbackSummary(in))
 			return
 		}
 		log.Printf("delivered chan=%s chat=%d topic=%s msg=%d to cli=%s pid=%d conn=%d",
@@ -264,14 +275,16 @@ func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound) 
 		return
 	}
 	if !w.broker.Fallbacks.ShouldSend(w.key) {
-		log.Printf("drop chan=%s chat=%d topic=%s msg=%d: no claim, fallback in cooldown",
-			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID)
+		log.Printf("drop chan=%s chat=%d topic=%s msg=%d: no claim, fallback in cooldown — %s",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID,
+			fallbackSummary(in))
 		return
 	}
 	ch, err := w.broker.Channel(in.Channel)
 	if err != nil {
-		log.Printf("fallback FAIL chan=%s chat=%d topic=%s msg=%d: channel lookup: %v",
-			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, err)
+		log.Printf("fallback FAIL chan=%s chat=%d topic=%s msg=%d: channel lookup: %v — %s",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, err,
+			fallbackSummary(in))
 		return
 	}
 	args := c3types.ReplyArgs{
@@ -281,12 +294,48 @@ func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound) 
 		Text:    fallbackText,
 	}
 	if _, err := ch.SendReply(args); err != nil {
-		log.Printf("fallback FAIL chan=%s chat=%d topic=%s msg=%d: send: %v",
-			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, err)
+		log.Printf("fallback FAIL chan=%s chat=%d topic=%s msg=%d: send: %v — %s",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, err,
+			fallbackSummary(in))
 		return
 	}
-	log.Printf("fallback chan=%s chat=%d topic=%s msg=%d: no claim, sent fallback reply",
-		w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID)
+	log.Printf("fallback chan=%s chat=%d topic=%s msg=%d: no claim, sent fallback reply — %s",
+		w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID,
+		fallbackSummary(in))
+}
+
+// fallbackSummary returns a one-liner of message content for use in
+// failure-path log lines. Content is truncated (text 200 chars) and
+// quote-escaped. ONLY call this on paths where the message was NOT
+// delivered to a CLI — successful delivery never logs content.
+func fallbackSummary(in *c3types.Inbound) string {
+	var parts []string
+	switch {
+	case in.Sender.Username != "" && in.Sender.UserID != 0:
+		parts = append(parts, fmt.Sprintf("from=@%s(uid=%d)", in.Sender.Username, in.Sender.UserID))
+	case in.Sender.Username != "":
+		parts = append(parts, fmt.Sprintf("from=@%s", in.Sender.Username))
+	case in.Sender.UserID != 0:
+		parts = append(parts, fmt.Sprintf("from=uid=%d", in.Sender.UserID))
+	}
+	if in.Text != "" {
+		text := in.Text
+		const maxText = 200
+		if len(text) > maxText {
+			text = text[:maxText] + "…"
+		}
+		parts = append(parts, fmt.Sprintf("text=%q", text))
+	}
+	if in.ReplyTo != nil {
+		parts = append(parts, fmt.Sprintf("reply_to=%d", in.ReplyTo.MessageID))
+	}
+	for _, att := range in.Attachments {
+		parts = append(parts, fmt.Sprintf("attach=%s/%d", att.Kind, att.Size))
+	}
+	if len(parts) == 0 {
+		return "(no content)"
+	}
+	return strings.Join(parts, " ")
 }
 
 // dispatchOutbound translates an OutboundJob into a channel call, returning

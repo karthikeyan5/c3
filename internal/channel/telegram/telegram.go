@@ -8,11 +8,23 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"time"
 
 	"github.com/PaulSonOfLars/gotgbot/v2"
 
 	"github.com/karthikeyan5/c3/internal/channel"
 )
+
+// longPollTimeoutSeconds is the server-side hold for getUpdates. Telegram
+// allows up to 50; 25 balances latency vs connection churn. Used by
+// timeoutFor to size the HTTP timeout for getUpdates calls.
+const longPollTimeoutSeconds = 25
+
+// auth401Threshold is the consecutive-401 count that trips the auth breaker.
+// 10 leaves headroom for transient auth weirdness while still cutting off a
+// retry-storm before it gets the bot banned.
+const auth401Threshold = 10
 
 // Name is the canonical channel name used in mappings.json:channels.telegram.*.
 const Name = "telegram"
@@ -40,9 +52,13 @@ type GroupConfig struct {
 // Channel is the Telegram channel implementation. Construct via New, register
 // via the broker's channel registry.
 type Channel struct {
-	bot  *gotgbot.Bot
-	host channel.Host
-	cfg  Config
+	bot     *gotgbot.Bot
+	host    channel.Host
+	cfg     Config
+	authBrk *authBreaker
+	offsets *offsetStore
+	dedup   *updateDedup
+	rate    *rateLimiter
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -69,12 +85,32 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 		return errors.New("telegram: bot_token missing in mappings.json:channels.telegram")
 	}
 
-	bot, err := gotgbot.NewBot(c.cfg.BotToken, nil)
+	// Custom BaseBotClient with DefaultRequestOpts set to the "send" budget
+	// (20s). Per-call sites pass RequestOpts with method-specific timeouts via
+	// requestOptsFor — getUpdates gets the long-poll budget, getMe gets a
+	// short control budget, etc. The default catches anything we forget to
+	// override and prevents falling back to gotgbot's 5s.
+	botClient := &gotgbot.BaseBotClient{
+		Client:             http.Client{},
+		DefaultRequestOpts: &gotgbot.RequestOpts{Timeout: 20 * time.Second},
+	}
+	bot, err := gotgbot.NewBot(c.cfg.BotToken, &gotgbot.BotOpts{
+		BotClient:   botClient,
+		RequestOpts: requestOptsFor("getMe", longPollTimeoutSeconds),
+	})
 	if err != nil {
 		return fmt.Errorf("telegram: NewBot: %w", err)
 	}
 	c.bot = bot
 	c.host = host
+	c.authBrk = newAuthBreaker(auth401Threshold)
+	c.dedup = newUpdateDedup(2000, 5*time.Minute)
+	c.rate = newRateLimiter()
+	if store, sErr := newOffsetStore(Name); sErr == nil {
+		c.offsets = store
+	} else {
+		host.Logf("telegram: offset store unavailable (%v); restarts will re-process the last 24h of updates", sErr)
+	}
 	c.ctx, c.cancel = context.WithCancel(ctx)
 
 	host.Logf("telegram: connected as @%s", bot.Username)

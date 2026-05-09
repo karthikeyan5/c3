@@ -52,17 +52,29 @@ Field meanings:
 
 ## Content policy
 
-Logs **never include**:
+The rule (set 2026-05-09): **never log content on a successful delivery,
+always log content on a failure.** A message that reached a CLI doesn't
+need to be in our log — it's already in the receiving session's
+context. A message that didn't reach anyone is at risk of being lost,
+and the log is the last place to find it.
 
-- the message text,
-- the sender username,
-- attachment file content (file_id is OK — it's an opaque Telegram token,
-  not user content).
+| Path | Content logged? |
+|---|---|
+| `delivered chan=… to cli=…` | **No** — message reached a CLI, content lives there. |
+| `deliver FAIL …` (write error to adapter) | **Yes** — `from=@user(uid=N) text="…" attach=kind/size`. |
+| `drop … no claim, fallback in cooldown` | **Yes** — bot didn't even reply, message is fully lost. |
+| `fallback … sent fallback reply` | **Yes** — user got a boilerplate, but no CLI processed the original. |
+| `fallback FAIL …` | **Yes** — couldn't even send the boilerplate. |
+| `telegram: skip update=… (unsupported service)` | **No** — these are forum_topic_created / new_chat_members type events with no useful content. |
 
-Sender `user_id` is also kept out of the success path. If you're tempted to
-add it for a bug hunt, prefer to derive it from `chat_id` first (DMs share
-`chat_id == user_id`); only log `user_id` in failure-path lines and only
-when needed to diagnose the failure.
+Specifics:
+
+- Text is truncated at 200 chars (with `…` suffix) and quote-escaped.
+- Sender as `@username(uid=N)` if both present, else just one or the
+  other. No user content beyond the text itself.
+- Attachments as `kind/size` only (e.g. `attach=voice/12345`). Never the
+  file content; `file_id` is a Telegram-side opaque token, not content.
+- See `fallbackSummary` in `internal/broker/worker.go`.
 
 ## Common diagnostic flows
 
@@ -181,7 +193,28 @@ hardening to `internal/channel/telegram/`.
   `DefaultTimeout` is 5s; our long-poll asked Telegram to hold 25s.
   Client cancelled every cycle with `context deadline exceeded`. Zero
   inbounds reached the broker. Fixed in `internal/channel/telegram/poll.go`
-  by passing `RequestOpts.Timeout: longPollTimeout + 10s` on each
-  GetUpdates call. The "per-method timeout policy" item in TODO.md
-  generalizes this — today *all* gotgbot calls share the 35s timeout, but
-  control calls (`getMe`, `sendMessage`) shouldn't wait that long.
+  by passing `RequestOpts.Timeout` per call.
+
+- **2026-05-09 — 10s margin still too tight for long-poll.** Even with
+  `25s + 10s = 35s`, occasional `context deadline exceeded` showed up
+  under transit-latency spikes. Generalized into `timeoutFor(method)` in
+  `internal/channel/telegram/resilience.go`: getUpdates gets `25s + 30s`,
+  control calls (`getMe`, `setMyCommands`) get 10s, sends/edits get 20s.
+
+- **2026-05-09 — adapter dies permanently on broker restart.** The old
+  reconnect-once policy meant any broker bounce killed every connected
+  CLI session. Replaced with `recoverBroker` (exponential backoff, no
+  give-up) plus `replayLastAttach` so the route claim is restored
+  automatically. See `cmd/c3-claude-adapter/main.go`.
+
+## Persistent state files
+
+| File | Purpose | Owner |
+|---|---|---|
+| `~/.config/c3/mappings.json` | Bot config + cwd→topic mappings | broker |
+| `~/.config/c3/mappings.json.bak` | One-generation backup, written before each rewrite | broker |
+| `$XDG_RUNTIME_DIR/c3-broker.pid` | Singleton flock + pid | broker |
+| `$XDG_RUNTIME_DIR/c3.sock` | Adapter ↔ broker socket | broker |
+| `$XDG_STATE_HOME/c3/broker.log` | Broker log (this file) | broker |
+| `$XDG_STATE_HOME/c3/telegram-offset.json` | Persisted highest update_id | broker (telegram channel) |
+| `$XDG_CACHE_HOME/c3/telegram/attachments/` | Downloaded media | broker (telegram channel) |

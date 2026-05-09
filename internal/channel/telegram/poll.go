@@ -15,24 +15,42 @@ import (
 var allowedUpdates = []string{"message", "edited_message", "callback_query", "message_reaction"}
 
 // pollLoop runs Bot.GetUpdates in a loop, converting each Message into an
-// Inbound and emitting via host.Emit. Honors c.ctx cancellation. Backoff on
-// errors: 1s base, doubles up to 30s, resets on success.
+// Inbound and emitting via host.Emit. Honors c.ctx cancellation.
 //
-// Long-poll: server-side Timeout is 25s (Telegram allows up to 50). The
-// client-side HTTP RequestOpts.Timeout MUST exceed that; gotgbot's
-// DefaultTimeout is 5s and would cancel every long-poll before the server
-// ever responds — manifests as "context deadline exceeded" on every cycle
-// and zero inbound messages reach the broker.
+// Error handling (per OpenClaw parity, see DEBUGGING.md):
+//   - 409 Conflict: another poller holds this token. Log loud and EXIT —
+//     retrying would just thrash; the human needs to kill the other poller.
+//   - 401/403 Permanent: increment authBreaker. After auth401Threshold
+//     consecutive 401s, the breaker trips: sleep long (5min) between
+//     attempts so a revoked-token retry-storm can't get the bot deleted.
+//   - 429 Rate-limited: honor parameters.retry_after (capped at 60s) before
+//     the next attempt. Don't compound onto the backoff timer.
+//   - Transient (network/timeout/5xx): exponential backoff 1s → 30s, reset
+//     on success.
+//   - Any non-classified: treated as transient (better to retry than crash).
+//
+// Long-poll budget is sized via timeoutFor("getUpdates", ...) — see
+// resilience.go. Don't shorten it past the server-side Timeout or we'll
+// re-introduce the 2026-05-09 bug.
 func (c *Channel) pollLoop() {
 	const (
-		longPollTimeout    = 25 // seconds, server-side
-		longPollHTTPMargin = 10 * time.Second
+		longPoll          = longPollTimeoutSeconds
+		maxRetryAfter     = 60 * time.Second
+		trippedSleep      = 5 * time.Minute
+		baseBackoff       = time.Second
+		maxBackoff        = 30 * time.Second
 	)
-	httpTimeout := time.Duration(longPollTimeout)*time.Second + longPollHTTPMargin
 
 	var offset int64
-	backoff := time.Second
-	maxBackoff := 30 * time.Second
+	if c.offsets != nil {
+		if loaded, err := c.offsets.Load(); err == nil && loaded > 0 {
+			offset = loaded + 1
+			c.host.Logf("telegram: resuming from persisted offset=%d (next=%d)", loaded, offset)
+		} else if err != nil {
+			c.host.Logf("telegram: offset Load failed (%v); starting from 0", err)
+		}
+	}
+	backoff := baseBackoff
 
 	for {
 		select {
@@ -41,36 +59,121 @@ func (c *Channel) pollLoop() {
 		default:
 		}
 
+		// If the auth breaker is tripped, sleep long and retry sparingly.
+		// Eventually the user fixes the token; one success clears the breaker.
+		if c.authBrk.IsTripped() {
+			c.host.Logf("telegram: auth breaker TRIPPED (%d consecutive 401s); sleeping %v before next probe — fix bot_token in mappings.json",
+				c.authBrk.Consec(), trippedSleep)
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-time.After(trippedSleep):
+			}
+		}
+
 		opts := &gotgbot.GetUpdatesOpts{
 			Offset:         offset,
-			Timeout:        longPollTimeout,
+			Timeout:        longPoll,
 			AllowedUpdates: allowedUpdates,
-			RequestOpts:    &gotgbot.RequestOpts{Timeout: httpTimeout},
+			RequestOpts:    requestOptsFor("getUpdates", longPoll),
 		}
 		updates, err := c.bot.GetUpdates(opts)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return
 			}
-			c.host.Logf("telegram: GetUpdates error: %v (backoff %v)", err, backoff)
-			select {
-			case <-c.ctx.Done():
+			class, retryAfter := classifyError(err)
+			switch class {
+			case errClassConflict:
+				// 409 — another poller has this token. Stop. The other process
+				// (often the Python POC, sometimes a leaked broker) needs to
+				// be killed before we can safely poll again. Logging loud so
+				// the user sees it in DEBUGGING.md flow.
+				c.host.Logf("telegram: 409 CONFLICT — another poller holds this bot token; pollLoop exiting. Kill the other process and restart c3-broker. Error: %v", err)
 				return
-			case <-time.After(backoff):
+			case errClassPermanent:
+				// 401/403 — token issue. Trip-on-N pattern.
+				tripped := c.authBrk.RecordFail()
+				c.host.Logf("telegram: GetUpdates permanent error (consec=%d, tripped=%v): %v",
+					c.authBrk.Consec(), tripped, err)
+				wait := backoff
+				if tripped {
+					wait = trippedSleep
+				}
+				select {
+				case <-c.ctx.Done():
+					return
+				case <-time.After(wait):
+				}
+				if !tripped {
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+				}
+				continue
+			case errClassRateLimited:
+				wait := time.Duration(retryAfter) * time.Second
+				if wait <= 0 {
+					wait = 5 * time.Second
+				}
+				if wait > maxRetryAfter {
+					wait = maxRetryAfter
+				}
+				c.host.Logf("telegram: GetUpdates 429 rate-limited; honoring retry_after=%ds (capped at %v)",
+					retryAfter, maxRetryAfter)
+				select {
+				case <-c.ctx.Done():
+					return
+				case <-time.After(wait):
+				}
+				continue
+			case errClassTransient:
+				c.host.Logf("telegram: GetUpdates transient error (backoff %v): %v", backoff, err)
+				select {
+				case <-c.ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+				continue
+			default:
+				c.host.Logf("telegram: GetUpdates unclassified error (treating as transient, backoff %v): %v", backoff, err)
+				select {
+				case <-c.ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+				continue
 			}
-			backoff *= 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
-			}
-			continue
 		}
-		// Reset backoff on success.
-		backoff = time.Second
+		// Success — clear auth breaker and reset transient backoff.
+		c.authBrk.RecordSuccess()
+		backoff = baseBackoff
 
+		var advanced bool
 		for _, u := range updates {
+			if c.dedup != nil && c.dedup.SeenOrAdd(&u) {
+				c.host.Logf("telegram: dedup skip update=%d (recent duplicate)", u.UpdateId)
+				if u.UpdateId >= offset {
+					offset = u.UpdateId + 1
+					advanced = true
+				}
+				continue
+			}
 			c.dispatchUpdate(&u)
 			if u.UpdateId >= offset {
 				offset = u.UpdateId + 1
+				advanced = true
+			}
+		}
+		if advanced && c.offsets != nil {
+			// Best-effort: log the failure but don't stop polling.
+			if err := c.offsets.Save(offset - 1); err != nil {
+				c.host.Logf("telegram: offset Save failed: %v", err)
 			}
 		}
 	}

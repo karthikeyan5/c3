@@ -48,8 +48,13 @@ func (c *Channel) SendReply(args c3types.ReplyArgs) (int64, error) {
 				AllowSendingWithoutReply: true,
 			}
 		}
+		opts.RequestOpts = requestOptsFor("sendMessage", longPollTimeoutSeconds)
+		if err := c.rate.Wait(c.ctx, args.ChatID); err != nil {
+			return firstID, fmt.Errorf("telegram: rate-wait: %w", err)
+		}
 		msg, err := c.bot.SendMessage(args.ChatID, chunk, opts)
 		if err != nil {
+			c.recordOutboundErr(err)
 			if i == 0 {
 				return 0, fmt.Errorf("telegram: SendMessage chunk 0: %w", err)
 			}
@@ -61,6 +66,7 @@ func (c *Channel) SendReply(args c3types.ReplyArgs) (int64, error) {
 			firstID = msg.MessageId
 		}
 	}
+	c.recordOutboundSuccess()
 	return firstID, nil
 }
 
@@ -71,13 +77,20 @@ func (c *Channel) SendTyping(chatID int64, threadID *int64) error {
 	if c.bot == nil {
 		return errors.New("telegram: channel not started")
 	}
-	opts := &gotgbot.SendChatActionOpts{}
+	opts := &gotgbot.SendChatActionOpts{
+		RequestOpts: requestOptsFor("sendChatAction", longPollTimeoutSeconds),
+	}
 	if threadID != nil {
 		opts.MessageThreadId = *threadID
 	}
+	if err := c.rate.Wait(c.ctx, chatID); err != nil {
+		return fmt.Errorf("telegram: rate-wait: %w", err)
+	}
 	if _, err := c.bot.SendChatAction(chatID, "typing", opts); err != nil {
+		c.recordOutboundErr(err)
 		return fmt.Errorf("telegram: SendChatAction: %w", err)
 	}
+	c.recordOutboundSuccess()
 	return nil
 }
 
@@ -88,15 +101,21 @@ func (c *Channel) EditMessage(args c3types.EditArgs) (*c3types.EditResult, error
 		return nil, errors.New("telegram: channel not started")
 	}
 	opts := &gotgbot.EditMessageTextOpts{
-		ChatId:    args.ChatID,
-		MessageId: args.MessageID,
+		ChatId:      args.ChatID,
+		MessageId:   args.MessageID,
+		RequestOpts: requestOptsFor("editMessageText", longPollTimeoutSeconds),
 	}
 	if args.ParseMode != "" {
 		opts.ParseMode = args.ParseMode
 	}
+	if err := c.rate.Wait(c.ctx, args.ChatID); err != nil {
+		return nil, fmt.Errorf("telegram: rate-wait: %w", err)
+	}
 	if _, _, err := c.bot.EditMessageText(args.Text, opts); err != nil {
+		c.recordOutboundErr(err)
 		return nil, fmt.Errorf("telegram: EditMessageText: %w", err)
 	}
+	c.recordOutboundSuccess()
 	return &c3types.EditResult{MessageID: args.MessageID}, nil
 }
 
@@ -109,10 +128,16 @@ func (c *Channel) React(args c3types.ReactArgs) error {
 		Reaction: []gotgbot.ReactionType{
 			gotgbot.ReactionTypeEmoji{Emoji: args.Emoji},
 		},
+		RequestOpts: requestOptsFor("setMessageReaction", longPollTimeoutSeconds),
+	}
+	if err := c.rate.Wait(c.ctx, args.ChatID); err != nil {
+		return fmt.Errorf("telegram: rate-wait: %w", err)
 	}
 	if _, err := c.bot.SetMessageReaction(args.ChatID, args.MessageID, opts); err != nil {
+		c.recordOutboundErr(err)
 		return fmt.Errorf("telegram: SetMessageReaction: %w", err)
 	}
+	c.recordOutboundSuccess()
 	return nil
 }
 
@@ -127,8 +152,11 @@ func (c *Channel) DownloadAttachment(fileID string) (string, error) {
 	if c.bot == nil {
 		return "", errors.New("telegram: channel not started")
 	}
-	f, err := c.bot.GetFile(fileID, nil)
+	f, err := c.bot.GetFile(fileID, &gotgbot.GetFileOpts{
+		RequestOpts: requestOptsFor("getFile", longPollTimeoutSeconds),
+	})
 	if err != nil {
+		c.recordOutboundErr(err)
 		return "", fmt.Errorf("telegram: GetFile: %w", err)
 	}
 	if f.FilePath == "" {
@@ -182,10 +210,17 @@ func (c *Channel) CreateTopic(chatID int64, name string) (int64, error) {
 	if c.bot == nil {
 		return 0, errors.New("telegram: channel not started")
 	}
-	t, err := c.bot.CreateForumTopic(chatID, name, nil)
+	if err := c.rate.Wait(c.ctx, chatID); err != nil {
+		return 0, fmt.Errorf("telegram: rate-wait: %w", err)
+	}
+	t, err := c.bot.CreateForumTopic(chatID, name, &gotgbot.CreateForumTopicOpts{
+		RequestOpts: requestOptsFor("createForumTopic", longPollTimeoutSeconds),
+	})
 	if err != nil {
+		c.recordOutboundErr(err)
 		return 0, fmt.Errorf("telegram: CreateForumTopic %q: %w", name, err)
 	}
+	c.recordOutboundSuccess()
 	return t.MessageThreadId, nil
 }
 
