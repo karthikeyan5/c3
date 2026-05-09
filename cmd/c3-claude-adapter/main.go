@@ -601,17 +601,24 @@ func (a *adapter) toolsListResponse(req *mcp.Request) *mcp.Response {
 	tools := []map[string]any{
 		{
 			"name":        "attach",
-			"description": "Attach this session to a Telegram topic. With no args, proposes a topic from cwd basename. `target='dm'` for the user's DM. `name='X'` for a specific name. `topic_id=N` to claim a known thread id. `create=true` to confirm a creation proposal.",
+			"description": "Attach this session to a Telegram topic. Either pass `expr` (raw user-supplied string the broker parses: empty=cwd-default, 'dm'=DM, '<int>'=topic-id, 'create <name>' or '-y <name>'=create that name, '<other>'=name) OR structured args. `target='dm'` for the user's DM. `name='X'` for a specific name. `topic_id=N` to claim a known thread id. `create=true` to confirm a creation proposal. `steal=true` to displace an existing alive holder (only after user-confirmed force_steal proposal).",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
+					"expr":     map[string]any{"type": "string"},
 					"target":   map[string]any{"type": "string"},
 					"name":     map[string]any{"type": "string"},
 					"topic_id": map[string]any{"type": "integer"},
 					"group":    map[string]any{"type": "string"},
 					"create":   map[string]any{"type": "boolean"},
+					"steal":    map[string]any{"type": "boolean"},
 				},
 			},
+		},
+		{
+			"name":        "detach",
+			"description": "Release this session's current Telegram topic claim. After detach, inbound messages on that route fall through to the broker's fallback. No-op if not attached.",
+			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
 		},
 		{
 			"name":        "topics",
@@ -692,6 +699,8 @@ func (a *adapter) toolsCallResponse(ctx context.Context, req *mcp.Request) *mcp.
 	switch params.Name {
 	case "attach":
 		return a.handleAttachLocal(ctx, req, params.Arguments)
+	case "detach":
+		return a.handleDetachLocal(req)
 	case "topics":
 		return a.handleTopicsLocal(ctx, req)
 	default:
@@ -699,9 +708,31 @@ func (a *adapter) toolsCallResponse(ctx context.Context, req *mcp.Request) *mcp.
 	}
 }
 
+// handleDetachLocal sends OpRelease so the broker frees this stub's
+// claims. Stub.SetRoute(nil) is also performed broker-side. Idempotent
+// (no-op if not attached).
+func (a *adapter) handleDetachLocal(req *mcp.Request) *mcp.Response {
+	conn := a.currentConn()
+	if conn == nil {
+		return errResp(req.ID, -32000, "broker not connected")
+	}
+	if err := conn.WriteJSON(struct {
+		Op ipc.Op `json:"op"`
+	}{Op: ipc.OpRelease}); err != nil {
+		return errResp(req.ID, -32000, "broker write: "+err.Error())
+	}
+	a.amu.Lock()
+	a.lastAttach = nil
+	a.amu.Unlock()
+	return mcpTextResp(req.ID, "detached")
+}
+
 func (a *adapter) handleAttachLocal(ctx context.Context, req *mcp.Request, args map[string]any) *mcp.Response {
 	cwd, _ := os.Getwd()
 	attachReq := ipc.AttachReq{Op: ipc.OpAttach, CWD: cwd}
+	if v, ok := args["expr"].(string); ok {
+		attachReq.Expr = v
+	}
 	if v, ok := args["target"].(string); ok {
 		attachReq.Target = v
 	}
@@ -713,6 +744,9 @@ func (a *adapter) handleAttachLocal(ctx context.Context, req *mcp.Request, args 
 	}
 	if v, ok := args["create"].(bool); ok {
 		attachReq.Create = v
+	}
+	if v, ok := args["steal"].(bool); ok {
+		attachReq.Steal = v
 	}
 	if v, ok := args["topic_id"]; ok {
 		switch x := v.(type) {
@@ -771,6 +805,14 @@ func formatAttached(a *ipc.AttachedMsg) string {
 			}
 			return fmt.Sprintf("Found topic %q in group %q (thread %d). Reply yes to claim it%s.",
 				a.Proposal.Existing.Name, a.Proposal.Existing.Group, a.Proposal.Existing.TopicID, alt)
+		case "disambiguate_dm":
+			ex := a.Proposal.Existing
+			return fmt.Sprintf("Ambiguous: a topic named %q exists in group %q (thread %d). Did you mean attach to that topic, or to your actual Telegram DM? Confirm by calling attach(topic_id=%d) for the topic, or attach(target=\"dm\", steal=true) for the actual DM.",
+				ex.Name, ex.Group, ex.TopicID, ex.TopicID)
+		case "force_steal":
+			h := a.Proposal.Holder
+			return fmt.Sprintf("Topic %q is currently held by %s pid %d (cwd %q). Re-invoke attach with steal=true to evict that session and take the claim. Only do this if the user explicitly confirms.",
+				a.Proposal.Name, h.CLI, h.PID, h.CWD)
 		}
 	}
 	if a.Err != "" {
