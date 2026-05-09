@@ -547,8 +547,15 @@ func (a *adapter) initializeResponse(req *mcp.Request) *mcp.Response {
 			"capabilities": map[string]any{
 				"tools": map[string]any{},
 				"experimental": map[string]any{
-					"claude/channel":            map[string]any{},
-					"claude/channel/permission": map[string]any{},
+					// Match fakechat (the reference channel impl)
+					// EXACTLY — only claude/channel. We previously also
+					// declared claude/channel/permission to match the
+					// official telegram plugin, but we don't implement
+					// the permission protocol. Declaring an unfulfilled
+					// capability may be why Claude Code silently drops
+					// our channel notifications. fakechat declares ONLY
+					// claude/channel and that's what we're testing.
+					"claude/channel": map[string]any{},
 				},
 			},
 			"serverInfo": map[string]any{
