@@ -314,7 +314,10 @@ func TestAttach_TopicID_ValidatesAndClaims(t *testing.T) {
 	}
 }
 
-func TestAttach_SavedMapping_SilentClaimNoSearch(t *testing.T) {
+func TestAttach_SavedMapping_SilentClaim(t *testing.T) {
+	// When no explicit name is provided (or name matches saved mapping), the
+	// saved cwd mapping wins as a silent claim — the common "cd into project,
+	// type attach" flow.
 	mf := mfWithTelegram()
 	mf.Mappings["/projects/widget"] = mappings.Mapping{
 		Channel: "telegram", ChatID: -100, TopicID: 281,
@@ -328,8 +331,8 @@ func TestAttach_SavedMapping_SilentClaimNoSearch(t *testing.T) {
 	defer done()
 	helloAck(t, peer, "/projects/widget")
 
-	// User says `attach widget` — saved mapping wins regardless of name search.
-	_ = peer.WriteJSON(ipc.AttachReq{Op: ipc.OpAttach, CWD: "/projects/widget", Name: "widget"})
+	// Bare `attach` (no name) → saved mapping wins.
+	_ = peer.WriteJSON(ipc.AttachReq{Op: ipc.OpAttach, CWD: "/projects/widget"})
 	raw, _ := peer.ReadFrame()
 	var ack ipc.AttachedMsg
 	_ = json.Unmarshal(raw, &ack)
@@ -341,7 +344,43 @@ func TestAttach_SavedMapping_SilentClaimNoSearch(t *testing.T) {
 		t.Error("saved mapping should be silent claim")
 	}
 	if ack.Name != "c3" {
-		t.Errorf("Name=%q, want c3 (from saved mapping, NOT widget)", ack.Name)
+		t.Errorf("Name=%q, want c3 (from saved mapping)", ack.Name)
+	}
+}
+
+func TestAttach_ExplicitNameOverridesSavedMapping(t *testing.T) {
+	// Karthi 2026-05-09: a stale cwd mapping was silently overriding an
+	// explicit name argument. Saved mapping must NOT win when the user
+	// explicitly asks for a different topic name.
+	mf := mfWithTelegram()
+	mf.Mappings["/projects/widget"] = mappings.Mapping{
+		Channel: "telegram", ChatID: -100, TopicID: 281,
+		Name: "c3", Group: "main",
+	}
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	peer, done := peerPair(t, b)
+	defer done()
+	helloAck(t, peer, "/projects/widget")
+
+	// Explicit name "widget" differs from saved mapping ("c3"). Saved
+	// mapping should NOT silent-claim. We expect a propose-creation since
+	// "widget" isn't in topics.
+	_ = peer.WriteJSON(ipc.AttachReq{Op: ipc.OpAttach, CWD: "/projects/widget", Name: "widget"})
+	raw, _ := peer.ReadFrame()
+	var ack ipc.AttachedMsg
+	_ = json.Unmarshal(raw, &ack)
+
+	if ack.OK {
+		t.Fatalf("expected propose-creation (not silent-claim from saved); got OK with Name=%q", ack.Name)
+	}
+	if !ack.NeedsConfirmation {
+		t.Errorf("expected NeedsConfirmation=true; got false. Err=%s", ack.Err)
+	}
+	if ack.Proposal == nil || ack.Proposal.Name != "widget" {
+		t.Errorf("expected proposal for name 'widget'; got %+v", ack.Proposal)
 	}
 }
 

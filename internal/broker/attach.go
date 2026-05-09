@@ -55,19 +55,18 @@ func (b *Broker) handleAttach(conn *ipc.Conn, stub *Stub, raw []byte) {
 	case req.TopicID != nil:
 		b.attachByTopicID(conn, stub, chanName, *req.TopicID, req.Group)
 	default:
-		name := req.Name
-		cwd := req.CWD
-		if name == "" && cwd != "" {
-			name = filepath.Base(cwd)
-		}
-		if name == "" {
+		// Pass through the user-supplied name as-is. attachByName will
+		// backfill from cwd basename only AFTER the saved-mapping check,
+		// so an empty name doesn't get treated as "explicit override" of
+		// the saved cwd mapping.
+		if req.Name == "" && req.CWD == "" {
 			_ = conn.WriteJSON(ipc.AttachedMsg{
 				Op: ipc.OpAttached, OK: false,
 				Err: "attach: provide cwd, name, target, or topic_id",
 			})
 			return
 		}
-		b.attachByName(conn, stub, chanName, name, cwd, req.Group, req.Create)
+		b.attachByName(conn, stub, chanName, req.Name, req.CWD, req.Group, req.Create)
 	}
 }
 
@@ -180,6 +179,11 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 	// for a different topic. Karthi 2026-05-09: a stale cwd-mapping made
 	// `attach name=c3` silently bind to topic-948 instead of c3, because
 	// the saved mapping pointed at 948. Honor explicit name now.
+	//
+	// Note `name` is the USER-SUPPLIED name here — empty if not provided.
+	// We backfill from cwd basename after this block so an empty name
+	// is treated as "no explicit choice" rather than "explicit choice
+	// equal to cwd basename".
 	if cwd != "" {
 		if m, ok := b.Mappings.LookupByCwd(cwd); ok && m.Channel == chanName {
 			explicitOverride := name != "" && name != m.Name
@@ -208,6 +212,18 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 	if !ok {
 		_ = conn.WriteJSON(ipc.AttachedMsg{Op: ipc.OpAttached, OK: false,
 			Err: fmt.Sprintf("attach: group %q not in mappings.json:channels.%s.groups", groupName, chanName)})
+		return
+	}
+
+	// Backfill name from cwd basename if still empty (steps 2-4 need a name
+	// to search/propose). At this point either no saved mapping was found,
+	// or the user explicitly differs from saved.
+	if name == "" && cwd != "" {
+		name = filepath.Base(cwd)
+	}
+	if name == "" {
+		_ = conn.WriteJSON(ipc.AttachedMsg{Op: ipc.OpAttached, OK: false,
+			Err: "attach: provide cwd, name, target, or topic_id"})
 		return
 	}
 
