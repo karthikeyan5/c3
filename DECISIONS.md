@@ -69,3 +69,12 @@
 **Why:** Karthi explicitly deferred the Codex piece during the rearch ("Codex adapter, we'll come back to it"). Plan 7 in the spec describes the full Go reimplementation; landing it is one focused multi-day effort, not a rounding-error addition to v0.1.0.
 
 **What this means in practice:** until Plan 7 ships, a user installing C3 Go-side gets Claude Code integration only. The Python POC is untouched and continues to function for whoever wants Codex routing — they just can't have both Go-Claude AND Python-Codex on the same machine because of Telegram's one-poller-per-token constraint.
+
+## D011: Codex bridge follow-up landed in Go
+**Date:** 2026-05-09
+
+**Decision:** Plan 7 is implemented in Go. The active Codex path is now `cmd/codex/main.go` launcher + `cmd/c3-codex-adapter/main.go` MCP adapter + `c3-broker install-codex-shim`.
+
+**What changed:** `codex` launches interactive sessions through a local Codex app-server with `c3-codex-adapter` injected into both the app-server and visible TUI config. The adapter speaks the Go broker IPC, exposes Codex tools, and forwards inbound Telegram messages to Codex as app-server turns over WebSocket. `install-codex-shim` replaces the old MVP shim in `~/.local/bin` and Node-manager bin directories.
+
+**Why:** The temporary MVP Python Codex bridge proved the app-server forwarding loop, but it could not coexist cleanly with the Go broker. The Go implementation restores the intended single-broker architecture while preserving the proven Codex forwarding behavior.

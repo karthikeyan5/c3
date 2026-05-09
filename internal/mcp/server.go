@@ -1,5 +1,6 @@
-// Package mcp is a minimal MCP stdio server. It speaks JSON-RPC 2.0
-// newline-framed over stdin/stdout. The writer is mutex-protected so
+// Package mcp is a minimal MCP stdio server. It speaks JSON-RPC 2.0 over
+// stdin/stdout, accepting both newline-delimited JSON and Content-Length
+// framing. The writer is mutex-protected so
 // background goroutines (e.g. the broker → adapter inbound forwarder) can
 // emit notifications/claude/channel frames concurrently with synchronous
 // request/response handling without interleaving.
@@ -16,6 +17,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -33,6 +36,8 @@ type Server struct {
 	r       io.Reader
 	w       io.Writer
 	wmu     sync.Mutex
+	fmu     sync.Mutex
+	framing string
 	handler Handler
 }
 
@@ -45,18 +50,20 @@ func New(r io.Reader, w io.Writer, handler Handler) *Server {
 // Run reads requests until r returns EOF or ctx is canceled. Returns when the
 // stdin loop exits.
 func (s *Server) Run(ctx context.Context) error {
-	scanner := bufio.NewScanner(s.r)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024) // up to 4MB per frame
+	reader := bufio.NewReaderSize(s.r, 4*1024*1024)
 
-	for scanner.Scan() {
+	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
+		line, err := s.readFrame(reader)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
 		}
 		var req Request
 		if err := json.Unmarshal(line, &req); err != nil {
@@ -68,7 +75,63 @@ func (s *Server) Run(ctx context.Context) error {
 			s.writeJSON(resp)
 		}
 	}
-	return scanner.Err()
+}
+
+func (s *Server) readFrame(r *bufio.Reader) ([]byte, error) {
+	for {
+		b, err := r.Peek(1)
+		if err != nil {
+			return nil, err
+		}
+		switch b[0] {
+		case '\n', '\r':
+			_, _ = r.ReadByte()
+			continue
+		case '{':
+			line, err := r.ReadBytes('\n')
+			if err != nil && err != io.EOF {
+				return nil, err
+			}
+			s.setFraming("newline")
+			return []byte(strings.TrimSpace(string(line))), nil
+		default:
+			return s.readHeaderFrame(r)
+		}
+	}
+}
+
+func (s *Server) readHeaderFrame(r *bufio.Reader) ([]byte, error) {
+	length := -1
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			break
+		}
+		name, value, ok := strings.Cut(line, ":")
+		if !ok {
+			return []byte(line), nil
+		}
+		if strings.EqualFold(strings.TrimSpace(name), "Content-Length") {
+			n, err := strconv.Atoi(strings.TrimSpace(value))
+			if err != nil {
+				return []byte(line), nil
+			}
+			length = n
+		}
+	}
+	if length < 0 {
+		return []byte{}, nil
+	}
+	buf := make([]byte, length)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	s.setFraming("content-length")
+	return buf, nil
 }
 
 // Notify writes an unsolicited notification frame. Safe for concurrent use.
@@ -91,13 +154,34 @@ func (s *Server) writeJSON(v any) error {
 	}
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
+	if s.currentFraming() == "content-length" {
+		if _, err := fmt.Fprintf(s.w, "Content-Length: %d\r\n\r\n", len(data)); err != nil {
+			return err
+		}
+		if _, err := s.w.Write(data); err != nil {
+			return err
+		}
+		return nil
+	}
 	if _, err := s.w.Write(data); err != nil {
 		return err
 	}
-	if _, err := s.w.Write([]byte{'\n'}); err != nil {
-		return err
+	_, err = s.w.Write([]byte{'\n'})
+	return err
+}
+
+func (s *Server) setFraming(framing string) {
+	s.fmu.Lock()
+	defer s.fmu.Unlock()
+	if s.framing == "" {
+		s.framing = framing
 	}
-	return nil
+}
+
+func (s *Server) currentFraming() string {
+	s.fmu.Lock()
+	defer s.fmu.Unlock()
+	return s.framing
 }
 
 func (s *Server) replyParseError(raw []byte) {

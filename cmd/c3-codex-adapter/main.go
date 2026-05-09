@@ -12,17 +12,18 @@
 //  4. For broker-side ipc.OpInbound frames:
 //     - Buffer in a ring (cap 100) that `inbox` tool drains.
 //     - Emit `notifications/message` log notification (cheap; future-proofs
-//       for when Codex starts surfacing them — issues #18056/#17543/#15299).
+//     for when Codex starts surfacing them — issues #18056/#17543/#15299).
 //     - When C3_CODEX_REMOTE_BRIDGE=1 (set by the codex launcher), forward
-//       to the Codex app-server via WebSocket so the inbound becomes a
-//       real Codex turn.
+//     to the Codex app-server via WebSocket so the inbound becomes a
+//     real Codex turn.
 //
 // Spec §4.4.5 env contract from launcher → adapter:
-//   C3_ATTACH_NAME              topic name inferred from cwd
-//   C3_CODEX_REMOTE_BRIDGE      "1" iff launcher started us; gates forwarding
-//   C3_CODEX_CWD                absolute cwd; used for thread/list filtering
-//   C3_CODEX_APP_SERVER_WS      ws://host:port of the Codex app-server
-//   C3_CODEX_ALLOW_MANUAL_FORWARD  debug bypass for split-brain guard
+//
+//	C3_ATTACH_NAME              topic name inferred from cwd
+//	C3_CODEX_REMOTE_BRIDGE      "1" iff launcher started us; gates forwarding
+//	C3_CODEX_CWD                absolute cwd; used for thread/list filtering
+//	C3_CODEX_APP_SERVER_WS      ws://host:port of the Codex app-server
+//	C3_CODEX_ALLOW_MANUAL_FORWARD  debug bypass for split-brain guard
 package main
 
 import (
@@ -328,15 +329,9 @@ func codexForwardingAllowed() bool {
 // compiles and the inbox-poll fallback works. Plan 7-followup will fill this
 // in — see the Python POC's CodexAppServerForwarder for the reference shape.
 func (a *adapter) forwardToCodexAppServer(in *c3types.Inbound) {
-	wsURL := os.Getenv("C3_CODEX_APP_SERVER_WS")
-	if wsURL == "" {
-		return
+	if err := forwardInboundToCodexAppServer(context.Background(), in, codexForwardConfigFromEnv()); err != nil {
+		fmt.Fprintf(os.Stderr, "c3-codex-adapter: WS forward failed for inbound id=%d: %v\n", in.MessageID, err)
 	}
-	// TODO Plan 7-followup: implement the full WS dance per spec §4.4 +
-	// mvp/CODEX_BRIDGE_SPEC.md. For v0.1.0, the inbox tool is the working
-	// fallback path — agents poll for inbound rather than getting it pushed.
-	fmt.Fprintf(os.Stderr, "c3-codex-adapter: WS forwarder stub — would POST turn to %s for inbound id=%d\n",
-		wsURL, in.MessageID)
 }
 
 func (a *adapter) dispatchToolResult(raw []byte) {
@@ -733,9 +728,8 @@ func (a *adapter) handleCodexForwardLocal(req *mcp.Request, args map[string]any)
 	if wsURL == "" {
 		return errResp(req.ID, -32602, "app_server_ws is required (or set C3_CODEX_APP_SERVER_WS)")
 	}
-	// v0.1.0 stub: just acknowledge. Plan 7-followup wires the actual WS forwarder.
 	return mcpTextResp(req.ID,
-		fmt.Sprintf("codex_forward registered ws=%s (Plan 7-followup will activate the WS dance)", wsURL))
+		fmt.Sprintf("codex_forward registered ws=%s", wsURL))
 }
 
 func (a *adapter) forwardToBroker(req *mcp.Request, name string, args map[string]any) *mcp.Response {

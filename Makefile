@@ -7,6 +7,7 @@ build:
 	go build -o $(BIN_DIR)/c3-broker ./cmd/c3-broker
 	go build -o $(BIN_DIR)/c3-claude-adapter ./cmd/c3-claude-adapter
 	go build -o $(BIN_DIR)/c3-codex-adapter ./cmd/c3-codex-adapter
+	go build -o $(BIN_DIR)/codex ./cmd/codex
 	go build -o $(BIN_DIR)/migrate-legacy ./cmd/migrate-legacy
 
 test:

@@ -43,6 +43,36 @@ func TestServer_Roundtrip(t *testing.T) {
 	}
 }
 
+func TestServer_RoundtripContentLengthFraming(t *testing.T) {
+	req := `{"jsonrpc":"2.0","id":1,"method":"ping"}`
+	in := strings.NewReader("Content-Length: " + itoa(len(req)) + "\r\n\r\n" + req)
+	var out bytes.Buffer
+
+	srv := New(in, &out, echoHandler{})
+	if err := srv.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	raw := out.String()
+	if !strings.HasPrefix(raw, "Content-Length: ") {
+		t.Fatalf("response should use Content-Length framing, got %q", raw)
+	}
+	parts := strings.SplitN(raw, "\r\n\r\n", 2)
+	if len(parts) != 2 {
+		t.Fatalf("response missing header separator: %q", raw)
+	}
+	var resp Response
+	if err := json.Unmarshal([]byte(parts[1]), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.JSONRPC != "2.0" {
+		t.Errorf("jsonrpc=%q", resp.JSONRPC)
+	}
+	if string(resp.ID) != "1" {
+		t.Errorf("id=%q", resp.ID)
+	}
+}
+
 func TestServer_NotificationProducesNoResponse(t *testing.T) {
 	in := strings.NewReader(`{"jsonrpc":"2.0","method":"notifications/initialized"}` + "\n")
 	var out bytes.Buffer

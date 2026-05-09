@@ -1,0 +1,148 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/karthikeyan5/c3/internal/c3types"
+)
+
+func TestForwardInboundToCodexAppServerStartsTurn(t *testing.T) {
+	var got []map[string]any
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		defer c.Close()
+		for {
+			var msg map[string]any
+			if err := c.ReadJSON(&msg); err != nil {
+				return
+			}
+			got = append(got, msg)
+			id, hasID := msg["id"]
+			if !hasID {
+				continue
+			}
+			method, _ := msg["method"].(string)
+			result := map[string]any{}
+			switch method {
+			case "thread/loaded/list":
+				result["data"] = []string{"thread-1"}
+			case "turn/start":
+				result["turn"] = map[string]any{"id": "turn-1"}
+			default:
+				result["ok"] = true
+			}
+			if err := c.WriteJSON(map[string]any{"id": id, "result": result}); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + server.URL[len("http"):]
+	msg := c3types.Inbound{
+		Channel:   "telegram",
+		ChatID:    85720317,
+		MessageID: 1491,
+		Sender:    c3types.Sender{UserID: 85720317, Username: "skarthi"},
+		Text:      "[Transcribed voice]: Hello my testing 1 2 3",
+	}
+
+	err := forwardInboundToCodexAppServer(context.Background(), &msg, codexForwardConfig{
+		WSURL:   wsURL,
+		CWD:     "/home/karthi/arogara",
+		Timeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("forward failed: %v", err)
+	}
+
+	methods := make([]string, 0, len(got))
+	for _, msg := range got {
+		if method, ok := msg["method"].(string); ok {
+			methods = append(methods, method)
+		}
+	}
+	wantMethods := []string{"initialize", "initialized", "thread/loaded/list", "thread/resume", "turn/start"}
+	if len(methods) != len(wantMethods) {
+		t.Fatalf("methods = %#v, want %#v", methods, wantMethods)
+	}
+	for i := range wantMethods {
+		if methods[i] != wantMethods[i] {
+			t.Fatalf("methods = %#v, want %#v", methods, wantMethods)
+		}
+	}
+
+	turnStart := got[len(got)-1]
+	params := turnStart["params"].(map[string]any)
+	if params["threadId"] != "thread-1" {
+		t.Fatalf("threadId = %v, want thread-1", params["threadId"])
+	}
+	input := params["input"].([]any)
+	item := input[0].(map[string]any)
+	text := item["text"].(string)
+	if text != "Telegram message from skarthi (chat=85720317 thread=0)\n[Transcribed voice]: Hello my testing 1 2 3" {
+		t.Fatalf("turn text = %q", text)
+	}
+}
+
+func TestForwardInboundToCodexAppServerPicksLoadedThreadForCWD(t *testing.T) {
+	var threadListParams map[string]any
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		defer c.Close()
+		for {
+			var msg map[string]any
+			if err := c.ReadJSON(&msg); err != nil {
+				return
+			}
+			id, hasID := msg["id"]
+			if !hasID {
+				continue
+			}
+			method, _ := msg["method"].(string)
+			result := map[string]any{"ok": true}
+			switch method {
+			case "thread/loaded/list":
+				result = map[string]any{"data": []string{"thread-old", "thread-new"}}
+			case "thread/list":
+				threadListParams = msg["params"].(map[string]any)
+				result = map[string]any{"data": []map[string]any{{"id": "thread-new"}}}
+			}
+			if err := c.WriteJSON(map[string]any{"id": id, "result": result}); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + server.URL[len("http"):]
+	err := forwardInboundToCodexAppServer(context.Background(), &c3types.Inbound{
+		Channel: "telegram",
+		ChatID:  85720317,
+		Sender:  c3types.Sender{Username: "skarthi"},
+		Text:    "hi",
+	}, codexForwardConfig{WSURL: wsURL, CWD: "/home/karthi/arogara/c3", Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("forward failed: %v", err)
+	}
+	if threadListParams["cwd"] != "/home/karthi/arogara/c3" {
+		encoded, _ := json.Marshal(threadListParams)
+		t.Fatalf("thread/list params = %s", encoded)
+	}
+}

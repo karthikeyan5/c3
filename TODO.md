@@ -11,19 +11,17 @@ Re-prioritize against the spec when picking next work.
   then `cd` into a project, `attach`, and confirm a real Telegram
   round-trip. Surfaces any rough edges before public GitHub push.
 
-## Deferred (D010 — Plan 7: Codex bridge in Go)
+## Completed follow-up (D011 — Plan 7: Codex bridge in Go)
 
-Until this lands, the Go broker supports Claude Code only. The Python POC
-keeps working standalone for Codex but can't coexist with the Go broker
-(Telegram one-poller-per-token).
+Landed 2026-05-09. The Go broker now supports Codex through the Go launcher
+and Go adapter; the Python POC remains in `mvp/` only as historical reference.
 
-- [ ] **`cmd/c3-codex-adapter`** — finish the WS forwarder. Scaffold +
-  9 tool definitions are in place; the actual codex websocket bridge is
-  stubbed.
-- [ ] **`cmd/codex/main.go`** — launcher binary that intercepts the `codex`
+- [x] **`cmd/c3-codex-adapter`** — WS forwarder implemented. Inbound C3
+  messages are submitted to the Codex app-server as turns.
+- [x] **`cmd/codex/main.go`** — launcher binary that intercepts the `codex`
   command and shims to the adapter (parallels how the Claude adapter is
   loaded as an MCP server).
-- [ ] **`c3-broker install-codex-shim`** — subcommand that symlinks the
+- [x] **`c3-broker install-codex-shim`** — subcommand that symlinks the
   launcher into the user's PATH.
 
 ## Broker — small follow-ups
