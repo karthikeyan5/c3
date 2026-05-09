@@ -25,6 +25,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -63,6 +65,15 @@ func main() {
 }
 
 func run() error {
+	// Persistent adapter log at $XDG_STATE_HOME/c3/adapter.log. Adapter stderr
+	// is socket-paired to Claude Code's plugin host and inaccessible from
+	// outside; the file is the durable signal for "did the adapter send the
+	// notification, and what did it look like." Same content policy as the
+	// broker (DEBUGGING.md): metadata only on success, content on failure.
+	if path, err := setupAdapterLog(); err == nil {
+		fmt.Fprintf(os.Stderr, "c3-claude-adapter: log file %s\n", path)
+	}
+
 	a := newAdapter()
 	if err := a.connectBroker(); err != nil {
 		return fmt.Errorf("connect broker: %w", err)
@@ -76,6 +87,29 @@ func run() error {
 
 	go a.brokerReader()
 	return mcpSrv.Run(context.Background())
+}
+
+// setupAdapterLog opens $XDG_STATE_HOME/c3/adapter.log (append) and tees
+// stdlib log there + stderr.
+func setupAdapterLog() (string, error) {
+	state := os.Getenv("XDG_STATE_HOME")
+	if state == "" {
+		home, _ := os.UserHomeDir()
+		state = filepath.Join(home, ".local", "state")
+	}
+	dir := filepath.Join(state, "c3")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "adapter.log")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return "", err
+	}
+	log.SetOutput(io.MultiWriter(f, os.Stderr))
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	log.Printf("adapter: started pid=%d", os.Getpid())
+	return path, nil
 }
 
 type adapter struct {
@@ -99,6 +133,10 @@ type adapter struct {
 	// if the user hasn't attached yet (or detached).
 	amu        sync.Mutex
 	lastAttach *ipc.AttachReq
+
+	// firstInbound triggers a one-shot wire dump of the first
+	// notifications/claude/channel frame for live debugging.
+	firstInbound atomic.Bool
 }
 
 func newAdapter() *adapter {
@@ -324,14 +362,26 @@ func (a *adapter) handleInbound(raw []byte) {
 		topic = strconv.FormatInt(*in.Inbound.TopicID, 10)
 	}
 	frame := buildClaudeChannelFrame(&in.Inbound)
+
+	// One-shot wire dump for diagnosing "broker delivers but CLI silent" —
+	// captures the exact bytes we send so we can prove the shape from outside
+	// the adapter. Logged on FIRST inbound only to avoid noise.
+	if a.firstInbound.CompareAndSwap(false, true) {
+		if raw, err := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"method":  "notifications/claude/channel",
+			"params":  frame,
+		}); err == nil {
+			log.Printf("notify FIRST-WIRE-DUMP: %s", string(raw))
+		}
+	}
+
 	if err := a.mcp.Notify("notifications/claude/channel", frame); err != nil {
-		fmt.Fprintf(os.Stderr,
-			"c3-claude-adapter: notify FAIL chan=%s chat=%d topic=%s msg=%d kind=%s: %v\n",
+		log.Printf("notify FAIL chan=%s chat=%d topic=%s msg=%d kind=%s: %v",
 			in.Inbound.Channel, in.Inbound.ChatID, topic, in.Inbound.MessageID, kind, err)
 		return
 	}
-	fmt.Fprintf(os.Stderr,
-		"c3-claude-adapter: notified chan=%s chat=%d topic=%s msg=%d kind=%s\n",
+	log.Printf("notified chan=%s chat=%d topic=%s msg=%d kind=%s",
 		in.Inbound.Channel, in.Inbound.ChatID, topic, in.Inbound.MessageID, kind)
 }
 
