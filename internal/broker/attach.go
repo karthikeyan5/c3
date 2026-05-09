@@ -299,7 +299,16 @@ func (b *Broker) createAndClaim(conn *ipc.Conn, stub *Stub, chanName, gName stri
 
 // tryClaim attempts to add (key → stub) to ROUTES; on collision, sends
 // AttachedMsg with claim_holder and returns false.
+//
+// Single-claim-per-stub invariant (Karthi 2026-05-09: "codex was attached
+// to two topic IDs"): if this stub already holds a different route, that
+// claim is released BEFORE the new one is granted. An adapter that wants
+// to switch topics can do so with a single attach call; it will never end
+// up holding two topics simultaneously.
 func (b *Broker) tryClaim(conn *ipc.Conn, stub *Stub, key RouteKey, label string) bool {
+	if old := stub.CurrentRoute(); old != nil && *old != key {
+		b.Routes.Release(*old, stub.ConnID)
+	}
 	holder, ok := b.Routes.Claim(key, stub)
 	if !ok {
 		_ = conn.WriteJSON(ipc.AttachedMsg{
