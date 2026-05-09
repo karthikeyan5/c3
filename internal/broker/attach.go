@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/karthikeyan5/c3/internal/ipc"
@@ -49,11 +51,19 @@ func (b *Broker) handleAttach(conn *ipc.Conn, stub *Stub, raw []byte) {
 		return
 	}
 
+	// If the caller passed a freeform Expr, parse it into structured fields
+	// before dispatching. This is the shared parser every CLI's slash-command
+	// wrapper invokes via `attach(expr=$ARGUMENTS)` — keeps each CLI's
+	// per-command file a one-liner with no duplicated parsing.
+	if req.Expr != "" {
+		applyExprToAttachReq(&req)
+	}
+
 	switch {
-	case req.Target == "dm":
-		b.attachDM(conn, stub, chanName)
+	case strings.EqualFold(req.Target, "dm"):
+		b.attachDM(conn, stub, chanName, req.Steal)
 	case req.TopicID != nil:
-		b.attachByTopicID(conn, stub, chanName, *req.TopicID, req.Group)
+		b.attachByTopicID(conn, stub, chanName, *req.TopicID, req.Group, req.Steal)
 	default:
 		// Pass through the user-supplied name as-is. attachByName will
 		// backfill from cwd basename only AFTER the saved-mapping check,
@@ -66,13 +76,64 @@ func (b *Broker) handleAttach(conn *ipc.Conn, stub *Stub, raw []byte) {
 			})
 			return
 		}
-		b.attachByName(conn, stub, chanName, req.Name, req.CWD, req.Group, req.Create)
+		b.attachByName(conn, stub, chanName, req.Name, req.CWD, req.Group, req.Create, req.Steal)
 	}
+}
+
+// applyExprToAttachReq parses the user-supplied freeform argument string and
+// fills in the structured fields. Rules (documented in the AttachReq.Expr
+// godoc and docs/COMMANDS.md):
+//
+//	""                          → leave fields untouched (cwd-saved silent claim)
+//	"dm" / "DM" (case-insens)   → Target = "dm"
+//	"<int>"                     → TopicID = <int>
+//	"-y <name>" / "yes <name>" / "create <name>"
+//	                            → Name = <name>, Create = true
+//	"<anything else>"           → Name = <string>
+//
+// Whitespace is trimmed; unparsable input falls through to Name with the
+// raw string so the broker can tell the user "no topic by that name; want
+// to create?". The "create" prefix forms map to the existing Create flag —
+// users who want to skip the propose/confirm round-trip type `/c3:attach
+// create my-topic` and the broker creates it on the spot.
+func applyExprToAttachReq(req *ipc.AttachReq) {
+	expr := strings.TrimSpace(req.Expr)
+	if expr == "" {
+		return
+	}
+	if strings.EqualFold(expr, "dm") {
+		req.Target = "dm"
+		return
+	}
+	// Numeric → topic id.
+	if n, err := strconv.ParseInt(expr, 10, 64); err == nil {
+		v := n
+		req.TopicID = &v
+		return
+	}
+	// Create-prefixed forms.
+	for _, p := range []string{"-y ", "--yes ", "yes ", "create "} {
+		if strings.HasPrefix(strings.ToLower(expr), p) {
+			req.Name = strings.TrimSpace(expr[len(p):])
+			req.Create = true
+			return
+		}
+	}
+	req.Name = expr
 }
 
 // attachDM claims the user's 1-on-1 chat with the bot. Spec §5.5: never
 // persists a per-cwd mapping; DM is universal across cwds.
-func (b *Broker) attachDM(conn *ipc.Conn, stub *Stub, chanName string) {
+//
+// DM disambiguation (Karthi 2026-05-09): if a topic named "dm"
+// (case-insensitive) exists in the channel, we can't tell whether the user
+// meant the actual Telegram DM or that topic. Surface as needs_confirmation
+// with a "disambiguate_dm" proposal — LLM asks the user. If they want the
+// topic, agent re-invokes `attach name="dm"` (or topic_id); for the actual
+// DM, agent re-invokes with `attach target="dm"` and a confirm flag (TBD)
+// or just agrees by sending steal=true to bypass. For now: agent re-issues
+// using the explicit form the user chose.
+func (b *Broker) attachDM(conn *ipc.Conn, stub *Stub, chanName string, steal bool) {
 	cc, ok := b.Mappings.Channels[chanName]
 	if !ok || cc.DMChatID == 0 {
 		_ = conn.WriteJSON(ipc.AttachedMsg{
@@ -81,8 +142,35 @@ func (b *Broker) attachDM(conn *ipc.Conn, stub *Stub, chanName string) {
 		})
 		return
 	}
+
+	// Disambiguation: a "dm"-named topic in the channel makes the request
+	// ambiguous. Skip disambiguation if the caller already steered past it
+	// by passing steal=true (which here we interpret as "I confirmed I want
+	// the actual DM, just attach").
+	if !steal {
+		for _, tp := range cc.Topics {
+			if strings.EqualFold(tp.Name, "dm") {
+				_ = conn.WriteJSON(ipc.AttachedMsg{
+					Op: ipc.OpAttached, OK: false,
+					NeedsConfirmation: true,
+					Proposal: &ipc.Proposal{
+						Action:  "disambiguate_dm",
+						Channel: chanName,
+						Group:   tp.Group,
+						Name:    tp.Name,
+						Existing: &ipc.TopicEntry{
+							Channel: chanName, ChatID: tp.ChatID,
+							TopicID: tp.TopicID, Name: tp.Name, Group: tp.Group,
+						},
+					},
+				})
+				return
+			}
+		}
+	}
+
 	key := MakeRouteKey(chanName, cc.DMChatID, nil)
-	if !b.tryClaim(conn, stub, key, "DM") {
+	if !b.tryClaim(conn, stub, key, "DM", steal) {
 		return
 	}
 	_ = conn.WriteJSON(ipc.AttachedMsg{
@@ -97,7 +185,7 @@ func (b *Broker) attachDM(conn *ipc.Conn, stub *Stub, chanName string) {
 // attachByTopicID validates a topic id against the channel (cheap typing
 // action) and, if valid, claims it. Adds to topics registry as `topic-<n>`
 // if not already known. Persists cwd mapping if cwd is provided.
-func (b *Broker) attachByTopicID(conn *ipc.Conn, stub *Stub, chanName string, topicID int64, groupName string) {
+func (b *Broker) attachByTopicID(conn *ipc.Conn, stub *Stub, chanName string, topicID int64, groupName string, steal bool) {
 	cc, ok := b.Mappings.Channels[chanName]
 	if !ok {
 		_ = conn.WriteJSON(ipc.AttachedMsg{
@@ -137,7 +225,7 @@ func (b *Broker) attachByTopicID(conn *ipc.Conn, stub *Stub, chanName string, to
 
 	tid := topicID
 	key := MakeRouteKey(chanName, gCfg.ChatID, &tid)
-	if !b.tryClaim(conn, stub, key, fmt.Sprintf("topic %d", topicID)) {
+	if !b.tryClaim(conn, stub, key, fmt.Sprintf("topic %d", topicID), steal) {
 		return
 	}
 	tp, _ := b.Mappings.LookupTopicByID(chanName, gCfg.ChatID, topicID)
@@ -167,7 +255,7 @@ func (b *Broker) attachByTopicID(conn *ipc.Conn, stub *Stub, chanName string, to
 //
 // On any "propose" outcome the response carries needs_confirmation=true and
 // a Proposal payload; the agent re-calls attach with create=true to confirm.
-func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, groupName string, create bool) {
+func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, groupName string, create bool, steal bool) {
 	cc, ok := b.Mappings.Channels[chanName]
 	if !ok {
 		_ = conn.WriteJSON(ipc.AttachedMsg{Op: ipc.OpAttached, OK: false,
@@ -194,7 +282,7 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 					tidPtr = nil
 				}
 				key := MakeRouteKey(chanName, m.ChatID, tidPtr)
-				if !b.tryClaim(conn, stub, key, m.Name) {
+				if !b.tryClaim(conn, stub, key, m.Name, steal) {
 					return
 				}
 				b.persistMapping(stub, chanName, m.ChatID, m.TopicID, m.Name, m.Group)
@@ -232,7 +320,7 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 		// In the default group already — silent claim.
 		tid := tp.TopicID
 		key := MakeRouteKey(chanName, tp.ChatID, &tid)
-		if !b.tryClaim(conn, stub, key, tp.Name) {
+		if !b.tryClaim(conn, stub, key, tp.Name, steal) {
 			return
 		}
 		b.persistMapping(stub, chanName, tp.ChatID, tp.TopicID, tp.Name, tp.Group)
@@ -286,11 +374,11 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 		})
 		return
 	}
-	b.createAndClaim(conn, stub, chanName, gName, gCfg.ChatID, name, cwd)
+	b.createAndClaim(conn, stub, chanName, gName, gCfg.ChatID, name, cwd, steal)
 }
 
 // createAndClaim invokes channel.CreateTopic, registers the topic, claims, persists.
-func (b *Broker) createAndClaim(conn *ipc.Conn, stub *Stub, chanName, gName string, chatID int64, name, cwd string) {
+func (b *Broker) createAndClaim(conn *ipc.Conn, stub *Stub, chanName, gName string, chatID int64, name, cwd string, steal bool) {
 	ch, err := b.Channel(chanName)
 	if err != nil {
 		_ = conn.WriteJSON(ipc.AttachedMsg{Op: ipc.OpAttached, OK: false, Err: err.Error()})
@@ -307,7 +395,7 @@ func (b *Broker) createAndClaim(conn *ipc.Conn, stub *Stub, chanName, gName stri
 	})
 	tid := topicID
 	key := MakeRouteKey(chanName, chatID, &tid)
-	if !b.tryClaim(conn, stub, key, name) {
+	if !b.tryClaim(conn, stub, key, name, steal) {
 		return
 	}
 	if cwd != "" {
@@ -322,23 +410,41 @@ func (b *Broker) createAndClaim(conn *ipc.Conn, stub *Stub, chanName, gName stri
 	})
 }
 
-// tryClaim attempts to add (key → stub) to ROUTES; on collision, sends
-// AttachedMsg with claim_holder and returns false.
+// tryClaim attempts to add (key → stub) to ROUTES; on collision with a
+// different alive holder, sends AttachedMsg with a force_steal proposal
+// (the LLM-side asks the user; on confirmation, attach is re-invoked with
+// steal=true).
 //
 // Single-claim-per-stub invariant (Karthi 2026-05-09: "codex was attached
 // to two topic IDs"): if this stub already holds a different route, that
 // claim is released BEFORE the new one is granted. An adapter that wants
 // to switch topics can do so with a single attach call; it will never end
 // up holding two topics simultaneously.
-func (b *Broker) tryClaim(conn *ipc.Conn, stub *Stub, key RouteKey, label string) bool {
+//
+// steal=true: the user has confirmed displacement of any existing holder.
+// Force-release first, then claim. Only this path can evict a live PID's
+// claim; everything else returns force_steal proposal for confirmation.
+func (b *Broker) tryClaim(conn *ipc.Conn, stub *Stub, key RouteKey, label string, steal bool) bool {
 	if old := stub.CurrentRoute(); old != nil && *old != key {
 		b.Routes.Release(*old, stub.ConnID)
+	}
+	if steal {
+		b.Routes.ForceReleaseKey(key)
 	}
 	holder, ok := b.Routes.Claim(key, stub)
 	if !ok {
 		_ = conn.WriteJSON(ipc.AttachedMsg{
 			Op: ipc.OpAttached, OK: false,
-			Err: fmt.Sprintf("attach %s: held by %s pid %d (cwd %s)",
+			NeedsConfirmation: true,
+			Proposal: &ipc.Proposal{
+				Action:  "force_steal",
+				Channel: key.Channel,
+				Name:    label,
+				Holder: &ipc.Holder{
+					CLI: holder.CLI, PID: holder.PID, CWD: holder.CWD,
+				},
+			},
+			Err: fmt.Sprintf("attach %s: held by %s pid %d (cwd %s) — re-invoke with steal=true to force",
 				label, holder.CLI, holder.PID, holder.CWD),
 		})
 		return false

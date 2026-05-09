@@ -89,6 +89,23 @@ func (r *Routes) FindByLogicalSession(cli string, pid int, cwd string) *Stub {
 	return nil
 }
 
+// ForceReleaseKey unconditionally evicts whatever holds key, returning the
+// previous holder (or nil). Used by the force_steal flow — only invoked
+// after the user has explicitly confirmed via the slash command's
+// AskUserQuestion prompt.
+func (r *Routes) ForceReleaseKey(key RouteKey) *Stub {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	existing, ok := r.m[key]
+	if !ok {
+		return nil
+	}
+	delete(r.m, key)
+	log.Printf("routes ForceReleaseKey key=%s evicted cli=%s pid=%d conn=%d (user-confirmed steal)",
+		routeKeyStr(key), existing.CLI, existing.PID, existing.ConnID)
+	return existing
+}
+
 // TransferAllByConnID re-points every claim from oldConnID to newStub
 // in-place. Used when an adapter reconnects with a fresh ConnID — its
 // existing claims should keep working without the adapter having to

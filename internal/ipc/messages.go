@@ -97,6 +97,37 @@ type TopicsListMsg struct {
 	Topics []TopicEntry `json:"topics"`
 }
 
+// ListClaimsReq is sent by a status-style client (CLI subcommand or any
+// adapter) to fetch a snapshot of the broker's live route-claim table.
+type ListClaimsReq struct {
+	Op Op `json:"op"` // = OpListClaims
+}
+
+// ClaimsListMsg is the broker's response to ListClaimsReq. Each entry is a
+// (route, holder) pair as the broker currently sees it. Renders into
+// `c3-broker status` output for the operator.
+type ClaimsListMsg struct {
+	Op     Op           `json:"op"` // = OpClaimsList
+	Claims []ClaimEntry `json:"claims"`
+}
+
+// ClaimEntry is one row of ClaimsListMsg.Claims. Includes the topic name
+// when the route corresponds to a known topic in mappings.json (lookup is
+// best-effort; empty when the route is a DM or a yet-unregistered topic).
+type ClaimEntry struct {
+	Channel    string `json:"channel"`
+	ChatID     int64  `json:"chat_id"`
+	HasTopic   bool   `json:"has_topic"`
+	TopicID    int64  `json:"topic_id,omitempty"`
+	TopicName  string `json:"topic_name,omitempty"`
+	GroupName  string `json:"group_name,omitempty"`
+	HolderCLI  string `json:"holder_cli"`
+	HolderPID  int    `json:"holder_pid"`
+	HolderCWD  string `json:"holder_cwd,omitempty"`
+	ConnID     uint64 `json:"conn_id"`
+	Connected  bool   `json:"connected"`
+}
+
 // TopicEntry is one row in TopicsListMsg.Topics. Also reused by Proposal.Existing
 // to describe a found-but-not-claimed topic (in which case ClaimedBy is nil).
 type TopicEntry struct {
@@ -109,6 +140,20 @@ type TopicEntry struct {
 }
 
 // AttachReq is the adapter → broker attach request. Spec §4.4.1.
+//
+// Two ways to specify the target:
+//
+//  1. Structured: any of Name / Target / TopicID (with optional Group/Channel).
+//  2. Freeform: Expr — a single user-supplied string the broker parses.
+//     Lets every CLI's slash-command wrapper be a one-liner —
+//     `attach(expr=$ARGUMENTS)` — instead of duplicating arg-parsing logic.
+//     Parsing rules in the broker:
+//       ""                  → fall back to cwd-saved mapping
+//       "dm" (any case)     → target=dm (with disambiguation if a topic
+//                              named "dm" also exists)
+//       "<int>"             → topic_id=<int>
+//       "<name>" / "create <name>" / "-y <name>"
+//                           → name=<name> (create=true if prefix used)
 type AttachReq struct {
 	Op      Op     `json:"op"` // = OpAttach
 	CWD     string `json:"cwd,omitempty"`
@@ -118,6 +163,15 @@ type AttachReq struct {
 	Group   string `json:"group,omitempty"`
 	Channel string `json:"channel,omitempty"`
 	Create  bool   `json:"create,omitempty"`
+	Expr    string `json:"expr,omitempty"`
+
+	// Steal: when true, evict any existing alive holder of the target
+	// route before claiming. Used in the force_steal proposal flow —
+	// LLM asks the user for confirmation, then re-invokes with steal=true.
+	// The "broker is authority" principle (claims survive PID-alive) is
+	// preserved: only an explicit user-confirmed steal can displace a live
+	// holder.
+	Steal bool `json:"steal,omitempty"`
 
 	// Confirm carries the prior proposal for sibling-stub race detection
 	// (spec §4.4.1). Optional; v1 broker doesn't yet validate it but the
@@ -140,14 +194,25 @@ type AttachedMsg struct {
 }
 
 // Proposal describes what the broker would do if the agent confirms.
-// Action is one of: "create", "use_existing_other_group", "claim_existing".
+// Action is one of:
+//   - "create" — create a new topic with the given Name in Group
+//   - "use_existing_other_group" — adopt Existing topic from a different group
+//   - "claim_existing" — claim the Existing topic (same group)
+//   - "disambiguate_dm" — a topic named "dm" exists; agent asks user
+//     whether they meant the topic or the actual Telegram DM (Existing
+//     describes the topic; pass target="dm" to confirm DM, or topic_id to
+//     confirm topic).
+//   - "force_steal" — the requested route is held by Holder; agent asks
+//     user for confirmation, then re-invokes attach with steal=true to
+//     evict and claim.
 type Proposal struct {
 	Action      string      `json:"action"`
 	Channel     string      `json:"channel"`
 	Group       string      `json:"group"`
 	Name        string      `json:"name"`
-	Existing    *TopicEntry `json:"existing,omitempty"`    // populated for use_existing_*
+	Existing    *TopicEntry `json:"existing,omitempty"`    // populated for use_existing_* / disambiguate_dm
 	Alternative *Proposal   `json:"alternative,omitempty"` // recursion: e.g. "or create new in default group"
+	Holder      *Holder     `json:"holder,omitempty"`      // populated for force_steal
 }
 
 // ErrorMsg is sent by either side on an unrecoverable error.

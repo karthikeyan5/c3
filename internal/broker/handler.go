@@ -93,6 +93,8 @@ func (b *Broker) HandleConn(nc net.Conn) {
 			b.handleAttach(conn, stub, raw)
 		case ipc.OpListTopics:
 			b.handleListTopics(conn)
+		case ipc.OpListClaims:
+			b.handleListClaims(conn)
 		case ipc.OpRelease:
 			b.Routes.ReleaseAllByConnID(stub.ConnID)
 			stub.SetRoute(nil)
@@ -165,6 +167,34 @@ func (b *Broker) handleListTopics(conn *ipc.Conn) {
 			}
 			resp.Topics = append(resp.Topics, entry)
 		}
+	}
+	_ = conn.WriteJSON(resp)
+}
+
+// handleListClaims returns a snapshot of every live route claim. Used by
+// `c3-broker status` (transient client) to render the live-claims section
+// without dropping the apologetic note we used to ship.
+func (b *Broker) handleListClaims(conn *ipc.Conn) {
+	resp := ipc.ClaimsListMsg{Op: ipc.OpClaimsList}
+	for _, e := range b.Routes.Snapshot() {
+		entry := ipc.ClaimEntry{
+			Channel:   e.Key.Channel,
+			ChatID:    e.Key.ChatID,
+			HasTopic:  e.Key.HasTopic,
+			TopicID:   e.Key.TopicID,
+			HolderCLI: e.Stub.CLI,
+			HolderPID: e.Stub.PID,
+			HolderCWD: e.Stub.CWD,
+			ConnID:    e.Stub.ConnID,
+			Connected: e.Stub.IsConnected(),
+		}
+		if e.Key.HasTopic {
+			if tp, ok := b.Mappings.LookupTopicByID(e.Key.Channel, e.Key.ChatID, e.Key.TopicID); ok {
+				entry.TopicName = tp.Name
+				entry.GroupName = tp.Group
+			}
+		}
+		resp.Claims = append(resp.Claims, entry)
 	}
 	_ = conn.WriteJSON(resp)
 }

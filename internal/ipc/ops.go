@@ -16,6 +16,7 @@ const (
 	OpAttach     Op = "attach"
 	OpRelease    Op = "release"
 	OpListTopics Op = "list_topics"
+	OpListClaims Op = "list_claims"
 	OpToolCall   Op = "tool_call"
 	OpBye        Op = "bye"
 
@@ -25,5 +26,6 @@ const (
 	OpToolResult Op = "tool_result"
 	OpInbound    Op = "inbound"
 	OpTopicsList Op = "topics_list"
+	OpClaimsList Op = "claims_list"
 	OpError      Op = "error"
 )
