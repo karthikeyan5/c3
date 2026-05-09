@@ -157,7 +157,10 @@ func (b *Broker) attachByTopicID(conn *ipc.Conn, stub *Stub, chanName string, to
 
 // attachByName runs the full search flow per spec §5.2-§5.4:
 //
-//  1. If args.CWD has a saved mapping → silent claim of the saved route.
+//  1. If args.CWD has a saved mapping AND no explicit name was provided
+//     (or the explicit name matches the saved mapping's name) → silent
+//     claim of the saved route. The user can OVERRIDE the saved mapping
+//     by passing an explicit name that differs.
 //  2. Else search default group for `name` → if found, claim it.
 //  3. Else search all groups → if found in non-default, propose
 //     disambiguation (action="use_existing_other_group").
@@ -173,25 +176,31 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 		return
 	}
 
-	// 1. Saved mapping wins.
+	// 1. Saved mapping wins — but only if the user didn't explicitly ask
+	// for a different topic. Karthi 2026-05-09: a stale cwd-mapping made
+	// `attach name=c3` silently bind to topic-948 instead of c3, because
+	// the saved mapping pointed at 948. Honor explicit name now.
 	if cwd != "" {
 		if m, ok := b.Mappings.LookupByCwd(cwd); ok && m.Channel == chanName {
-			tid := m.TopicID
-			tidPtr := &tid
-			if tid == 0 {
-				tidPtr = nil
-			}
-			key := MakeRouteKey(chanName, m.ChatID, tidPtr)
-			if !b.tryClaim(conn, stub, key, m.Name) {
+			explicitOverride := name != "" && name != m.Name
+			if !explicitOverride {
+				tid := m.TopicID
+				tidPtr := &tid
+				if tid == 0 {
+					tidPtr = nil
+				}
+				key := MakeRouteKey(chanName, m.ChatID, tidPtr)
+				if !b.tryClaim(conn, stub, key, m.Name) {
+					return
+				}
+				b.persistMapping(stub, chanName, m.ChatID, m.TopicID, m.Name, m.Group)
+				_ = conn.WriteJSON(ipc.AttachedMsg{
+					Op: ipc.OpAttached, OK: true,
+					Channel: chanName, ChatID: m.ChatID, TopicID: tidPtr,
+					Name: m.Name, Group: m.Group,
+				})
 				return
 			}
-			b.persistMapping(stub, chanName, m.ChatID, m.TopicID, m.Name, m.Group)
-			_ = conn.WriteJSON(ipc.AttachedMsg{
-				Op: ipc.OpAttached, OK: true,
-				Channel: chanName, ChatID: m.ChatID, TopicID: tidPtr,
-				Name: m.Name, Group: m.Group,
-			})
-			return
 		}
 	}
 
