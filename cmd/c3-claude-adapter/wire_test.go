@@ -85,8 +85,12 @@ func TestHandleInboundEndToEnd(t *testing.T) {
 		t.Errorf("params.content = %T; want string", params["content"])
 	}
 	meta := params["meta"].(map[string]any)
-	if _, isNum := meta["chat_id"].(float64); !isNum {
-		t.Errorf("meta.chat_id = %T; want number", meta["chat_id"])
+	// Per channels-reference.md, meta is Record<string, string>: every value
+	// must be a string. We previously sent chat_id as int (matching the
+	// official Telegram plugin's accidental shape) but the doc spec is
+	// string and Claude Code may silently drop non-conforming meta values.
+	if _, isString := meta["chat_id"].(string); !isString {
+		t.Errorf("meta.chat_id = %T; want string per docs", meta["chat_id"])
 	}
 }
 
@@ -177,18 +181,19 @@ func TestChannelFrameWireBytes(t *testing.T) {
 		t.Fatalf("params.meta: want object, got %T", msg.Params["meta"])
 	}
 
-	// chat_id MUST be a raw number (not a string). Official sends `chat_id` as-is.
-	chatID, ok := meta["chat_id"].(float64) // json numbers decode as float64 by default
+	// chat_id is a STRING per channels-reference.md (meta is
+	// Record<string, string>). All values must be strings.
+	chatIDStr, ok := meta["chat_id"].(string)
 	if !ok {
-		t.Fatalf("meta.chat_id: want number, got %T (value: %v)",
+		t.Fatalf("meta.chat_id: want string, got %T (value: %v)",
 			meta["chat_id"], meta["chat_id"])
 	}
-	if int64(chatID) != -1003990699908 {
-		t.Errorf("meta.chat_id: want -1003990699908, got %v", chatID)
+	if chatIDStr != "-1003990699908" {
+		t.Errorf("meta.chat_id: want %q, got %q", "-1003990699908", chatIDStr)
 	}
 
 	// String fields.
-	for _, k := range []string{"message_thread_id", "message_id", "user", "user_id", "ts"} {
+	for _, k := range []string{"chat_id", "message_thread_id", "message_id", "user", "user_id", "ts"} {
 		v, ok := meta[k]
 		if !ok {
 			t.Errorf("meta.%s: missing", k)

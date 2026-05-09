@@ -400,7 +400,13 @@ func (a *adapter) handleInbound(raw []byte) {
 //     attachment / reply_to fields.
 func buildClaudeChannelFrame(in *c3types.Inbound) map[string]any {
 	meta := map[string]any{
-		"chat_id": in.ChatID, // raw int — matches official plugin
+		// Per channels-reference.md, `meta` is typed Record<string, string>.
+		// All values must be strings; non-string values may cause Claude
+		// Code to silently drop the field (or the whole notification).
+		// Official Telegram plugin's TypeScript happens to serialize chat_id
+		// as a number due to gotgbot's Long type, but the contract is string.
+		// fakechat (the reference impl) sends "web" — clearly a string.
+		"chat_id": strconv.FormatInt(in.ChatID, 10),
 		"ts":      in.Timestamp.Format("2006-01-02T15:04:05.000Z"),
 	}
 	if in.MessageID != 0 {
