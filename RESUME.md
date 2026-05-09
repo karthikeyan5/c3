@@ -50,6 +50,17 @@
 
 ## Where to resume
 
+**The launch command matters** — to receive inbound channel notifications,
+Claude Code must be started with:
+
+```
+claude --dangerously-load-development-channels plugin:c3@c3
+```
+
+A plain `claude` leaves notifications silently dropped on the receiving
+side (broker log shows `delivered`, conversation sees nothing). See
+[`CLAUDE.md`](CLAUDE.md) for why.
+
 **Most likely next step (user-driven):** paste the install one-liner into a
 fresh Claude Code session and walk through it as the first real user. This
 flushes out any rough edges in the playbook before pushing the repo to

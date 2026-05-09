@@ -214,10 +214,17 @@ they confirm.
 
 > "Installation complete.
 >
-> **Restart this Claude Code session** — the current one still binds to the
-> previous MCP setup. In your next session, in any project directory, type
-> `attach` and confirm the proposal — the broker will create a Telegram
-> topic named after that directory.
+> **Restart this Claude Code session with the dev-channels flag**:
+>
+>     claude --dangerously-load-development-channels plugin:c3@c3
+>
+> A plain `claude` will work for sending outbound, but **inbound channel
+> notifications get silently dropped** — the broker delivers correctly,
+> but Claude Code rejects channel notifications from plugins not opted-in
+> via this flag (or via the production marketplace flow).
+>
+> Then in any project directory, type `attach` and confirm the proposal —
+> the broker will create a Telegram topic named after that directory.
 >
 > Useful slash commands going forward:
 >   `/c3-status`  — health check
