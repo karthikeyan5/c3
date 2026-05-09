@@ -86,12 +86,35 @@ func runStatus() error {
 		}
 	}
 
-	// Note: live route claims aren't visible from outside the broker process.
-	// A future runtime IPC op (`status` over /tmp/c3.sock) would let us
-	// surface them. For v1 the daemon's stderr is the source of truth.
+	// Live claims via OpListClaims (transient client → broker). When the
+	// broker is up, this shows the actual route table; when it's down, we
+	// note that fact instead of the old apologetic placeholder.
 	fmt.Fprintln(&b)
-	fmt.Fprintln(&b, "(For live route claims, check `c3-broker status` against a running daemon.")
-	fmt.Fprintln(&b, " Phase 4B-followup will add a live status IPC op.)")
+	fmt.Fprintln(&b, "Live claims:")
+	if claimsList, err := fetchClaimsList(); err != nil {
+		fmt.Fprintf(&b, "  (broker unreachable: %v)\n", err)
+	} else if len(claimsList.Claims) == 0 {
+		fmt.Fprintln(&b, "  (no claims)")
+	} else {
+		for _, c := range claimsList.Claims {
+			route := fmt.Sprintf("%s/%d", c.Channel, c.ChatID)
+			if c.HasTopic {
+				if c.TopicName != "" {
+					route += fmt.Sprintf("/topic-%d (%q)", c.TopicID, c.TopicName)
+				} else {
+					route += fmt.Sprintf("/topic-%d", c.TopicID)
+				}
+			} else {
+				route += "/dm"
+			}
+			liveness := "connected"
+			if !c.Connected {
+				liveness = "disconnected (claim survives while pid alive)"
+			}
+			fmt.Fprintf(&b, "  • %s — held by %s pid %d conn=%d [%s]\n",
+				route, c.HolderCLI, c.HolderPID, c.ConnID, liveness)
+		}
+	}
 
 	fmt.Print(b.String())
 	return nil

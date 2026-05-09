@@ -6,6 +6,7 @@
 //	c3-broker validate    — parse + validate mappings.json
 //	c3-broker release CWD — drop the claim on a route bound to CWD
 //	c3-broker reload-config — re-read mappings.json without dropping live claims (running broker only)
+//	c3-broker install-codex-shim — install Codex launcher symlinks
 //
 // Singleton-per-machine via flock on $XDG_RUNTIME_DIR/c3-broker.pid (or
 // fallback). Spawned by adapters via exec.Command + setsid; runs until its
@@ -48,6 +49,12 @@ func main() {
 				os.Exit(1)
 			}
 			return
+		case "topics":
+			if err := runTopics(); err != nil {
+				fmt.Fprintf(os.Stderr, "c3-broker topics: %v\n", err)
+				os.Exit(1)
+			}
+			return
 		case "validate":
 			if err := runValidate(os.Args[2:]); err != nil {
 				fmt.Fprintf(os.Stderr, "c3-broker validate: %v\n", err)
@@ -57,6 +64,12 @@ func main() {
 		case "release":
 			if err := runRelease(os.Args[2:]); err != nil {
 				fmt.Fprintf(os.Stderr, "c3-broker release: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		case "install-codex-shim":
+			if err := runInstallCodexShim(); err != nil {
+				fmt.Fprintf(os.Stderr, "c3-broker install-codex-shim: %v\n", err)
 				os.Exit(1)
 			}
 			return
@@ -80,13 +93,18 @@ Usage:
                         group chat id; validate against Telegram; write
                         ~/.config/c3/mappings.json (mode 0600).
   c3-broker status      Read-only health check (broker, socket, mappings,
-                        channels, claims).
+                        channels, plugins, live claims).
+  c3-broker topics      List known topics + claim state (queries the
+                        running broker via the unix socket).
   c3-broker validate [path]
                         Parse + validate mappings.json. Defaults to default
                         path. Exits 0 on valid, 1 on invalid.
   c3-broker release <cwd>
                         Drop the claim on a route bound to <cwd>.
                         (Runtime op against a running broker.)
+  c3-broker install-codex-shim
+                        Symlink the Go Codex launcher into ~/.local/bin and
+                        Node-manager bin directories.
   c3-broker --help      This text.
 `
 
