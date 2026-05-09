@@ -146,13 +146,12 @@ func (a *adapter) hello() error {
 	return nil
 }
 
-// brokerReader runs in a goroutine, draining frames from the broker. Each
-// frame is dispatched by Op:
-//   - OpInbound → translate to notifications/claude/channel and emit via mcp.Notify
-//   - OpToolResult → resolve the matching pending entry
-//   - OpAttached / OpTopicsList → relayed to whichever handler is awaiting
-//   - OpError → log
+// brokerReader runs in a goroutine, draining frames from the broker. On
+// read error, attempts ONE reconnect before giving up. Pending tool calls
+// are woken with an error during the reconnect window so callers don't
+// hang. Spec §4.4 "reconnect once" semantics.
 func (a *adapter) brokerReader() {
+	reconnected := false
 	for {
 		conn := a.currentConn()
 		if conn == nil {
@@ -160,7 +159,18 @@ func (a *adapter) brokerReader() {
 		}
 		raw, err := conn.ReadFrame()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "c3-claude-adapter: broker read: %v\n", err)
+			if !reconnected {
+				reconnected = true
+				fmt.Fprintf(os.Stderr, "c3-claude-adapter: broker read err: %v — reconnecting once\n", err)
+				if rerr := a.reconnectBroker(); rerr != nil {
+					fmt.Fprintf(os.Stderr, "c3-claude-adapter: reconnect failed: %v\n", rerr)
+					a.wakePendingWithErr("broker disconnected: " + err.Error())
+					return
+				}
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "c3-claude-adapter: broker read err after reconnect: %v\n", err)
+			a.wakePendingWithErr("broker disconnected after retry")
 			return
 		}
 		op, err := ipc.PeekOp(raw)
@@ -180,6 +190,39 @@ func (a *adapter) brokerReader() {
 			var errMsg ipc.ErrorMsg
 			_ = json.Unmarshal(raw, &errMsg)
 			fmt.Fprintf(os.Stderr, "c3-claude-adapter: broker error: %s\n", errMsg.Err)
+		}
+	}
+}
+
+// reconnectBroker tears down the dead conn, dials a fresh one, sends hello.
+// Pending tool calls are woken with an error so callers don't hang during
+// the reconnect window.
+func (a *adapter) reconnectBroker() error {
+	a.wakePendingWithErr("broker reconnect — request canceled")
+
+	a.bmu.Lock()
+	if a.conn != nil {
+		_ = a.conn.Close()
+		a.conn = nil
+	}
+	a.bmu.Unlock()
+
+	if err := a.connectBroker(); err != nil {
+		return err
+	}
+	return a.hello()
+}
+
+// wakePendingWithErr resolves every pending entry with an error.
+func (a *adapter) wakePendingWithErr(msg string) {
+	a.pmu.Lock()
+	pending := a.pending
+	a.pending = map[string]chan ipc.ToolResultMsg{}
+	a.pmu.Unlock()
+	for _, ch := range pending {
+		select {
+		case ch <- ipc.ToolResultMsg{Error: &ipc.ErrorPayload{Code: -32000, Message: msg}}:
+		default:
 		}
 	}
 }

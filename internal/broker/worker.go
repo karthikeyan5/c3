@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -40,6 +41,10 @@ type OutboundResult struct {
 
 // RouteWorker is the per-route serial executor (spec §4.2.0). One goroutine
 // owns inbound pipeline + outbound channel calls + per-route mutable state.
+//
+// Inbound debouncing: spec §7.3 — buffer up to debounceMax messages or
+// debounceWindow time, whichever comes first, then forward as a single
+// merged Inbound (concatenated text, latest message_id, sum of attachments).
 type RouteWorker struct {
 	key     RouteKey
 	queue   chan Job
@@ -51,11 +56,14 @@ type RouteWorker struct {
 	stopped bool
 }
 
+// debounceWindow / debounceMax defaults from spec §7.3 + §6.
+const (
+	defaultDebounceWindow  = 1500 * time.Millisecond
+	defaultDebounceMaxMsgs = 50
+)
+
 // newRouteWorker starts a worker that runs until ctx is canceled OR no jobs
-// arrive within `idle`. Caller observes Done() for completion.
-//
-// broker may be nil for unit tests that exercise idle/stop/release behavior
-// without depending on broker state.
+// arrive within `idle`. broker may be nil in unit tests.
 func newRouteWorker(parent context.Context, key RouteKey, idle time.Duration, broker *Broker) *RouteWorker {
 	ctx, cancel := context.WithCancel(parent)
 	w := &RouteWorker{
@@ -72,61 +80,103 @@ func newRouteWorker(parent context.Context, key RouteKey, idle time.Duration, br
 
 func (w *RouteWorker) run(ctx context.Context) {
 	defer close(w.done)
-	timer := time.NewTimer(w.idle)
-	defer timer.Stop()
+	idleTimer := time.NewTimer(w.idle)
+	defer idleTimer.Stop()
 
-	for {
-		if !timer.Stop() {
+	var debBuf []*c3types.Inbound
+	var debTimer *time.Timer
+	var debC <-chan time.Time
+
+	flushDeb := func() {
+		if len(debBuf) > 0 {
+			w.flushInbounds(ctx, debBuf)
+			debBuf = nil
+		}
+		if debTimer != nil {
+			debTimer.Stop()
+			debTimer = nil
+		}
+		debC = nil
+	}
+
+	stopIdle := func() {
+		if !idleTimer.Stop() {
 			select {
-			case <-timer.C:
+			case <-idleTimer.C:
 			default:
 			}
 		}
-		timer.Reset(w.idle)
+	}
+
+	for {
+		stopIdle()
+		idleTimer.Reset(w.idle)
 
 		select {
 		case <-ctx.Done():
+			flushDeb()
 			return
-		case <-timer.C:
-			return // idle shutdown
+		case <-idleTimer.C:
+			flushDeb()
+			return
+		case <-debC:
+			flushDeb()
 		case job, ok := <-w.queue:
 			if !ok {
+				flushDeb()
 				return
 			}
-			w.dispatch(ctx, job)
-			if job.Kind == JobRelease {
+			switch job.Kind {
+			case JobInbound:
+				if job.Inbound == nil {
+					continue
+				}
+				debBuf = append(debBuf, job.Inbound)
+				maxMsgs := w.debounceMaxMessages()
+				if len(debBuf) >= maxMsgs {
+					flushDeb()
+					continue
+				}
+				if debTimer == nil {
+					debTimer = time.NewTimer(w.debounceWindow())
+					debC = debTimer.C
+				}
+			case JobOutbound:
+				w.dispatchOutbound(ctx, job.Outbound)
+			case JobRelease:
+				flushDeb()
 				return
 			}
 		}
 	}
 }
 
-// dispatch is the per-job handler. Implements the per-route serial
-// invariant from spec §4.2.0.
-func (w *RouteWorker) dispatch(ctx context.Context, job Job) {
-	switch job.Kind {
-	case JobInbound:
-		w.dispatchInbound(ctx, job.Inbound)
-	case JobOutbound:
-		w.dispatchOutbound(ctx, job.Outbound)
-	case JobRelease:
-		// Run loop sees JobRelease and returns; nothing to dispatch here.
-	}
-}
-
-// dispatchInbound forwards a normalized inbound to the claimed stub, or fires
-// the cooldown-fallback reply if the route is unclaimed. Plugin chain runs
-// per spec §4.5.1: OnVoiceReceived (substitutes Inbound.Text) before
-// OnInbound (transforms / drops).
-func (w *RouteWorker) dispatchInbound(ctx context.Context, in *c3types.Inbound) {
-	if w.broker == nil || in == nil {
+// flushInbounds runs the plugin pipeline + forwards a debounce-collapsed
+// batch as a single ipc.OpInbound.
+//
+// Merge rules (spec §7.3):
+//   - Text: each inbound's text joined with "\n", in arrival order. Voice
+//     STT (OnVoiceReceived) runs per-inbound BEFORE merge so transcripts
+//     land in the right order.
+//   - MessageID: latest in the batch (canonical id for the merged block).
+//   - Timestamp: earliest (when the burst started).
+//   - Sender: from the latest message (most recent author wins; bursts
+//     from a single user are the common case).
+//   - ReplyTo: from the FIRST message that has one (only one quote-reply
+//     attribution per merged block — agent sees the original anchor).
+//   - Attachments: concatenated in order — agent sees all media.
+//   - OnInbound chain runs ONCE on the merged Inbound, not per-message.
+func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inbound) {
+	if w.broker == nil || len(batch) == 0 {
 		return
 	}
 
-	// Plugin pipeline.
+	// Per-inbound STT substitution.
 	if w.broker.Plugins != nil {
-		// 1. STT for voice attachments.
-		if hasVoice(in) {
+		for _, in := range batch {
+			if !hasVoice(in) {
+				continue
+			}
 			payload := c3types.VoicePayload{
 				Channel:   in.Channel,
 				ChatID:    in.ChatID,
@@ -137,30 +187,67 @@ func (w *RouteWorker) dispatchInbound(ctx context.Context, in *c3types.Inbound) 
 				Size:      in.Attachments[0].Size,
 			}
 			if transcript := w.broker.Plugins.FireOnVoiceReceived(ctx, payload); transcript != "" {
-				prefix := w.sttPrefix(in.Channel)
-				in.Text = prefix + transcript
+				in.Text = w.sttPrefix(in.Channel) + transcript
 			}
 		}
-		// 2. OnInbound chain.
-		next := w.broker.Plugins.FireOnInbound(ctx, in)
-		if next == nil {
-			return // a plugin dropped the inbound
-		}
-		in = next
 	}
 
+	// Merge.
+	merged := mergeBatch(batch)
+
+	// OnInbound chain on the merged inbound.
+	if w.broker.Plugins != nil {
+		next := w.broker.Plugins.FireOnInbound(ctx, merged)
+		if next == nil {
+			return // dropped
+		}
+		merged = next
+	}
+
+	w.forwardOrFallback(ctx, merged)
+}
+
+// mergeBatch collapses a batch of inbounds into one. See flushInbounds for
+// the merge rules. Single-element batches return the element unchanged.
+func mergeBatch(batch []*c3types.Inbound) *c3types.Inbound {
+	if len(batch) == 1 {
+		return batch[0]
+	}
+	last := batch[len(batch)-1]
+	out := &c3types.Inbound{
+		Channel:   last.Channel,
+		ChatID:    last.ChatID,
+		TopicID:   last.TopicID,
+		MessageID: last.MessageID,
+		Sender:    last.Sender,
+		Timestamp: batch[0].Timestamp,
+	}
+	var texts []string
+	for _, in := range batch {
+		if in.Text != "" {
+			texts = append(texts, in.Text)
+		}
+		out.Attachments = append(out.Attachments, in.Attachments...)
+		if out.ReplyTo == nil && in.ReplyTo != nil {
+			out.ReplyTo = in.ReplyTo
+		}
+	}
+	out.Text = strings.Join(texts, "\n")
+	return out
+}
+
+// forwardOrFallback is the post-pipeline delivery: claimed stub or
+// cooldown-fallback reply.
+func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound) {
 	holder, claimed := w.broker.Routes.Holder(w.key)
 	if claimed {
-		// Forward to the claimed stub.
 		conn, ok := holder.Conn.(*ipc.Conn)
 		if !ok {
-			return // stub didn't store an *ipc.Conn — shouldn't happen
+			return
 		}
 		_ = conn.WriteJSON(ipc.InboundMsg{Op: ipc.OpInbound, Inbound: *in})
 		return
 	}
-
-	// No claim → cooldown-fallback.
 	if !w.broker.Fallbacks.ShouldSend(w.key) {
 		return
 	}
@@ -174,17 +261,12 @@ func (w *RouteWorker) dispatchInbound(ctx context.Context, in *c3types.Inbound) 
 		TopicID: in.TopicID,
 		Text:    fallbackText,
 	}
-	if _, err := ch.SendReply(args); err != nil {
-		// Don't reset the cooldown on failure — Telegram could be down. Just
-		// drop and let the next inbound try again after the window.
-		return
-	}
+	_, _ = ch.SendReply(args)
 }
 
 // dispatchOutbound translates an OutboundJob into a channel call, returning
-// the result via job.ResultCh. The channel is resolved from the worker's
-// route key (which carries the channel name).
-func (w *RouteWorker) dispatchOutbound(ctx context.Context, job *OutboundJob) {
+// the result via job.ResultCh.
+func (w *RouteWorker) dispatchOutbound(_ context.Context, job *OutboundJob) {
 	if job == nil || job.ResultCh == nil {
 		return
 	}
@@ -233,20 +315,16 @@ func (w *RouteWorker) Stop() {
 // Done returns a channel that closes when the worker has exited.
 func (w *RouteWorker) Done() <-chan struct{} { return w.done }
 
-// errOutboundNotImpl is returned when the worker has no broker (test-only path).
 var errOutboundNotImpl = workerErr("worker has no broker reference")
 
 type workerErr string
 
 func (e workerErr) Error() string { return string(e) }
 
-// hasVoice returns true when the inbound's first attachment is a voice clip.
 func hasVoice(in *c3types.Inbound) bool {
 	return len(in.Attachments) > 0 && in.Attachments[0].Kind == "voice"
 }
 
-// sttPrefix returns the configured STT prefix for the channel, falling back
-// to "[Transcribed voice]: " (the spec §4.3 default).
 func (w *RouteWorker) sttPrefix(chanName string) string {
 	if w.broker == nil || w.broker.Mappings == nil {
 		return "[Transcribed voice]: "
@@ -256,4 +334,26 @@ func (w *RouteWorker) sttPrefix(chanName string) string {
 		return "[Transcribed voice]: "
 	}
 	return cc.STTPrefix
+}
+
+func (w *RouteWorker) debounceWindow() time.Duration {
+	if w.broker == nil || w.broker.Mappings == nil {
+		return defaultDebounceWindow
+	}
+	cc, ok := w.broker.Mappings.Channels[w.key.Channel]
+	if !ok || cc.DebounceMS <= 0 {
+		return defaultDebounceWindow
+	}
+	return time.Duration(cc.DebounceMS) * time.Millisecond
+}
+
+func (w *RouteWorker) debounceMaxMessages() int {
+	if w.broker == nil || w.broker.Mappings == nil {
+		return defaultDebounceMaxMsgs
+	}
+	cc, ok := w.broker.Mappings.Channels[w.key.Channel]
+	if !ok || cc.DebounceMaxMessages <= 0 {
+		return defaultDebounceMaxMsgs
+	}
+	return cc.DebounceMaxMessages
 }
