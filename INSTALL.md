@@ -1,215 +1,212 @@
-# Installing C3 on a new machine
+# Install C3
 
-**What you end up with:** a running C3 broker daemon and Claude Code sessions whose Telegram MCP plugin routes messages to it. Starting `claude` inside `~/arogara/<project>/` auto-attaches that session to the matching forum topic.
+> **For human users:** open a Claude Code session in any directory and paste:
+>
+>     follow https://github.com/karthikeyan5/c3/blob/main/INSTALL.md to install c3
+>
+> (or `follow /path/to/local/c3/INSTALL.md` if you've cloned locally)
+>
+> The agent does everything below. You'll only be asked for your Telegram
+> bot token and chat ids during step 5.
 
-## The working version
+> **For Claude Code (or any) agent reading this:** you are installing C3 for
+> the user. Execute the numbered steps in order. Surface errors verbatim and
+> stop on first failure. Don't paraphrase commands — run them exactly. Every
+> step is idempotent (safe to re-run).
 
-The working implementation is [`mvp/`](mvp/) — Python wrapper over the official `claude-plugins-official/telegram` bun plugin. Every path below refers to files under `mvp/` unless noted otherwise.
+---
 
-The rest of this repo (`README.md`, `TODO.md`, `DECISIONS.md`, and the Go rewrite plan in `RESUME.md`) is design history. For setup, ignore it — the Python MVP is what ships and is what the author's own machine runs through.
+## 1. Verify Go is installed
 
-## Prerequisites
-
-- **Python 3.11+** — stdlib only for the broker/stub; no `pip install` for C3 itself. STT providers may want extras (`requests`, etc.) — see `mvp/stt/stt-pkg/README.md`.
-- **bun** — the JS runtime for the upstream Anthropic plugin's `server.ts`. Install: https://bun.sh
-- **Claude Code CLI** — installed and logged in. Verify with `claude --version`.
-- **A Telegram bot** — chat with `@BotFather` → `/newbot` → grab the `HTTP API` token.
-- **Your Telegram user id** — send any message to `@userinfobot` and note the `Id:` number.
-
-## One-time setup
-
-### 1. Clone the repo
-
-Pick a stable path — `topics.json` and the plugin's `.mcp.json` (both install-specific, gitignored, see steps 5 and 5b) bake in absolute paths derived from this clone location, so moving the tree later means re-editing them.
-
-```
-mkdir -p ~/arogara
-git clone <repo-url> ~/arogara/c3
+```bash
+go version
 ```
 
-### 2. Install the upstream Anthropic Telegram plugin
+If "command not found": tell the user to install Go ≥1.22 from
+https://go.dev/dl/, then re-run this install. Stop.
 
-Inside Claude Code:
+If the printed version is older than 1.22: tell the user to upgrade Go
+and re-run. Stop.
 
-```
-/plugin marketplace add claude-plugins-official
-/plugin install telegram@claude-plugins-official
-```
+## 2. Detect existing Python C3 broker (cutover case only)
 
-This pulls `server.ts` into `~/.claude/plugins/cache/claude-plugins-official/telegram/<version>/`. `mvp/patch_server.py` applies the 7 C3 patches to that file idempotently every time the broker starts — you never run the patcher by hand.
+If the user previously ran the Python POC under `~/arogara/c3/mvp`, that
+broker may still hold the Telegram bot's `getUpdates` poller. Two pollers
+on the same bot = 409 Conflict; the new Go broker can't run alongside.
 
-### 3. Configure the bot token
+Detect:
 
-```
-mkdir -p ~/.claude/channels/telegram
-cat > ~/.claude/channels/telegram/.env <<'EOF'
-TELEGRAM_BOT_TOKEN=<paste token here>
-EOF
-chmod 600 ~/.claude/channels/telegram/.env
+```bash
+pgrep -fa 'mvp/broker.py' || true
 ```
 
-### 4. Bootstrap `access.json`
+If pgrep prints a pid, ask the user:
 
-Allowlist yourself as the only DM-eligible user (adjust `<your-user-id>`):
+> "I found the old Python C3 broker running (pid \<X\>). To switch to the
+> Go version I need to stop it — Telegram only allows one bot poller at a
+> time. Stop it now? [yes/no]"
 
-```
-cat > ~/.claude/channels/telegram/access.json <<'EOF'
-{
-  "dmPolicy": "allowlist",
-  "allowFrom": ["<your-user-id>"],
-  "groups": {},
-  "pending": {}
-}
-EOF
-chmod 600 ~/.claude/channels/telegram/access.json
+Only proceed on explicit "yes". Then:
+
+```bash
+pkill -f 'mvp/broker.py'
+sleep 1
+pgrep -fa 'mvp/broker.py' && echo "WARNING: still running" || echo "Python broker stopped."
 ```
 
-Group approvals come later via `mvp/approve_group.py`.
+If still running, tell the user the pid and ask them to kill it manually.
 
-### 5. Create the C3 plugin's `.mcp.json` from the template
+## 3. Add the marketplace and install the plugin
 
-The plugin's MCP config is install-specific (it bakes in an absolute path
-to your clone) and is gitignored. Copy the template and edit:
+These are slash commands the USER runs in their Claude Code session. Tell
+the user:
 
-```
-cp ~/arogara/c3/plugin/plugins/c3-telegram/.mcp.json.example \
-   ~/arogara/c3/plugin/plugins/c3-telegram/.mcp.json
-```
+> "Run these three slash commands in this session, then tell me when
+> they're done:
+>
+>     /plugin marketplace add karthikeyan5/c3
+>     /plugin install c3@c3
+>     /reload-plugins
+>
+> (For local installs replace `karthikeyan5/c3` with the absolute path
+> to the cloned repo.)"
 
-Then open `.mcp.json` and replace `<ABSOLUTE-PATH-TO-c3-CLONE>` with the
-full path to your clone — e.g. `/home/you/arogara/c3`. `~` does not expand
-in `.mcp.json`.
+Wait for the user to confirm completion.
 
-### 5b. Create `mvp/config.json` from the template
+## 4. Build the binaries
 
-`config.json` pins the Telegram group new topics get created in. Required
-on every install — without it the broker silently creates topics in the
-wrong group as soon as it has ever seen more than one. Gitignored.
+The plugin shipped Go source, not pre-built binaries.
 
-```
-cp ~/arogara/c3/mvp/config.json.example ~/arogara/c3/mvp/config.json
-```
-
-You can leave the placeholder `-100XXXXXXXXXX` in place for now; you'll
-fill in the real `group_chat_id` after you approve your first group (see
-`mvp/README.md` → **Pin the active group**). The broker re-reads
-`config.json` on every `attach_auto` call, so no restart is needed when
-you edit it.
-
-`dm_chat_id` is optional but lets `attach(target='dm')` resolve to your
-personal 1-on-1 Telegram chat. Set it to your own Telegram user id
-(positive integer — DM @userinfobot to find it). Without it,
-`attach(target='dm')` returns an error asking you to set it. The stub
-reads `dm_chat_id` once at startup, so a Claude Code restart is needed
-after changing it.
-
-### 6. Install the C3 plugin from this repo's marketplace
-
-Inside Claude Code:
-
-```
-/plugin marketplace add ~/arogara/c3/plugin
-/plugin install c3-telegram@c3
+```bash
+PLUGIN_ROOT=$(ls -d ~/.claude/plugins/cache/*/c3 2>/dev/null | head -1)
+if [ -z "$PLUGIN_ROOT" ]; then
+  echo "ERROR: c3 plugin not found in ~/.claude/plugins/cache — did step 3 complete?"
+  exit 1
+fi
+SRC_ROOT=$(cd "$PLUGIN_ROOT/../.." && pwd)
+if [ ! -f "$SRC_ROOT/go.mod" ]; then
+  echo "ERROR: no go.mod at $SRC_ROOT"
+  exit 1
+fi
+echo "Building from $SRC_ROOT (1–3 minutes on first run)..."
+cd "$SRC_ROOT" && go install ./cmd/...
 ```
 
-### 7. Disable the upstream Telegram plugin
+Then verify:
 
-C3 needs the upstream plugin's `server.ts` *file* (the broker spawns it
-directly and applies patches to it on every startup) — but it must not
-also have the upstream plugin's MCP server registered in Claude Code.
-Both polling `getUpdates` against the same bot token at once gives you
-the `409 Conflict` error from the troubleshooting section; it's the
-single most common way a fresh install silently half-works.
-
-Inside Claude Code, open `/plugin`, pick `telegram@claude-plugins-official`,
-and disable it. Leave `c3-telegram@c3` enabled — that's the one that
-routes through the broker.
-
-**Make sure the disable persists.** `/plugin` sometimes only flips state
-in-memory for the current session. Check `~/.claude/settings.json` —
-`enabledPlugins` should read:
-
-```json
-"enabledPlugins": {
-  "telegram@claude-plugins-official": false,
-  "c3-telegram@c3": true
-}
+```bash
+GOBIN_DIR=$(go env GOBIN)
+[ -z "$GOBIN_DIR" ] && GOBIN_DIR=$(go env GOPATH)/bin
+echo "Binaries installed to: $GOBIN_DIR"
+for bin in c3-broker c3-claude-adapter c3-codex-adapter migrate-legacy; do
+  if [ -x "$GOBIN_DIR/$bin" ]; then
+    echo "  ✓ $bin"
+  else
+    echo "  ✗ $bin (missing)"
+  fi
+done
+command -v c3-broker >/dev/null || echo "WARNING: $GOBIN_DIR is not on \$PATH"
 ```
 
-If the upstream line is still `true` or missing, edit it by hand. A
-session that re-enables it on next launch will immediately start racing
-the broker again.
+If `c3-broker` isn't on PATH, tell the user:
 
-Verify: `/mcp` should list exactly one Telegram-related MCP server
-(from `c3-telegram`) once plugins reload. The upstream plugin's cached
-files under `~/.claude/plugins/cache/claude-plugins-official/telegram/`
-stay on disk — that's intentional; the broker still reads `server.ts`
-from there.
+> "Add `<GOBIN_DIR>` to your `$PATH` by appending this to your shell rc
+> (`~/.zshrc` or `~/.bashrc`):
+>
+>     export PATH=\"<GOBIN_DIR>:$PATH\"
+>
+> Open a new terminal and re-run this install to verify."
 
-### 7b. Opt in to channel notifications
+…and stop.
 
-Inbound Telegram messages arrive in your session as `<channel>` blocks
-via the MCP `notifications/claude/channel` mechanism. Claude Code gates
-this behind an off-by-default setting. Add to `~/.claude/settings.json`:
+## 5. Configure C3
 
-```json
-"channelsEnabled": true
+Branch on existing config:
+
+### 5a. Migrate from Python POC (preferred when applicable)
+
+If `~/.claude/channels/telegram/.env` exists AND `~/.config/c3/mappings.json`
+does NOT exist, migrate:
+
+```bash
+if [ -f ~/.claude/channels/telegram/.env ] && [ ! -f ~/.config/c3/mappings.json ]; then
+  migrate-legacy \
+    --env=$HOME/.claude/channels/telegram/.env \
+    --config=$HOME/arogara/c3/mvp/config.json \
+    --out=$HOME/.config/c3/mappings.json
+fi
 ```
-
-Without this, the broker still receives messages and the stub still
-forwards the JSON-RPC notifications — but Claude Code drops them on the
-floor instead of rendering them. Symptom: `/tmp/c3-stub.log` shows
-`op=inbound` entries, yet your session stays silent.
-
-### 8. (Optional) Add STT keys for voice transcription
-
-```
-# file: ~/.claude/stt.env
-GEMINI_API_KEY=...
-SARVAM_API_KEY=...
-# or ELEVENLABS_API_KEY=...
-```
-
-Providers chain in order — default is `gemini,sarvam`. See `mvp/stt/stt-pkg/README.md`.
-
-### 9. First run
-
-```
-cd ~/arogara/c3 && claude
-```
-
-What should happen:
-
-1. The stub starts, sees `/tmp/c3.sock` is absent, spawns `broker.py` detached (`c3-stub: spawned broker ...; waiting for socket` on stderr).
-2. Broker acquires the flock on `/tmp/c3-broker.pid`, applies patches to `server.ts`, starts bun, installs STT symlinks.
-3. bun logs `telegram channel: polling as @YourBot`.
-4. Stub's `infer_topic_name()` sees `pwd` is `~/arogara/c3`, calls `attach_auto(name='c3')` — broker creates the forum topic in your Telegram group if missing.
-5. Claude Code takes over.
 
 Verify:
 
-```
-pgrep -af 'broker.py|bun server'
-# one of each, broker's child is bun
-
-ls -la /tmp/c3.sock /tmp/c3-broker.pid
-# socket + pid file
-
-readlink ~/.claude/channels/telegram/stt-handler.py
-# -> ~/arogara/c3/mvp/stt/stt-handler.py
+```bash
+[ -f ~/.config/c3/mappings.json ] && echo "Config exists." || echo "Config missing — run 5b."
 ```
 
-Logs: `/tmp/c3b.log` (broker stderr + bun output), `/tmp/c3-stub.log` (stub ops). Both are tmpfs; they reset on reboot.
+If migration ran successfully, skip to step 6.
 
-## After setup
+### 5b. Fresh setup (no prior Python POC)
 
-Ongoing operations (adding groups, creating topics, renaming, attaching) are covered in `mvp/README.md` under **Lifecycle: onboarding a new group or topic**.
+If no prior config exists, run interactive setup:
 
-## Troubleshooting
+```bash
+c3-broker setup
+```
 
-- **`bun server.ts` exits with 409 Conflict** — another `getUpdates` consumer holds the token (typically the stock Anthropic Telegram plugin running outside C3). Stop it, then restart the broker.
-- **MCP plugin disconnects after reboot** — expected; `/tmp` is tmpfs. Start any fresh `claude` session and the stub will auto-spawn a new broker.
-- **`c3-broker: another broker already holds /tmp/c3-broker.pid; exiting`** — another broker is live. `pgrep -af broker.py` to find it. `flock` auto-releases on process exit.
-- **`PATCH BROKEN — <id>`** — upstream refactored `server.ts`. Read `mvp/PATCH_SPEC.md` for the patch's **Purpose / Final behavior / Detection**, then update the anchor/replacement in `mvp/patch_server.py`. A pristine upstream copy lives at `server.ts.c3-backup` next to the patched file.
-- **Group messages silently don't arrive** — the group isn't in `access.json.groups`. Run `python3 ~/arogara/c3/mvp/approve_group.py '<t.me/c/...-url>'`.
-- **Stub exits immediately with `cannot reach broker`** — broker failed to bind or crashed. Read `/tmp/c3b.log` for the actual error (token invalid, port in use, etc.).
+This prompts on stdin for:
+- Telegram bot token (from `@BotFather`)
+- DM chat id (their Telegram user id; positive int — `@userinfobot` provides it)
+- Default group name (e.g. "main")
+- That group's chat id (negative `-100…`)
+
+It validates the token via Telegram `getMe` BEFORE writing. On 401 or
+network failure it refuses to write and surfaces the actual error.
+
+Tell the user to follow the interactive prompts.
+
+### 5c. Existing Go config
+
+If `~/.config/c3/mappings.json` already exists, do nothing here. Tell the
+user:
+
+> "Existing Go config at `~/.config/c3/mappings.json` — keeping it. Run
+> `c3-broker setup` manually if you want to overwrite (it asks before
+> overwriting)."
+
+## 6. Verify
+
+```bash
+c3-broker validate
+c3-broker status
+```
+
+`validate` exits 0 on a parseable + valid mappings.json. `status` reports
+broker liveness, socket path, channels, plugin states. The broker won't
+be running yet — that's fine; the next CLI session will spawn it.
+
+## 7. Tell the user the install is complete
+
+> "Installation complete.
+>
+> **Restart this Claude Code session** — the current one still binds to the
+> previous MCP setup. In your next session, in any project directory, type
+> `attach` and confirm the proposal — the broker will create a Telegram
+> topic named after that directory.
+>
+> Useful slash commands going forward:
+>   `/c3-status`  — health check
+>   `/c3-setup`   — re-run setup (overwrites config)
+>   `/c3-build`   — rebuild after `git pull` in the source dir
+>
+> Day-to-day guide: `docs/USAGE.md`."
+
+End.
+
+---
+
+## Manual install (without an agent)
+
+The same steps run by hand work fine — copy each shell block above into a
+terminal. The only interactive step is `c3-broker setup` which prompts on
+stdin. See [`docs/INSTALL.md`](docs/INSTALL.md) for a more verbose
+human-targeted version.
