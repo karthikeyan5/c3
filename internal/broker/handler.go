@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net"
 
 	"github.com/karthikeyan5/c3/internal/ipc"
@@ -31,9 +32,37 @@ func (b *Broker) HandleConn(nc net.Conn) {
 		return
 	}
 
-	stub := b.Stubs.Register(hello.CLI, hello.PID, hello.CWD, conn)
+	// Reconnect detection: if we have a disconnected stub for the same
+	// (CLI, PID, CWD), this is the same adapter coming back after a brief
+	// drop. Transfer its claims to a fresh ConnID instead of registering a
+	// new stub and racing the original's claims. Per the "broker is the
+	// authority" principle, claims survive conn drops as long as PID lives.
+	var stub *Stub
+	if existing := b.Routes.FindByLogicalSession(hello.CLI, hello.PID, hello.CWD); existing != nil {
+		stub = b.Stubs.Register(hello.CLI, hello.PID, hello.CWD, conn)
+		oldConnID := existing.ConnID
+		// Unregister the OLD stub (now superseded) and transfer its claims.
+		b.Stubs.Unregister(oldConnID)
+		b.Routes.TransferAllByConnID(oldConnID, stub)
+		log.Printf("hello: RECONNECT cli=%s pid=%d cwd=%q old-conn=%d new-conn=%d (claims transferred)",
+			hello.CLI, hello.PID, hello.CWD, oldConnID, stub.ConnID)
+	} else {
+		stub = b.Stubs.Register(hello.CLI, hello.PID, hello.CWD, conn)
+		log.Printf("hello: NEW cli=%s pid=%d cwd=%q conn=%d",
+			hello.CLI, hello.PID, hello.CWD, stub.ConnID)
+	}
+
+	// Defer: mark the stub as disconnected (NOT release its claims).
+	// Claims persist until either:
+	//   - the same logical session (CLI+PID+CWD) reconnects and transfers,
+	//   - or another session attempts to claim and the broker confirms this
+	//     PID is no longer alive (Routes.Claim's DISPLACE path).
+	defer func() {
+		stub.MarkDisconnected()
+		log.Printf("conn-drop: cli=%s pid=%d cwd=%q conn=%d (claims preserved while pid alive)",
+			stub.CLI, stub.PID, stub.CWD, stub.ConnID)
+	}()
 	defer b.Stubs.Unregister(stub.ConnID)
-	defer b.Routes.ReleaseAllByConnID(stub.ConnID)
 
 	ack := ipc.HelloAckMsg{Op: ipc.OpHelloAck, ConnID: stub.ConnID}
 	if len(b.Mappings.Channels) == 0 {
