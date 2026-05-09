@@ -328,16 +328,31 @@ func (a *adapter) handleInbound(raw []byte) {
 }
 
 // buildClaudeChannelFrame converts a c3types.Inbound into the params for
-// notifications/claude/channel. All meta values are stringified per spec §6.1.
+// notifications/claude/channel.
+//
+// Shape MUST match the official Telegram plugin's frame
+// (~/.claude/plugins/cache/claude-plugins-official/telegram/0.0.6/server.ts
+// around line 978) — Claude Code silently drops malformed channel
+// notifications. Cross-checked 2026-05-09:
+//   - `content` is a STRING, not an array of MCP-style content blocks. We
+//     had it as the array shape originally and Claude Code dropped every
+//     inbound on the floor (broker logged "delivered", user saw nothing).
+//   - `chat_id` is a raw int64; everything else (ids, sizes) is stringified.
+//   - `message_thread_id` only present when non-nil; same for the optional
+//     attachment / reply_to fields.
 func buildClaudeChannelFrame(in *c3types.Inbound) map[string]any {
 	meta := map[string]any{
-		"source":     in.Channel,
-		"chat_id":    strconv.FormatInt(in.ChatID, 10),
-		"message_id": strconv.FormatInt(in.MessageID, 10),
-		"ts":         in.Timestamp.Format("2006-01-02T15:04:05.000Z"),
+		"source":  in.Channel,
+		"chat_id": in.ChatID, // raw int — matches official plugin
+		"ts":      in.Timestamp.Format("2006-01-02T15:04:05.000Z"),
+	}
+	if in.MessageID != 0 {
+		meta["message_id"] = strconv.FormatInt(in.MessageID, 10)
 	}
 	if in.Sender.Username != "" {
 		meta["user"] = in.Sender.Username
+	} else if in.Sender.UserID != 0 {
+		meta["user"] = strconv.FormatInt(in.Sender.UserID, 10)
 	}
 	if in.Sender.UserID != 0 {
 		meta["user_id"] = strconv.FormatInt(in.Sender.UserID, 10)
@@ -370,6 +385,9 @@ func buildClaudeChannelFrame(in *c3types.Inbound) map[string]any {
 		if att.MIME != "" {
 			meta["attachment_mime"] = att.MIME
 		}
+		if att.Name != "" {
+			meta["attachment_name"] = att.Name
+		}
 	}
 
 	text := in.Text
@@ -381,10 +399,8 @@ func buildClaudeChannelFrame(in *c3types.Inbound) map[string]any {
 	}
 
 	return map[string]any{
-		"content": []map[string]any{
-			{"type": "text", "text": text},
-		},
-		"meta": meta,
+		"content": text, // STRING — matches official plugin shape
+		"meta":    meta,
 	}
 }
 
