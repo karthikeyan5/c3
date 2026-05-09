@@ -1,43 +1,24 @@
 {
-  "phase": "phase-4b-pending",
+  "phase": "v0.1.0-functionally-complete",
   "spec_locked": true,
   "spec_locked_at": "2026-05-09T00:30:00Z",
   "build": {
-    "phases_completed": [
-      {"phase": 1, "summary": "Repo skeleton", "commits": ["61551e5", "830ede0", "6af2de4"]},
-      {"phase": 2, "summary": "Mappings registry + migration", "commits": ["68b55e0", "80a552a", "e311187", "0a4e5e6", "88379b1", "8939f80"]},
-      {"phase": 3, "summary": "Broker core + IPC; live broker daemon works", "commits": ["88cf087", "ad26a41", "4c4defd", "286fb40", "391ad4f", "05b0304", "8a7bc50", "d997cda", "c204873"]},
-      {"phase": "4A", "summary": "Channel + plugin.Host interfaces + per-route worker substrate. c3types/channel/plugin packages, RouteWorker, WorkerPool, Broker.Shutdown.", "commits": ["f4aafa9 (plan)", "4d8b8f9", "9e16b45", "76bd5b2"], "self_review": "Substrate for Plan 4B (Telegram) and Plan 5 (plugin host concrete impl) in place. Channel interface and plugin.Host interface declared. RouteWorker idle-timeout/stop/release-exit all tested. WorkerPool lazy-spawn + reap. Worker dispatch stubbed; real wiring deferred. 72 tests pass."}
+    "complete": [
+      {"phase": 1, "summary": "Repo skeleton (go.mod, cmd/, internal/, Makefile)"},
+      {"phase": 2, "summary": "Mappings registry + migrate-legacy (27 tests)"},
+      {"phase": 3, "summary": "Broker core + IPC; live daemon (27 broker/ipc tests)"},
+      {"phase": "4A", "summary": "Channel/Host interfaces + RouteWorker + WorkerPool"},
+      {"phase": "4B", "summary": "Telegram channel cleanroom Go (gotgbot/v2 rc.34): outbound tools, getUpdates polling, inbound conversion, OpToolCall + cooldown-fallback, attach proposal flow (8 tests), debounce + mergeBatch (7 tests), reconnect-once on adapter"},
+      {"phase": 5, "summary": "Plugin host concrete impl + STT plugin (shells out to ~/.claude/channels/telegram/stt-handler.py)"},
+      {"phase": 6, "summary": "Claude Code MCP adapter — END-TO-END LIVE: MCP exchange verified, broker auto-spawn, 7 tools, notifications/claude/channel manual framing"},
+      {"phase": 9, "summary": "Install plumbing — marketplace.json, plugin.json, .mcp.json, /c3-build /c3-setup /c3-status slash commands, c3-broker subcommands (setup/status/validate)"},
+      {"phase": 10, "summary": "Doc pass — D009/D010 added, April deviation banners retired, README points at Go binaries"}
     ],
-    "phase_4b_progress": {
-      "scaffold": {"status": "done", "commit": "22fbcc6"},
-      "outbound_tools": {"status": "done", "commit": "433311a", "tools": ["SendReply", "SendTyping", "EditMessage", "React", "DownloadAttachment", "CreateTopic", "ValidateTopic"]},
-      "polling_and_inbound": {"status": "done", "commit": "c356984", "details": "getUpdates loop with allowed_updates and exponential backoff; inbound conversion for text/voice/photo/document/audio/video/video_note/sticker; ReplyContext from reply_to_message; service messages dropped (forum_topic_*, chat metadata events); 7 unit tests."},
-      "wiring": {"status": "done", "commit": "261cca0"},
-      "attach_proposal_flow": {"status": "done", "commit": "be43397", "details": "8 unit tests with fakeChannel: DM, name in default group (silent claim), name in other group (proposes use_existing_other_group + Alternative), unknown name (proposes create), create=true (calls channel.CreateTopic + persists), topic_id (validates + registers placeholder), saved mapping (silent claim regardless of name search), already-claimed (returns holder-identifying error). Persists mappings.json atomically on every successful attach via SaveMappings()."},
-      "remaining": [
-        "Debounce window (small)."
-      ]
-    },
-    "phase_5_stt_plugin": {
-      "status": "DONE",
-      "commit": "3f60e6c",
-      "details": "PluginHost concrete impl in broker package; FireOnVoiceReceived runs BEFORE FireOnInbound in worker.dispatchInbound. STT plugin shells out to existing ~/.claude/channels/telegram/stt-handler.py (configurable). Voice messages now get [Transcribed voice]: <text> prefix per spec. Live broker boot logs '[plugin] stt: registered'."
-    },
-    "phase_6_claude_adapter": {
-      "status": "DONE — END-TO-END WORKING",
-      "commit": "72b893c",
-      "details": "MCP stdio server, broker auto-spawn, full dispatch, 7 tools, notifications/claude/channel manual framing per spec §4.4.4. Live MCP exchange verified."
-    },
-    "phase_9_install_plumbing": {
-      "status": "DONE",
-      "commit": "d2ed3e1",
-      "details": "Plugin manifest at .claude-plugin/marketplace.json + plugins/c3/{plugin.json, .mcp.json, commands/c3-build.md, c3-setup.md, c3-status.md}. Broker subcommands: setup (token-validates via getMe before writing), status (read-only health check), validate (parse + Validate). Full first-install flow: /plugin marketplace add karthikeyan5/c3 → /plugin install c3@c3 → /reload-plugins → /c3-build → /c3-setup → restart → attach."
-    },
-    "phase_4a_complete": {
-      "summary": "Channel/Host interfaces + per-route worker substrate. c3types/channel/plugin packages, RouteWorker, WorkerPool, Broker.Shutdown.",
-      "commits": ["f4aafa9 (plan)", "4d8b8f9", "9e16b45", "76bd5b2", "1fc48aa"]
-    }
+    "deferred": [
+      {"plan": 7, "summary": "Codex bridge in Go. D010 records deferral; Python POC continues to work standalone."},
+      {"item": "live Telegram round-trip with new broker", "summary": "Requires user to stop Python broker, start Go broker, send real message. Karthi-side validation."}
+    ]
   },
-  "notes": "Phase 1+2+3+4A complete. Plan 4B is the Telegram channel implementation — first plan that adds an external dependency and significant integration with a third-party API. Will need careful TDD given the live Bot API surface."
+  "summary": "v0.1.0 functionally complete. ~7100 lines of Go, all tests green, ~40 commits in the c3-v3 series. Live broker connects to @OCDWaterBot, MCP exchange verified, voice STT plugin loads handler on boot. User can install via /plugin install c3@c3 → /c3-build → /c3-setup → restart → attach in any project directory.",
+  "loop_status": "All in-scope work done. Plan 7 (Codex) deferred per D010. Karthi-side end-to-end validation against real Telegram bot remains."
 }
