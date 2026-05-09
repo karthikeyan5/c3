@@ -7,7 +7,23 @@ import (
 	"testing"
 )
 
-func TestSocketPath_XDGRuntime(t *testing.T) {
+// Path-resolution invariant (Karthi 2026-05-09): SocketPath() and
+// PidFilePath() MUST live in the same directory and MUST be deterministic
+// across invocations regardless of the calling process's env. Two brokers
+// with different XDG_RUNTIME_DIR ended up on different sockets, both
+// polled Telegram, both 409'd, adapter conns scattered → claims landed on
+// the wrong broker → messages fell to fallback even with valid claims.
+func TestSocketAndPidFile_SameDirectory(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	sock := SocketPath()
+	pid := PidFilePath()
+	if filepath.Dir(sock) != filepath.Dir(pid) {
+		t.Errorf("SocketPath dir %q != PidFilePath dir %q",
+			filepath.Dir(sock), filepath.Dir(pid))
+	}
+}
+
+func TestSocketPath_XDGRuntimeHonored(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", dir)
 	got := SocketPath()
@@ -17,15 +33,20 @@ func TestSocketPath_XDGRuntime(t *testing.T) {
 	}
 }
 
-func TestSocketPath_FallbackPerUID(t *testing.T) {
+func TestSocketPath_NoXDG_FallsBackDeterministically(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv("HOME", t.TempDir()) // make sure HOME is unrelated
 	got := SocketPath()
-	if !strings.HasPrefix(got, "/tmp/c3-") || !strings.HasSuffix(got, ".sock") {
-		t.Errorf("got %q, expected /tmp/c3-<uid>.sock", got)
+	if !strings.HasSuffix(got, "/c3.sock") {
+		t.Errorf("got %q, want path ending in /c3.sock", got)
+	}
+	// Calling twice in the same env must return the same value.
+	if got2 := SocketPath(); got2 != got {
+		t.Errorf("non-deterministic: %q vs %q", got, got2)
 	}
 }
 
-func TestPidFilePath_XDGRuntime(t *testing.T) {
+func TestPidFilePath_XDGRuntimeHonored(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", dir)
 	got := PidFilePath()
@@ -35,14 +56,15 @@ func TestPidFilePath_XDGRuntime(t *testing.T) {
 	}
 }
 
-func TestPidFilePath_FallbackToHomeCacheC3(t *testing.T) {
+func TestPidFilePath_NoXDG_FallsBackDeterministically(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "")
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	t.Setenv("HOME", t.TempDir())
 	got := PidFilePath()
-	want := filepath.Join(home, ".cache", "c3", "c3-broker.pid")
-	if got != want {
-		t.Errorf("got %q, want %q", got, want)
+	if !strings.HasSuffix(got, "/c3-broker.pid") {
+		t.Errorf("got %q, want path ending in /c3-broker.pid", got)
+	}
+	if got2 := PidFilePath(); got2 != got {
+		t.Errorf("non-deterministic: %q vs %q", got, got2)
 	}
 }
 

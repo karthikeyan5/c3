@@ -63,6 +63,17 @@ func (c *Channel) SendReply(args c3types.ReplyArgs) (int64, error) {
 			return firstID, fmt.Errorf("telegram: rate-wait: %w", err)
 		}
 		msg, err := c.bot.SendMessage(args.ChatID, chunk, opts)
+		if err != nil && autoHTML && isParseEntityError(err) {
+			// Plaintext fallback (per OpenClaw bot/delivery.send.ts pattern).
+			// Our markdown converter occasionally produces malformed HTML for
+			// pathological input; re-send the ORIGINAL chunk as plain text
+			// rather than dropping the message.
+			c.host.Logf("telegram: HTML parse error on chunk %d, retrying as plaintext: %v", i, err)
+			plainOpts := *opts
+			plainOpts.ParseMode = ""
+			plain := chunks[i] // original markdown, pre-conversion
+			msg, err = c.bot.SendMessage(args.ChatID, plain, &plainOpts)
+		}
 		if err != nil {
 			c.recordOutboundErr(err)
 			if i == 0 {
@@ -78,6 +89,21 @@ func (c *Channel) SendReply(args c3types.ReplyArgs) (int64, error) {
 	}
 	c.recordOutboundSuccess()
 	return firstID, nil
+}
+
+// isParseEntityError returns whether a SendMessage error indicates Telegram
+// rejected the entities we sent (malformed HTML or MarkdownV2). On these we
+// retry plain-text rather than drop the message — pattern from OpenClaw's
+// extensions/telegram/src/bot/delivery.send.ts (sub-agent research 2026-05-09).
+func isParseEntityError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "can't parse entities") ||
+		strings.Contains(s, "parse entities") ||
+		strings.Contains(s, "find end of the entity") ||
+		strings.Contains(s, "Bad Request: can't parse")
 }
 
 // SendTyping sends a typing chat action. Used both for the typing indicator

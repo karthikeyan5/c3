@@ -78,6 +78,8 @@ func (c *Channel) pollLoop() {
 			RequestOpts:    requestOptsFor("getUpdates", longPoll),
 		}
 		updates, err := c.bot.GetUpdates(opts)
+		// Record return time for stallWatchdog regardless of err vs success.
+		c.lastPollReturn.Store(time.Now().UnixNano())
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return
