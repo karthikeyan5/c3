@@ -33,6 +33,7 @@ human-readable walkthrough.
 | [`docs/plans/`](docs/plans) | Phase-by-phase implementation plans. |
 | [`docs/USAGE.md`](docs/USAGE.md) | Day-to-day user guide. |
 | [`DEBUGGING.md`](DEBUGGING.md) | Where the logs live and how to read them. |
+| [`docs/COMMANDS.md`](docs/COMMANDS.md) | Cross-CLI verb spec — single source of truth for `/c3:*` semantics. |
 | [`docs/PLUGINS.md`](docs/PLUGINS.md), [`CHANNELS.md`](docs/CHANNELS.md), [`ADAPTERS.md`](docs/ADAPTERS.md) | Authoring docs for extension points. |
 | [`mvp/`](mvp) | Original Python wrapper. Superseded by the Go rewrite (D009); kept for Codex POC and reference. |
 
@@ -90,14 +91,11 @@ Tools: `attach`, `reply`, `react`, `edit_message`, `download_attachment`,
 
 ## Status
 
-**v0.1.0 functionally complete (2026-05-09).** Plans 1–6 + 9 done. Live
+**v0.1.0 functionally complete (2026-05-09).** Plans 1–7 + 9 done. Live
 broker verified against `@OCDWaterBot`; MCP exchange round-trip confirmed;
-voice STT plugin loads its handler on boot. ~7100 lines of Go, all tests
-green.
+voice STT plugin loads its handler on boot. The Go Codex launcher and adapter
+are installed via `c3-broker install-codex-shim`.
 
-What's next: see [`RESUME.md`](RESUME.md) and [`TODO.md`](TODO.md). The
-Codex adapter is deferred per D010 — until Plan 7 ships, Go-side install
-gives Claude Code integration only; the Python POC continues to work for
-Codex on machines that haven't switched.
+What's next: see [`RESUME.md`](RESUME.md) and [`TODO.md`](TODO.md).
 
 See [`DECISIONS.md`](DECISIONS.md) for the full decision log.

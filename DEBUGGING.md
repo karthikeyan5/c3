@@ -1,5 +1,10 @@
 # Debugging C3
 
+> Companion to [`docs/COMMANDS.md`](docs/COMMANDS.md), the cross-CLI
+> source of truth for verb behavior. If you're adding/changing a
+> command, read that first.
+
+
 When something looks wrong (message didn't arrive, attach is rejected, the
 broker won't start), this is where to look first. **Read this before adding
 print statements or `pkill`-ing the broker.**
@@ -233,6 +238,44 @@ You'll see strings like
 Naming gotcha: the entry uses **plugin name from plugin.json**, not the
 .mcp.json server key. They happen to be the same in our case (`c3`), but
 in general they're different concepts.
+
+## STT failure modes
+
+The STT plugin shells out to a Python handler that runs the
+gemini-3-flash-openrouter → sarvam-saaras-v3 chain. The broker logs
+explicit failure lines now (no more silent empty transcripts).
+
+| Log line shape                                                 | Meaning                                                                                |
+|-----------------------------------------------------------------|----------------------------------------------------------------------------------------|
+| `stt: msg=N transcribed in 22s (chars=730)`                    | Success.                                                                               |
+| `stt: msg=N timeout after 5m0s (timeout=5m0s, file_size=...)`  | Hit the broker's 300s subprocess deadline. Long voice notes + slow downloads are the usual culprit. |
+| `stt: msg=N error after Ns (...): exit status 1 \| stderr-tail=...` | Python handler errored. stderr-tail (last 240 chars) shows the cause.                 |
+| `stt: msg=N empty transcript after Ns (no provider returned text)` | Both providers returned empty. Token expired? Provider down?                       |
+| `stt: token read failed for msg=N: ...`                         | mappings.json missing or `bot_token` empty.                                            |
+
+When transcription fails, the inbound text becomes `[STT FAILED: <reason>]`
+instead of the silent `(voice message)` placeholder — the receiver
+knows to ask the user to resend.
+
+Tunables in mappings.json:
+- `plugins.stt.timeout_seconds` — broker's hard deadline (default 300).
+- `plugins.stt.handler_path` — override the Python script path.
+- `plugins.stt.enabled` — set false to disable transcription entirely.
+
+## DM disambiguation
+
+If a topic literally named `dm` (case-insensitive) exists in a channel,
+`attach target="dm"` is ambiguous — the user could mean the actual
+Telegram DM or that topic. The broker returns
+`needs_confirmation` with proposal_action=`disambiguate_dm`; the LLM
+asks the user which they meant. To bypass disambiguation (e.g. after
+the user explicitly confirmed the actual DM), pass `steal=true` along
+with `target="dm"`.
+
+Topic creation with name "dm" is **not** refused — Karthi 2026-05-09:
+"don't refuse creating DM or anything. Whenever there's an attach and
+there's an ambiguity, just show them as a question." The disambiguation
+happens at attach time, not creation time.
 
 ## Things we've found and fixed (history)
 
