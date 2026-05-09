@@ -184,6 +184,32 @@ c3-broker status
 broker liveness, socket path, channels, plugin states. The broker won't
 be running yet — that's fine; the next CLI session will spawn it.
 
+## 6.5. Enable channel notifications (REQUIRED)
+
+Claude Code requires explicit opt-in before it surfaces
+`notifications/claude/channel` from any plugin. **Without this step the
+broker delivers messages successfully but the CLI never sees them.**
+
+Read `~/.claude/settings.json` and ensure these two top-level keys are
+present:
+
+```json
+"channelsEnabled": true,
+"allowedChannelPlugins": [
+  { "marketplace": "c3", "plugin": "c3" }
+]
+```
+
+If the user already has `allowedChannelPlugins` with other entries,
+keep them and add `c3` alongside. If there's a stale `c3-telegram` entry
+from a prior install, replace it with `c3` (the plugin was renamed).
+
+**Permission gotcha:** Claude Code's auto-permission classifier treats
+`~/.claude/settings.json` edits as self-modification and may deny
+write access. If your edit is denied, **surface the JSON snippet to the
+user verbatim and ask them to paste it themselves**, then proceed once
+they confirm.
+
 ## 7. Tell the user the install is complete
 
 > "Installation complete.

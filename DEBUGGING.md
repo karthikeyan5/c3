@@ -187,6 +187,53 @@ The actionable punch list (researched 2026-05-09) lives in
 Not done yet; pick from there in priority order when adding more
 hardening to `internal/channel/telegram/`.
 
+## The channel-allowlist gate (THE 2026-05-09 silent-drop bug)
+
+Even when the broker delivers, the adapter writes the correct frame to
+stdout, AND the wire bytes match the official telegram + fakechat plugins,
+**Claude Code will silently drop `notifications/claude/channel` from any
+plugin not on the user's allowlist.**
+
+The allowlist lives in `~/.claude/settings.json`:
+
+```json
+"channelsEnabled": true,
+"allowedChannelPlugins": [
+  { "marketplace": "c3", "plugin": "c3" }
+]
+```
+
+`channelsEnabled` is the global on/off. `allowedChannelPlugins` is a
+per-plugin opt-in keyed by `(marketplace, plugin)` names exactly as
+declared in the plugin's marketplace.json + plugin.json.
+
+If our plugin emits `notifications/claude/channel` but isn't listed,
+Claude Code drops the frame with no log surfaced to the user. The broker
+log will say `delivered`, the adapter will say `notified`, and the CLI
+will see nothing.
+
+**How to verify** (search the Claude Code binary):
+
+```bash
+strings /home/karthi/.local/share/claude/versions/*/  | grep -E 'allowedChannelPlugins|--channels|channel_enable'
+```
+
+You'll see strings like
+"Managed-org allowlist of channel plugins. When set, …" and
+"is not plugin-sourced; channel_enable requires a marketplace plugin".
+
+**How to fix** (one of):
+
+1. Edit `~/.claude/settings.json` to include
+   `{ "marketplace": "c3", "plugin": "c3" }` in `allowedChannelPlugins`.
+2. Or invoke Claude Code with `--channels c3` per session (per-run flag).
+3. Or rely on Claude Code's interactive elicitation — when a new
+   channel-capable plugin loads, CC may prompt the user to opt in.
+
+Naming gotcha: the entry uses **plugin name from plugin.json**, not the
+.mcp.json server key. They happen to be the same in our case (`c3`), but
+in general they're different concepts.
+
 ## Things we've found and fixed (history)
 
 - **2026-05-09 — getUpdates always timing out.** gotgbot's
