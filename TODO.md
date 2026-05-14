@@ -19,24 +19,25 @@ Surfaced during install/attach pilot. Must fix before the public push.
   (`internal/broker/attach.go:sendWelcome`). Friendly tone, no PID, async,
   suppressed for adapter-replay re-attaches (broker bounce or conn-drop
   recovery doesn't spam the topic).
-- [ ] **CLI doesn't actually `cd` into the named project.** When a user
-  names a project at session start ("c3"), the agent reads that project's
-  `CLAUDE.md` but never changes directory, so `pwd` still shows the
-  launch root. Discrepancy: agent narrative says "I'm in c3" but shell
-  state disagrees. Fix: either the agent must `cd` explicitly when
-  identifying a project, OR document clearly that the agent stays put and
-  uses absolute paths.
+- [x] **CLI doesn't actually `cd` into the named project.** Done
+  2026-05-14 via `~/arogara/AGENTS.md` rule "Hard rule — `cd` before
+  anything else when switching projects". Promoted to its own section
+  near the top of the C3 attach docs so it's impossible to miss.
+  Multi-project caveat documented for the rare case where staying at
+  the parent and using absolute paths is correct. Not a broker change —
+  shell discipline lives in agent instructions.
 - [x] **Default cwd for a fresh topic = launch root, not project root.**
   Done 2026-05-14 (`internal/broker/attach.go:resolveAttachCWD`). The
   broker now refines launch_cwd → launch_cwd/topic_name when that
   subdirectory exists, so attaching to multiple topics from the same
   parent directory persists distinct mappings.
 - [x] **Mappings registry allows duplicate default cwd across topics.**
-  Done 2026-05-14 (`internal/broker/attach.go:persistMapping`). The
-  broker logs a clear `cwd=... rebound from topic-X → topic-Y` warning
-  when an upsert would overwrite an existing mapping with a different
-  topic. Live claim still proceeds; only the saved-default behavior is
-  highlighted in the log so the user sees the rebind.
+  Done 2026-05-14, hardened later same day per voice feedback
+  (`internal/broker/attach.go:persistMapping`). Broker now REFUSES to
+  silently rebind a saved cwd → topic mapping when a different topic
+  is being attached from the same cwd. Live claim still proceeds;
+  only an explicit `~/.config/c3/mappings.json` edit can change the
+  saved default. Loud log line on refusal.
 
 ## Completed follow-up (D011 — Plan 7: Codex bridge in Go)
 
