@@ -1118,5 +1118,5 @@ Phases 1-7 unblock single-user daily use. 8-10 are about shippability to others.
 - The Codex bridge architecture was informed by an end-to-end Python prototype (Telegram ↔ Codex turns + voice transcription, all working) that preceded this rewrite. v5 takes that architecture and re-implements it in Go.
 - Existing plugin scaffold: `plugin/.claude-plugin/marketplace.json`, `plugin/plugins/c3-telegram/`.
 - C3 stated direction: README.md §"Key Features (Full Vision)", TODO.md Phases 1-4, DECISIONS.md D001-D008.
-- Go MCP SDK: github.com/modelcontextprotocol/go-sdk v1.0.0+ (per `research/go-mcp-sdk.md`).
+- Go MCP SDK: github.com/modelcontextprotocol/go-sdk v1.0.0+ (per `docs/research/go-mcp-sdk.md`).
 - Go Telegram libraries surveyed: gotgbot (PaulSonOfLars), telegram-bot-api (go-telegram-bot-api).
