@@ -96,6 +96,46 @@ def run_stt(audio_path, extra_env):
         return None
     return transcript
 
+# ── Telegram echo (testable) ──────────────────────────────────────────────────
+
+def send_transcript_to_telegram(token, chat_id, msg_id, thread_id, transcript, tg_fn=None):
+    """Echo a transcript back to Telegram, splitting into 4096-char chunks
+    when needed. Returns the number of chunks sent.
+
+    Critical invariant (regression-tested in test_stt_handler.py): every
+    chunk carries `message_thread_id` when `thread_id` is set. Without it,
+    Telegram routes chunks 2+ to the General topic — the regression Karthi
+    hit on 2026-05-14 because an older handler version only carried the
+    thread id implicitly via `reply_parameters` on the first chunk.
+
+    `tg_fn` is the Telegram-API caller (defaults to the module-level `tg`);
+    tests inject a fake to capture calls without doing network I/O.
+    """
+    if tg_fn is None:
+        tg_fn = tg
+    prefix = '\U0001f3a4 [Voice transcript]: '
+    full_text = prefix + transcript
+    MAX_LEN = 4096
+    thread_kwargs = {'message_thread_id': thread_id} if thread_id else {}
+    if len(full_text) <= MAX_LEN:
+        tg_fn(token, 'sendMessage',
+              chat_id=chat_id,
+              text=full_text,
+              reply_parameters={'message_id': msg_id},
+              **thread_kwargs)
+        return 1
+    chunks = []
+    remaining = full_text
+    while remaining:
+        chunks.append(remaining[:MAX_LEN])
+        remaining = remaining[MAX_LEN:]
+    for i, chunk in enumerate(chunks):
+        params = {'chat_id': chat_id, 'text': chunk, **thread_kwargs}
+        if i == 0:
+            params['reply_parameters'] = {'message_id': msg_id}
+        tg_fn(token, 'sendMessage', **params)
+    return len(chunks)
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -142,33 +182,13 @@ def main():
         sys.exit(1)
     logging.info(f'Transcript ({len(transcript)} chars): {transcript[:80]}...')
 
-    # Echo transcript back to Telegram (4096 char limit per message)
+    # Echo transcript back to Telegram (chunked if it exceeds the 4096-char
+    # per-message cap). Extracted into a helper so the chunking + topic
+    # propagation is regression-tested in test_stt_handler.py.
     try:
-        prefix = '\U0001f3a4 [Voice transcript]: '
-        full_text = prefix + transcript
-        # Split into chunks if exceeding Telegram's 4096 char limit.
-        # message_thread_id must be on every chunk, not just the first —
-        # reply_parameters alone only anchors chunk 0 to the topic.
-        MAX_LEN = 4096
-        thread_kwargs = {'message_thread_id': thread_id} if thread_id else {}
-        if len(full_text) <= MAX_LEN:
-            tg(token, 'sendMessage',
-               chat_id=chat_id,
-               text=full_text,
-               reply_parameters={'message_id': msg_id},
-               **thread_kwargs)
-        else:
-            chunks = []
-            remaining = full_text
-            while remaining:
-                chunks.append(remaining[:MAX_LEN])
-                remaining = remaining[MAX_LEN:]
-            for i, chunk in enumerate(chunks):
-                params = {'chat_id': chat_id, 'text': chunk, **thread_kwargs}
-                if i == 0:
-                    params['reply_parameters'] = {'message_id': msg_id}
-                tg(token, 'sendMessage', **params)
-            logging.info(f'Echo split into {len(chunks)} messages (total {len(full_text)} chars)')
+        n = send_transcript_to_telegram(token, chat_id, msg_id, thread_id, transcript)
+        if n > 1:
+            logging.info(f'Echo split into {n} messages')
     except Exception as e:
         logging.warning(f'Telegram echo failed (non-fatal): {e}')
         print(f'[stt-handler] telegram reply failed: {e}', file=sys.stderr)

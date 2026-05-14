@@ -311,12 +311,27 @@ happens at attach time, not creation time.
 
 ## Persistent state files
 
+Everything C3 reads or writes lives in one of these paths. There is **no** pre-c3 / legacy path that's still active; if you see files under `~/.claude/channels/telegram/` they are leftovers from the Python POC and not used by the Go broker.
+
 | File | Purpose | Owner |
 |---|---|---|
-| `~/.config/c3/mappings.json` | Bot config + cwd→topic mappings | broker |
+| `~/.config/c3/mappings.json` | Bot token, channel config, cwd→topic mappings, plugin config | broker (config) |
 | `~/.config/c3/mappings.json.bak` | One-generation backup, written before each rewrite | broker |
+| `~/.claude/stt.env` | API keys for STT providers (`OPENROUTER_API_KEY`, `SARVAM_API_KEY`); read by the bundled handler. Optional — skip if STT is disabled or you've pointed `plugins.stt.handler_path` at a custom script that loads keys differently. | user (manual, one-time setup) |
 | `$XDG_RUNTIME_DIR/c3-broker.pid` | Singleton flock + pid | broker |
 | `$XDG_RUNTIME_DIR/c3.sock` | Adapter ↔ broker socket | broker |
 | `$XDG_STATE_HOME/c3/broker.log` | Broker log (this file) | broker |
 | `$XDG_STATE_HOME/c3/telegram-offset.json` | Persisted highest update_id | broker (telegram channel) |
 | `$XDG_CACHE_HOME/c3/telegram/attachments/` | Downloaded media | broker (telegram channel) |
+
+`$XDG_RUNTIME_DIR` defaults to `/run/user/$UID`; `$XDG_STATE_HOME` defaults to `~/.local/state`; `$XDG_CACHE_HOME` defaults to `~/.cache`.
+
+## STT handler path resolution
+
+One rule, no fallbacks:
+
+1. If `mappings.json:plugins.stt.handler_path` is set → use that. (User override.)
+2. Else if `$CLAUDE_PLUGIN_ROOT` is in the broker's env → use `$CLAUDE_PLUGIN_ROOT/stt/stt-handler.py`. Claude Code sets this env when it launches the c3 adapter; the adapter inherits it when spawning the broker.
+3. Else → no handler. Voice messages surface `[STT FAILED: handler_missing]` per call.
+
+If you run `c3-broker` outside Claude Code (manual daemon, systemd unit, debugging), `$CLAUDE_PLUGIN_ROOT` won't be set and you must set `plugins.stt.handler_path` explicitly. That's the supported path for any non-Claude-Code launcher.

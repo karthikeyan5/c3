@@ -184,27 +184,20 @@ func readTelegramToken(host plugin.Host) (string, error) {
 
 // defaultHandlerPath returns the path to the bundled handler shipped under
 // `plugins/c3/stt/stt-handler.py` inside the plugin install directory. The
-// plugin install root is conveyed via `$CLAUDE_PLUGIN_ROOT`, set by Claude
-// Code when it launches the c3 adapter; the adapter inherits the env when
-// it spawns the broker, so the broker sees the same root.
+// plugin install root is conveyed via `$CLAUDE_PLUGIN_ROOT`, which Claude
+// Code sets when launching the c3 adapter; the adapter inherits the env
+// when it spawns the broker, so the broker sees the same root.
 //
-// If `$CLAUDE_PLUGIN_ROOT` is unset or the bundled handler isn't there
-// (e.g. broker launched manually outside Claude Code, or an older install
-// without the bundled handler), we fall back to the pre-c3 legacy path
-// (`~/.claude/channels/telegram/stt-handler.py`) so existing installs that
-// still have the handler in that location keep working without config
-// changes. Users can always override via `plugins.stt.handler_path` in
-// `mappings.json`.
+// Returns "" if `$CLAUDE_PLUGIN_ROOT` isn't set. Operators who run
+// `c3-broker` outside Claude Code (manual daemon, systemd unit, etc.)
+// must set `plugins.stt.handler_path` in `~/.config/c3/mappings.json`
+// explicitly — that's the only resolution rule, and the user-override
+// path always wins when set. There is intentionally no fallback to
+// pre-c3 legacy paths; behavior must be predictable from config + env.
 func defaultHandlerPath() string {
-	if root := os.Getenv("CLAUDE_PLUGIN_ROOT"); root != "" {
-		bundled := filepath.Join(root, "stt", "stt-handler.py")
-		if _, err := os.Stat(bundled); err == nil {
-			return bundled
-		}
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
+	root := os.Getenv("CLAUDE_PLUGIN_ROOT")
+	if root == "" {
 		return ""
 	}
-	return filepath.Join(home, ".claude", "channels", "telegram", "stt-handler.py")
+	return filepath.Join(root, "stt", "stt-handler.py")
 }

@@ -3,11 +3,14 @@ package broker
 import (
 	"encoding/json"
 	"fmt"
+	"log"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/karthikeyan5/c3/internal/c3types"
 	"github.com/karthikeyan5/c3/internal/ipc"
 	"github.com/karthikeyan5/c3/internal/mappings"
 )
@@ -425,6 +428,16 @@ func (b *Broker) createAndClaim(conn *ipc.Conn, stub *Stub, chanName, gName stri
 // Force-release first, then claim. Only this path can evict a live PID's
 // claim; everything else returns force_steal proposal for confirmation.
 func (b *Broker) tryClaim(conn *ipc.Conn, stub *Stub, key RouteKey, label string, steal bool) bool {
+	// Detect "is this a fresh claim or a no-op re-claim by the same logical
+	// session?" before we mutate Routes. Same-session re-claims happen on
+	// every adapter reconnect (the adapter replays its last attach so the
+	// route is restored automatically) and shouldn't trigger a welcome
+	// message — the user didn't ask for one, they just bounced their CLI.
+	isFresh := true
+	if existing, held := b.Routes.Holder(key); held && sameLogicalSession(existing, stub) {
+		isFresh = false
+	}
+
 	if old := stub.CurrentRoute(); old != nil && *old != key {
 		b.Routes.Release(*old, stub.ConnID)
 	}
@@ -450,7 +463,67 @@ func (b *Broker) tryClaim(conn *ipc.Conn, stub *Stub, key RouteKey, label string
 		return false
 	}
 	stub.SetRoute(&key)
+	if isFresh {
+		go b.sendWelcome(stub, key, label)
+	}
 	return true
+}
+
+// sendWelcome posts a one-shot friendly confirmation to the channel after a
+// successful, fresh attach. Async (off the IPC thread) — a slow Telegram
+// network call must not block the AttachedMsg reply to the adapter. Errors
+// are logged but never surface to the user: a missing welcome is annoying,
+// a failed attach is worse.
+//
+// Suppressed for re-claims by the same logical session (see tryClaim's
+// isFresh check) so adapter reconnects don't spam the topic.
+//
+// Pre-release UX bug #1 (TODO.md, 2026-05-13): without this, `attach`
+// returned silence on success — the user had to send a probe message to
+// confirm the route worked.
+func (b *Broker) sendWelcome(stub *Stub, key RouteKey, label string) {
+	if b == nil {
+		return
+	}
+	ch, err := b.Channel(key.Channel)
+	if err != nil {
+		log.Printf("welcome: channel %s lookup failed: %v", key.Channel, err)
+		return
+	}
+	var topicID *int64
+	if key.HasTopic {
+		t := key.TopicID
+		topicID = &t
+	}
+	text := welcomeText(stub, label)
+	if _, err := ch.SendReply(c3types.ReplyArgs{
+		Channel: key.Channel,
+		ChatID:  key.ChatID,
+		TopicID: topicID,
+		Text:    text,
+	}); err != nil {
+		log.Printf("welcome: send failed for %s: %v", routeKeyStr(key), err)
+		return
+	}
+	log.Printf("welcome: sent for %s cli=%s cwd=%q", routeKeyStr(key), stub.CLI, stub.CWD)
+}
+
+// welcomeText renders the on-attach confirmation. Friendly tone (PID
+// intentionally omitted per pre-release UX feedback 2026-05-14: the PID
+// is mechanical clutter for a human reader; cwd + cli are what matter).
+func welcomeText(stub *Stub, label string) string {
+	cwd := stub.CWD
+	if home, err := os.UserHomeDir(); err == nil && home != "" && strings.HasPrefix(cwd, home) {
+		cwd = "~" + cwd[len(home):]
+	}
+	cli := stub.CLI
+	if cli == "" {
+		cli = "cli"
+	}
+	if cwd == "" {
+		return fmt.Sprintf("👋 Hi! Attached as **%s** to **%s**. Send anything — voice, text, replies. I'm listening here.", cli, label)
+	}
+	return fmt.Sprintf("👋 Hi! Attached and listening here.\n📁 `%s`\n🤖 `%s` → **%s**", cwd, cli, label)
 }
 
 // persistMapping upserts the cwd → mapping into the in-memory MappingsFile.

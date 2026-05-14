@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +23,7 @@ type fakeChannel struct {
 	mu              sync.Mutex
 	createCalls     []createCall
 	validateCalls   []validateCall
+	replyCalls      []c3types.ReplyArgs
 	createReturnID  int64
 	createReturnErr error
 	validateErr     error
@@ -38,7 +41,19 @@ type validateCall struct {
 func (f *fakeChannel) Name() string                                 { return "telegram" }
 func (f *fakeChannel) Start(_ context.Context, _ channel.Host) error { return nil }
 func (f *fakeChannel) Stop() error                                  { return nil }
-func (f *fakeChannel) SendReply(c3types.ReplyArgs) (int64, error)   { return 0, nil }
+func (f *fakeChannel) SendReply(args c3types.ReplyArgs) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.replyCalls = append(f.replyCalls, args)
+	return 0, nil
+}
+func (f *fakeChannel) sendRepliesSnapshot() []c3types.ReplyArgs {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]c3types.ReplyArgs, len(f.replyCalls))
+	copy(out, f.replyCalls)
+	return out
+}
 func (f *fakeChannel) SendTyping(int64, *int64) error               { return nil }
 func (f *fakeChannel) EditMessage(c3types.EditArgs) (*c3types.EditResult, error) {
 	return &c3types.EditResult{}, nil
@@ -422,3 +437,121 @@ func TestAttach_AlreadyClaimed_ReturnsHolderError(t *testing.T) {
 // file may evolve; remove if removed elsewhere.
 var _ = filepath.Join
 var _ = time.Now
+
+// ─── welcome-message-on-attach tests (TODO.md pre-release UX bug #1) ───────
+
+func TestWelcomeText_HomeShortened(t *testing.T) {
+	home, _ := os.UserHomeDir()
+	if home == "" {
+		t.Skip("no home dir")
+	}
+	stub := &Stub{CLI: "claude", CWD: filepath.Join(home, "arogara", "c3")}
+	got := welcomeText(stub, "c3")
+	if !strings.Contains(got, "~/arogara/c3") {
+		t.Errorf("welcomeText should home-shorten cwd, got %q", got)
+	}
+	if strings.Contains(got, home) {
+		t.Errorf("welcomeText should not include literal home prefix, got %q", got)
+	}
+}
+
+func TestWelcomeText_IncludesCLIAndLabel(t *testing.T) {
+	stub := &Stub{CLI: "claude", CWD: "/tmp/x"}
+	got := welcomeText(stub, "my-project")
+	for _, want := range []string{"claude", "my-project"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("welcomeText missing %q in %q", want, got)
+		}
+	}
+}
+
+func TestWelcomeText_NoPID(t *testing.T) {
+	// Karthi explicit feedback 2026-05-14: PID is mechanical clutter,
+	// don't include it.
+	stub := &Stub{CLI: "claude", PID: 12345, CWD: "/tmp/x"}
+	got := welcomeText(stub, "label")
+	if strings.Contains(got, "12345") {
+		t.Errorf("welcomeText should not include PID, got %q", got)
+	}
+}
+
+func TestWelcomeText_NoCWD_StillFriendly(t *testing.T) {
+	stub := &Stub{CLI: "claude"}
+	got := welcomeText(stub, "label")
+	if got == "" {
+		t.Fatal("welcomeText with no cwd should still return something")
+	}
+	if !strings.Contains(got, "claude") || !strings.Contains(got, "label") {
+		t.Errorf("welcomeText cwd-less: %q", got)
+	}
+}
+
+func TestTryClaim_FreshClaimTriggersWelcome(t *testing.T) {
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	stub := &Stub{CLI: "claude", PID: 1, CWD: "/home/u/proj"}
+	tid := int64(914)
+	key := MakeRouteKey("telegram", -100, &tid)
+	if !b.tryClaim(nil, stub, key, "c3", false) {
+		t.Fatal("fresh claim should succeed (nil conn is OK because we won't hit the collision branch)")
+	}
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(fc.sendRepliesSnapshot()) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	calls := fc.sendRepliesSnapshot()
+	if len(calls) != 1 {
+		t.Fatalf("want 1 welcome SendReply, got %d", len(calls))
+	}
+	r := calls[0]
+	if r.ChatID != -100 || r.TopicID == nil || *r.TopicID != 914 {
+		t.Errorf("welcome went to wrong destination: chat=%d topic=%v", r.ChatID, r.TopicID)
+	}
+	if !strings.Contains(r.Text, "claude") {
+		t.Errorf("welcome text missing cli: %q", r.Text)
+	}
+}
+
+func TestTryClaim_SameLogicalSessionReclaimSuppressesWelcome(t *testing.T) {
+	// Adapter reconnect replays attach. Same CLI+PID+CWD → should NOT
+	// re-send welcome (would spam the topic on every CLI bounce).
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	tid := int64(914)
+	key := MakeRouteKey("telegram", -100, &tid)
+
+	// First claim by stub#1.
+	stub1 := &Stub{CLI: "claude", PID: 99, CWD: "/home/u/proj"}
+	if !b.tryClaim(nil, stub1, key, "c3", false) {
+		t.Fatal("first claim should succeed")
+	}
+	// Wait for the welcome to land.
+	time.Sleep(50 * time.Millisecond)
+	first := len(fc.sendRepliesSnapshot())
+	if first != 1 {
+		t.Fatalf("first claim should send 1 welcome, got %d", first)
+	}
+
+	// Simulate an adapter reconnect — same logical session (CLI+PID+CWD),
+	// different ConnID.
+	stub2 := &Stub{CLI: "claude", PID: 99, CWD: "/home/u/proj"}
+	if !b.tryClaim(nil, stub2, key, "c3", false) {
+		t.Fatal("re-claim by same logical session should succeed")
+	}
+	time.Sleep(50 * time.Millisecond)
+	second := len(fc.sendRepliesSnapshot())
+	if second != first {
+		t.Errorf("same-session re-claim sent %d additional welcomes (want 0): total=%d, first=%d",
+			second-first, second, first)
+	}
+}
