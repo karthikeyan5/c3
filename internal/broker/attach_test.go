@@ -492,9 +492,6 @@ func TestTryClaim_FreshClaimTriggersWelcome(t *testing.T) {
 	b := brokerWithChannel(t, mf, fc)
 	defer b.Shutdown()
 
-	// Past the recovery window so genuine fresh attaches fire welcome.
-	b.startedAt = time.Now().Add(-2 * welcomeRecoveryWindow)
-
 	stub := &Stub{CLI: "claude", PID: 1, CWD: "/home/u/proj"}
 	tid := int64(914)
 	key := MakeRouteKey("telegram", -100, &tid)
@@ -529,10 +526,6 @@ func TestTryClaim_SameLogicalSessionReclaimSuppressesWelcome(t *testing.T) {
 	fc := &fakeChannel{}
 	b := brokerWithChannel(t, mf, fc)
 	defer b.Shutdown()
-
-	// Past the recovery window so the first claim's welcome actually
-	// fires; we want to test the same-session suppression independently.
-	b.startedAt = time.Now().Add(-2 * welcomeRecoveryWindow)
 
 	tid := int64(914)
 	key := MakeRouteKey("telegram", -100, &tid)
@@ -691,47 +684,33 @@ func TestPersistMapping_RebindRefusesToOverwrite(t *testing.T) {
 	}
 }
 
-// ─── recovery-window welcome suppression (2026-05-14) ──────────────────────
+// ─── welcome firing rules: Replay is the sole suppression signal ───────────
+//
+// History (2026-05-14): an earlier belt-and-suspenders 30-second post-startup
+// recovery window false-positived against a real user attach — Karthi typed
+// `attach` 21 seconds after a broker restart and the welcome never fired.
+// The recovery window was removed. Replay (in AttachReq) is now the
+// authoritative signal that an attach is operational recovery rather than
+// user-initiated; same-logical-session re-claims are still suppressed by
+// the upstream isFresh check in tryClaim.
 
-func TestSendWelcome_SuppressedDuringStartupRecoveryWindow(t *testing.T) {
-	// Right after a broker bounce, adapters auto-replay attach. With
-	// `welcomeRecoveryWindow`, any attach in the first 30s is presumed
-	// to be a recovery and welcomes are skipped — even when the
-	// adapter's AttachReq lacks the Replay flag (deployment gap with
-	// an older live adapter binary).
+func TestSendWelcome_FreshUserAttachJustAfterBrokerStartup_Fires(t *testing.T) {
+	// Regression for 2026-05-14: a fresh `attach` typed shortly after the
+	// broker started must fire welcome. Older code suppressed any attach
+	// within 30s of broker startup (intended for adapter replays) and
+	// silently swallowed legitimate user attaches.
 	mf := mfWithTelegram()
 	fc := &fakeChannel{}
 	b := brokerWithChannel(t, mf, fc)
 	defer b.Shutdown()
 
-	// brokerWithChannel just called New(), so startedAt is "now-ish".
+	// Deliberately do NOT backdate any startup time — the broker is
+	// "just-now-started" from the framework's perspective. Fresh user
+	// attach (replay=false). Must still send.
 	stub := &Stub{CLI: "claude", PID: 1, CWD: "/home/u/proj"}
 	tid := int64(914)
 	key := MakeRouteKey("telegram", -100, &tid)
-	if !b.tryClaim(nil, stub, key, "c3", false, false) {
-		t.Fatal("fresh claim should succeed")
-	}
-	time.Sleep(50 * time.Millisecond)
-	if got := len(fc.sendRepliesSnapshot()); got != 0 {
-		t.Errorf("welcome fired during recovery window: got %d sends, want 0", got)
-	}
-}
-
-func TestSendWelcome_FiresAfterRecoveryWindowExpires(t *testing.T) {
-	// Confirm the suppression is bounded — once `welcomeRecoveryWindow`
-	// elapses, welcomes fire normally for fresh claims.
-	mf := mfWithTelegram()
-	fc := &fakeChannel{}
-	b := brokerWithChannel(t, mf, fc)
-	defer b.Shutdown()
-
-	// Backdate startedAt past the recovery window.
-	b.startedAt = time.Now().Add(-2 * welcomeRecoveryWindow)
-
-	stub := &Stub{CLI: "claude", PID: 1, CWD: "/home/u/proj"}
-	tid := int64(914)
-	key := MakeRouteKey("telegram", -100, &tid)
-	if !b.tryClaim(nil, stub, key, "c3", false, false) {
+	if !b.tryClaim(nil, stub, key, "c3", false, false /*replay*/) {
 		t.Fatal("fresh claim should succeed")
 	}
 	deadline := time.Now().Add(500 * time.Millisecond)
@@ -742,7 +721,7 @@ func TestSendWelcome_FiresAfterRecoveryWindowExpires(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if got := len(fc.sendRepliesSnapshot()); got != 1 {
-		t.Errorf("welcome should fire after recovery window: got %d sends, want 1", got)
+		t.Errorf("fresh user attach must fire welcome regardless of broker uptime: got %d sends, want 1", got)
 	}
 }
 
@@ -757,10 +736,6 @@ func TestTryClaim_ReplayFlagSuppressesWelcomeAfterBrokerBounce(t *testing.T) {
 	fc := &fakeChannel{}
 	b := brokerWithChannel(t, mf, fc)
 	defer b.Shutdown()
-
-	// Past the recovery window so the Replay-flag suppression is what
-	// we're actually testing (not the time-based fallback).
-	b.startedAt = time.Now().Add(-2 * welcomeRecoveryWindow)
 
 	stub := &Stub{CLI: "claude", PID: 99, CWD: "/home/u/proj"}
 	tid := int64(914)

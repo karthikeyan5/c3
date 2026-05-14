@@ -489,17 +489,16 @@ func (b *Broker) sendWelcome(stub *Stub, key RouteKey, label string) {
 	if b == nil {
 		return
 	}
-	// Recovery-window guard: any attach within `welcomeRecoveryWindow` of
-	// broker startup is presumed to be an adapter's automatic replay
-	// (not a user-typed attach). This is the belt to the AttachReq.Replay
-	// flag's suspenders — protects against deployment gaps where the
-	// broker has the flag-aware code but a live adapter doesn't.
-	// Karthi 2026-05-14: "I keep getting this message; it's annoying."
-	if !b.startedAt.IsZero() && time.Since(b.startedAt) < welcomeRecoveryWindow {
-		log.Printf("welcome: suppressed (within %v of broker startup) for %s cli=%s",
-			welcomeRecoveryWindow, routeKeyStr(key), stub.CLI)
-		return
-	}
+	// Suppression is handled upstream in tryClaim's isFresh check: replay
+	// attaches (AttachReq.Replay=true) and same-logical-session re-claims
+	// never reach this function. We previously also held a 30-second
+	// post-startup recovery window here as belt-and-suspenders for the
+	// case where an older adapter binary didn't yet thread the Replay
+	// flag — but in practice it false-positived against legitimate
+	// user-typed attaches that happened to land within 30s of broker
+	// startup (Karthi 2026-05-14: typed `attach` 21s after a broker
+	// restart and got no welcome). Replay is the authoritative signal;
+	// trust it.
 	ch, err := b.Channel(key.Channel)
 	if err != nil {
 		log.Printf("welcome: channel %s lookup failed: %v", key.Channel, err)

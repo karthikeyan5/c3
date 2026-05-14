@@ -30,11 +30,13 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/karthikeyan5/c3/internal/broker"
@@ -42,6 +44,16 @@ import (
 	"github.com/karthikeyan5/c3/internal/ipc"
 	"github.com/karthikeyan5/c3/internal/mcp"
 )
+
+// idleStartupTimeout bounds how long the adapter waits for Claude Code to
+// send its first MCP frame (initialize). If Claude Code spawns the adapter
+// but then abandons it without driving stdin — observed during `--resume`
+// flows where CC respawns MCP servers and the prior process is orphaned
+// alive — the adapter exits cleanly after this window rather than living
+// as a zombie holding a broker conn. 60s is well past the millisecond-scale
+// MCP handshake budget; any real Claude Code session is past initialize
+// long before this fires.
+const idleStartupTimeout = 60 * time.Second
 
 const (
 	mcpProtocolVersion = "2024-11-05"
@@ -74,11 +86,17 @@ func run() error {
 		fmt.Fprintf(os.Stderr, "c3-claude-adapter: log file %s\n", path)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	installSignalHandlers(cancel)
+
 	a := newAdapter()
 	if err := a.connectBroker(); err != nil {
+		log.Printf("adapter: exit pid=%d reason=connect-broker err=%v", os.Getpid(), err)
 		return fmt.Errorf("connect broker: %w", err)
 	}
 	if err := a.hello(); err != nil {
+		log.Printf("adapter: exit pid=%d reason=hello err=%v", os.Getpid(), err)
 		return fmt.Errorf("hello: %w", err)
 	}
 
@@ -86,7 +104,58 @@ func run() error {
 	a.mcp = mcpSrv
 
 	go a.brokerReader()
-	return mcpSrv.Run(context.Background())
+	go a.idleStartupWatchdog(ctx, cancel)
+
+	err := mcpSrv.Run(ctx)
+	switch {
+	case err == nil:
+		log.Printf("adapter: exit pid=%d reason=stdin-eof (clean)", os.Getpid())
+		return nil
+	case errors.Is(err, context.Canceled):
+		log.Printf("adapter: exit pid=%d reason=context-canceled (signal or idle-startup) (clean)", os.Getpid())
+		return nil
+	default:
+		log.Printf("adapter: exit pid=%d reason=mcp-error err=%v", os.Getpid(), err)
+		return err
+	}
+}
+
+// installSignalHandlers cancels ctx on SIGTERM/SIGINT/SIGHUP. Without this,
+// Go's default behavior is to terminate immediately, leaving no log line
+// explaining why the adapter died. We need that breadcrumb to diagnose
+// "MCP server disconnected" incidents — was it a signal from Claude Code,
+// stdin EOF, or an internal error? Cancellation propagates through the
+// MCP server loop so its Run() returns and main() logs the exit reason.
+func installSignalHandlers(cancel context.CancelFunc) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	go func() {
+		sig := <-ch
+		log.Printf("adapter: received signal=%v pid=%d", sig, os.Getpid())
+		cancel()
+	}()
+}
+
+// idleStartupWatchdog cancels ctx if Claude Code never sends an MCP frame
+// within idleStartupTimeout. This handles the observed `--resume` failure
+// mode where CC spawns an adapter, the adapter completes broker handshake,
+// but CC never sends `initialize` (presumed: CC orphans the spawn during
+// session resume teardown). Without this, the adapter sits in os.Stdin.Read
+// forever, holding a broker conn, and the user sees the plugin as
+// "disconnected" until they manually `/mcp` reconnect.
+func (a *adapter) idleStartupWatchdog(ctx context.Context, cancel context.CancelFunc) {
+	timer := time.NewTimer(idleStartupTimeout)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+		if !a.dispatched.Load() {
+			log.Printf("adapter: idle-startup timeout pid=%d (no MCP frame in %v) — exiting so Claude Code can respawn",
+				os.Getpid(), idleStartupTimeout)
+			cancel()
+		}
+	}
 }
 
 // setupAdapterLog opens $XDG_STATE_HOME/c3/adapter.log (append) and tees
@@ -137,6 +206,12 @@ type adapter struct {
 	// firstInbound triggers a one-shot wire dump of the first
 	// notifications/claude/channel frame for live debugging.
 	firstInbound atomic.Bool
+
+	// dispatched is set the first time Dispatch is called — i.e. Claude
+	// Code has sent at least one MCP frame. The idle-startup watchdog
+	// uses this to distinguish "live session" from "orphaned spawn that
+	// Claude Code never drove".
+	dispatched atomic.Bool
 }
 
 func newAdapter() *adapter {
@@ -527,6 +602,9 @@ func (a *adapter) dispatchTopicsList(raw []byte) {
 
 // Dispatch implements mcp.Handler.
 func (a *adapter) Dispatch(ctx context.Context, req *mcp.Request) *mcp.Response {
+	// Mark the adapter as "driven" — disarms the idle-startup watchdog.
+	a.dispatched.Store(true)
+
 	// Log every method Claude Code sends — diagnosing "channel notification
 	// silently dropped" requires knowing whether Claude Code is invoking some
 	// method we reject. tools/call and tools/list are noisy but useful for

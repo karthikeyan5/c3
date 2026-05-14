@@ -15,6 +15,35 @@ Re-prioritize against the spec when picking next work.
 
 Surfaced during install/attach pilot. Must fix before the public push.
 
+### Second-round bugs surfaced 2026-05-14 (post-computer-restart resume)
+
+- [x] **Welcome message never fired after broker bounce + fresh user attach.**
+  Done 2026-05-14. Root cause: a 30s post-startup `welcomeRecoveryWindow`
+  was added as belt-and-suspenders for adapters that didn't yet thread
+  the `Replay` flag — but it false-positived against legitimate
+  user-typed attaches landing within 30s of broker startup. Replay
+  flag is the authoritative signal; the window was removed
+  (`internal/broker/attach.go:sendWelcome`,
+  `internal/broker/broker.go`). Regression test:
+  `TestSendWelcome_FreshUserAttachJustAfterBrokerStartup_Fires`.
+- [x] **`c3` MCP plugin shows "disconnected" on Claude Code `--resume`,
+  requires manual `/mcp` reconnect.** Done 2026-05-14. Hardened the
+  adapter against the observed failure mode where Claude Code spawns
+  the adapter but never sends an MCP frame (orphaned spawn during
+  session resume teardown). Three changes in
+  `cmd/c3-claude-adapter/main.go`: (1) signal handlers
+  (SIGTERM/SIGINT/SIGHUP) that log + cancel ctx so future incidents
+  leave a breadcrumb in adapter.log; (2) idle-startup watchdog —
+  if no MCP frame within 60s of startup, exit cleanly so the adapter
+  doesn't zombie holding a broker conn; (3) explicit exit-reason
+  logging at every return path. Regression tests:
+  `TestIdleStartupWatchdog_CancelsWhenNoDispatch`,
+  `TestIdleStartupWatchdog_StaysQuietAfterDispatch`,
+  `TestDispatch_SetsDispatchedFlag`. Open follow-up: deeper Claude
+  Code MCP lifecycle interactions on resume are still
+  poorly-understood — surface a heartbeat and a singleton-PID guard
+  if symptoms recur.
+
 - [x] **Welcome message on attach.** Done 2026-05-14
   (`internal/broker/attach.go:sendWelcome`). Friendly tone, no PID, async,
   suppressed for adapter-replay re-attaches (broker bounce or conn-drop
