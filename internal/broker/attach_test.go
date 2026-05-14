@@ -495,7 +495,7 @@ func TestTryClaim_FreshClaimTriggersWelcome(t *testing.T) {
 	stub := &Stub{CLI: "claude", PID: 1, CWD: "/home/u/proj"}
 	tid := int64(914)
 	key := MakeRouteKey("telegram", -100, &tid)
-	if !b.tryClaim(nil, stub, key, "c3", false) {
+	if !b.tryClaim(nil, stub, key, "c3", false, false) {
 		t.Fatal("fresh claim should succeed (nil conn is OK because we won't hit the collision branch)")
 	}
 
@@ -532,7 +532,7 @@ func TestTryClaim_SameLogicalSessionReclaimSuppressesWelcome(t *testing.T) {
 
 	// First claim by stub#1.
 	stub1 := &Stub{CLI: "claude", PID: 99, CWD: "/home/u/proj"}
-	if !b.tryClaim(nil, stub1, key, "c3", false) {
+	if !b.tryClaim(nil, stub1, key, "c3", false, false) {
 		t.Fatal("first claim should succeed")
 	}
 	// Wait for the welcome to land.
@@ -545,7 +545,7 @@ func TestTryClaim_SameLogicalSessionReclaimSuppressesWelcome(t *testing.T) {
 	// Simulate an adapter reconnect — same logical session (CLI+PID+CWD),
 	// different ConnID.
 	stub2 := &Stub{CLI: "claude", PID: 99, CWD: "/home/u/proj"}
-	if !b.tryClaim(nil, stub2, key, "c3", false) {
+	if !b.tryClaim(nil, stub2, key, "c3", false, false) {
 		t.Fatal("re-claim by same logical session should succeed")
 	}
 	time.Sleep(50 * time.Millisecond)
@@ -553,5 +553,30 @@ func TestTryClaim_SameLogicalSessionReclaimSuppressesWelcome(t *testing.T) {
 	if second != first {
 		t.Errorf("same-session re-claim sent %d additional welcomes (want 0): total=%d, first=%d",
 			second-first, second, first)
+	}
+}
+
+func TestTryClaim_ReplayFlagSuppressesWelcomeAfterBrokerBounce(t *testing.T) {
+	// Distinct from the same-session reclaim case: this models a broker
+	// restart, where the new broker's Routes map is empty. The adapter
+	// sets Replay=true on its restored AttachReq so the broker knows the
+	// attach is operational recovery, not a user-initiated attach.
+	// Without the Replay flag, every broker bounce would post a welcome
+	// to every reconnecting session.
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	stub := &Stub{CLI: "claude", PID: 99, CWD: "/home/u/proj"}
+	tid := int64(914)
+	key := MakeRouteKey("telegram", -100, &tid)
+
+	if !b.tryClaim(nil, stub, key, "c3", false /*steal*/, true /*replay*/) {
+		t.Fatal("replay claim against an empty Routes map should still succeed")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := len(fc.sendRepliesSnapshot()); got != 0 {
+		t.Errorf("replay attach sent %d welcomes, want 0 (user didn't initiate)", got)
 	}
 }

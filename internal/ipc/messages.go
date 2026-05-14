@@ -173,6 +173,15 @@ type AttachReq struct {
 	// holder.
 	Steal bool `json:"steal,omitempty"`
 
+	// Replay: set true by the adapter when this attach is being re-sent
+	// after a broker reconnect (see replayLastAttach in
+	// cmd/c3-claude-adapter/main.go). The broker uses this to suppress
+	// the on-attach welcome message — a broker bounce or transient
+	// disconnect shouldn't surface as "👋 Hi! I'm connected…" since the
+	// user didn't initiate anything. User-typed attach calls leave this
+	// false (default) and get the friendly welcome.
+	Replay bool `json:"replay,omitempty"`
+
 	// Confirm carries the prior proposal for sibling-stub race detection
 	// (spec §4.4.1). Optional; v1 broker doesn't yet validate it but the
 	// field is plumbed for forward-compat.

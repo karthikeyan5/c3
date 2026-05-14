@@ -314,7 +314,12 @@ func (a *adapter) replayLastAttach() {
 		return
 	}
 	if conn := a.currentConn(); conn != nil {
-		if err := conn.WriteJSON(*req); err != nil {
+		// Copy and mark as replay so the broker can suppress the
+		// on-attach welcome message — this isn't a user-initiated
+		// attach, it's transparent recovery.
+		replay := *req
+		replay.Replay = true
+		if err := conn.WriteJSON(replay); err != nil {
 			fmt.Fprintf(os.Stderr, "c3-claude-adapter: replay attach failed: %v\n", err)
 			return
 		}

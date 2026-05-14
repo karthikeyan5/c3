@@ -64,9 +64,9 @@ func (b *Broker) handleAttach(conn *ipc.Conn, stub *Stub, raw []byte) {
 
 	switch {
 	case strings.EqualFold(req.Target, "dm"):
-		b.attachDM(conn, stub, chanName, req.Steal)
+		b.attachDM(conn, stub, chanName, req.Steal, req.Replay)
 	case req.TopicID != nil:
-		b.attachByTopicID(conn, stub, chanName, *req.TopicID, req.Group, req.Steal)
+		b.attachByTopicID(conn, stub, chanName, *req.TopicID, req.Group, req.Steal, req.Replay)
 	default:
 		// Pass through the user-supplied name as-is. attachByName will
 		// backfill from cwd basename only AFTER the saved-mapping check,
@@ -79,7 +79,7 @@ func (b *Broker) handleAttach(conn *ipc.Conn, stub *Stub, raw []byte) {
 			})
 			return
 		}
-		b.attachByName(conn, stub, chanName, req.Name, req.CWD, req.Group, req.Create, req.Steal)
+		b.attachByName(conn, stub, chanName, req.Name, req.CWD, req.Group, req.Create, req.Steal, req.Replay)
 	}
 }
 
@@ -136,7 +136,7 @@ func applyExprToAttachReq(req *ipc.AttachReq) {
 // DM, agent re-invokes with `attach target="dm"` and a confirm flag (TBD)
 // or just agrees by sending steal=true to bypass. For now: agent re-issues
 // using the explicit form the user chose.
-func (b *Broker) attachDM(conn *ipc.Conn, stub *Stub, chanName string, steal bool) {
+func (b *Broker) attachDM(conn *ipc.Conn, stub *Stub, chanName string, steal, replay bool) {
 	cc, ok := b.Mappings.Channels[chanName]
 	if !ok || cc.DMChatID == 0 {
 		_ = conn.WriteJSON(ipc.AttachedMsg{
@@ -173,7 +173,7 @@ func (b *Broker) attachDM(conn *ipc.Conn, stub *Stub, chanName string, steal boo
 	}
 
 	key := MakeRouteKey(chanName, cc.DMChatID, nil)
-	if !b.tryClaim(conn, stub, key, "DM", steal) {
+	if !b.tryClaim(conn, stub, key, "DM", steal, replay) {
 		return
 	}
 	_ = conn.WriteJSON(ipc.AttachedMsg{
@@ -188,7 +188,7 @@ func (b *Broker) attachDM(conn *ipc.Conn, stub *Stub, chanName string, steal boo
 // attachByTopicID validates a topic id against the channel (cheap typing
 // action) and, if valid, claims it. Adds to topics registry as `topic-<n>`
 // if not already known. Persists cwd mapping if cwd is provided.
-func (b *Broker) attachByTopicID(conn *ipc.Conn, stub *Stub, chanName string, topicID int64, groupName string, steal bool) {
+func (b *Broker) attachByTopicID(conn *ipc.Conn, stub *Stub, chanName string, topicID int64, groupName string, steal, replay bool) {
 	cc, ok := b.Mappings.Channels[chanName]
 	if !ok {
 		_ = conn.WriteJSON(ipc.AttachedMsg{
@@ -228,7 +228,7 @@ func (b *Broker) attachByTopicID(conn *ipc.Conn, stub *Stub, chanName string, to
 
 	tid := topicID
 	key := MakeRouteKey(chanName, gCfg.ChatID, &tid)
-	if !b.tryClaim(conn, stub, key, fmt.Sprintf("topic %d", topicID), steal) {
+	if !b.tryClaim(conn, stub, key, fmt.Sprintf("topic %d", topicID), steal, replay) {
 		return
 	}
 	tp, _ := b.Mappings.LookupTopicByID(chanName, gCfg.ChatID, topicID)
@@ -258,7 +258,7 @@ func (b *Broker) attachByTopicID(conn *ipc.Conn, stub *Stub, chanName string, to
 //
 // On any "propose" outcome the response carries needs_confirmation=true and
 // a Proposal payload; the agent re-calls attach with create=true to confirm.
-func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, groupName string, create bool, steal bool) {
+func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, groupName string, create, steal, replay bool) {
 	cc, ok := b.Mappings.Channels[chanName]
 	if !ok {
 		_ = conn.WriteJSON(ipc.AttachedMsg{Op: ipc.OpAttached, OK: false,
@@ -285,7 +285,7 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 					tidPtr = nil
 				}
 				key := MakeRouteKey(chanName, m.ChatID, tidPtr)
-				if !b.tryClaim(conn, stub, key, m.Name, steal) {
+				if !b.tryClaim(conn, stub, key, m.Name, steal, replay) {
 					return
 				}
 				b.persistMapping(stub, chanName, m.ChatID, m.TopicID, m.Name, m.Group)
@@ -323,7 +323,7 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 		// In the default group already — silent claim.
 		tid := tp.TopicID
 		key := MakeRouteKey(chanName, tp.ChatID, &tid)
-		if !b.tryClaim(conn, stub, key, tp.Name, steal) {
+		if !b.tryClaim(conn, stub, key, tp.Name, steal, replay) {
 			return
 		}
 		b.persistMapping(stub, chanName, tp.ChatID, tp.TopicID, tp.Name, tp.Group)
@@ -377,11 +377,11 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 		})
 		return
 	}
-	b.createAndClaim(conn, stub, chanName, gName, gCfg.ChatID, name, cwd, steal)
+	b.createAndClaim(conn, stub, chanName, gName, gCfg.ChatID, name, cwd, steal, replay)
 }
 
 // createAndClaim invokes channel.CreateTopic, registers the topic, claims, persists.
-func (b *Broker) createAndClaim(conn *ipc.Conn, stub *Stub, chanName, gName string, chatID int64, name, cwd string, steal bool) {
+func (b *Broker) createAndClaim(conn *ipc.Conn, stub *Stub, chanName, gName string, chatID int64, name, cwd string, steal, replay bool) {
 	ch, err := b.Channel(chanName)
 	if err != nil {
 		_ = conn.WriteJSON(ipc.AttachedMsg{Op: ipc.OpAttached, OK: false, Err: err.Error()})
@@ -398,7 +398,7 @@ func (b *Broker) createAndClaim(conn *ipc.Conn, stub *Stub, chanName, gName stri
 	})
 	tid := topicID
 	key := MakeRouteKey(chanName, chatID, &tid)
-	if !b.tryClaim(conn, stub, key, name, steal) {
+	if !b.tryClaim(conn, stub, key, name, steal, replay) {
 		return
 	}
 	if cwd != "" {
@@ -427,15 +427,19 @@ func (b *Broker) createAndClaim(conn *ipc.Conn, stub *Stub, chanName, gName stri
 // steal=true: the user has confirmed displacement of any existing holder.
 // Force-release first, then claim. Only this path can evict a live PID's
 // claim; everything else returns force_steal proposal for confirmation.
-func (b *Broker) tryClaim(conn *ipc.Conn, stub *Stub, key RouteKey, label string, steal bool) bool {
-	// Detect "is this a fresh claim or a no-op re-claim by the same logical
-	// session?" before we mutate Routes. Same-session re-claims happen on
-	// every adapter reconnect (the adapter replays its last attach so the
-	// route is restored automatically) and shouldn't trigger a welcome
-	// message — the user didn't ask for one, they just bounced their CLI.
-	isFresh := true
-	if existing, held := b.Routes.Holder(key); held && sameLogicalSession(existing, stub) {
-		isFresh = false
+func (b *Broker) tryClaim(conn *ipc.Conn, stub *Stub, key RouteKey, label string, steal, replay bool) bool {
+	// Determine whether to fire the on-attach welcome message. Two
+	// suppression conditions:
+	//   1. The adapter marked this attach as a replay (broker bounce or
+	//      conn-drop recovery) — the user didn't ask, the adapter just
+	//      transparently restored its claim.
+	//   2. Same logical session is already holding this key — the
+	//      claim is a no-op (re-attach during a single connection).
+	isFresh := !replay
+	if isFresh {
+		if existing, held := b.Routes.Holder(key); held && sameLogicalSession(existing, stub) {
+			isFresh = false
+		}
 	}
 
 	if old := stub.CurrentRoute(); old != nil && *old != key {
