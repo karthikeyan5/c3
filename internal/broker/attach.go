@@ -533,12 +533,31 @@ func welcomeText(stub *Stub, label string) string {
 // persistMapping upserts the cwd → mapping into the in-memory MappingsFile.
 // SaveMappings is called at the end of any attach that mutates state to flush
 // to disk atomically.
+//
+// Cwd resolution (TODO.md pre-release UX bug #2, 2026-05-14): if the user
+// launched Claude in a parent directory and attached to a topic whose name
+// matches a subdirectory, persist that subdirectory as the mapped cwd —
+// not the launch root. Without this, every topic attached from the same
+// parent directory ends up clobbering the same `parent → topic` entry,
+// turning every fresh attach into a silent rebind of the parent's default.
+//
+// Conflict guard (TODO.md pre-release UX bug #3): if the resolved cwd
+// already maps to a *different* topic, log a clear warning before
+// overwriting. The live claim still proceeds; the warning surfaces in
+// the broker log so a user can see when their default flipped.
 func (b *Broker) persistMapping(stub *Stub, chanName string, chatID, topicID int64, name, group string) {
-	if stub.CWD == "" {
+	cwd := resolveAttachCWD(stub.CWD, name)
+	if cwd == "" {
 		return
 	}
+	if existing, ok := b.Mappings.LookupByCwd(cwd); ok {
+		if existing.ChatID != chatID || existing.TopicID != topicID {
+			log.Printf("attach: cwd=%q rebound from topic-%d (%s) → topic-%d (%s); previous default lost",
+				cwd, existing.TopicID, existing.Name, topicID, name)
+		}
+	}
 	now := time.Now().UTC()
-	b.Mappings.UpsertMapping(stub.CWD, mappings.Mapping{
+	b.Mappings.UpsertMapping(cwd, mappings.Mapping{
 		Channel:        chanName,
 		ChatID:         chatID,
 		TopicID:        topicID,
@@ -547,6 +566,36 @@ func (b *Broker) persistMapping(stub *Stub, chanName string, chatID, topicID int
 		LastAttachedAt: now,
 	})
 	_ = b.SaveMappings()
+}
+
+// resolveAttachCWD picks the cwd to persist for a `cwd → topic` mapping.
+//
+// Order:
+//  1. If launchCWD == "" → "" (nothing to persist, caller must skip).
+//  2. If topicName == "" → launchCWD (no signal to refine; persist as-is).
+//  3. If `filepath.Base(launchCWD) == topicName` → launchCWD (the launch
+//     directory IS the project directory; basename matches).
+//  4. If `<launchCWD>/<topicName>` exists as a directory → that path
+//     (the user launched in a parent of the project; refine downward).
+//  5. Otherwise → launchCWD (best-effort fallback; conflict-detection
+//     in persistMapping will catch silent rebinds).
+//
+// Exported as a package-private helper so tests can pin the rules.
+func resolveAttachCWD(launchCWD, topicName string) string {
+	if launchCWD == "" {
+		return ""
+	}
+	if topicName == "" {
+		return launchCWD
+	}
+	if filepath.Base(launchCWD) == topicName {
+		return launchCWD
+	}
+	candidate := filepath.Join(launchCWD, topicName)
+	if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+		return candidate
+	}
+	return launchCWD
 }
 
 // SaveMappings writes the in-memory MappingsFile to its on-disk path. Called

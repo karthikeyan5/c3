@@ -15,12 +15,10 @@ Re-prioritize against the spec when picking next work.
 
 Surfaced during install/attach pilot. Must fix before the public push.
 
-- [ ] **Welcome message on attach.** When a session claims a topic, the
-  broker should send a one-shot confirmation to the channel: `Attached.
-  CWD: <cwd> · CLI: <cli> · PID: <pid>`. Confirms the route works one-way
-  (no need for the user to send a probe message) and tells them which
-  CLI/cwd is bound. Currently silent — the user has to send a message and
-  wait for a reply to learn whether attach succeeded.
+- [x] **Welcome message on attach.** Done 2026-05-14
+  (`internal/broker/attach.go:sendWelcome`). Friendly tone, no PID, async,
+  suppressed for adapter-replay re-attaches (broker bounce or conn-drop
+  recovery doesn't spam the topic).
 - [ ] **CLI doesn't actually `cd` into the named project.** When a user
   names a project at session start ("c3"), the agent reads that project's
   `CLAUDE.md` but never changes directory, so `pwd` still shows the
@@ -28,14 +26,17 @@ Surfaced during install/attach pilot. Must fix before the public push.
   state disagrees. Fix: either the agent must `cd` explicitly when
   identifying a project, OR document clearly that the agent stays put and
   uses absolute paths.
-- [ ] **Default cwd for a fresh topic = launch root, not project root.**
-  When the broker records the default cwd for a freshly-attached topic,
-  it uses the session's launch directory rather than the actual project
-  subdir. Investigate `RouteAttach` cwd resolution in `internal/broker/`.
-- [ ] **Mappings registry allows duplicate default cwd across topics.**
-  Two chat/topic pairs ended up pointing at the same default cwd; should
-  be rejected with a clear error (or at minimum a warning) when writing
-  the mappings file. Add uniqueness check in `internal/mappings/`.
+- [x] **Default cwd for a fresh topic = launch root, not project root.**
+  Done 2026-05-14 (`internal/broker/attach.go:resolveAttachCWD`). The
+  broker now refines launch_cwd → launch_cwd/topic_name when that
+  subdirectory exists, so attaching to multiple topics from the same
+  parent directory persists distinct mappings.
+- [x] **Mappings registry allows duplicate default cwd across topics.**
+  Done 2026-05-14 (`internal/broker/attach.go:persistMapping`). The
+  broker logs a clear `cwd=... rebound from topic-X → topic-Y` warning
+  when an upsert would overwrite an existing mapping with a different
+  topic. Live claim still proceeds; only the saved-default behavior is
+  highlighted in the log so the user sees the rebind.
 
 ## Completed follow-up (D011 — Plan 7: Codex bridge in Go)
 

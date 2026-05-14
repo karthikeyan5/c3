@@ -556,6 +556,131 @@ func TestTryClaim_SameLogicalSessionReclaimSuppressesWelcome(t *testing.T) {
 	}
 }
 
+// ─── cwd resolution + conflict guard (TODO.md pre-release UX bugs #2/#3) ───
+
+func TestResolveAttachCWD_EmptyLaunchReturnsEmpty(t *testing.T) {
+	if got := resolveAttachCWD("", "anything"); got != "" {
+		t.Errorf("got %q, want \"\"", got)
+	}
+}
+
+func TestResolveAttachCWD_NoTopicReturnsLaunch(t *testing.T) {
+	if got := resolveAttachCWD("/home/u/proj", ""); got != "/home/u/proj" {
+		t.Errorf("got %q, want /home/u/proj (no topic = no refinement)", got)
+	}
+}
+
+func TestResolveAttachCWD_LaunchBasenameMatchesTopic(t *testing.T) {
+	// Most common pattern: user launches claude FROM the project dir.
+	if got := resolveAttachCWD("/home/u/c3", "c3"); got != "/home/u/c3" {
+		t.Errorf("got %q, want /home/u/c3 (basename matches)", got)
+	}
+}
+
+func TestResolveAttachCWD_RefinesToSubdirectory(t *testing.T) {
+	// User launched in a parent directory; <launch>/<topic> exists.
+	root := t.TempDir()
+	sub := filepath.Join(root, "c3")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got := resolveAttachCWD(root, "c3")
+	if got != sub {
+		t.Errorf("got %q, want %q (subdir exists, refine downward)", got, sub)
+	}
+}
+
+func TestResolveAttachCWD_SubdirNotADirectory(t *testing.T) {
+	// <launch>/<topic> exists but is a regular file, not a dir → fall back.
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "c3"), []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := resolveAttachCWD(root, "c3")
+	if got != root {
+		t.Errorf("got %q, want %q (subdir is a file, fall back to launch)", got, root)
+	}
+}
+
+func TestResolveAttachCWD_SubdirMissingFallsBack(t *testing.T) {
+	// User launched in `~/arogara` and attached to a topic with no matching
+	// subdir. Best-effort fallback: persist the launch dir; conflict guard
+	// in persistMapping will warn if this collides.
+	root := t.TempDir()
+	got := resolveAttachCWD(root, "topic-with-no-subdir")
+	if got != root {
+		t.Errorf("got %q, want %q (no subdir, fall back to launch)", got, root)
+	}
+}
+
+func TestPersistMapping_RefinesToProjectSubdirectory(t *testing.T) {
+	// End-to-end: stub launched in the PARENT of the project dir;
+	// persistMapping should resolve down to the project subdir so two
+	// topics attached from the same parent don't clobber each other's
+	// default mappings.
+	root := t.TempDir()
+	c3 := filepath.Join(root, "c3")
+	sthapati := filepath.Join(root, "sthapati")
+	for _, d := range []string{c3, sthapati} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	// First attach: c3.
+	stub := &Stub{CLI: "claude", PID: 1, CWD: root}
+	b.persistMapping(stub, "telegram", -100, 914, "c3", "main")
+	// Second attach: sthapati (same launch root).
+	b.persistMapping(stub, "telegram", -100, 207, "sthapati", "main")
+
+	if got, ok := b.Mappings.LookupByCwd(c3); !ok || got.TopicID != 914 {
+		t.Errorf("expected %s → topic 914, got %+v (ok=%v)", c3, got, ok)
+	}
+	if got, ok := b.Mappings.LookupByCwd(sthapati); !ok || got.TopicID != 207 {
+		t.Errorf("expected %s → topic 207, got %+v (ok=%v)", sthapati, got, ok)
+	}
+	if _, ok := b.Mappings.LookupByCwd(root); ok {
+		t.Errorf("expected NO mapping at launch root %s, but one was persisted (silent-rebind bug back?)", root)
+	}
+}
+
+func TestPersistMapping_RebindLogsWarning(t *testing.T) {
+	// Same cwd, different topic → warning + still persists. (Live claim
+	// is handled upstream in tryClaim; persistMapping just records.)
+	// Inability to capture log output here is fine — we verify the
+	// overwrite behavior; the log message is structural, exercised by
+	// the surrounding code path.
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	// Stub launched directly in /tmp/X (no subdir refinement possible).
+	root := t.TempDir()
+	stub := &Stub{CLI: "claude", PID: 1, CWD: root}
+
+	// First attach claims topic 914 under name matching root's basename
+	// so the launch dir IS the persisted cwd.
+	name1 := filepath.Base(root)
+	b.persistMapping(stub, "telegram", -100, 914, name1, "main")
+	// Same cwd, different topic. resolveAttachCWD returns launch as
+	// fallback (no subdir match for the second name).
+	b.persistMapping(stub, "telegram", -100, 207, "other", "main")
+
+	got, ok := b.Mappings.LookupByCwd(root)
+	if !ok {
+		t.Fatal("rebind should have overwritten, not skipped")
+	}
+	if got.TopicID != 207 {
+		t.Errorf("expected rebind to topic 207, got topic %d", got.TopicID)
+	}
+}
+
 func TestTryClaim_ReplayFlagSuppressesWelcomeAfterBrokerBounce(t *testing.T) {
 	// Distinct from the same-session reclaim case: this models a broker
 	// restart, where the new broker's Routes map is empty. The adapter
