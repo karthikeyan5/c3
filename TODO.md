@@ -11,10 +11,36 @@ Re-prioritize against the spec when picking next work.
   then `cd` into a project, `attach`, and confirm a real Telegram
   round-trip. Surfaces any rough edges before public GitHub push.
 
+## Pre-release UX bugs (surfaced 2026-05-13)
+
+Surfaced during install/attach pilot. Must fix before the public push.
+
+- [ ] **Welcome message on attach.** When a session claims a topic, the
+  broker should send a one-shot confirmation to the channel: `Attached.
+  CWD: <cwd> · CLI: <cli> · PID: <pid>`. Confirms the route works one-way
+  (no need for the user to send a probe message) and tells them which
+  CLI/cwd is bound. Currently silent — the user has to send a message and
+  wait for a reply to learn whether attach succeeded.
+- [ ] **CLI doesn't actually `cd` into the named project.** When a user
+  names a project at session start ("c3"), the agent reads that project's
+  `CLAUDE.md` but never changes directory, so `pwd` still shows the
+  launch root. Discrepancy: agent narrative says "I'm in c3" but shell
+  state disagrees. Fix: either the agent must `cd` explicitly when
+  identifying a project, OR document clearly that the agent stays put and
+  uses absolute paths.
+- [ ] **Default cwd for a fresh topic = launch root, not project root.**
+  When the broker records the default cwd for a freshly-attached topic,
+  it uses the session's launch directory rather than the actual project
+  subdir. Investigate `RouteAttach` cwd resolution in `internal/broker/`.
+- [ ] **Mappings registry allows duplicate default cwd across topics.**
+  Two chat/topic pairs ended up pointing at the same default cwd; should
+  be rejected with a clear error (or at minimum a warning) when writing
+  the mappings file. Add uniqueness check in `internal/mappings/`.
+
 ## Completed follow-up (D011 — Plan 7: Codex bridge in Go)
 
 Landed 2026-05-09. The Go broker now supports Codex through the Go launcher
-and Go adapter; the Python POC remains in `mvp/` only as historical reference.
+and Go adapter.
 
 - [x] **`cmd/c3-codex-adapter`** — WS forwarder implemented. Inbound C3
   messages are submitted to the Codex app-server as turns.
@@ -109,8 +135,7 @@ Skipped (intentional):
 
 ## Done — v0.1.0
 
-Kept short for reference; full detail in
-[`docs/.loop/state.json`](docs/.loop/state.json) and the c3-v3 git history.
+Kept short for reference; full detail in the git history.
 
 - Plan 1: repo skeleton (go.mod, cmd/, internal/, Makefile)
 - Plan 2: mappings registry + `migrate-legacy` (27 tests)
@@ -126,5 +151,5 @@ Kept short for reference; full detail in
 - Plan 9: install plumbing — marketplace.json, plugin.json, .mcp.json,
   `/c3-build`/`/c3-setup`/`/c3-status` slash commands, `c3-broker setup` /
   `status` / `validate` subcommands, root `INSTALL.md` single-line install
-- Plan 10: doc pass — D009/D010 added, deviation banners retired, README +
-  RESUME + TODO rewritten to current state
+- Plan 10: doc pass — D009 added, README + RESUME + TODO rewritten to
+  current state

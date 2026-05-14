@@ -1,6 +1,7 @@
-// migrate-legacy ports the Python MVP's bot token (.env) and chat ids
-// (mvp/config.json) into a fresh ~/.config/c3/mappings.json. Idempotent —
-// refuses to overwrite an existing output file.
+// migrate-legacy ports a legacy Python-prototype config (.env with a bot
+// token plus a JSON file with chat ids) into a fresh
+// ~/.config/c3/mappings.json. Idempotent — refuses to overwrite an
+// existing output file.
 package main
 
 import (
@@ -22,7 +23,7 @@ func main() {
 		os.Exit(1)
 	}
 	envPath := flag.String("env", filepath.Join(os.Getenv("HOME"), ".claude", "channels", "telegram", ".env"), "path to legacy .env")
-	cfgPath := flag.String("config", "mvp/config.json", "path to legacy mvp/config.json")
+	cfgPath := flag.String("config", "legacy-config.json", "path to legacy JSON config (with group_chat_id, dm_chat_id)")
 	outPath := flag.String("out", defaultOut, "path to write new mappings.json")
 	flag.Parse()
 
@@ -30,7 +31,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "migrate-legacy: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("migrate-legacy: wrote %s (mode 0600). Verify, then you can delete the old mvp/config.json.\n", *outPath)
+	fmt.Printf("migrate-legacy: wrote %s (mode 0600). Verify, then you can delete the old config files.\n", *outPath)
 }
 
 func migrate(envPath, cfgPath, outPath string) error {

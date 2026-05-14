@@ -43,7 +43,7 @@ type Config struct {
 }
 
 // defaultTimeoutSeconds is the broker's hard deadline for the STT subprocess.
-// 60s was too short — Karthi 2026-05-09: a 6m25s voice note (7.9 MB) ate
+// 60s was too short — 2026-05-09: a 6m25s voice note (7.9 MB) ate
 // 45s on download alone, leaving only 15s for the gemini/sarvam chain →
 // SIGKILL'd before either provider returned. 300s gives room for slow
 // downloads + a long-audio transcription cycle without surprising the user.
@@ -66,16 +66,29 @@ func Register(host plugin.Host) error {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = defaultTimeoutSeconds
 	}
+	// Handler existence is checked PER-CALL (inside the callback) rather than
+	// once at startup. Two reasons:
+	//   1. A missing handler at startup used to silently disable transcription,
+	//      so voice messages reached the agent as a bare "(voice message)"
+	//      placeholder with no indication anything had gone wrong.
+	//   2. With the per-call check, if the user restores the script, the very
+	//      next voice message transcribes — no broker restart required.
+	// We still log once at startup so the operator knows the current state.
 	if _, err := os.Stat(cfg.HandlerPath); err != nil {
-		host.Logf("stt: handler %s not found (%v); voice transcription disabled", cfg.HandlerPath, err)
-		return nil
+		host.Logf("stt: handler %s missing at startup (%v); voice messages will surface [STT FAILED: handler_missing] until the handler is restored",
+			cfg.HandlerPath, err)
+	} else {
+		host.Logf("stt: registered with handler=%s timeout=%ds", cfg.HandlerPath, cfg.Timeout)
 	}
-	host.Logf("stt: registered with handler=%s timeout=%ds", cfg.HandlerPath, cfg.Timeout)
 
 	// Resolve telegram channel for the bot token. We need the token because
 	// the POC handler shells out to Telegram's getFile API itself; the channel
 	// owns the only authoritative copy of the token.
 	host.OnVoiceReceived(func(ctx context.Context, p c3types.VoicePayload) (string, error) {
+		if _, err := os.Stat(cfg.HandlerPath); err != nil {
+			host.Logf("stt: msg=%d handler missing at %s (%v)", p.MessageID, cfg.HandlerPath, err)
+			return sttFailureMarker("handler_missing"), nil
+		}
 		token, err := readTelegramToken(host)
 		if err != nil {
 			host.Logf("stt: token read failed for msg=%d: %v", p.MessageID, err)
@@ -89,7 +102,7 @@ func Register(host plugin.Host) error {
 // sttFailureMarker is the stand-in transcript text the broker forwards when
 // the STT chain fails. It replaces the previous silent (voice message)
 // fallback so the receiver knows transcription didn't run and can resend.
-// Karthi 2026-05-09: "if it's not delivered, you can log it"; equivalent
+// 2026-05-09: "if it's not delivered, you can log it"; equivalent
 // principle for STT failure — surface, don't swallow.
 func sttFailureMarker(reason string) string {
 	return "[STT FAILED: " + reason + "]"
@@ -169,8 +182,26 @@ func readTelegramToken(host plugin.Host) (string, error) {
 	return cc.BotToken, nil
 }
 
-// defaultHandlerPath matches the Python POC's installed-symlink convention.
+// defaultHandlerPath returns the path to the bundled handler shipped under
+// `plugins/c3/stt/stt-handler.py` inside the plugin install directory. The
+// plugin install root is conveyed via `$CLAUDE_PLUGIN_ROOT`, set by Claude
+// Code when it launches the c3 adapter; the adapter inherits the env when
+// it spawns the broker, so the broker sees the same root.
+//
+// If `$CLAUDE_PLUGIN_ROOT` is unset or the bundled handler isn't there
+// (e.g. broker launched manually outside Claude Code, or an older install
+// without the bundled handler), we fall back to the pre-c3 legacy path
+// (`~/.claude/channels/telegram/stt-handler.py`) so existing installs that
+// still have the handler in that location keep working without config
+// changes. Users can always override via `plugins.stt.handler_path` in
+// `mappings.json`.
 func defaultHandlerPath() string {
+	if root := os.Getenv("CLAUDE_PLUGIN_ROOT"); root != "" {
+		bundled := filepath.Join(root, "stt", "stt-handler.py")
+		if _, err := os.Stat(bundled); err == nil {
+			return bundled
+		}
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""

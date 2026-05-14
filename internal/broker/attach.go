@@ -125,7 +125,7 @@ func applyExprToAttachReq(req *ipc.AttachReq) {
 // attachDM claims the user's 1-on-1 chat with the bot. Spec §5.5: never
 // persists a per-cwd mapping; DM is universal across cwds.
 //
-// DM disambiguation (Karthi 2026-05-09): if a topic named "dm"
+// DM disambiguation (2026-05-09): if a topic named "dm"
 // (case-insensitive) exists in the channel, we can't tell whether the user
 // meant the actual Telegram DM or that topic. Surface as needs_confirmation
 // with a "disambiguate_dm" proposal — LLM asks the user. If they want the
@@ -264,7 +264,7 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 	}
 
 	// 1. Saved mapping wins — but only if the user didn't explicitly ask
-	// for a different topic. Karthi 2026-05-09: a stale cwd-mapping made
+	// for a different topic. 2026-05-09: a stale cwd-mapping made
 	// `attach name=c3` silently bind to topic-948 instead of c3, because
 	// the saved mapping pointed at 948. Honor explicit name now.
 	//
@@ -415,7 +415,7 @@ func (b *Broker) createAndClaim(conn *ipc.Conn, stub *Stub, chanName, gName stri
 // (the LLM-side asks the user; on confirmation, attach is re-invoked with
 // steal=true).
 //
-// Single-claim-per-stub invariant (Karthi 2026-05-09: "codex was attached
+// Single-claim-per-stub invariant (2026-05-09: "codex was attached
 // to two topic IDs"): if this stub already holds a different route, that
 // claim is released BEFORE the new one is granted. An adapter that wants
 // to switch topics can do so with a single attach call; it will never end

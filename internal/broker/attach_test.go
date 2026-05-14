@@ -349,7 +349,7 @@ func TestAttach_SavedMapping_SilentClaim(t *testing.T) {
 }
 
 func TestAttach_ExplicitNameOverridesSavedMapping(t *testing.T) {
-	// Karthi 2026-05-09: a stale cwd mapping was silently overriding an
+	// 2026-05-09: a stale cwd mapping was silently overriding an
 	// explicit name argument. Saved mapping must NOT win when the user
 	// explicitly asks for a different topic name.
 	mf := mfWithTelegram()

@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// Path-resolution invariant (Karthi 2026-05-09): SocketPath() and
+// Path-resolution invariant (2026-05-09): SocketPath() and
 // PidFilePath() MUST live in the same directory and MUST be deterministic
 // across invocations regardless of the calling process's env. Two brokers
 // with different XDG_RUNTIME_DIR ended up on different sockets, both

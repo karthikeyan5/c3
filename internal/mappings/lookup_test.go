@@ -15,7 +15,7 @@ func newTestFile() *MappingsFile {
 				DMChatID: 42,
 				Topics: []Topic{
 					{ChatID: -100, TopicID: 281, Name: "c3", Group: "main"},
-					{ChatID: -100, TopicID: 207, Name: "sthapati", Group: "main"},
+					{ChatID: -100, TopicID: 207, Name: "widget", Group: "main"},
 					{ChatID: -200, TopicID: 412, Name: "feature-x", Group: "work"},
 				},
 			},

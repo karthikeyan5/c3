@@ -52,15 +52,15 @@ func TestForwardInboundToCodexAppServerStartsTurn(t *testing.T) {
 	wsURL := "ws" + server.URL[len("http"):]
 	msg := c3types.Inbound{
 		Channel:   "telegram",
-		ChatID:    85720317,
+		ChatID:    12345678,
 		MessageID: 1491,
-		Sender:    c3types.Sender{UserID: 85720317, Username: "skarthi"},
+		Sender:    c3types.Sender{UserID: 12345678, Username: "alice"},
 		Text:      "[Transcribed voice]: Hello my testing 1 2 3",
 	}
 
 	err := forwardInboundToCodexAppServer(context.Background(), &msg, codexForwardConfig{
 		WSURL:   wsURL,
-		CWD:     "/home/karthi/arogara",
+		CWD:     "/home/user/projects",
 		Timeout: time.Second,
 	})
 	if err != nil {
@@ -91,7 +91,7 @@ func TestForwardInboundToCodexAppServerStartsTurn(t *testing.T) {
 	input := params["input"].([]any)
 	item := input[0].(map[string]any)
 	text := item["text"].(string)
-	if text != "Telegram message from skarthi (chat=85720317 thread=0)\n[Transcribed voice]: Hello my testing 1 2 3" {
+	if text != "Telegram message from alice (chat=12345678 thread=0)\n[Transcribed voice]: Hello my testing 1 2 3" {
 		t.Fatalf("turn text = %q", text)
 	}
 }
@@ -134,14 +134,14 @@ func TestForwardInboundToCodexAppServerPicksLoadedThreadForCWD(t *testing.T) {
 	wsURL := "ws" + server.URL[len("http"):]
 	err := forwardInboundToCodexAppServer(context.Background(), &c3types.Inbound{
 		Channel: "telegram",
-		ChatID:  85720317,
-		Sender:  c3types.Sender{Username: "skarthi"},
+		ChatID:  12345678,
+		Sender:  c3types.Sender{Username: "alice"},
 		Text:    "hi",
-	}, codexForwardConfig{WSURL: wsURL, CWD: "/home/karthi/arogara/c3", Timeout: time.Second})
+	}, codexForwardConfig{WSURL: wsURL, CWD: "/home/user/projects/c3", Timeout: time.Second})
 	if err != nil {
 		t.Fatalf("forward failed: %v", err)
 	}
-	if threadListParams["cwd"] != "/home/karthi/arogara/c3" {
+	if threadListParams["cwd"] != "/home/user/projects/c3" {
 		encoded, _ := json.Marshal(threadListParams)
 		t.Fatalf("thread/list params = %s", encoded)
 	}

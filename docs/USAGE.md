@@ -88,16 +88,16 @@ Each group needs the bot as an admin with `Manage Topics`.
 
 ## Cross-CLI on the same project
 
-You're in `~/arogara/sthapati`. You started Claude Code there earlier; it auto-attached to topic `sthapati`. Now you want to ask Codex something about the same project. From a different terminal:
+You're in `~/projects/widget`. You started Claude Code there earlier; it auto-attached to topic `widget`. Now you want to ask Codex something about the same project. From a different terminal:
 
 ```
-$ cd ~/arogara/sthapati
+$ cd ~/projects/widget
 $ codex
 ```
 
-The `codex` command goes through the C3 launcher, which spawns a Codex app-server, registers the C3 MCP adapter, and launches the visible TUI bound to that app-server. The adapter sees the cwd has a mapping but it's already claimed by Claude Code — so Codex stays unattached and tells you. To take over, either `/exit` the Claude session, or run `c3-broker release ~/arogara/sthapati` from any shell to drop the claim without quitting Claude. Then `attach` from Codex.
+The `codex` command goes through the C3 launcher, which spawns a Codex app-server, registers the C3 MCP adapter, and launches the visible TUI bound to that app-server. The adapter sees the cwd has a mapping but it's already claimed by Claude Code — so Codex stays unattached and tells you. To take over, either `/exit` the Claude session, or run `c3-broker release ~/projects/widget` from any shell to drop the claim without quitting Claude. Then `attach` from Codex.
 
-If you want Claude and Codex on different topics in the same group, attach Codex to a different topic explicitly: `attach(target="sthapati-codex")`. The broker creates that as a sibling topic in the group; future Codex sessions in this dir will need the same explicit override (or you switch the dir's default mapping).
+If you want Claude and Codex on different topics in the same group, attach Codex to a different topic explicitly: `attach(target="widget-codex")`. The broker creates that as a sibling topic in the group; future Codex sessions in this dir will need the same explicit override (or you switch the dir's default mapping).
 
 ## Editing mappings.json by hand
 

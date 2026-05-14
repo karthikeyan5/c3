@@ -26,7 +26,7 @@ human-readable walkthrough.
 | [`cmd/c3-broker`](cmd/c3-broker) | The broker daemon + `setup` / `status` / `validate` subcommands. |
 | [`cmd/c3-claude-adapter`](cmd/c3-claude-adapter) | MCP stdio adapter for Claude Code. |
 | [`cmd/c3-codex-adapter`](cmd/c3-codex-adapter) | Codex MCP adapter (scaffold; full impl deferred per D010). |
-| [`cmd/migrate-legacy`](cmd/migrate-legacy) | One-shot migrator from the Python POC config. |
+| [`cmd/migrate-legacy`](cmd/migrate-legacy) | One-shot migrator from a legacy Python-prototype config layout into `~/.config/c3/mappings.json`. |
 | [`internal/`](internal) | broker, channel/telegram, plugin host, mappings, IPC, MCP server. |
 | [`plugins/c3/`](plugins/c3) | Plugin manifest + slash commands shipped to users. |
 | [`docs/specs/2026-05-08-c3-rearch-design.md`](docs/specs/2026-05-08-c3-rearch-design.md) | **Locked spec (v5).** Source of truth. |
@@ -35,7 +35,6 @@ human-readable walkthrough.
 | [`DEBUGGING.md`](DEBUGGING.md) | Where the logs live and how to read them. |
 | [`docs/COMMANDS.md`](docs/COMMANDS.md) | Cross-CLI verb spec — single source of truth for `/c3:*` semantics. |
 | [`docs/PLUGINS.md`](docs/PLUGINS.md), [`CHANNELS.md`](docs/CHANNELS.md), [`ADAPTERS.md`](docs/ADAPTERS.md) | Authoring docs for extension points. |
-| [`mvp/`](mvp) | Original Python wrapper. Superseded by the Go rewrite (D009); kept for Codex POC and reference. |
 
 ## Architecture
 
@@ -72,18 +71,19 @@ Tools: `attach`, `reply`, `react`, `edit_message`, `download_attachment`,
 (`internal/channel/telegram`, cleanroom Go via `gotgbot/v2` rc.34).
 
 **Plugins.** Five hook points: `OnInbound`, `OnVoiceReceived`, `OnOutbound`,
-`OnAttach`, `RegisterTools`. Built-in: STT (subprocesses the user's existing
-`~/.claude/channels/telegram/stt-handler.py`).
+`OnAttach`, `RegisterTools`. Built-in: STT — Go shim under
+`internal/plugin/builtins/stt/` plus a bundled Python pipeline at
+`plugins/c3/stt/` (Gemini 3 Flash → Sarvam Saaras v3 chain, vocabulary-biased).
+Override the handler via `mappings.json:plugins.stt.handler_path`.
 
 **Config.** `~/.config/c3/mappings.json` (mode 0600, atomic-rewrite with one
-`.bak`). Replaces the April triplet (`mvp/config.json` +
-`mvp/topics.json` + `.env`).
+`.bak`).
 
 ## Routing
 
 - **Topic-based** (primary) — Telegram group with topics enabled. Each topic
   binds to one CLI session. The natural way to start work is `cd
-  ~/arogara/<project> && claude` — the adapter auto-attaches to a topic
+  <project-dir> && claude` — the adapter auto-attaches to a topic
   named after the project, creating it via the attach proposal flow if it
   doesn't exist.
 - **DM-based** — User X's DMs route to CLI-1.
@@ -92,9 +92,9 @@ Tools: `attach`, `reply`, `react`, `edit_message`, `download_attachment`,
 ## Status
 
 **v0.1.0 functionally complete (2026-05-09).** Plans 1–7 + 9 done. Live
-broker verified against `@OCDWaterBot`; MCP exchange round-trip confirmed;
-voice STT plugin loads its handler on boot. The Go Codex launcher and adapter
-are installed via `c3-broker install-codex-shim`.
+broker verified end-to-end against a Telegram bot; MCP exchange round-trip
+confirmed; voice STT plugin loads its handler on boot. The Go Codex launcher
+and adapter are installed via `c3-broker install-codex-shim`.
 
 What's next: see [`RESUME.md`](RESUME.md) and [`TODO.md`](TODO.md).
 

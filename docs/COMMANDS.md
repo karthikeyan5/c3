@@ -6,7 +6,7 @@ MCP tool) and exposed by each CLI through a thin wrapper. **When a
 verb's behavior changes, edit this file first**, then sync each CLI's
 wrapper to match.
 
-The principle (Karthi 2026-05-09): the actual logic lives in the
+The principle: the actual logic lives in the
 shared layer (broker / MCP); per-CLI surface area is intentionally
 thin so the same set of verbs is trivial to add for every new CLI we
 support.

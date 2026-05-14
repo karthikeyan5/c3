@@ -46,13 +46,13 @@ func TestHandleInboundEndToEnd(t *testing.T) {
 	tid := int64(914)
 	in := c3types.Inbound{
 		Channel:   "telegram",
-		ChatID:    -1003990699908,
+		ChatID:    -1001234567890,
 		MessageID: 933,
 		TopicID:   &tid,
 		Text:      "hi inbound",
 		Sender: c3types.Sender{
-			UserID:   85720317,
-			Username: "skarthi",
+			UserID:   12345678,
+			Username: "alice",
 		},
 		Timestamp: time.Date(2026, 5, 9, 9, 17, 55, 0, time.UTC),
 	}
@@ -104,11 +104,11 @@ func TestHandleInboundEndToEnd(t *testing.T) {
 //	{"jsonrpc":"2.0","method":"notifications/claude/channel","params":{
 //	  "content":"hi inbound",
 //	  "meta":{
-//	    "chat_id": -1003990699908,
+//	    "chat_id": -1001234567890,
 //	    "message_thread_id": "914",
 //	    "message_id": "933",
-//	    "user": "skarthi",
-//	    "user_id": "85720317",
+//	    "user": "alice",
+//	    "user_id": "12345678",
 //	    "ts": "2026-05-09T09:17:55.000Z"
 //	  }
 //	}}
@@ -121,13 +121,13 @@ func TestChannelFrameWireBytes(t *testing.T) {
 	tid := int64(914)
 	in := &c3types.Inbound{
 		Channel:   "telegram",
-		ChatID:    -1003990699908,
+		ChatID:    -1001234567890,
 		MessageID: 933,
 		TopicID:   &tid,
 		Text:      "hi inbound",
 		Sender: c3types.Sender{
-			UserID:   85720317,
-			Username: "skarthi",
+			UserID:   12345678,
+			Username: "alice",
 		},
 		Timestamp: time.Date(2026, 5, 9, 9, 17, 55, 0, time.UTC),
 	}
@@ -188,8 +188,8 @@ func TestChannelFrameWireBytes(t *testing.T) {
 		t.Fatalf("meta.chat_id: want string, got %T (value: %v)",
 			meta["chat_id"], meta["chat_id"])
 	}
-	if chatIDStr != "-1003990699908" {
-		t.Errorf("meta.chat_id: want %q, got %q", "-1003990699908", chatIDStr)
+	if chatIDStr != "-1001234567890" {
+		t.Errorf("meta.chat_id: want %q, got %q", "-1001234567890", chatIDStr)
 	}
 
 	// String fields.
@@ -211,11 +211,11 @@ func TestChannelFrameWireBytes(t *testing.T) {
 	if meta["message_id"] != "933" {
 		t.Errorf("meta.message_id: want %q, got %v", "933", meta["message_id"])
 	}
-	if meta["user"] != "skarthi" {
-		t.Errorf("meta.user: want %q, got %v", "skarthi", meta["user"])
+	if meta["user"] != "alice" {
+		t.Errorf("meta.user: want %q, got %v", "alice", meta["user"])
 	}
-	if meta["user_id"] != "85720317" {
-		t.Errorf("meta.user_id: want %q, got %v", "85720317", meta["user_id"])
+	if meta["user_id"] != "12345678" {
+		t.Errorf("meta.user_id: want %q, got %v", "12345678", meta["user_id"])
 	}
 
 	// Reject any spurious fields the official plugin doesn't send. This is the

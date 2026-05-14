@@ -33,7 +33,7 @@ func (c *Channel) SendReply(args c3types.ReplyArgs) (int64, error) {
 	// Markdown rendering: when the caller didn't pin a ParseMode, treat the
 	// text as standard markdown and convert to Telegram HTML. Without this,
 	// `**bold**` and `` `code` `` show as literal characters in Telegram
-	// (Karthi 2026-05-09 photo report). We chunk the RAW text first, then
+	// (2026-05-09 photo report). We chunk the RAW text first, then
 	// convert each chunk independently so a 4096-char split never bisects an
 	// opened tag.
 	autoHTML := args.ParseMode == ""

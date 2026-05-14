@@ -9,8 +9,8 @@ import (
 func TestConvertInbound_TextMessage(t *testing.T) {
 	msg := &gotgbot.Message{
 		MessageId: 868,
-		From:      &gotgbot.User{Id: 42, Username: "skarthi"},
-		Chat:      gotgbot.Chat{Id: -1003990699908},
+		From:      &gotgbot.User{Id: 42, Username: "alice"},
+		Chat:      gotgbot.Chat{Id: -1001234567890},
 		Date:      1715151931,
 		Text:      "hello",
 	}
@@ -21,10 +21,10 @@ func TestConvertInbound_TextMessage(t *testing.T) {
 	if in.Text != "hello" {
 		t.Errorf("Text=%q", in.Text)
 	}
-	if in.ChatID != -1003990699908 {
+	if in.ChatID != -1001234567890 {
 		t.Errorf("ChatID=%d", in.ChatID)
 	}
-	if in.Sender.UserID != 42 || in.Sender.Username != "skarthi" {
+	if in.Sender.UserID != 42 || in.Sender.Username != "alice" {
 		t.Errorf("Sender=%+v", in.Sender)
 	}
 	if in.TopicID != nil {
@@ -74,13 +74,13 @@ func TestConvertInbound_VoiceMessage(t *testing.T) {
 func TestConvertInbound_ReplyContext(t *testing.T) {
 	parent := &gotgbot.Message{
 		MessageId: 281,
-		From:      &gotgbot.User{Id: 999, Username: "OCDWaterBot"},
+		From:      &gotgbot.User{Id: 999, Username: "examplebot"},
 		Chat:      gotgbot.Chat{Id: -100},
 		Text:      "previous message",
 	}
 	msg := &gotgbot.Message{
 		MessageId:      900,
-		From:           &gotgbot.User{Id: 42, Username: "skarthi"},
+		From:           &gotgbot.User{Id: 42, Username: "alice"},
 		Chat:           gotgbot.Chat{Id: -100},
 		ReplyToMessage: parent,
 		Text:           "reply",
@@ -92,7 +92,7 @@ func TestConvertInbound_ReplyContext(t *testing.T) {
 	if in.ReplyTo.MessageID != 281 {
 		t.Errorf("ReplyTo.MessageID=%d", in.ReplyTo.MessageID)
 	}
-	if in.ReplyTo.User.Username != "OCDWaterBot" {
+	if in.ReplyTo.User.Username != "examplebot" {
 		t.Errorf("ReplyTo.User=%+v", in.ReplyTo.User)
 	}
 	if in.ReplyTo.Text != "previous message" {

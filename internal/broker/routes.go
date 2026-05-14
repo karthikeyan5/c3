@@ -22,7 +22,7 @@ func NewRoutes() *Routes {
 // no-op re-claim by the same stub, or successful displacement of a dead
 // holder.
 //
-// Liveness rule (the "broker is the authority" principle, Karthi 2026-05-09):
+// Liveness rule (the "broker is the authority" principle, 2026-05-09):
 // A claim is sacrosanct as long as the holding adapter's process is alive.
 // A momentary conn drop does NOT free the claim — we wait for the holder
 // to reconnect. Only if the holder's PID is confirmed dead do we release

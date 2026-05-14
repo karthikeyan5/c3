@@ -26,7 +26,7 @@ var ErrSiblingListening = errors.New("broker: socket already served by sibling")
 // Listen binds a unix socket at path (mode 0600) and starts accepting
 // connections. Caller must Stop() at shutdown to drain in-flight handlers.
 //
-// Singleton enforcement (Karthi 2026-05-09 incident — two brokers ended up
+// Singleton enforcement (2026-05-09 incident — two brokers ended up
 // with overlapping listen sockets after a restart-broker race that bypassed
 // the pidfile flock by deleting the inode):
 //

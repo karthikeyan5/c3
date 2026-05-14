@@ -11,9 +11,9 @@
 
 C3 is a Telegram multiplexer for multiple Claude Code CLI instances. One daemon, many MCP stubs, topic-based routing. Written in Go. See README.md for the full architecture.
 
-Discuss before building anything non-trivial. Karthi makes final calls.
+Discuss before building anything non-trivial. The maintainer makes final calls.
 
-## Launch command (for Karthi to type)
+## Launch command (for the maintainer to type)
 
 For the Telegram channel to actually surface inbound messages in this CLI,
 Claude Code must be started with the development-channels flag:
@@ -32,5 +32,4 @@ the dev-channels-flag gate, separate from `~/.claude/settings.json`'s
 marketplace-published plugins; our `c3@c3` is a local-directory
 marketplace and needs the dev flag).
 
-Do NOT alias this — Karthi prefers the full command in his shell history
-(see his `feedback_explicit_launch_flags` memory).
+Do NOT alias this — the maintainer prefers the full command in shell history.

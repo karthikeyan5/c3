@@ -21,8 +21,8 @@ func TestShouldBypassNonInteractiveCommands(t *testing.T) {
 
 func TestInferTopicNameUsesNearestClaudeMDWithSharedRootGuard(t *testing.T) {
 	root := t.TempDir()
-	shared := filepath.Join(root, "arogara")
-	project := filepath.Join(shared, "sthapati")
+	shared := filepath.Join(root, "projects")
+	project := filepath.Join(shared, "widget")
 	if err := os.MkdirAll(project, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -38,8 +38,8 @@ func TestInferTopicNameUsesNearestClaudeMDWithSharedRootGuard(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(project, "CLAUDE.md"), []byte("# project\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := inferTopicName(project, shared); got != "sthapati" {
-		t.Fatalf("project topic = %q, want sthapati", got)
+	if got := inferTopicName(project, shared); got != "widget" {
+		t.Fatalf("project topic = %q, want widget", got)
 	}
 }
 

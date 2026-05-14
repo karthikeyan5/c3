@@ -188,8 +188,16 @@ func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inboun
 				MIME:      in.Attachments[0].MIME,
 				Size:      in.Attachments[0].Size,
 			}
-			if transcript := w.broker.Plugins.FireOnVoiceReceived(ctx, payload); transcript != "" {
+			transcript := w.broker.Plugins.FireOnVoiceReceived(ctx, payload)
+			switch {
+			case transcript != "":
 				in.Text = w.sttPrefix(in.Channel) + transcript
+			case in.Text == "":
+				// Defense-in-depth: no plugin produced a transcript AND the
+				// message has no caption. Without this, the adapter falls
+				// back to a silent "(voice message)" placeholder. Marker
+				// shape matches sttFailureMarker() in plugins/builtins/stt.
+				in.Text = w.sttPrefix(in.Channel) + "[STT FAILED: no_transcript_plugin]"
 			}
 		}
 	}
@@ -246,7 +254,7 @@ func mergeBatch(batch []*c3types.Inbound) *c3types.Inbound {
 //   - Any failure path where the CLI never saw the message → log line
 //     INCLUDES content (sender, text [200-char cap], attachment summary).
 //     This is the explicit "don't lose undelivered content" rule from
-//     2026-05-09 — Karthi: "I don't want you to lose the content without
+//     2026-05-09: "I don't want you to lose the content without
 //     delivering it anywhere".
 //
 // "Failure paths" here means anything that ends without a `delivered` line:

@@ -59,7 +59,7 @@ const (
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go build ./internal/ipc/...
+cd <repo-root> && go build ./internal/ipc/...
 ```
 
 Expected: no output (success).
@@ -147,7 +147,7 @@ func TestErrorMsg_Roundtrip(t *testing.T) {
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/ipc/... -v
+cd <repo-root> && go test ./internal/ipc/... -v
 ```
 
 Expected: compile error, `HelloMsg`/`ErrorMsg`/`PeekOp` undefined.
@@ -258,7 +258,7 @@ func PeekOp(raw []byte) (Op, error) {
 - [ ] **Step 4: Run tests**
 
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/ipc/... -v
+cd <repo-root> && go test ./internal/ipc/... -v
 ```
 
 Expected: all four pass.
@@ -356,7 +356,7 @@ func TestConn_ConcurrentWritesAreFramed(t *testing.T) {
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/ipc/... -run TestConn -v
+cd <repo-root> && go test ./internal/ipc/... -run TestConn -v
 ```
 
 Expected: compile error, `Conn`/`NewConn`/`WriteJSON`/`ReadFrame` undefined.
@@ -456,7 +456,7 @@ func (c *Conn) Close() error {
 - [ ] **Step 4: Run tests**
 
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/ipc/... -v
+cd <repo-root> && go test ./internal/ipc/... -v
 ```
 
 Expected: all tests pass.
@@ -546,7 +546,7 @@ func TestEnsureParentDir(t *testing.T) {
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/broker/... -v
+cd <repo-root> && go test ./internal/broker/... -v
 ```
 
 Expected: compile error, `SocketPath`/`PidFilePath`/`ensureParentDir` undefined.
@@ -600,7 +600,7 @@ func ensureParentDir(path string) error {
 - [ ] **Step 4: Run tests**
 
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/broker/... -v
+cd <repo-root> && go test ./internal/broker/... -v
 ```
 
 Expected: all five pass.
@@ -696,7 +696,7 @@ func TestAcquireSingleton_WritesOurPid(t *testing.T) {
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/broker/... -run TestAcquireSingleton -v
+cd <repo-root> && go test ./internal/broker/... -run TestAcquireSingleton -v
 ```
 
 Expected: compile error, `AcquireSingleton`/`Release` undefined.
@@ -813,7 +813,7 @@ func pidAlive(pidFile string) (bool, error) {
 - [ ] **Step 4: Run tests**
 
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/broker/... -v
+cd <repo-root> && go test ./internal/broker/... -v
 ```
 
 Expected: all three TestAcquireSingleton tests pass.
@@ -905,7 +905,7 @@ func TestRouteKey_NilDistinctFromZero(t *testing.T) {
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/broker/... -run RouteKey -v
+cd <repo-root> && go test ./internal/broker/... -run RouteKey -v
 ```
 
 Expected: compile error, `RouteKey`/`MakeRouteKey` undefined.
@@ -943,7 +943,7 @@ func MakeRouteKey(channel string, chatID int64, topicID *int64) RouteKey {
 - [ ] **Step 4: Run tests**
 
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/broker/... -v
+cd <repo-root> && go test ./internal/broker/... -v
 ```
 
 Expected: all five RouteKey tests pass.
@@ -1009,7 +1009,7 @@ func TestStubRegistry_Unregister(t *testing.T) {
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/broker/... -run TestStubRegistry -v
+cd <repo-root> && go test ./internal/broker/... -run TestStubRegistry -v
 ```
 
 Expected: compile error, `StubRegistry`/`NewStubRegistry`/`Register`/`Get`/`Unregister` undefined.
@@ -1094,7 +1094,7 @@ func (r *StubRegistry) Snapshot() []*Stub {
 - [ ] **Step 4: Run tests**
 
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/broker/... -v
+cd <repo-root> && go test ./internal/broker/... -v
 ```
 
 Expected: all three TestStubRegistry pass.
@@ -1198,7 +1198,7 @@ func ptrI64(v int64) *int64 { return &v }
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/broker/... -run TestRoutes -v
+cd <repo-root> && go test ./internal/broker/... -run TestRoutes -v
 ```
 
 Expected: compile error, `Routes`/`NewRoutes`/`Claim`/`Release`/`Holder`/`ReleaseAllByConnID` undefined.
@@ -1294,7 +1294,7 @@ type RouteEntry struct {
 - [ ] **Step 4: Run tests**
 
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/broker/... -v
+cd <repo-root> && go test ./internal/broker/... -v
 ```
 
 Expected: all five TestRoutes tests pass.
@@ -1463,7 +1463,7 @@ func TestHandle_ByeClosesCleanly(t *testing.T) {
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/broker/... -v
+cd <repo-root> && go test ./internal/broker/... -v
 ```
 
 Expected: compile error, `Broker`/`HandleConn` undefined.
@@ -1744,7 +1744,7 @@ func ptrI64Val(v int64) *int64 { return &v }
 - [ ] **Step 4: Run tests**
 
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/broker/... -v
+cd <repo-root> && go test ./internal/broker/... -v
 ```
 
 Expected: all four TestHandle_* tests pass.
@@ -1822,7 +1822,7 @@ func TestServer_AcceptsAndHandlesHello(t *testing.T) {
 - [ ] **Step 2: Run test to verify it fails**
 
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/broker/... -run TestServer -v
+cd <repo-root> && go test ./internal/broker/... -run TestServer -v
 ```
 
 Expected: compile error, `Listen`/`Stop` undefined.
@@ -1913,7 +1913,7 @@ func (s *Server) Stop() {
 - [ ] **Step 4: Run tests**
 
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/broker/... -v
+cd <repo-root> && go test ./internal/broker/... -v
 ```
 
 Expected: all broker tests pass.
@@ -2030,7 +2030,7 @@ func directoryOf(path string) string {
 - [ ] **Step 2: Build**
 
 ```bash
-cd /home/karthi/arogara/c3 && go build ./cmd/c3-broker
+cd <repo-root> && go build ./cmd/c3-broker
 ```
 
 Expected: success.
@@ -2040,7 +2040,7 @@ Expected: success.
 Manual test:
 
 ```bash
-cd /home/karthi/arogara/c3 && ./bin/c3-broker &
+cd <repo-root> && ./bin/c3-broker &
 BROKER=$!
 sleep 0.3
 SOCK=$(ls /run/user/$UID/c3.sock 2>/dev/null || echo /tmp/c3-$UID.sock)
@@ -2067,7 +2067,7 @@ git commit -m "c3-v3: c3-broker main — singleton + mappings load + socket serv
 - [ ] **Step 1: Full test suite**
 
 ```bash
-cd /home/karthi/arogara/c3 && go test ./... -v
+cd <repo-root> && go test ./... -v
 ```
 
 Expected: every test passes.
@@ -2075,7 +2075,7 @@ Expected: every test passes.
 - [ ] **Step 2: Build**
 
 ```bash
-cd /home/karthi/arogara/c3 && make build
+cd <repo-root> && make build
 ```
 
 Expected: all four binaries built.
@@ -2083,7 +2083,7 @@ Expected: all four binaries built.
 - [ ] **Step 3: Live broker smoke test (optional)**
 
 ```bash
-cd /home/karthi/arogara/c3 && ./bin/c3-broker &
+cd <repo-root> && ./bin/c3-broker &
 sleep 0.3
 ls -la "${XDG_RUNTIME_DIR:-/tmp}/c3.sock" 2>/dev/null || ls -la /tmp/c3-$UID.sock
 ls -la "${XDG_RUNTIME_DIR:-$HOME/.cache/c3}/c3-broker.pid" 2>/dev/null

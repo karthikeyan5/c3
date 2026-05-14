@@ -7,7 +7,7 @@ import (
 
 // mdToTelegramHTML converts a subset of standard markdown to Telegram's HTML
 // parse_mode. Telegram doesn't render raw markdown; without conversion,
-// `**bold**` shows as literal asterisks (Karthi 2026-05-09 photo report).
+// `**bold**` shows as literal asterisks (2026-05-09 photo report).
 //
 // Conversions handled (well enough to render LLM-generated text cleanly):
 //

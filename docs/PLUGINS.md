@@ -155,15 +155,16 @@ Metrics: `host.Metric("plugin.example.invocations", 1, tags...)` if you need obs
 
 ## STT as a worked example
 
-The STT plugin (`internal/plugin/builtins/stt/`) is the v1 shipped example. Skim it for a real implementation:
+The STT plugin is the v1 shipped first-class example. Two pieces ship together:
 
-- Subscribes to `OnVoiceReceived` only.
-- Reads `plugins.stt.{language, vocabulary_file, model_path}` config.
-- On invocation, downloads the voice attachment via `host.Channel("telegram").DownloadAttachment(file_id)`, then invokes the existing Python whisper pipeline as a subprocess (`stt/transcribe.py`) with the file path and config.
-- Returns the transcript string. The broker substitutes it for the voice payload's text on the inbound that gets routed to the CLI.
-- Errors degrade to empty string — the channel falls back to its caption-or-`(voice message)` default.
+- **Go shim** at `internal/plugin/builtins/stt/` — compiled into the broker, subscribes to `OnVoiceReceived`, reads `plugins.stt.{handler_path, timeout_seconds, enabled}` from `mappings.json`, and subprocesses a Python handler with `<bot_token> <chat_id> <reply_msg_id> <file_id> [<message_thread_id>]` on argv. The handler script is responsible for fetching the audio from Telegram (the bot token is passed in) and printing the transcript to stdout.
+- **Python pipeline** at `plugins/c3/stt/` — `stt-handler.py` plus a `stt-pkg/` package with a chained provider runner (`stt-pkg/stt.py`) and two providers (`gemini-3-flash-openrouter`, `sarvam-saaras-v3`). Default chain: Gemini first, Sarvam fallback. Vocabulary file at `stt-pkg/vocabulary.txt` biases recognition toward domain-specific terms. API keys come from `~/.claude/stt.env`.
 
-The Python pipeline is a deliberate scope choice; STT is the only first-party plugin that uses a non-Go runtime. New plugins should default to pure Go.
+The default `handler_path` resolves to the bundled `${CLAUDE_PLUGIN_ROOT}/stt/stt-handler.py` (when the broker is launched by Claude Code) and falls back to `~/.claude/channels/telegram/stt-handler.py` (the pre-c3 legacy path) so existing installs keep working. Users who want a different STT engine (whisper, deepgram, a local model) override `plugins.stt.handler_path` to point at their own script — the argv contract is the only requirement.
+
+Errors don't degrade silently. On any failure the shim returns `[STT FAILED: <reason>]` so the CLI sees the failure explicitly (`handler_missing`, `timeout`, `killed`, `error`, `empty`, `token_unavailable`). The worker also forces `[STT FAILED: no_transcript_plugin]` if no `OnVoiceReceived` plugin produced output at all (defense-in-depth).
+
+The Python pipeline is a deliberate scope choice — STT is the only first-party plugin that uses a non-Go runtime, because the provider chain (and the room for adding new providers without recompiling) is more valuable than language uniformity. New plugins should default to pure Go.
 
 ## External subprocess plugins (v1.x — not yet implemented)
 
@@ -196,11 +197,11 @@ func TestExample_GreetTool(t *testing.T) {
 	if !ok {
 		t.Fatal("example_greet not registered")
 	}
-	got, err := tool.Handler(t.Context(), map[string]any{"name": "Karthi"})
+	got, err := tool.Handler(t.Context(), map[string]any{"name": "World"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "Hello, Karthi!" {
+	if got != "Hello, World!" {
 		t.Errorf("got %q", got)
 	}
 }

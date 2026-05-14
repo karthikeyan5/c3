@@ -64,10 +64,6 @@ func run(args []string, self string) error {
 		return err
 	}
 	sharedRoot := os.Getenv("C3_CODEX_SHARED_ROOT")
-	if sharedRoot == "" {
-		home, _ := os.UserHomeDir()
-		sharedRoot = filepath.Join(home, "arogara")
-	}
 	topic := inferTopicName(cwd, sharedRoot)
 	if override, ok := os.LookupEnv("C3_ATTACH_NAME"); ok {
 		topic = override

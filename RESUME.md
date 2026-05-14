@@ -2,7 +2,7 @@
 
 ## Current state — 2026-05-09
 
-**Phase: v0.1.0 functionally complete.** The Go rewrite landed during
+**Phase: v0.1.0 functionally complete.** The Go implementation landed during
 2026-05-08 → 2026-05-09. Plans 1–7 + 9 + plugin host (5) shipped. The
 Codex bridge follow-up landed per D011. Tests are green.
 
@@ -16,8 +16,8 @@ Codex bridge follow-up landed per D011. Tests are green.
   polling, outbound tools, attach proposal flow with cross-group
   disambiguation, debounce + mergeBatch (1.5s, 50-msg cap), cooldown-fallback
   (300s dedup per `RouteKey`).
-- **Claude Code adapter** (`c3-claude-adapter`) — END-TO-END VERIFIED
-  against `@OCDWaterBot`. 7 tools, manual JSON-RPC framing for
+- **Claude Code adapter** (`c3-claude-adapter`) — end-to-end verified
+  against a live Telegram bot. 7 tools, manual JSON-RPC framing for
   `notifications/claude/channel`, broker auto-spawn on first connect,
   reconnect-once with pending-tool-call wake-with-error.
 - **Codex bridge** (`codex` + `c3-codex-adapter`) — Go launcher and adapter
@@ -25,14 +25,11 @@ Codex bridge follow-up landed per D011. Tests are green.
   IPC, supports `attach dm`, `reply`, `inbox`, and forwards inbound Telegram
   messages to the Codex app-server as turns.
 - **Plugin host** — 5 hook points (`OnInbound`, `OnVoiceReceived`,
-  `OnOutbound`, `OnAttach`, `RegisterTools`). STT plugin loads on boot,
-  shells out to `~/.claude/channels/telegram/stt-handler.py`.
+  `OnOutbound`, `OnAttach`, `RegisterTools`). STT plugin loads on boot and
+  shells out to a user-supplied speech-to-text handler script.
 - **Install plumbing** — `karthikeyan5/c3` marketplace, `c3@c3` plugin,
   `/c3-build`, `/c3-setup`, `/c3-status` slash commands. Single-line install
   via [`INSTALL.md`](INSTALL.md) at repo root.
-- **Migration** — `migrate-legacy` converts the Python POC's
-  `mvp/config.json` + `~/.claude/channels/telegram/.env` triplet into the
-  new `~/.config/c3/mappings.json`.
 
 ### What's NOT done
 
@@ -55,17 +52,9 @@ A plain `claude` leaves notifications silently dropped on the receiving
 side (broker log shows `delivered`, conversation sees nothing). See
 [`CLAUDE.md`](CLAUDE.md) for why.
 
-**Most likely next step (user-driven):** paste the install one-liner into a
-fresh Claude Code session and walk through it as the first real user. This
-flushes out any rough edges in the playbook before pushing the repo to
-GitHub publicly.
-
-```
-follow /home/karthi/arogara/c3/INSTALL.md to install c3
-```
-
-Then `cd` into any project, type `attach`, confirm the proposal, and send a
-message from Telegram to verify the round-trip.
+**Next step:** walk through [`INSTALL.md`](INSTALL.md) end-to-end on a fresh
+machine. Then `cd` into any project, type `attach`, confirm the proposal,
+and send a message from Telegram to verify the round-trip.
 
 **Build-side options when picking back up:**
 
@@ -78,29 +67,6 @@ message from Telegram to verify the round-trip.
 
 - **Spec (locked):** [`docs/specs/2026-05-08-c3-rearch-design.md`](docs/specs/2026-05-08-c3-rearch-design.md) — v5
 - **Plans:** [`docs/plans/`](docs/plans) — 2026-05-08 foundation, 2026-05-09 broker+ipc, 2026-05-09 channel+worker
-- **Decisions:** [`DECISIONS.md`](DECISIONS.md) — D009 (Go rewrite landed), D010 (Codex deferred) are the most recent
+- **Decisions:** [`DECISIONS.md`](DECISIONS.md) — D009 (Go implementation landed) and D011 (Codex bridge in Go) are the most recent
 - **User guide:** [`docs/USAGE.md`](docs/USAGE.md)
 - **Authoring:** [`docs/PLUGINS.md`](docs/PLUGINS.md), [`docs/CHANNELS.md`](docs/CHANNELS.md), [`docs/ADAPTERS.md`](docs/ADAPTERS.md)
-
----
-
-## Appendix — historical session notes
-
-### 2026-04-15 — Project created
-
-Architecture designed (daemon + MCP stubs, topic routing, STT in daemon).
-Decisions D001–D008 recorded. Original Python wrapper MVP scope set.
-
-### 2026-04-15 → 2026-05-07 — Python wrapper MVP
-
-Bun-plugin-wrapping + `patch_server.py` machinery. Ran in production on
-`@OCDWaterBot` for ~3 weeks. Validated the architecture end-to-end and
-surfaced the rough edges that drove the rearch (e.g. `*int64` map-key
-pointer-identity bug, multi-channel data model, attach proposal flow,
-cooldown-fallback). Lives in [`mvp/`](mvp).
-
-### 2026-05-08 → 2026-05-09 — Go rewrite
-
-Spec written and refined through 5 versions + 3 review rounds. Implementation
-landed Plans 1–6 + 9 + plugin host. Live MCP exchange verified. Single-line
-install playbook written. Codex bridge deferred per D010.

@@ -9,7 +9,7 @@ import (
 // runTopics queries the running broker for the topics registry + claim
 // state and prints a human-readable rendering. Identical content to the
 // adapter-side `topics` MCP tool, but invokable from any CLI's
-// pure-shell command wrapper (Karthi 2026-05-09: keep CLI-specific
+// pure-shell command wrapper (2026-05-09: keep CLI-specific
 // layers thin; logic lives in the broker / its subcommands).
 func runTopics() error {
 	msg, err := fetchTopicsList()

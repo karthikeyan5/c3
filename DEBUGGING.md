@@ -36,12 +36,12 @@ All lines use stdlib `log` format: `2026/05/09 06:45:01.123456 ` prefix.
 Field order is stable so you can grep / awk.
 
 ```
-telegram: inbound update=12345 msg=914 chat=-1003990699908 thread=914 kind=text edited=false
-emit DROP chan=telegram chat=-1003... topic=914 msg=914: worker queue full or stopped
-delivered chan=telegram chat=-1003... topic=914 msg=914 to cli=claude pid=1234 conn=2
-deliver FAIL chan=telegram chat=-1003... topic=914 msg=914 to cli=claude pid=1234: write: broken pipe
-drop chan=telegram chat=-1003... topic=- msg=915: no claim, fallback in cooldown
-fallback chan=telegram chat=-1003... topic=- msg=916: no claim, sent fallback reply
+telegram: inbound update=12345 msg=914 chat=-1001234567890 thread=914 kind=text edited=false
+emit DROP chan=telegram chat=-1001... topic=914 msg=914: worker queue full or stopped
+delivered chan=telegram chat=-1001... topic=914 msg=914 to cli=claude pid=1234 conn=2
+deliver FAIL chan=telegram chat=-1001... topic=914 msg=914 to cli=claude pid=1234: write: broken pipe
+drop chan=telegram chat=-1001... topic=- msg=915: no claim, fallback in cooldown
+fallback chan=telegram chat=-1001... topic=- msg=916: no claim, sent fallback reply
 fallback FAIL ... : send: telegram: 400 Bad Request: chat not found
 ```
 
@@ -220,7 +220,7 @@ will see nothing.
 **How to verify** (search the Claude Code binary):
 
 ```bash
-strings /home/karthi/.local/share/claude/versions/*/  | grep -E 'allowedChannelPlugins|--channels|channel_enable'
+strings ~/.local/share/claude/versions/*/  | grep -E 'allowedChannelPlugins|--channels|channel_enable'
 ```
 
 You'll see strings like
@@ -252,10 +252,22 @@ explicit failure lines now (no more silent empty transcripts).
 | `stt: msg=N error after Ns (...): exit status 1 \| stderr-tail=...` | Python handler errored. stderr-tail (last 240 chars) shows the cause.                 |
 | `stt: msg=N empty transcript after Ns (no provider returned text)` | Both providers returned empty. Token expired? Provider down?                       |
 | `stt: token read failed for msg=N: ...`                         | mappings.json missing or `bot_token` empty.                                            |
+| `stt: msg=N handler missing at <path> (...)`                    | Handler script went missing between broker start and this message. Marker = `handler_missing`. Restoring the script makes the NEXT voice message transcribe — no broker restart needed. |
+| `stt: handler <path> missing at startup (...); voice messages will surface [STT FAILED: handler_missing] ...` | Startup-time notice that the script is absent. The plugin still registers; per-message check inside the callback decides each time. |
 
 When transcription fails, the inbound text becomes `[STT FAILED: <reason>]`
 instead of the silent `(voice message)` placeholder — the receiver
-knows to ask the user to resend.
+knows to ask the user to resend. Two safety nets layer here:
+
+1. **Plugin-level marker** — STT plugin returns `[STT FAILED: <reason>]` on
+   any failure mode it can name (handler_missing, token_unavailable,
+   timeout, killed, error, empty).
+2. **Broker-side defense-in-depth** — if the OnVoiceReceived chain produces
+   no transcript AT ALL (e.g. STT plugin disabled, no plugin registered,
+   future channel/plugin layout where voice arrives unrouted), the worker
+   substitutes `[STT FAILED: no_transcript_plugin]` before forwarding to
+   the adapter. The silent `(voice message)` placeholder is no longer
+   reachable for voice attachments going through the broker pipeline.
 
 Tunables in mappings.json:
 - `plugins.stt.timeout_seconds` — broker's hard deadline (default 300).
@@ -272,9 +284,9 @@ asks the user which they meant. To bypass disambiguation (e.g. after
 the user explicitly confirmed the actual DM), pass `steal=true` along
 with `target="dm"`.
 
-Topic creation with name "dm" is **not** refused — Karthi 2026-05-09:
-"don't refuse creating DM or anything. Whenever there's an attach and
-there's an ambiguity, just show them as a question." The disambiguation
+Topic creation with name "dm" is **not** refused. The design choice:
+don't refuse creating DM or anything; whenever there's an attach and
+there's an ambiguity, just show it as a question. The disambiguation
 happens at attach time, not creation time.
 
 ## Things we've found and fixed (history)

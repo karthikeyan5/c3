@@ -12,7 +12,12 @@ You need:
 - **Your Telegram user id** for DMs. Message `@userinfobot` from your phone; it replies with your user id (a positive integer).
 - **The supergroup's chat id.** Send any message in the group; the bot now sees it. Or use `@username_to_id_bot`-style helpers. Group chat ids are negative integers starting with `-100`.
 - **For Codex integration:** Codex CLI installed (typically via `npm install -g @openai/codex` or similar). The C3 launcher will detect it. NVM users: take note — long-running shells hash `codex` to your NVM path, so the install step below symlinks both `~/.local/bin/codex` and the NVM bin path.
-- **For voice transcription (STT plugin):** Python whisper installed once: `pip install openai-whisper`. The STT plugin's Go shim subprocesses `python3` to run whisper; the Python package is a system dependency, not bundled. If you don't need voice, set `mappings.json:plugins.stt.enabled=false` and skip the install. First-time whisper invocation downloads the model weights (a few hundred MB depending on `plugins.stt.model`); allow that to complete before sending your first voice message.
+- **For voice transcription (STT plugin):** the shipped first-class STT plugin runs a chained pipeline — **Gemini 3 Flash** (via OpenRouter) with **Sarvam Saaras v3** as the fallback. The plugin lives at `plugins/c3/stt/`; the broker subprocesses `python3` to run it. You need:
+  - `python3` on PATH (3.11+ recommended).
+  - API keys in `~/.claude/stt.env` — `OPENROUTER_API_KEY` for Gemini and `SARVAM_API_KEY` for Sarvam. The pipeline tries Gemini first, falls back to Sarvam if Gemini fails. Setting only one key works; the other provider gets skipped.
+  - No model downloads — both providers are remote APIs.
+
+  If you don't need voice, set `mappings.json:plugins.stt.enabled=false` and skip the API keys. You can swap in a custom handler (whisper, local, anything that matches the argv contract) by setting `plugins.stt.handler_path` to your own script — see `docs/PLUGINS.md`.
 
 ## Step 1: Install the Claude Code plugin
 
@@ -40,7 +45,7 @@ This is a slash command shipped by the plugin. It runs `go install ./cmd/...` fr
 - `c3-claude-adapter` — Claude Code MCP server
 - `codex` — the C3 launcher (will replace `which codex`)
 - `c3-codex-adapter` — Codex MCP server
-- `migrate-legacy` — one-shot config migration if you used the old Python MVP
+- `migrate-legacy` — one-shot migrator from a legacy Python-prototype config layout (only relevant if you have such a config)
 
 Confirm `$GOBIN` is on your `PATH`. If `$GOBIN` is unset, Go installs to `$(go env GOPATH)/bin`. Add it:
 
@@ -58,7 +63,7 @@ The slash command interactively gathers:
 
 - Your bot token (the `1234567:abc...` string).
 - Your DM chat id (positive integer, your own user id).
-- At least one group and its chat id (e.g. `main` → `-1003990699908`). You can add more groups later by editing `~/.config/c3/mappings.json`.
+- At least one group and its chat id (e.g. `main` → `-1001234567890`). You can add more groups later by editing `~/.config/c3/mappings.json`.
 - (Optional) `master_user_id` for the future access-control feature; default is your DM id.
 
 **Token validation.** Before writing the file, `/c3-setup` calls Telegram's `getMe` with the token. If it 401s (bad token) or times out (no network), the command refuses to write `mappings.json` and prints the actual Telegram error. Re-run `/c3-setup` after fixing the token. This avoids the failure mode where a typo in the token gets silently saved and surfaces only on the next inbound poll.
@@ -72,9 +77,9 @@ It writes `~/.config/c3/mappings.json` at mode 600 with this skeleton:
     "telegram": {
       "bot_token": "1234567:abc...",
       "default_group": "main",
-      "groups": {"main": {"chat_id": -1003990699908, "title": "Karthi C3"}},
-      "dm_chat_id": 85720317,
-      "master_user_id": 85720317,
+      "groups": {"main": {"chat_id": -1001234567890, "title": "My C3 Group"}},
+      "dm_chat_id": 12345678,
+      "master_user_id": 12345678,
       "topics": [],
       "debounce_ms": 1500
     }
@@ -125,30 +130,6 @@ Confirm. The topic appears in your Telegram supergroup. Send a message into it f
 
 If voice messages are working: send a voice note from your phone. After a couple of seconds it should arrive in the CLI as `[Transcribed voice]: <text>`. STT can take 1-3 seconds depending on length.
 
-## Migrating from the Python MVP
-
-If you previously ran the Python MVP (`mvp/broker.py` etc.) and have a working bot token + chat ids in:
-
-- `~/.claude/channels/telegram/.env` (bot token)
-- `<repo>/mvp/config.json` (group + DM chat ids)
-
-Migrate them to the new location with:
-
-```
-migrate-legacy
-```
-
-It reads both files, writes `~/.config/c3/mappings.json`, and refuses to overwrite if the file already exists. Existing topic registrations from the old `mvp/topics.json` are NOT migrated — by design, you start clean.
-
-**Re-binding existing Telegram topics post-migration.** If you have Telegram topics that were created by the old MVP and still exist in your supergroup, you have two options for each project:
-
-1. **`cd` into the project and `attach`** — broker proposes creating a topic with that cwd's basename. If the name matches the existing Telegram topic, the cross-group search finds it; if not, you can decline the create proposal and use option 2.
-2. **`attach --topic=<id>`** — pass the existing Telegram thread id directly. Broker validates against Telegram (lightweight `sendChatAction` call), accepts on success, and persists the cwd→topic mapping. No duplicate topic gets created.
-
-Either way, after the first successful attach the cwd→topic mapping is persistent and future sessions auto-attach.
-
-After verifying the new broker works end-to-end, you can delete `mvp/`. Don't `rm -rf` until you've confirmed at least one round-trip on the new stack.
-
 ## Upgrading
 
 Inside Claude Code:
@@ -185,4 +166,4 @@ The `~/.config/c3/mappings.json` lives outside both plugins; uninstalling the pl
 - **`/c3-setup` says it can't reach Telegram** — check the bot token. Try `curl https://api.telegram.org/bot<TOKEN>/getMe`; should return your bot's info.
 - **Topic creation fails** — the bot isn't an admin with `Manage Topics` in the supergroup. Group settings → Administrators → your bot → toggle "Manage Topics" on.
 - **`which codex` still resolves to NVM** — re-run `c3-broker install-codex-shim`, then `hash -r` (bash/zsh) or open a new terminal. Verify with `readlink $(which codex)`; it should point at `$GOBIN/codex`.
-- **Voice transcription doesn't fire** — STT plugin needs Python whisper installed. Check `~/.config/c3/mappings.json:plugins.stt.enabled` is `true` and the whisper command resolves on the broker's PATH. STT plugin is the only Python in C3; if you don't need voice, set `enabled: false`.
+- **Voice transcription doesn't fire** — the broker log surfaces a `[plugin] stt: ...` line per voice message; check `~/.local/state/c3/broker.log`. Common causes: `~/.claude/stt.env` is missing or has no `OPENROUTER_API_KEY` / `SARVAM_API_KEY` (look for `stt: msg=N error ... stderr-tail=...`); `python3` not on the broker's PATH; `mappings.json:plugins.stt.enabled` is `false`. Failing voice messages now surface as `[STT FAILED: <reason>]` in the CLI rather than silent `(voice message)`. If you don't need voice, set `enabled: false`.

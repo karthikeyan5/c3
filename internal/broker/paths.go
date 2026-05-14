@@ -10,7 +10,7 @@ import (
 // + pidfile. CRITICAL: must be deterministic across all broker invocations,
 // regardless of the calling process's env.
 //
-// Karthi 2026-05-09 incident: two brokers spawned with different
+// 2026-05-09 incident: two brokers spawned with different
 // XDG_RUNTIME_DIR (one from a shell with the env set, one from a codex-side
 // spawn without). The env-fallback `/tmp/c3-$UID.sock` was used by one
 // while the other used `/run/user/$UID/c3.sock` — two listen sockets,

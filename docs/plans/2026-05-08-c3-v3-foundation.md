@@ -24,7 +24,7 @@
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go mod init github.com/karthikeyan5/c3
+cd <repo-root> && go mod init github.com/karthikeyan5/c3
 ```
 
 Expected output: `go: creating new go.mod: module github.com/karthikeyan5/c3`
@@ -144,7 +144,7 @@ package mappings
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go build ./...
+cd <repo-root> && go build ./...
 ```
 
 Expected: no output (success). All four placeholder mains compile.
@@ -193,7 +193,7 @@ install:
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && make build
+cd <repo-root> && make build
 ```
 
 Expected: four binaries in `bin/`. Verify with `ls bin/`.
@@ -202,7 +202,7 @@ Expected: four binaries in `bin/`. Verify with `ls bin/`.
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && make test
+cd <repo-root> && make test
 ```
 
 Expected: `ok` lines for any package with tests; `?  no test files` for packages without; exit code 0.
@@ -282,7 +282,7 @@ type Mapping struct {
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go build ./internal/mappings/...
+cd <repo-root> && go build ./internal/mappings/...
 ```
 
 Expected: no output (success).
@@ -398,7 +398,7 @@ func TestRead_MalformedJSON(t *testing.T) {
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/mappings/... -v
+cd <repo-root> && go test ./internal/mappings/... -v
 ```
 
 Expected: compile error or `Read undefined`. The test must fail because `Read` does not exist yet.
@@ -435,7 +435,7 @@ func Read(path string) (*MappingsFile, error) {
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/mappings/... -v -run TestRead
+cd <repo-root> && go test ./internal/mappings/... -v -run TestRead
 ```
 
 Expected: `--- PASS: TestRead_ValidFile`, `--- PASS: TestRead_FileNotFound`, `--- PASS: TestRead_MalformedJSON`. All three pass.
@@ -533,7 +533,7 @@ func TestWrite_FileMode600(t *testing.T) {
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/mappings/... -v -run TestWrite
+cd <repo-root> && go test ./internal/mappings/... -v -run TestWrite
 ```
 
 Expected: `Write undefined` compile error.
@@ -595,7 +595,7 @@ import (
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/mappings/... -v
+cd <repo-root> && go test ./internal/mappings/... -v
 ```
 
 Expected: all `TestRead_*` and `TestWrite_*` PASS.
@@ -637,7 +637,7 @@ func newTestFile() *MappingsFile {
 				DMChatID: 42,
 				Topics: []Topic{
 					{ChatID: -100, TopicID: 281, Name: "c3", Group: "main"},
-					{ChatID: -100, TopicID: 207, Name: "sthapati", Group: "main"},
+					{ChatID: -100, TopicID: 207, Name: "widget", Group: "main"},
 					{ChatID: -200, TopicID: 412, Name: "feature-x", Group: "work"},
 				},
 			},
@@ -675,7 +675,7 @@ func TestLookupByCwd_NotFound(t *testing.T) {
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/mappings/... -v -run TestLookupByCwd
+cd <repo-root> && go test ./internal/mappings/... -v -run TestLookupByCwd
 ```
 
 Expected: compile error `LookupByCwd undefined`.
@@ -702,7 +702,7 @@ func (mf *MappingsFile) LookupByCwd(cwd string) (Mapping, bool) {
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/mappings/... -v -run TestLookupByCwd
+cd <repo-root> && go test ./internal/mappings/... -v -run TestLookupByCwd
 ```
 
 Expected: both `TestLookupByCwd_*` PASS.
@@ -772,7 +772,7 @@ func TestLookupTopicInDefaultGroup_ChannelHasNoDefault(t *testing.T) {
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/mappings/... -v -run TestLookupTopicInDefaultGroup
+cd <repo-root> && go test ./internal/mappings/... -v -run TestLookupTopicInDefaultGroup
 ```
 
 Expected: compile error `LookupTopicInDefaultGroup undefined`.
@@ -807,7 +807,7 @@ func (mf *MappingsFile) LookupTopicInDefaultGroup(channel, name string) (Topic, 
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/mappings/... -v -run TestLookupTopicInDefaultGroup
+cd <repo-root> && go test ./internal/mappings/... -v -run TestLookupTopicInDefaultGroup
 ```
 
 Expected: all four `TestLookupTopicInDefaultGroup_*` PASS.
@@ -877,7 +877,7 @@ func TestLookupTopicAcrossGroups_UnknownChannel(t *testing.T) {
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/mappings/... -v -run TestLookupTopicAcrossGroups
+cd <repo-root> && go test ./internal/mappings/... -v -run TestLookupTopicAcrossGroups
 ```
 
 Expected: compile error `LookupTopicAcrossGroups undefined`.
@@ -912,7 +912,7 @@ func (mf *MappingsFile) LookupTopicAcrossGroups(channel, name string) []Topic {
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/mappings/... -v -run TestLookupTopicAcrossGroups
+cd <repo-root> && go test ./internal/mappings/... -v -run TestLookupTopicAcrossGroups
 ```
 
 Expected: all four `TestLookupTopicAcrossGroups_*` PASS.
@@ -970,7 +970,7 @@ func TestLookupTopicByID_WrongChat(t *testing.T) {
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/mappings/... -v -run TestLookupTopicByID
+cd <repo-root> && go test ./internal/mappings/... -v -run TestLookupTopicByID
 ```
 
 Expected: compile error `LookupTopicByID undefined`.
@@ -1003,7 +1003,7 @@ func (mf *MappingsFile) LookupTopicByID(channel string, chatID, topicID int64) (
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/mappings/... -v -run TestLookupTopicByID
+cd <repo-root> && go test ./internal/mappings/... -v -run TestLookupTopicByID
 ```
 
 Expected: all three `TestLookupTopicByID_*` PASS.
@@ -1125,7 +1125,7 @@ func TestUpsertMapping_UpdatePreservesCreatedAt(t *testing.T) {
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/mappings/... -v -run "TestUpsertTopic|TestUpsertMapping"
+cd <repo-root> && go test ./internal/mappings/... -v -run "TestUpsertTopic|TestUpsertMapping"
 ```
 
 Expected: compile error — `UpsertTopic` / `UpsertMapping` undefined.
@@ -1175,7 +1175,7 @@ func (mf *MappingsFile) UpsertMapping(cwd string, m Mapping) {
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/mappings/... -v -run "TestUpsertTopic|TestUpsertMapping"
+cd <repo-root> && go test ./internal/mappings/... -v -run "TestUpsertTopic|TestUpsertMapping"
 ```
 
 Expected: all five `TestUpsert*` PASS.
@@ -1267,7 +1267,7 @@ func TestValidate_MappingChannelMissing(t *testing.T) {
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/mappings/... -v -run TestValidate
+cd <repo-root> && go test ./internal/mappings/... -v -run TestValidate
 ```
 
 Expected: compile error `Validate undefined`.
@@ -1327,7 +1327,7 @@ func (mf *MappingsFile) Validate() error {
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/mappings/... -v -run TestValidate
+cd <repo-root> && go test ./internal/mappings/... -v -run TestValidate
 ```
 
 Expected: all five `TestValidate_*` PASS.
@@ -1404,7 +1404,7 @@ func TestDefaultPath_NoHomeNoXDG(t *testing.T) {
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/mappings/... -v -run TestDefaultPath
+cd <repo-root> && go test ./internal/mappings/... -v -run TestDefaultPath
 ```
 
 Expected: compile error `DefaultPath undefined`.
@@ -1445,7 +1445,7 @@ func DefaultPath() (string, error) {
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go test ./internal/mappings/... -v -run TestDefaultPath
+cd <repo-root> && go test ./internal/mappings/... -v -run TestDefaultPath
 ```
 
 Expected: both `TestDefaultPath_*` PASS.
@@ -1563,7 +1563,7 @@ func TestMigrate_MissingEnv(t *testing.T) {
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go test ./cmd/migrate-legacy/... -v
+cd <repo-root> && go test ./cmd/migrate-legacy/... -v
 ```
 
 Expected: compile error — `migrate` undefined.
@@ -1574,7 +1574,7 @@ Replace `cmd/migrate-legacy/main.go` with:
 
 ```go
 // migrate-legacy ports the Python MVP's bot token (.env) and chat ids
-// (mvp/config.json) into a fresh ~/.config/c3/mappings.json. Idempotent —
+// (legacy-config.json) into a fresh ~/.config/c3/mappings.json. Idempotent —
 // refuses to overwrite an existing output file.
 package main
 
@@ -1591,7 +1591,7 @@ import (
 
 func main() {
 	envPath := flag.String("env", os.Getenv("HOME")+"/.claude/channels/telegram/.env", "path to legacy .env")
-	cfgPath := flag.String("config", "mvp/config.json", "path to legacy mvp/config.json")
+	cfgPath := flag.String("config", "legacy-config.json", "path to legacy legacy-config.json")
 	defaultOut, err := mappings.DefaultPath()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "migrate-legacy: cannot resolve default mappings path: %v\n", err)
@@ -1604,7 +1604,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "migrate-legacy: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("migrate-legacy: wrote %s (mode 0600). Verify, then you can delete the old mvp/config.json.\n", *outPath)
+	fmt.Printf("migrate-legacy: wrote %s (mode 0600). Verify, then you can delete the old legacy-config.json.\n", *outPath)
 }
 
 func migrate(envPath, cfgPath, outPath string) error {
@@ -1695,7 +1695,7 @@ func parentDir(p string) string {
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go test ./cmd/migrate-legacy/... -v
+cd <repo-root> && go test ./cmd/migrate-legacy/... -v
 ```
 
 Expected: all three `TestMigrate_*` PASS.
@@ -1704,7 +1704,7 @@ Expected: all three `TestMigrate_*` PASS.
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && make build
+cd <repo-root> && make build
 ```
 
 Expected: `bin/migrate-legacy` exists.
@@ -1726,7 +1726,7 @@ git commit -m "c3-v3: migrate-legacy ports Python MVP config to mappings.json"
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && go test ./... -v
+cd <repo-root> && go test ./... -v
 ```
 
 Expected: every test passes. The output should include `ok` for `internal/mappings` and `cmd/migrate-legacy`, and `?  no test files` for the placeholder cmd packages.
@@ -1735,7 +1735,7 @@ Expected: every test passes. The output should include `ok` for `internal/mappin
 
 Run:
 ```bash
-cd /home/karthi/arogara/c3 && make build
+cd <repo-root> && make build
 ```
 
 Expected: all four binaries built into `bin/`.
@@ -1743,7 +1743,7 @@ Expected: all four binaries built into `bin/`.
 - [ ] **Step 3: Smoke test migrate-legacy with the real legacy files (dry run)**
 
 ```bash
-cd /home/karthi/arogara/c3 && ./bin/migrate-legacy --env=$HOME/.claude/channels/telegram/.env --config=mvp/config.json --out=/tmp/c3-test-mappings.json
+cd <repo-root> && ./bin/migrate-legacy --env=$HOME/.claude/channels/telegram/.env --config=legacy-config.json --out=/tmp/c3-test-mappings.json
 ```
 
 Expected: `migrate-legacy: wrote /tmp/c3-test-mappings.json (mode 0600). ...`
@@ -1780,11 +1780,11 @@ The following come in subsequent plans, in order:
 - **Plan 4 (Phase 5):** Plugin host + STT plugin (Go shim → existing Python whisper).
 - **Plan 5 (Phase 6):** Claude Code adapter, `.mcp.json`, `${CLAUDE_PLUGIN_ROOT}` resolution, attach proposal flow surfacing.
 - **Plan 6 (Phase 7):** Debounce, dedup, typing indicator, edit_progress.
-- **Plan 7 (Phase 8):** **Codex bridge in Go.** Implement `cmd/codex/main.go` (the launcher: real-codex finder with PATH skip-self + NVM glob, bypass detection per `CODEX_SUBCOMMANDS`, CLAUDE.md walk-up topic inference with shared-root guard, app-server lifecycle with port fallback via `/tmp/c3-codex-app-server-${UID}.json` + `flock`, MCP config injection for both app-server AND TUI, TUI launch with `--remote ws_url -C cwd`). Implement `cmd/c3-codex-adapter/main.go` (MCP stdio server: broker IPC, five tools — `attach`, `topics`, `inbox`, `reply`, `codex_forward` — inbound buffer + WebSocket forwarder with thread discovery, split-brain guard via `C3_CODEX_REMOTE_BRIDGE`/`C3_CODEX_ALLOW_MANUAL_FORWARD`). Implement `c3-broker install-codex-shim` subcommand that idempotently installs symlinks (`~/.local/bin/codex` + every NVM-version bin dir). Spec v5 §4.4 specifies the architecture in full — the Python POC under `mvp/` was a proof-of-concept; this plan re-implements that architecture natively in Go. The POC files remain on disk only until the Go binaries are verified working end-to-end, then `mvp/` can be removed.
+- **Plan 7 (Phase 8):** **Codex bridge in Go.** Implement `cmd/codex/main.go` (the launcher: real-codex finder with PATH skip-self + NVM glob, bypass detection per `CODEX_SUBCOMMANDS`, CLAUDE.md walk-up topic inference with shared-root guard, app-server lifecycle with port fallback via `/tmp/c3-codex-app-server-${UID}.json` + `flock`, MCP config injection for both app-server AND TUI, TUI launch with `--remote ws_url -C cwd`). Implement `cmd/c3-codex-adapter/main.go` (MCP stdio server: broker IPC, five tools — `attach`, `topics`, `inbox`, `reply`, `codex_forward` — inbound buffer + WebSocket forwarder with thread discovery, split-brain guard via `C3_CODEX_REMOTE_BRIDGE`/`C3_CODEX_ALLOW_MANUAL_FORWARD`). Implement `c3-broker install-codex-shim` subcommand that idempotently installs symlinks (`~/.local/bin/codex` + every NVM-version bin dir). Spec v5 §4.4 specifies the architecture in full — this plan implements it natively in Go (informed by an earlier end-to-end Python prototype that proved the loop).
 - **Plan 8 (Phase 9):** `/c3-setup`, `/c3-build`, `/c3-status` slash commands (Claude) + Codex `SETUP.md` author. The Codex SETUP.md instructs the agent to run `c3-broker install-codex-shim` (the Go subcommand from Plan 7).
-- **Plan 9 (Phase 10):** Documentation pass, deviation banner retirement, D009 entry (Go-everywhere supersedes April Python wrapper MVP), public release tag.
+- **Plan 9 (Phase 10):** Documentation pass, deviation banner retirement, D009 entry (Go implementation lands), public release tag.
 
-After this plan, the broker doesn't exist yet — but the data layer is complete, tested, and the migration tool works against the real Python MVP files. The Codex POC files under `mvp/` remain on disk for reference until Plan 7 (Phase 8) lands the Go reimplementation; once the Go binaries run end-to-end, the `mvp/` tree can be archived.
+After this plan, the broker doesn't exist yet — but the data layer is complete, tested, and the migration tool works against a legacy-prototype config layout.
 
 ---
 

@@ -1,7 +1,7 @@
 # C3 Re-Architecture — Design Spec
 
 **Date:** 2026-05-08 (v5 — fully Go after Codex POC review)
-**Status:** Approved. **Go end-to-end** for broker, channels, all CLI adapters, launchers, and operational tooling. The only Python in C3 is the existing whisper STT pipeline, invoked from a Go plugin shim via subprocess — and even that's a plugin, not a core dependency. The Codex bridge architecture in this spec is informed by a Python POC that proved the loop end-to-end (send/receive Telegram + voice transcription on Codex's TUI), but the spec describes a clean Go implementation; no part of the POC carries forward.
+**Status:** Approved. **Go end-to-end** for broker, channels, all CLI adapters, launchers, and operational tooling. The only Python in C3 is the bundled STT pipeline (Gemini 3 Flash → Sarvam Saaras v3 chain), invoked from a Go plugin shim via subprocess — and even that's a plugin, not a core dependency. The Codex bridge architecture in this spec is informed by a Python POC that proved the loop end-to-end (send/receive Telegram + voice transcription on Codex's TUI), but the spec describes a clean Go implementation; no part of the POC carries forward.
 **Reaffirms:** D006 (Go for daemon and stubs), D007 (pluggable transport — promoted to v1), D008 (official Go MCP SDK).
 **Supersedes:** the deviation banners across `RESUME.md` / `TODO.md` / `DECISIONS.md` (Python wrapper MVP). A formal D009 will record the v1-MVP-superseded note when implementation starts.
 
@@ -10,14 +10,14 @@
 Take C3 from a hand-tuned Python MVP into a **distributable, multi-channel, multi-CLI** plugin set, written in **Go**, with a **plugin extension system** so STT and future capabilities slot in cleanly.
 
 - **Distributable** — one public github URL, anyone can install via Claude Code or Codex plugin marketplace.
-- **Go end-to-end** — broker, all channels, all CLI adapters (Claude, Codex), launchers (the `codex` shim that intercepts the user's command), and operational tooling (migrate-legacy, install-codex-shim) are all Go. The **only** Python that runs is the whisper STT pipeline, called by a Go plugin shim via subprocess — and that's a swappable plugin, not part of the core. New plugins can be written in any language since they speak a defined wire protocol; "Go everywhere" is the rule for first-party code.
+- **Go end-to-end** — broker, all channels, all CLI adapters (Claude, Codex), launchers (the `codex` shim that intercepts the user's command), and operational tooling (migrate-legacy, install-codex-shim) are all Go. The **only** Python that runs is the bundled STT pipeline (Gemini 3 Flash → Sarvam Saaras v3, with vocabulary biasing), called by a Go plugin shim via subprocess — and that's a swappable plugin, not part of the core. Users can override the handler with their own script (whisper, local model, anything matching the argv contract); the chain is editable too. New plugins can be written in any language since they speak a defined wire protocol; "Go everywhere" is the rule for first-party code.
 - **Multi-channel** — Telegram is the only channel today; web chat and voice mode were always D007's destination, now plumbed into v1's data model and code paths.
 - **Multi-CLI** — Claude Code first, Codex parity, future CLIs through a documented adapter contract.
 - **Multi-group** — multiple Telegram supergroups can host C3 topics simultaneously, addressed by name.
 - **Seamless attach UX** — sessions in known directories auto-attach; new directories prompt for confirmation; nothing gets created behind the user's back; bare topic ids get validated against Telegram and accepted if real; `attach dm` works anywhere.
 - **Plugin extension system** — STT is a plugin in v1, not a built-in. Defined hook points let other plugins drop in without core changes.
 
-The current Python MVP works for Karthi but creates duplicate forum topics on every non-arogara session, hardcodes `/home/karthi/...` paths, bottlenecks future channels behind the upstream bun plugin's release schedule, and was written as a temporary wrapper that was never meant to scale across users.
+The Python prototype proved the architecture but creates duplicate forum topics on out-of-tree sessions, hardcodes absolute paths, bottlenecks future channels behind the upstream bun plugin's release schedule, and was written as a temporary wrapper that was never meant to scale across users.
 
 ## 2. Alignment with C3's stated direction
 
@@ -53,7 +53,7 @@ Implications:
 - **Nothing gets created without explicit confirmation.** Even if the LLM is acting autonomously, it has to make a second tool call (`attach(create=true)`) after seeing the proposal.
 - **`attach` in a mapped directory is silent and immediate** — no proposal, no extra round-trip. That's the auto-attach case.
 - **Topic-id-by-number gets validated, not gated by `force=true`.** If the user knows the id, the broker validates via a lightweight Bot API call (sendChatAction with thread id, or no-op editForumTopic) and accepts if Telegram says yes. No make-them-confirm-twice flow.
-- **All operational state — channel configs, group ids, DM id, mappings, topic registry — lives in one user-visible JSON file** (`~/.config/c3/mappings.json`). Karthi's request: "everything in mappings.json".
+- **All operational state — channel configs, group ids, DM id, mappings, topic registry — lives in one user-visible JSON file** (`~/.config/c3/mappings.json`). Explicit design goal: "everything in mappings.json".
 - **Multi-group is first-class.** Default group resolves bare `attach`; cross-group search happens when the default doesn't have a match.
 - **Multi-channel is first-class in the data model**, even though only Telegram is implemented in v1. The mapping schema, IPC protocol, and broker code all carry a `channel` field.
 - **One cwd ↔ one mapping.** A cwd cannot map to multiple (channel, chat_id, topic_id) tuples. If you want both Telegram and a future Slack notification for the same project, that's a future routing-rules feature, not a mappings extension.
@@ -207,7 +207,7 @@ type VoicePayload struct {
 ```
 
 The Telegram channel in v1:
-- **Cleanroom Go rewrite.** No retained file from upstream bun plugin — Karthi explicitly chose this in §11.1 review. We use upstream as inspiration at the spec level (what features it has, how it's structured) and write our own Go implementation.
+- **Cleanroom Go rewrite.** No retained file from upstream bun plugin — this is the explicit direction per §11.1 review. We use upstream as inspiration at the spec level (what features it has, how it's structured) and write our own Go implementation.
 - Library choice: `github.com/go-telegram-bot-api/telegram-bot-api/v5` or `github.com/PaulSonOfLars/gotgbot/v2`. Both maintained, both Bot API. **Open question §11.A** — pick during plan phase. My lean: gotgbot (strongly typed, more idiomatic Go, active development).
 - Owns Telegram bot token, manages getUpdates with `allowed_updates = ["message", "edited_message", "callback_query", "message_reaction"]`, applies rate-limit handling (`parameters.retry_after`), runs in a goroutine inside the broker process (not a separate subprocess).
 - All P1-P5 patch behaviors built natively: `message_thread_id` in inbound and outbound, `reply_to_message_id`/`reply_to_user`/`reply_to_text` in inbound meta, no orphan watchdog at all (broker manages its own lifecycle), STT plugin invoked on `message:voice` events.
@@ -308,14 +308,14 @@ Schema:
       "bot_token": "1234567:abc...",
       "default_group": "main",
       "groups": {
-        "main": {"chat_id": -1003990699908, "title": "Karthi C3 (personal)"},
+        "main": {"chat_id": -1001234567890, "title": "C3 main group"},
         "work": {"chat_id": -1009999999999, "title": "Work multiplexer"}
       },
-      "dm_chat_id": 85720317,
-      "master_user_id": 85720317,
+      "dm_chat_id": 12345678,
+      "master_user_id": 12345678,
       "topics": [
-        {"chat_id": -1003990699908, "topic_id": 281, "name": "c3", "group": "main"},
-        {"chat_id": -1003990699908, "topic_id": 207, "name": "sthapati", "group": "main"}
+        {"chat_id": -1001234567890, "topic_id": 281, "name": "c3", "group": "main"},
+        {"chat_id": -1001234567890, "topic_id": 207, "name": "widget", "group": "main"}
       ],
       "debounce_ms": 1500,
       "debounce_max_messages": 50,
@@ -324,13 +324,13 @@ Schema:
     }
   },
   "codex": {
-    "shared_root": "~/arogara",
+    "shared_root": "~/projects",
     "app_server_meta_path": "/tmp/c3-codex-app-server-${UID}.json"
   },
   "mappings": {
-    "/home/karthi/arogara/c3": {
+    "/home/user/projects/c3": {
       "channel": "telegram",
-      "chat_id": -1003990699908,
+      "chat_id": -1001234567890,
       "topic_id": 281,
       "name": "c3",
       "group": "main",
@@ -359,14 +359,14 @@ Channel-level field semantics:
 - `stt_prefix` — string prefix the channel writes onto STT-substituted inbound text (default `"[Transcribed voice]: "`). The Telegram channel applies this BEFORE emitting the `Inbound`; the broker doesn't re-add it. Plugins reading the inbound see the prefixed text.
 
 Codex section:
-- `shared_root` — directory whose `CLAUDE.md` does NOT trigger auto-attach. Default `~/arogara`. Honored by the `codex` launcher's topic inference.
+- `shared_root` — directory whose `CLAUDE.md` does NOT trigger auto-attach. No default; set via `C3_CODEX_SHARED_ROOT` env var (or `mappings.json:codex.shared_root` when that key lands). Honored by the `codex` launcher's topic inference.
 - `app_server_meta_path` — absolute path template; `${UID}` substituted with the running user's numeric uid for multi-user safety. Default `/tmp/c3-codex-app-server-${UID}.json`. The C3 launcher uses `flock` on this file before reading/writing the signature; concurrent invocations of `codex` from the same user are serialized.
 
 Reserved plugin keys: `enabled` (bool, default true) skips subscriptions when false; `priority` (int, default 100) orders chained hooks (lower runs first). Other keys are plugin-defined.
 
 `plugins` is added so plugins keep their config alongside everything else (per the "everything in mappings.json" rule). Each plugin owns its own subkey.
 
-Why one file: explicit Karthi request. Operator's view in one place. Mode 600 protects the bot token. Atomic rewrites via temp-file-then-rename so a half-written file can't corrupt state.
+Why one file: explicit design constraint. Operator's view in one place. Mode 600 protects the bot token. Atomic rewrites via temp-file-then-rename so a half-written file can't corrupt state.
 
 **Backup-on-write:** before each atomic rewrite the broker copies the current `mappings.json` to `mappings.json.bak` (mode 0600). One generation only — successive writes overwrite the same `.bak`. This protects against operator error (e.g. a hand-edit followed by a broker restart that fails validation): the user can `cp mappings.json.bak mappings.json` to roll back without going to git.
 
@@ -560,7 +560,7 @@ Host-specific translations:
   - **`codex`** (built from `cmd/codex/main.go`, installed on the user's `PATH` ahead of the real `codex` binary). This is the launcher. It does five things in order on every invocation:
     1. **Find the real Codex executable.** Walk `PATH` skipping `os.Args[0]` (so we don't recurse into ourselves). If nothing matches, glob `~/.nvm/versions/node/*/lib/node_modules/@openai/codex/bin/codex.js`. Honor `C3_CODEX_REAL` env override for testing.
     2. **Decide whether to bypass.** A defined set of subcommands (`exec`, `e`, `review`, `login`, `logout`, `mcp`, `plugin`, `mcp-server`, `app-server`, `completion`, `update`, `sandbox`, `debug`, `apply`, `a`, `cloud`, `exec-server`, `features`, `help`) plus `-h`/`--help`/`-V`/`--version` plus any argv already containing `--remote` (anti-recursion guard) → exec real codex with the user's argv unchanged. `codex resume`, `codex fork`, and bare `codex` go through the bridge.
-    3. **Infer the topic.** Walk from cwd up to the nearest `CLAUDE.md`; the basename of that directory is the topic name. **Shared-root guard:** if the nearest `CLAUDE.md` is at a configured shared-root (default `~/arogara`, configurable via `mappings.json:codex.shared_root`), return empty — let the user attach explicitly rather than silently bind a "shared-root" topic. Fallback to `basename(cwd)` only when no `CLAUDE.md` is found AND cwd is not under a shared-root. `C3_ATTACH_NAME` env always overrides.
+    3. **Infer the topic.** Walk from cwd up to the nearest `CLAUDE.md`; the basename of that directory is the topic name. **Shared-root guard:** if the nearest `CLAUDE.md` is at a configured shared-root (opt-in via `C3_CODEX_SHARED_ROOT` env, no default; future `mappings.json:codex.shared_root` will provide a persistent form), return empty — let the user attach explicitly rather than silently bind a "shared-root" topic. Fallback to `basename(cwd)` only when no `CLAUDE.md` is found AND cwd is not under a shared-root. `C3_ATTACH_NAME` env always overrides.
     4. **Start or reuse a Codex app-server.** Default URL `ws://127.0.0.1:8766`. Maintain a metadata file at `/tmp/c3-codex-app-server.json` with the **C3 signature** `(cwd, topic, adapter_path)` of the running app-server. If port 8766 is reachable AND the metadata signature matches, reuse it. If reachable but signature mismatches (stale app-server from a different cwd or topic), **fall forward** to the next free port in `[8767, 8767+50)`. If unreachable, start a new app-server: `<real-codex> <mcp-config-args> app-server --listen <ws-url>`, redirect stdout/stderr to `/tmp/c3-codex-app-server.log`, wait for the TCP port to open (15s timeout), write the metadata file with our signature.
     5. **Launch the visible TUI** with `<real-codex> <mcp-config-args> --remote <ws-url> -C <cwd> <user-argv>` and exit with the TUI's exit code.
 
@@ -797,9 +797,9 @@ $ cd ~/projects/widget-foo
 $ claude
 ```
 
-1. Adapter `hello` with `cwd=/home/karthi/projects/widget-foo`.
+1. Adapter `hello` with `cwd=/home/user/projects/widget-foo`.
 2. Broker checks `mappings.mappings`. No entry. Replies `{auto_attached: false, no_mapping: true}`.
-3. Adapter instructions: *"No mapping for `/home/karthi/projects/widget-foo`. Type `attach` to set one up."*
+3. Adapter instructions: *"No mapping for `/home/user/projects/widget-foo`. Type `attach` to set one up."*
 4. User types `attach`.
 5. Claude calls `attach()` with no args.
 6. Adapter forwards `{op: attach, cwd: "..."}`.
@@ -853,7 +853,7 @@ User types `attach dm`.
 
 ### 5.6 Cross-CLI cwd collision
 
-Session 1 (Claude in `~/arogara/c3`) auto-attached to topic 281. User opens Codex in same dir.
+Session 1 (Claude in `~/projects/c3`) auto-attached to topic 281. User opens Codex in same dir.
 
 1. Codex stub `hello` with same cwd.
 2. Broker finds mapping → topic 281. ROUTES already claims it for Claude pid 12345.
@@ -914,14 +914,14 @@ The Claude Code adapter emits this JSON-RPC notification (manually framed per §
     ],
     "meta": {
       "source":            "telegram",
-      "chat_id":           "-1003990699908",
+      "chat_id":           "-1001234567890",
       "message_id":        "868",
-      "user":              "skarthi",
-      "user_id":           "85720317",
+      "user":              "alice",
+      "user_id":           "12345678",
       "ts":                "2026-05-08T06:05:29.000Z",
       "message_thread_id": "281",                     // omitted if no topic
       "reply_to_message_id": "281",                   // omitted if not a reply
-      "reply_to_user":     "OCDWaterBot",             // omitted if not a reply
+      "reply_to_user":     "examplebot",             // omitted if not a reply
       "reply_to_text":     "<replied-to text>",       // omitted if not a reply
       "attachment_kind":   "voice",                   // omitted if no attachment
       "attachment_file_id":"AwACAgUAAyEFAA…",         // omitted if no attachment
@@ -938,28 +938,24 @@ Future channels emit notifications with the same shape but `meta.source` set to 
 
 #### 6.2 STT plugin distribution
 
-The STT plugin is a Go package under `internal/plugin/builtins/stt/` plus a Python whisper helper. The Go package is statically compiled in. The Python helper is **embedded** via Go's `//go:embed`:
+The STT plugin is a Go package under `internal/plugin/builtins/stt/` plus a Python pipeline shipped alongside the plugin manifest at `plugins/c3/stt/`. The Go package is statically compiled into the broker. The Python tree is **bundled in the plugin distribution** (not embedded in the binary) — the plugin manifest, the slash commands, and the Python files all live under the same `plugins/c3/` root and ship together when a user installs `c3@c3`.
 
-```go
-package stt
+Path resolution:
+- Default: `${CLAUDE_PLUGIN_ROOT}/stt/stt-handler.py`. `$CLAUDE_PLUGIN_ROOT` is set by Claude Code when it launches the c3 adapter; the adapter inherits the env when spawning the broker.
+- Fallback (for installs without `$CLAUDE_PLUGIN_ROOT`, e.g. broker started manually, or pre-c3 installs that still carry the handler at the legacy path): `~/.claude/channels/telegram/stt-handler.py`.
+- User override: `mappings.json:plugins.stt.handler_path` wins over both.
 
-import _ "embed"
+Runtime: the Go shim invokes `python3 <resolved-handler-path> <bot_token> <chat_id> <reply_msg_id> <file_id> [<message_thread_id>]` as a subprocess. The handler downloads the audio (via Telegram's `getFile`), invokes the provider chain in `stt-pkg/stt.py`, prints the final transcript to stdout, and exits non-zero on hard failure.
 
-//go:embed handler.py
-var handlerScript []byte
-```
+Provider chain (default): **Gemini 3 Flash via OpenRouter** → **Sarvam Saaras v3** fallback. Both are remote APIs — no model weights downloaded, no large dependencies pinned. API keys are loaded from `~/.claude/stt.env` (`OPENROUTER_API_KEY`, `SARVAM_API_KEY`). Vocabulary biasing via `stt-pkg/vocabulary.txt` (one preferred term per line; optional `!=` for misheard alternatives, `--` for notes).
 
-On plugin `Register()`, the Go shim writes `handler.py` to `$XDG_DATA_HOME/c3/stt/handler.py` (default `~/.local/share/c3/stt/handler.py`) if missing OR if its sha256 differs from the embedded copy. Permissions 0644.
+Why distribute the Python tree under the plugin instead of embedding via `//go:embed`:
+- **`/c3-build` writes the Go binaries; the plugin install writes the Python tree.** Both happen during the same `claude plugin install c3@c3` flow, so there's no extra step for the user.
+- **Provider chain stays editable.** Power users adding a new provider (e.g. a local whisper option) drop a file into `${CLAUDE_PLUGIN_ROOT}/stt/stt-pkg/providers/<name>.py` and switch the chain via the `--chain` arg the runner accepts; no rebuild needed.
+- **User override stays clean.** Custom handler scripts override via `plugins.stt.handler_path` in `mappings.json` and don't conflict with plugin updates.
+- **No binary bloat.** The 734-line Python tree never enters the broker binary.
 
-Runtime: the Go shim invokes `python3 ~/.local/share/c3/stt/handler.py <args>` as a subprocess. The subprocess imports `openai-whisper` (or the configured whisper backend); the user is responsible for installing the Python package via `pip install openai-whisper` once. INSTALL.md documents this prerequisite.
-
-Why this approach:
-- **`go install ./cmd/...` does not ship .py files.** Embedding them in the binary keeps the install surface a single `go install`.
-- **Updates are automatic.** A new C3 release with a tweaked `handler.py` writes the new copy on next broker start (sha-mismatch wins).
-- **User can override.** Custom-tuned `handler.py` can be dropped at the same path with mode 0644 and a hash that matches a `.user-override` sentinel — broker leaves it alone if the sentinel is present.
-- **No build-time choice between go-only and python-shipped.** One binary, one path, zero install steps for the .py.
-
-The whisper Python package is not embedded. It's too large (model weights, dependencies); shipping it would balloon the binary. Treating it as a system dependency is the same posture the Python POC took.
+Whisper is **not** shipped as a default provider. Users who want a local STT engine point `handler_path` at their own script — the argv contract (`<bot_token> <chat_id> <reply_msg_id> <file_id> [<message_thread_id>]`) is the only requirement.
 
 ## 7. OpenClaw-inspired UX features (top 3, in v1)
 
@@ -1006,7 +1002,8 @@ func Register(host *plugin.Host) error {
 }
 
 func handleVoice(ctx context.Context, channel string, payload VoicePayload) (string, error) {
-    // subprocess Python whisper, return transcript or empty string
+    // subprocess the bundled Python pipeline (Gemini → Sarvam), return
+    // transcript or "[STT FAILED: <reason>]" marker on failure
 }
 ```
 
@@ -1014,7 +1011,7 @@ Plugin host calls `Register` at broker startup. Plugin reads its config via `hos
 
 ### v1 plugins
 
-- `core/plugins/stt/` — Speech-to-text. Reads voice attachments via `OnVoiceReceived`, subprocesses the existing Python whisper pipeline (`stt-handler.py`), returns transcript. Bundled Python shim ships with the binary.
+- `internal/plugin/builtins/stt/` — Speech-to-text. Reads voice attachments via `OnVoiceReceived`, subprocesses the bundled Python pipeline at `plugins/c3/stt/stt-handler.py` (Gemini 3 Flash → Sarvam Saaras v3 chain, with vocabulary biasing), returns transcript or an `[STT FAILED: <reason>]` marker on failure.
 
 That's it for v1. The architecture leaves room for more.
 
@@ -1041,14 +1038,15 @@ Documented but **not implemented in v1**. Users wanting a plugin in v1 either pa
 
 Plugin order is config-driven (`mappings.json:plugins.<name>.priority`), with stable default order.
 
-## 9. Migration from current Python MVP
+## 9. Migration from a legacy Python prototype config
 
-Karthi handles legacy topic cleanup. We migrate config:
+For installations carrying a legacy Python-prototype config layout
+(`.env` with `TELEGRAM_BOT_TOKEN` + a JSON file with `dm_chat_id` /
+`group_chat_id`), the `migrate-legacy` binary performs an idempotent
+one-shot rewrite:
 
-`tools/migrate-legacy.go` (or equivalent script), idempotent:
-
-1. Read `~/.claude/channels/telegram/.env` for `TELEGRAM_BOT_TOKEN`.
-2. Read `c3/mvp/config.json` for `dm_chat_id`, `group_chat_id`.
+1. Read the `.env` for `TELEGRAM_BOT_TOKEN`.
+2. Read the legacy config JSON for `dm_chat_id`, `group_chat_id`.
 3. If `~/.config/c3/mappings.json` exists, refuse to overwrite.
 4. Otherwise write a fresh `mappings.json` skeleton:
    - `channels.telegram.bot_token` from .env
@@ -1057,13 +1055,14 @@ Karthi handles legacy topic cleanup. We migrate config:
    - `channels.telegram.dm_chat_id = <legacy>`
    - empty `topics`, empty `mappings`, default plugin config
 5. Print summary, set mode 600.
-6. Tell user `c3/mvp/` can be deleted once they're satisfied (don't auto-delete).
 
-Old Python broker stays runnable alongside the new Go broker — flock prevents both running at once, user picks which one starts. Once Go broker is verified, user kills Python MVP and removes its files manually.
+Topic registrations are not migrated — by design, the user starts clean and
+re-attaches per project. Legacy topic cleanup in the Telegram supergroup is
+handled by the user out-of-band.
 
 ## 10. What v3 explicitly does NOT include
 
-- Cleaning up legacy topics (Karthi's call).
+- Cleaning up legacy topics (operator's call).
 - Auto-creating topics opportunistically on inbound (removed entirely).
 - Auto-deleting topics (manual via Bot API; future tool).
 - `forum_topic_edited` rename tracking (defer; plumbed-but-inert in update parsing).
@@ -1073,11 +1072,11 @@ Old Python broker stays runnable alongside the new Go broker — flock prevents 
 - Reactions / business connections / paid media surfacing (`message_reaction` is plumbed via `allowed_updates` but no tool exposes it yet).
 - Auto-spawn of CLIs (TODO Phase 2 — adapter plane is ready, no code yet).
 - Inter-CLI messaging, master-CLI admin commands, pairing flow, monitoring dashboard.
-- Cleanroom STT rewrite (Go shim → Python whisper subprocess; the working pipeline keeps working). STT is the only Python in C3.
+- Cleanroom STT rewrite (Go shim → bundled Python pipeline subprocess; Gemini → Sarvam chain keeps working). STT is the only Python in C3.
 
 ## 11. Resolved questions (no opens left)
 
-All Karthi calls:
+All resolved design choices:
 
 - §11.1 ⇒ cleanroom; no upstream baseline file.
 - §11.2 ⇒ one cwd → one mapping.
@@ -1105,7 +1104,7 @@ This spec produces an implementation plan via the `writing-plans` skill. Rough p
 9. **`/c3-setup`, `/c3-build`, `/c3-status` slash commands (Claude) and Codex `SETUP.md` (which instructs the agent to run `c3-broker install-codex-shim`).**
 10. **Documentation + release.** README rewrite, INSTALL rewrite, retire deviation banners with formal D009. Tag v0.1.0.
 
-Phases 1-7 unblock Karthi's daily use. 8-10 are about shippability to others.
+Phases 1-7 unblock single-user daily use. 8-10 are about shippability to others.
 
 ## 13. Sources
 
@@ -1116,8 +1115,7 @@ Phases 1-7 unblock Karthi's daily use. 8-10 are about shippability to others.
 - Telegram Bot API: core.telegram.org/bots/api, /api-changelog.
 - Telegram forums constraint: tdlib/telegram-bot-api#356 (no `getForumTopics`).
 - OpenClaw messaging features: c3/README.md §"Inspiration: OpenClaw's Message Tool".
-- Internal Codex bridge architecture was informed by an end-to-end Python POC (Telegram ↔ Codex turns + voice transcription, all working). The POC validated the **architecture**; v5 takes the architecture, writes it in Go, and discards the POC code. The POC files in `mvp/` are kept on disk only for personal continuity until the Go binaries land — they are NOT a reference for new code.
-- `mvp/PATCH_SPEC.md` (reference for what behaviors the cleanroom Go Telegram channel must replicate).
+- The Codex bridge architecture was informed by an end-to-end Python prototype (Telegram ↔ Codex turns + voice transcription, all working) that preceded this rewrite. v5 takes that architecture and re-implements it in Go.
 - Existing plugin scaffold: `plugin/.claude-plugin/marketplace.json`, `plugin/plugins/c3-telegram/`.
 - C3 stated direction: README.md §"Key Features (Full Vision)", TODO.md Phases 1-4, DECISIONS.md D001-D008.
 - Go MCP SDK: github.com/modelcontextprotocol/go-sdk v1.0.0+ (per `research/go-mcp-sdk.md`).
