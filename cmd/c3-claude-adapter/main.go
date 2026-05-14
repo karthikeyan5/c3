@@ -242,11 +242,19 @@ func (a *adapter) connectBroker() error {
 
 // spawnBroker forks a `c3-broker` process detached from our process group so
 // it survives our shutdown.
+//
+// Stderr is explicitly NOT inherited from the adapter. The adapter's stderr
+// is piped to Claude Code's plugin host; piping broker log lines through
+// that channel made the plugin host appear distressed (lots of unexplained
+// stderr noise during normal broker bounces), which we suspect contributes
+// to CC closing the adapter's stdin during /c3:restart-broker. The broker
+// has its own structured log at $XDG_STATE_HOME/c3/broker.log via
+// SetupLogging; CC has no reason to see broker stderr.
 func spawnBroker() error {
 	cmd := exec.Command("c3-broker")
 	cmd.Stdin = nil
 	cmd.Stdout = nil
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = nil
 	cmd.SysProcAttr = sysSetsid()
 	return cmd.Start()
 }
@@ -290,9 +298,12 @@ func (a *adapter) brokerReader() {
 		}
 		raw, err := conn.ReadFrame()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "c3-claude-adapter: broker read err: %v — recovering\n", err)
+			// File-only log: CC's plugin host treats noisy stderr as
+			// "distressed plugin → recycle me". Broker bounces are
+			// expected and recoverable; don't telegraph them to CC.
+			log.Printf("broker read err: %v — recovering", err)
 			if !a.recoverBroker() {
-				fmt.Fprintf(os.Stderr, "c3-claude-adapter: recovery aborted\n")
+				log.Printf("broker recovery aborted")
 				return
 			}
 			continue
@@ -313,7 +324,7 @@ func (a *adapter) brokerReader() {
 		case ipc.OpError:
 			var errMsg ipc.ErrorMsg
 			_ = json.Unmarshal(raw, &errMsg)
-			fmt.Fprintf(os.Stderr, "c3-claude-adapter: broker error: %s\n", errMsg.Err)
+			log.Printf("broker error: %s", errMsg.Err)
 		}
 	}
 }
@@ -352,12 +363,11 @@ func (a *adapter) recoverBroker() bool {
 	for attempt := 1; ; attempt++ {
 		err := a.reconnectBroker()
 		if err == nil {
-			fmt.Fprintf(os.Stderr, "c3-claude-adapter: reconnected (attempt %d)\n", attempt)
+			log.Printf("broker reconnected (attempt %d)", attempt)
 			a.replayLastAttach()
 			return true
 		}
-		fmt.Fprintf(os.Stderr, "c3-claude-adapter: reconnect attempt %d failed: %v (retry in %v)\n",
-			attempt, err, backoff)
+		log.Printf("broker reconnect attempt %d failed: %v (retry in %v)", attempt, err, backoff)
 		time.Sleep(backoff)
 		backoff *= 2
 		if backoff > cap {
@@ -395,11 +405,10 @@ func (a *adapter) replayLastAttach() {
 		replay := *req
 		replay.Replay = true
 		if err := conn.WriteJSON(replay); err != nil {
-			fmt.Fprintf(os.Stderr, "c3-claude-adapter: replay attach failed: %v\n", err)
+			log.Printf("replay attach failed: %v", err)
 			return
 		}
-		fmt.Fprintf(os.Stderr, "c3-claude-adapter: replayed attach (target=%q name=%q)\n",
-			req.Target, req.Name)
+		log.Printf("replayed attach (target=%q name=%q)", req.Target, req.Name)
 	}
 }
 
@@ -430,7 +439,7 @@ func (a *adapter) currentConn() *ipc.Conn {
 func (a *adapter) handleInbound(raw []byte) {
 	var in ipc.InboundMsg
 	if err := json.Unmarshal(raw, &in); err != nil {
-		fmt.Fprintf(os.Stderr, "c3-claude-adapter: handleInbound unmarshal: %v\n", err)
+		log.Printf("handleInbound unmarshal: %v", err)
 		return
 	}
 	kind := "text"
@@ -846,7 +855,14 @@ func (a *adapter) handleAttachLocal(ctx context.Context, req *mcp.Request, args 
 	a.pending["attached"] = ch
 	a.pmu.Unlock()
 
-	if err := a.currentConn().WriteJSON(attachReq); err != nil {
+	conn := a.currentConn()
+	if conn == nil {
+		a.pmu.Lock()
+		delete(a.pending, "attached")
+		a.pmu.Unlock()
+		return errResp(req.ID, -32000, "broker reconnecting — retry attach in a moment")
+	}
+	if err := conn.WriteJSON(attachReq); err != nil {
 		a.pmu.Lock()
 		delete(a.pending, "attached")
 		a.pmu.Unlock()
@@ -909,7 +925,14 @@ func (a *adapter) handleTopicsLocal(ctx context.Context, req *mcp.Request) *mcp.
 	a.pmu.Lock()
 	a.pending["topics_list"] = ch
 	a.pmu.Unlock()
-	if err := a.currentConn().WriteJSON(ipc.ListTopicsReq{Op: ipc.OpListTopics}); err != nil {
+	conn := a.currentConn()
+	if conn == nil {
+		a.pmu.Lock()
+		delete(a.pending, "topics_list")
+		a.pmu.Unlock()
+		return errResp(req.ID, -32000, "broker reconnecting — retry topics in a moment")
+	}
+	if err := conn.WriteJSON(ipc.ListTopicsReq{Op: ipc.OpListTopics}); err != nil {
 		a.pmu.Lock()
 		delete(a.pending, "topics_list")
 		a.pmu.Unlock()
@@ -951,7 +974,14 @@ func (a *adapter) forwardToBroker(req *mcp.Request, name string, args map[string
 	a.pmu.Unlock()
 
 	tcReq := ipc.ToolCallReq{Op: ipc.OpToolCall, ID: id, Name: name, Args: args}
-	if err := a.currentConn().WriteJSON(tcReq); err != nil {
+	conn := a.currentConn()
+	if conn == nil {
+		a.pmu.Lock()
+		delete(a.pending, id)
+		a.pmu.Unlock()
+		return errResp(req.ID, -32000, "broker reconnecting — retry tool call in a moment")
+	}
+	if err := conn.WriteJSON(tcReq); err != nil {
 		a.pmu.Lock()
 		delete(a.pending, id)
 		a.pmu.Unlock()
