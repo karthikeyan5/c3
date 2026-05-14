@@ -64,13 +64,13 @@ echo "Building from $SRC_ROOT (1–3 minutes on first run)..."
 cd "$SRC_ROOT" && go install ./cmd/...
 ```
 
-Then verify:
+Then verify all five binaries are present:
 
 ```bash
 GOBIN_DIR=$(go env GOBIN)
 [ -z "$GOBIN_DIR" ] && GOBIN_DIR=$(go env GOPATH)/bin
 echo "Binaries installed to: $GOBIN_DIR"
-for bin in c3-broker c3-claude-adapter c3-codex-adapter; do
+for bin in c3-broker c3-claude-adapter c3-codex-adapter codex migrate-legacy; do
   if [ -x "$GOBIN_DIR/$bin" ]; then
     echo "  ✓ $bin"
   else
@@ -79,6 +79,11 @@ for bin in c3-broker c3-claude-adapter c3-codex-adapter; do
 done
 command -v c3-broker >/dev/null || echo "WARNING: $GOBIN_DIR is not on \$PATH"
 ```
+
+The `codex` binary is the Codex CLI launcher (only used if the user wants
+Codex integration; symlinked into PATH by `install-codex-shim` in the
+optional step below). `migrate-legacy` is a one-shot config migrator from
+the Python-prototype layout — most users never run it.
 
 If `c3-broker` isn't on PATH, tell the user:
 
@@ -152,7 +157,25 @@ write access. If the edit is denied, **surface the JSON snippet to the
 user verbatim and ask them to paste it themselves**, then proceed once
 they confirm.
 
-## 6. Tell the user the install is complete
+## 6. (Optional) Enable Codex integration
+
+Skip this step if the user only uses Claude Code. If they also use Codex,
+run:
+
+```bash
+c3-broker install-codex-shim
+```
+
+This symlinks the C3 `codex` launcher into `~/.local/bin/codex` and into
+every `~/.nvm/versions/node/*/bin/` so existing shells (which hash `codex`
+to the NVM path) bypass NVM in favor of the launcher. It's idempotent;
+re-running is safe. Tell the user to open a fresh terminal and verify with
+`readlink $(which codex)` — it should point at `$GOBIN/codex`.
+
+If they don't have Codex installed yet, skip — they can run this later
+after `npm install -g @openai/codex` (or however they get Codex).
+
+## 7. Tell the user the install is complete
 
 > "Installation complete.
 >
@@ -169,9 +192,9 @@ they confirm.
 > the broker will create a Telegram topic named after that directory.
 >
 > Useful slash commands going forward:
->   `/c3-status`  — health check
->   `/c3-setup`   — re-run setup (overwrites config)
->   `/c3-build`   — rebuild after `git pull` in the source dir
+>   `/c3:status`  — health check
+>   `/c3:setup`   — re-run setup (overwrites config)
+>   `/c3:build`   — rebuild after `git pull` in the source dir
 >
 > Day-to-day guide: `docs/USAGE.md`."
 

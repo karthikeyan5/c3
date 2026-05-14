@@ -36,7 +36,7 @@ This clones the repo into `~/.claude/plugins/cache/c3/c3/<version>/`. Nothing's 
 Still inside Claude Code, run:
 
 ```
-/c3-build
+/c3:build
 ```
 
 This is a slash command shipped by the plugin. It runs `go install ./cmd/...` from the plugin source dir. Five binaries land in `$GOBIN` (default `~/go/bin/`):
@@ -56,7 +56,7 @@ export PATH="$(go env GOPATH)/bin:$PATH"
 ## Step 3: Configure C3
 
 ```
-/c3-setup
+/c3:setup
 ```
 
 The slash command interactively gathers:
@@ -66,7 +66,7 @@ The slash command interactively gathers:
 - At least one group and its chat id (e.g. `main` → `-1001234567890`). You can add more groups later by editing `~/.config/c3/mappings.json`.
 - (Optional) `master_user_id` for the future access-control feature; default is your DM id.
 
-**Token validation.** Before writing the file, `/c3-setup` calls Telegram's `getMe` with the token. If it 401s (bad token) or times out (no network), the command refuses to write `mappings.json` and prints the actual Telegram error. Re-run `/c3-setup` after fixing the token. This avoids the failure mode where a typo in the token gets silently saved and surfaces only on the next inbound poll.
+**Token validation.** Before writing the file, `/c3:setup` calls Telegram's `getMe` with the token. If it 401s (bad token) or times out (no network), the command refuses to write `mappings.json` and prints the actual Telegram error. Re-run `/c3:setup` after fixing the token. This avoids the failure mode where a typo in the token gets silently saved and surfaces only on the next inbound poll.
 
 It writes `~/.config/c3/mappings.json` at mode 600 with this skeleton:
 
@@ -110,7 +110,7 @@ This is a Go subcommand that idempotently:
 
 1. Symlinks `~/.local/bin/codex` to `$GOBIN/codex`.
 2. Walks `~/.nvm/versions/node/*/bin/` and creates the same symlink in each version's bin dir. **This is required, not optional** — long-running shells hash `codex` to the NVM path; without these symlinks, your existing terminals bypass the C3 bridge entirely.
-3. Verifies `~/.config/c3/mappings.json` exists (it does if you ran `/c3-setup`).
+3. Verifies `~/.config/c3/mappings.json` exists (it does if you ran `/c3:setup`).
 4. Verifies the broker is reachable.
 5. Prints a one-line audit of every symlink it created or confirmed.
 
@@ -137,12 +137,12 @@ Inside Claude Code:
 ```
 /plugin marketplace update
 /plugin upgrade c3@c3
-/c3-build
+/c3:build
 ```
 
 State (`~/.config/c3/mappings.json`) is in XDG, not the plugin cache, so upgrades don't touch it.
 
-For Codex side, re-run `c3-broker install-codex-shim` after `/c3-build` to refresh the symlinks against the new binary.
+For Codex side, re-run `c3-broker install-codex-shim` after `/c3:build` to refresh the symlinks against the new binary.
 
 ## Uninstalling
 
@@ -161,9 +161,9 @@ The `~/.config/c3/mappings.json` lives outside both plugins; uninstalling the pl
 
 ## Troubleshooting first-install issues
 
-- **`/c3-build` fails with `command not found: go`** — install Go ≥1.22.
+- **`/c3:build` fails with `command not found: go`** — install Go ≥1.22.
 - **Build succeeds but `c3-broker` not on PATH** — `$GOBIN` isn't on `PATH`. See Step 2.
-- **`/c3-setup` says it can't reach Telegram** — check the bot token. Try `curl https://api.telegram.org/bot<TOKEN>/getMe`; should return your bot's info.
+- **`/c3:setup` says it can't reach Telegram** — check the bot token. Try `curl https://api.telegram.org/bot<TOKEN>/getMe`; should return your bot's info.
 - **Topic creation fails** — the bot isn't an admin with `Manage Topics` in the supergroup. Group settings → Administrators → your bot → toggle "Manage Topics" on.
 - **`which codex` still resolves to NVM** — re-run `c3-broker install-codex-shim`, then `hash -r` (bash/zsh) or open a new terminal. Verify with `readlink $(which codex)`; it should point at `$GOBIN/codex`.
 - **Voice transcription doesn't fire** — the broker log surfaces a `[plugin] stt: ...` line per voice message; check `~/.local/state/c3/broker.log`. Common causes: `~/.claude/stt.env` is missing or has no `OPENROUTER_API_KEY` / `SARVAM_API_KEY` (look for `stt: msg=N error ... stderr-tail=...`); `python3` not on the broker's PATH; `mappings.json:plugins.stt.enabled` is `false`. Failing voice messages now surface as `[STT FAILED: <reason>]` in the CLI rather than silent `(voice message)`. If you don't need voice, set `enabled: false`.

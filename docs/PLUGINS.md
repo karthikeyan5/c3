@@ -97,7 +97,7 @@ var Builtins = []plugin.Registrar{
 }
 ```
 
-Rebuild via `/c3-build` (or `make build`) and the new plugin loads on next broker start.
+Rebuild via `/c3:build` (or `make build`) and the new plugin loads on next broker start.
 
 ## Configuration
 
@@ -160,7 +160,7 @@ The STT plugin is the v1 shipped first-class example. Two pieces ship together:
 - **Go shim** at `internal/plugin/builtins/stt/` — compiled into the broker, subscribes to `OnVoiceReceived`, reads `plugins.stt.{handler_path, timeout_seconds, enabled}` from `mappings.json`, and subprocesses a Python handler with `<bot_token> <chat_id> <reply_msg_id> <file_id> [<message_thread_id>]` on argv. The handler script is responsible for fetching the audio from Telegram (the bot token is passed in) and printing the transcript to stdout.
 - **Python pipeline** at `plugins/c3/stt/` — `stt-handler.py` plus a `stt-pkg/` package with a chained provider runner (`stt-pkg/stt.py`) and two providers (`gemini-3-flash-openrouter`, `sarvam-saaras-v3`). Default chain: Gemini first, Sarvam fallback. Vocabulary file at `stt-pkg/vocabulary.txt` biases recognition toward domain-specific terms. API keys come from `~/.claude/stt.env`.
 
-The default `handler_path` resolves to the bundled `${CLAUDE_PLUGIN_ROOT}/stt/stt-handler.py` (when the broker is launched by Claude Code) and falls back to `~/.claude/channels/telegram/stt-handler.py` (the pre-c3 legacy path) so existing installs keep working. Users who want a different STT engine (whisper, deepgram, a local model) override `plugins.stt.handler_path` to point at their own script — the argv contract is the only requirement.
+The handler path resolves in exactly this order: `mappings.json:plugins.stt.handler_path` if set, else `${CLAUDE_PLUGIN_ROOT}/stt/stt-handler.py` (the bundled pipeline, when the broker is launched by Claude Code), else empty — in which case every voice message surfaces as `[STT FAILED: handler_missing]` rather than silently dropping. Users who want a different STT engine (whisper, deepgram, a local model) override `plugins.stt.handler_path` to point at their own script — the argv contract is the only requirement.
 
 Errors don't degrade silently. On any failure the shim returns `[STT FAILED: <reason>]` so the CLI sees the failure explicitly (`handler_missing`, `timeout`, `killed`, `error`, `empty`, `token_unavailable`). The worker also forces `[STT FAILED: no_transcript_plugin]` if no `OnVoiceReceived` plugin produced output at all (defense-in-depth).
 

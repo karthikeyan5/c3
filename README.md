@@ -25,7 +25,8 @@ human-readable walkthrough.
 |---|---|
 | [`cmd/c3-broker`](cmd/c3-broker) | The broker daemon + `setup` / `status` / `validate` subcommands. |
 | [`cmd/c3-claude-adapter`](cmd/c3-claude-adapter) | MCP stdio adapter for Claude Code. |
-| [`cmd/c3-codex-adapter`](cmd/c3-codex-adapter) | Codex MCP adapter (scaffold; full impl deferred per D010). |
+| [`cmd/c3-codex-adapter`](cmd/c3-codex-adapter) | Codex MCP adapter — full WS-to-IPC bridge (D011). |
+| [`cmd/codex`](cmd/codex) | Codex CLI launcher — replaces `which codex` to route through the C3 bridge (D011). |
 | [`cmd/migrate-legacy`](cmd/migrate-legacy) | One-shot migrator from a legacy Python-prototype config layout into `~/.config/c3/mappings.json`. |
 | [`internal/`](internal) | broker, channel/telegram, plugin host, mappings, IPC, MCP server. |
 | [`plugins/c3/`](plugins/c3) | Plugin manifest + slash commands shipped to users. |
@@ -65,7 +66,8 @@ debounce/merge. flock singleton with stale-pid recovery.
 **Adapters.** Thin MCP stdio servers. Each looks like a normal MCP plugin
 to its CLI. Receives only messages routed to its attached topics/chats.
 Tools: `attach`, `reply`, `react`, `edit_message`, `download_attachment`,
-`topics`. Reconnect-once on broker drop with pending-tool-call wake-with-error.
+`topics`. Survives a broker bounce via exponential-backoff reconnect plus
+replay of the last successful attach (no manual re-attach needed).
 
 **Channels.** Pluggable transport. v1 ships Telegram only
 (`internal/channel/telegram`, cleanroom Go via `gotgbot/v2` rc.34).
