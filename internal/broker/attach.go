@@ -489,6 +489,17 @@ func (b *Broker) sendWelcome(stub *Stub, key RouteKey, label string) {
 	if b == nil {
 		return
 	}
+	// Recovery-window guard: any attach within `welcomeRecoveryWindow` of
+	// broker startup is presumed to be an adapter's automatic replay
+	// (not a user-typed attach). This is the belt to the AttachReq.Replay
+	// flag's suspenders — protects against deployment gaps where the
+	// broker has the flag-aware code but a live adapter doesn't.
+	// Karthi 2026-05-14: "I keep getting this message; it's annoying."
+	if !b.startedAt.IsZero() && time.Since(b.startedAt) < welcomeRecoveryWindow {
+		log.Printf("welcome: suppressed (within %v of broker startup) for %s cli=%s",
+			welcomeRecoveryWindow, routeKeyStr(key), stub.CLI)
+		return
+	}
 	ch, err := b.Channel(key.Channel)
 	if err != nil {
 		log.Printf("welcome: channel %s lookup failed: %v", key.Channel, err)
@@ -541,10 +552,14 @@ func welcomeText(stub *Stub, label string) string {
 // parent directory ends up clobbering the same `parent → topic` entry,
 // turning every fresh attach into a silent rebind of the parent's default.
 //
-// Conflict guard (TODO.md pre-release UX bug #3): if the resolved cwd
-// already maps to a *different* topic, log a clear warning before
-// overwriting. The live claim still proceeds; the warning surfaces in
-// the broker log so a user can see when their default flipped.
+// Rebind guard (TODO.md pre-release UX bug #3, hardened 2026-05-14 per
+// Karthi's "should be rejected" directive): if the resolved cwd already
+// maps to a *different* topic, the broker refuses to overwrite the
+// saved default. The live claim still proceeds — the user has the
+// session they wanted — but the default-for-next-launch stays put.
+// To actually change the default, the user edits
+// `~/.config/c3/mappings.json` directly. Loud log line so the rejection
+// is visible.
 func (b *Broker) persistMapping(stub *Stub, chanName string, chatID, topicID int64, name, group string) {
 	cwd := resolveAttachCWD(stub.CWD, name)
 	if cwd == "" {
@@ -552,8 +567,9 @@ func (b *Broker) persistMapping(stub *Stub, chanName string, chatID, topicID int
 	}
 	if existing, ok := b.Mappings.LookupByCwd(cwd); ok {
 		if existing.ChatID != chatID || existing.TopicID != topicID {
-			log.Printf("attach: cwd=%q rebound from topic-%d (%s) → topic-%d (%s); previous default lost",
+			log.Printf("attach: REFUSED to rebind cwd=%q (saved=topic-%d %q → requested=topic-%d %q); live claim proceeds but saved default unchanged. To rebind, edit ~/.config/c3/mappings.json.",
 				cwd, existing.TopicID, existing.Name, topicID, name)
+			return
 		}
 	}
 	now := time.Now().UTC()

@@ -492,6 +492,9 @@ func TestTryClaim_FreshClaimTriggersWelcome(t *testing.T) {
 	b := brokerWithChannel(t, mf, fc)
 	defer b.Shutdown()
 
+	// Past the recovery window so genuine fresh attaches fire welcome.
+	b.startedAt = time.Now().Add(-2 * welcomeRecoveryWindow)
+
 	stub := &Stub{CLI: "claude", PID: 1, CWD: "/home/u/proj"}
 	tid := int64(914)
 	key := MakeRouteKey("telegram", -100, &tid)
@@ -526,6 +529,10 @@ func TestTryClaim_SameLogicalSessionReclaimSuppressesWelcome(t *testing.T) {
 	fc := &fakeChannel{}
 	b := brokerWithChannel(t, mf, fc)
 	defer b.Shutdown()
+
+	// Past the recovery window so the first claim's welcome actually
+	// fires; we want to test the same-session suppression independently.
+	b.startedAt = time.Now().Add(-2 * welcomeRecoveryWindow)
 
 	tid := int64(914)
 	key := MakeRouteKey("telegram", -100, &tid)
@@ -649,35 +656,93 @@ func TestPersistMapping_RefinesToProjectSubdirectory(t *testing.T) {
 	}
 }
 
-func TestPersistMapping_RebindLogsWarning(t *testing.T) {
-	// Same cwd, different topic → warning + still persists. (Live claim
-	// is handled upstream in tryClaim; persistMapping just records.)
-	// Inability to capture log output here is fine — we verify the
-	// overwrite behavior; the log message is structural, exercised by
-	// the surrounding code path.
+func TestPersistMapping_RebindRefusesToOverwrite(t *testing.T) {
+	// Karthi 2026-05-14: "rebinding should be explicit." persistMapping
+	// must NOT silently change a saved cwd → topic mapping. The live
+	// claim is granted upstream in tryClaim; persistMapping's job is
+	// preserving the saved default until the user takes an explicit
+	// action (edit mappings.json).
 	mf := mfWithTelegram()
 	fc := &fakeChannel{}
 	b := brokerWithChannel(t, mf, fc)
 	defer b.Shutdown()
 
-	// Stub launched directly in /tmp/X (no subdir refinement possible).
 	root := t.TempDir()
 	stub := &Stub{CLI: "claude", PID: 1, CWD: root}
 
-	// First attach claims topic 914 under name matching root's basename
-	// so the launch dir IS the persisted cwd.
+	// First attach claims topic 914 under a name matching root's
+	// basename → resolveAttachCWD returns root → persisted.
 	name1 := filepath.Base(root)
 	b.persistMapping(stub, "telegram", -100, 914, name1, "main")
-	// Same cwd, different topic. resolveAttachCWD returns launch as
-	// fallback (no subdir match for the second name).
+	if got, ok := b.Mappings.LookupByCwd(root); !ok || got.TopicID != 914 {
+		t.Fatalf("first attach should persist topic 914: got %+v ok=%v", got, ok)
+	}
+
+	// Second attach to a different topic (no subdir refinement, falls
+	// back to root). Should NOT clobber.
 	b.persistMapping(stub, "telegram", -100, 207, "other", "main")
 
 	got, ok := b.Mappings.LookupByCwd(root)
 	if !ok {
-		t.Fatal("rebind should have overwritten, not skipped")
+		t.Fatal("first mapping should still be in place after refused rebind")
 	}
-	if got.TopicID != 207 {
-		t.Errorf("expected rebind to topic 207, got topic %d", got.TopicID)
+	if got.TopicID != 914 {
+		t.Errorf("rebind silently overwrote saved default: got topic %d, want 914", got.TopicID)
+	}
+}
+
+// ─── recovery-window welcome suppression (2026-05-14) ──────────────────────
+
+func TestSendWelcome_SuppressedDuringStartupRecoveryWindow(t *testing.T) {
+	// Right after a broker bounce, adapters auto-replay attach. With
+	// `welcomeRecoveryWindow`, any attach in the first 30s is presumed
+	// to be a recovery and welcomes are skipped — even when the
+	// adapter's AttachReq lacks the Replay flag (deployment gap with
+	// an older live adapter binary).
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	// brokerWithChannel just called New(), so startedAt is "now-ish".
+	stub := &Stub{CLI: "claude", PID: 1, CWD: "/home/u/proj"}
+	tid := int64(914)
+	key := MakeRouteKey("telegram", -100, &tid)
+	if !b.tryClaim(nil, stub, key, "c3", false, false) {
+		t.Fatal("fresh claim should succeed")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := len(fc.sendRepliesSnapshot()); got != 0 {
+		t.Errorf("welcome fired during recovery window: got %d sends, want 0", got)
+	}
+}
+
+func TestSendWelcome_FiresAfterRecoveryWindowExpires(t *testing.T) {
+	// Confirm the suppression is bounded — once `welcomeRecoveryWindow`
+	// elapses, welcomes fire normally for fresh claims.
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	// Backdate startedAt past the recovery window.
+	b.startedAt = time.Now().Add(-2 * welcomeRecoveryWindow)
+
+	stub := &Stub{CLI: "claude", PID: 1, CWD: "/home/u/proj"}
+	tid := int64(914)
+	key := MakeRouteKey("telegram", -100, &tid)
+	if !b.tryClaim(nil, stub, key, "c3", false, false) {
+		t.Fatal("fresh claim should succeed")
+	}
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(fc.sendRepliesSnapshot()) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := len(fc.sendRepliesSnapshot()); got != 1 {
+		t.Errorf("welcome should fire after recovery window: got %d sends, want 1", got)
 	}
 }
 
@@ -692,6 +757,10 @@ func TestTryClaim_ReplayFlagSuppressesWelcomeAfterBrokerBounce(t *testing.T) {
 	fc := &fakeChannel{}
 	b := brokerWithChannel(t, mf, fc)
 	defer b.Shutdown()
+
+	// Past the recovery window so the Replay-flag suppression is what
+	// we're actually testing (not the time-based fallback).
+	b.startedAt = time.Now().Add(-2 * welcomeRecoveryWindow)
 
 	stub := &Stub{CLI: "claude", PID: 99, CWD: "/home/u/proj"}
 	tid := int64(914)

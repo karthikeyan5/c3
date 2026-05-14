@@ -22,12 +22,27 @@ type Broker struct {
 	Fallbacks *fallbackTracker
 	Plugins   *PluginHost
 
+	// startedAt is the wall-clock time the broker was constructed. Used by
+	// sendWelcome to suppress on-attach welcome messages during the
+	// post-startup recovery window — adapters that connect right after a
+	// broker bounce are auto-replaying their last attach, not user-typed
+	// attaches, and shouldn't spam the topic.
+	startedAt time.Time
+
 	ctx    context.Context
 	cancel context.CancelFunc
 
 	chMu     sync.RWMutex
 	channels map[string]*channelRegistration
 }
+
+// welcomeRecoveryWindow suppresses on-attach welcomes for this duration
+// after broker startup. Empirically: an adapter's replayLastAttach lands
+// within ~1s of broker readiness; 30s is generous enough to cover slow
+// reconnects without crossing into the timeframe where a real interactive
+// `attach` would be issued (those go through user confirmation, well
+// past startup).
+const welcomeRecoveryWindow = 30 * time.Second
 
 const defaultWorkerIdle = 60 * time.Second
 
@@ -39,6 +54,7 @@ func New(mf *mappings.MappingsFile) *Broker {
 		Stubs:     NewStubRegistry(),
 		Routes:    NewRoutes(),
 		Fallbacks: newFallbackTracker(defaultFallbackCooldown),
+		startedAt: time.Now(),
 		ctx:       ctx,
 		cancel:    cancel,
 		channels:  map[string]*channelRegistration{},
