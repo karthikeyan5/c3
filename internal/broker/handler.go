@@ -52,15 +52,28 @@ func (b *Broker) HandleConn(nc net.Conn) {
 			hello.CLI, hello.PID, hello.CWD, stub.ConnID)
 	}
 
-	// Defer: mark the stub as disconnected (NOT release its claims).
-	// Claims persist until either:
-	//   - the same logical session (CLI+PID+CWD) reconnects and transfers,
-	//   - or another session attempts to claim and the broker confirms this
-	//     PID is no longer alive (Routes.Claim's DISPLACE path).
+	// Defer: mark the stub as disconnected and decide whether to release
+	// its claims based on PID liveness. The "claims preserved while PID
+	// alive" rule covers the common case where the adapter is briefly
+	// reconnecting (network blip, broker bounce). When the PID is
+	// already dead at conn-drop time — e.g. Claude Code killed the
+	// adapter for /mcp reconnect, the user quit the CLI — preserving
+	// the claim would only block fallback delivery and future attaches
+	// from competing PIDs.
+	//
+	// Defense-in-depth: forwardOrFallback also checks IsAlive on every
+	// dispatch and releases dead-holder claims (kernel may not reap the
+	// process by the time this defer runs).
 	defer func() {
 		stub.MarkDisconnected()
-		log.Printf("conn-drop: cli=%s pid=%d cwd=%q conn=%d (claims preserved while pid alive)",
-			stub.CLI, stub.PID, stub.CWD, stub.ConnID)
+		if isPIDAlive(stub.PID) {
+			log.Printf("conn-drop: cli=%s pid=%d cwd=%q conn=%d (claims preserved while pid alive)",
+				stub.CLI, stub.PID, stub.CWD, stub.ConnID)
+			return
+		}
+		released := b.Routes.ReleaseAllByConnID(stub.ConnID)
+		log.Printf("conn-drop: cli=%s pid=%d cwd=%q conn=%d (PID dead — released %d claim(s))",
+			stub.CLI, stub.PID, stub.CWD, stub.ConnID, len(released))
 	}()
 	defer b.Stubs.Unregister(stub.ConnID)
 

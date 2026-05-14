@@ -263,12 +263,33 @@ func mergeBatch(batch []*c3types.Inbound) *c3types.Inbound {
 // boilerplate; no CLI processed it).
 func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound) {
 	holder, claimed := w.broker.Routes.Holder(w.key)
+
+	// Liveness sweep: if the holder's PID is dead (e.g. Claude Code killed
+	// the adapter as part of /mcp reconnect, or the user quit the CLI),
+	// the claim is stale. Release it and fall through to fallback. Without
+	// this, every inbound for a dead-holder claim ends with a "holder.Conn
+	// is not *ipc.Conn" log line and silently never reaches anywhere
+	// (including no Telegram fallback). This is the 2026-05-14 regression
+	// Karthi hit immediately after /mcp reconnect.
+	if claimed && !holder.IsAlive() {
+		log.Printf("deliver STALE chan=%s chat=%d topic=%s msg=%d: holder cli=%s pid=%d is dead, releasing claim",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID,
+			holder.CLI, holder.PID)
+		w.broker.Routes.Release(w.key, holder.ConnID)
+		claimed = false
+		holder = nil
+	}
+
 	if claimed {
 		conn, ok := holder.Conn.(*ipc.Conn)
 		if !ok {
-			log.Printf("deliver FAIL chan=%s chat=%d topic=%s msg=%d: holder.Conn is not *ipc.Conn — %s",
+			// Holder is alive (kill -0 succeeded) but its conn is nil —
+			// the adapter is between reconnects. Don't deliver to a half-
+			// dead stub; drop with a log line. The adapter will catch up
+			// when it reconnects (route-conn transfer rebinds the stub).
+			log.Printf("deliver SKIP chan=%s chat=%d topic=%s msg=%d: holder cli=%s pid=%d alive but disconnected — %s",
 				w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID,
-				fallbackSummary(in))
+				holder.CLI, holder.PID, fallbackSummary(in))
 			return
 		}
 		if err := conn.WriteJSON(ipc.InboundMsg{Op: ipc.OpInbound, Inbound: *in}); err != nil {

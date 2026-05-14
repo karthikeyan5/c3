@@ -43,6 +43,22 @@ Surfaced during install/attach pilot. Must fix before the public push.
   Code MCP lifecycle interactions on resume are still
   poorly-understood — surface a heartbeat and a singleton-PID guard
   if symptoms recur.
+- [x] **Stale claim after `/mcp` reconnect blocks inbound delivery AND
+  fallback.** Done 2026-05-14. Sequence Karthi hit: `/c3:attach` (got
+  welcome ✅) → `/mcp` reconnect (CC kills old adapter, spawns new) →
+  old adapter dies; broker's conn-drop defer marks stub disconnected
+  but doesn't release the claim. New inbounds hit `deliver FAIL:
+  holder.Conn is not *ipc.Conn` (type-assertion on nil conn) and no
+  fallback fires either (a stale-but-present claim ≠ no claim). Fixes:
+  (1) `internal/broker/worker.go:forwardOrFallback` now calls
+  `holder.IsAlive()` at dispatch time; dead-holder claims are released
+  in-place and the message falls through to the fallback path; alive-
+  but-disconnected holders cause a SKIP log (adapter is between
+  reconnects). (2) `internal/broker/handler.go` conn-drop defer now
+  checks `isPIDAlive(stub.PID)` and releases claims when the PID is
+  already dead at conn-drop time. Regression tests:
+  `TestForwardOrFallback_StaleClaim_ReleasesAndFallsThrough`,
+  `TestForwardOrFallback_AliveButDisconnectedHolder_SkipsDelivery`.
 
 - [x] **Welcome message on attach.** Done 2026-05-14
   (`internal/broker/attach.go:sendWelcome`). Friendly tone, no PID, async,

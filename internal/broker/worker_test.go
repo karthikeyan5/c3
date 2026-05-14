@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -116,6 +117,93 @@ func TestFlushInbounds_VoiceWithSTTPluginUsesTranscript(t *testing.T) {
 
 	if !strings.Contains(in.Text, "transcribed text") {
 		t.Errorf("voice with STT plugin: in.Text=%q, want transcript embedded", in.Text)
+	}
+}
+
+// Regression test for 2026-05-14: after /mcp reconnect, Claude Code killed
+// the old adapter; the broker kept the now-stale claim "while pid alive"
+// and every inbound failed with `holder.Conn is not *ipc.Conn` because the
+// MarkDisconnected'd stub had nil Conn. Worse, no Telegram fallback fired
+// either (the stale claim made `claimed=true`). Fix: liveness check at
+// dispatch time, release-and-fall-through when holder PID is dead.
+func TestForwardOrFallback_StaleClaim_ReleasesAndFallsThrough(t *testing.T) {
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	tid := int64(914)
+	key := MakeRouteKey("telegram", -1003990699908, &tid)
+
+	// Stub with a PID that's definitively dead. PIDs above PID_MAX
+	// (typically 4194304 on Linux, 99999 on macOS) reliably return
+	// ESRCH from kill(2). 1<<30 is safely beyond both. MarkDisconnected
+	// mirrors the post-conn-drop state.
+	deadStub := &Stub{
+		CLI: "claude", PID: 1 << 30, CWD: "/home/u/proj", ConnID: 99,
+	}
+	deadStub.MarkDisconnected()
+	b.Routes.Claim(key, deadStub)
+	if _, held := b.Routes.Holder(key); !held {
+		t.Fatal("test setup: claim should be in place before delivery")
+	}
+
+	w := newRouteWorker(context.Background(), key, time.Hour, b)
+	defer w.Stop()
+
+	in := &c3types.Inbound{
+		Channel:   "telegram",
+		ChatID:    -1003990699908,
+		TopicID:   &tid,
+		MessageID: 1133,
+		Text:      "Hi",
+	}
+	w.forwardOrFallback(context.Background(), in)
+
+	// Stale claim must be released.
+	if _, held := b.Routes.Holder(key); held {
+		t.Error("stale dead-holder claim should have been released on dispatch")
+	}
+	// Fallback should have fired since claim was cleared.
+	if got := len(fc.sendRepliesSnapshot()); got != 1 {
+		t.Errorf("expected fallback SendReply after releasing stale claim, got %d sends", got)
+	}
+}
+
+// Companion: a holder that IS alive but currently has nil Conn (between
+// reconnects) must NOT be released; deliver-skip is the correct behavior,
+// because the adapter will be back on the wire shortly. Otherwise a
+// momentary network blip would race against the inbound flow.
+func TestForwardOrFallback_AliveButDisconnectedHolder_SkipsDelivery(t *testing.T) {
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	tid := int64(914)
+	key := MakeRouteKey("telegram", -1003990699908, &tid)
+
+	// Use this test process's PID — guaranteed alive.
+	aliveStub := &Stub{
+		CLI: "claude", PID: os.Getpid(), CWD: "/home/u/proj", ConnID: 99,
+	}
+	aliveStub.MarkDisconnected() // alive but disconnected
+	b.Routes.Claim(key, aliveStub)
+
+	w := newRouteWorker(context.Background(), key, time.Hour, b)
+	defer w.Stop()
+
+	in := &c3types.Inbound{
+		Channel: "telegram", ChatID: -1003990699908, TopicID: &tid,
+		MessageID: 1134, Text: "Hi",
+	}
+	w.forwardOrFallback(context.Background(), in)
+
+	if _, held := b.Routes.Holder(key); !held {
+		t.Error("alive-but-disconnected claim must be preserved (adapter may reconnect)")
+	}
+	if got := len(fc.sendRepliesSnapshot()); got != 0 {
+		t.Errorf("expected no fallback for alive disconnected holder, got %d sends", got)
 	}
 }
 
