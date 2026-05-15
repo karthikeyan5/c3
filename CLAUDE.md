@@ -26,10 +26,10 @@ claude --dangerously-load-development-channels plugin:c3@c3
 
 A plain `claude` will leave the c3 channel notifications enabled at the
 broker but **silently dropped by Claude Code** — broker log shows
-`delivered`, but no `<channel>` block appears in the conversation. That's
-the dev-channels-flag gate, separate from `~/.claude/settings.json`'s
-`allowedChannelPlugins` (which is the production allowlist for
-marketplace-published plugins; our `c3@c3` is a local-directory
-marketplace and needs the dev flag).
+`delivered`, but no `<channel>` block appears in the conversation. Both
+gates must be passed: `~/.claude/settings.json`'s `channelsEnabled` +
+`allowedChannelPlugins` (the user-side allowlist) AND the dev-channels
+flag (additional gate for local-directory marketplace plugins like c3
+that haven't shipped through Anthropic's marketplace yet).
 
 Do NOT alias this — the maintainer prefers the full command in shell history.

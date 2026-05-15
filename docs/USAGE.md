@@ -117,7 +117,7 @@ C3 doesn't auto-delete. From your phone (Telegram), long-press the topic in the 
 ## When things go wrong
 
 - **No CLI is attached, but messages keep arriving** — the broker sends a one-shot fallback reply (cooldown 5 min) telling you to attach a CLI. Open a session in the project directory and `attach`.
-- **`attach` says the topic is held** — `topics` lists who. If it's a stale claim (the holder crashed), the broker now sweeps dead-pid holders on dispatch (2026-05-14 fix); just retry `attach`. If that doesn't free it, quit Claude Code and relaunch — the new session's broker auto-spawn starts clean. Don't `/c3:restart-broker` (removed in favor of `/c3:reload-config`, which is non-disruptive) — bouncing the broker from inside CC kills the MCP server too. From an external terminal, `pkill c3-broker` works.
+- **`attach` says the topic is held** — `topics` lists who. If it's a stale claim (the holder crashed), the broker now sweeps dead-pid holders on dispatch (2026-05-14 fix); just retry `attach`. If that doesn't free it, quit Claude Code and relaunch — the new session's broker auto-spawn starts clean. Don't bounce the broker from inside CC (killing the broker also kills this session's MCP server, requiring a manual `/mcp` reconnect). From an external terminal, `pkill c3-broker` works. For mappings.json edits, `/c3:reload-config` is non-disruptive.
 - **Voice transcription is wrong** — re-record (Telegram preserves the original audio; the CLI can `download_attachment` to re-listen). The STT plugin's confidence isn't surfaced in v1; treat the transcript as a hint when accuracy matters.
 - **`codex` doesn't seem to be using C3** — check `which codex` returns the C3 launcher (`$GOBIN/codex` after install). Long-running shells hash; open a new terminal or `hash -r`. The launcher logs to `/tmp/c3-codex-supervisor.log` — `tail` it during a `codex` invocation to see what it thinks it's doing.
 - **`reply` says to attach first** — your adapter lost local state but the broker may still hold your claim. Try `attach` again with the same target; the adapter recovers from the broker's claim (both Claude and Codex adapters do this). If that fails, `topics` shows who's holding what; `c3-broker status` from a separate shell tells you the same with more detail.
@@ -127,11 +127,13 @@ C3 doesn't auto-delete. From your phone (Telegram), long-press the topic in the 
 Quick sanity sweep when something feels off:
 
 ```
-ls -la "${XDG_RUNTIME_DIR:-/tmp}/c3.sock" 2>/dev/null || ls -la /tmp/c3-$UID.sock   # broker socket; should exist + 0o600
-cat /tmp/c3-broker.pid        # the running broker's pid
-tail /tmp/c3-broker.log       # recent activity
-tail /tmp/c3-codex-supervisor.log  # last codex launcher invocation (if Codex installed)
-cat /tmp/c3-codex-app-server.json  # current app-server signature (cwd, topic, adapter path)
+c3-broker status              # one-shot summary of everything below
+ls -la "${XDG_RUNTIME_DIR:-/run/user/$UID}/c3.sock"     # broker socket; should exist + 0o600
+cat "${XDG_RUNTIME_DIR:-/run/user/$UID}/c3-broker.pid"  # the running broker's pid
+tail ~/.local/state/c3/broker.log     # broker activity (XDG_STATE_HOME, or default)
+tail ~/.local/state/c3/adapter.log    # adapter MCP frames
+tail /tmp/c3-codex-supervisor.log     # last codex launcher invocation (if Codex installed)
+cat /tmp/c3-codex-app-server-$UID.json  # current app-server signature (cwd, topic, adapter path)
 ```
 
 If the socket is missing or the pid file points at a nonexistent process, the next CLI session will spawn a fresh broker. If something looks corrupted, `pkill c3-broker; rm -f "${XDG_RUNTIME_DIR:-/tmp}/c3.sock" /tmp/c3-$UID.sock "${XDG_RUNTIME_DIR:-$HOME/.cache/c3}/c3-broker.pid"` resets the world — do this from a separate terminal, not from inside Claude Code (broker death + adapter recycle = double pain). Operational subcommands: `c3-broker status` prints liveness, `c3-broker topics` lists topics and live claim state, `c3-broker validate` parses mappings.json. After editing `~/.config/c3/mappings.json` by hand, `/c3:reload-config` sends SIGHUP to the running broker so it re-reads the file in-place (live claims preserved, no process churn). (`c3-broker release <cwd>` is wired but stubbed in v0.1.0 — roadmap.)

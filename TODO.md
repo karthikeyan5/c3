@@ -210,7 +210,7 @@ Kept short for reference; full detail in the git history.
 - Plan 6: Claude Code MCP adapter — end-to-end live, 7 tools, manual
   framing for `notifications/claude/channel`
 - Plan 9: install plumbing — marketplace.json, plugin.json, .mcp.json,
-  `/c3-build`/`/c3-setup`/`/c3-status` slash commands, `c3-broker setup` /
+  `/c3:build`/`/c3:setup`/`/c3:status` slash commands, `c3-broker setup` /
   `status` / `validate` subcommands, root `INSTALL.md` single-line install
 - Plan 10: doc pass — D009 added, README + RESUME + TODO rewritten to
   current state

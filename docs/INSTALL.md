@@ -19,17 +19,27 @@ You need:
 
   If you don't need voice, set `mappings.json:plugins.stt.enabled=false` and skip the API keys. You can swap in a custom handler (whisper, local, anything that matches the argv contract) by setting `plugins.stt.handler_path` to your own script — see `docs/PLUGINS.md`.
 
-## Step 1: Install the Claude Code plugin
+## Step 1: Clone the repo and install the Claude Code plugin
 
-Inside Claude Code:
+`/c3:build` (step 2) needs access to the Go source — `cmd/`, `go.mod`, the
+whole tree. Claude Code's marketplace cache from a remote source only ships
+the plugin subtree, so the install path is: clone the repo first, then point
+Claude Code at the clone as a local marketplace.
+
+```bash
+mkdir -p ~/src && cd ~/src && git clone https://github.com/karthikeyan5/c3
+```
+
+Then inside Claude Code:
 
 ```
-/plugin marketplace add karthikeyan5/c3
+/plugin marketplace add ~/src/c3
 /plugin install c3@c3
 /reload-plugins
 ```
 
-This clones the repo into `~/.claude/plugins/cache/c3/c3/<version>/`. Nothing's compiled yet.
+The clone location is permanent — `/c3:build` reads source from there to
+compile, so don't move or delete it.
 
 ## Step 2: Build the binaries
 
@@ -89,18 +99,40 @@ It writes `~/.config/c3/mappings.json` at mode 600 with this skeleton:
 }
 ```
 
-Restart your Claude Code session. The first new session spawns the broker daemon and you're ready.
+## Step 4: Enable channel notifications
 
-## Step 4 (optional): Enable Codex integration
+Claude Code requires explicit opt-in before it surfaces
+`notifications/claude/channel` from any plugin. **Without this step the
+broker delivers messages successfully but the CLI never sees them.**
 
-Inside Codex:
+Open `~/.claude/settings.json` and add (merge if other top-level keys
+exist):
+
+```json
+"channelsEnabled": true,
+"allowedChannelPlugins": [
+  { "marketplace": "c3", "plugin": "c3" }
+]
+```
+
+If `allowedChannelPlugins` already has other entries, keep them and
+append `c3` alongside.
+
+Then **restart Claude Code with the development-channels flag**:
 
 ```
-codex plugin marketplace add github:karthikeyan5/c3
-codex plugin install c3-codex
+claude --dangerously-load-development-channels plugin:c3@c3
 ```
 
-Then read the `SETUP.md` the plugin ships, or just have the agent run:
+The plain `claude` command keeps `allowedChannelPlugins` enabled but
+also gates local-marketplace plugins behind the dev flag (so the c3
+adapter's `notifications/claude/channel` frames get silently dropped).
+The official-marketplace plugin distribution flow doesn't need this
+flag; we do, until c3 is published through Anthropic's marketplace.
+
+## Step 5 (optional): Enable Codex integration
+
+If you also use the Codex CLI, run:
 
 ```
 c3-broker install-codex-shim
@@ -116,9 +148,10 @@ This is a Go subcommand that idempotently:
 
 Open a fresh terminal (or `hash -r` your existing one) and run `which codex`. It should resolve to `~/.local/bin/codex`. From now on every `codex` invocation goes through the C3 launcher → app-server → adapter chain. Use Codex normally.
 
-## Step 5: Verify
+## Step 6: Verify
 
-In a fresh Claude Code session in some project directory:
+In a fresh Claude Code session (started with the dev-channels flag from
+step 4) in some project directory:
 
 ```
 attach
@@ -147,15 +180,18 @@ For Codex side, re-run `c3-broker install-codex-shim` after `/c3:build` to refre
 ## Uninstalling
 
 ```
-/plugin uninstall c3@c3                # removes the plugin from Claude Code
-codex plugin uninstall c3-codex         # removes from Codex
-rm ~/.local/bin/codex                   # restore your real codex
-find ~/.nvm/versions/node -name codex -type l -delete   # remove NVM-side symlinks (CAUTION: only if they pointed at the C3 launcher)
-rm -f "${XDG_RUNTIME_DIR:-/tmp}/c3.sock" /tmp/c3-$UID.sock "${XDG_RUNTIME_DIR:-$HOME/.cache/c3}/c3-broker.pid"   # broker scratch files
-rm -f /tmp/c3-codex-app-server.json     # codex launcher scratch
-rm -rf ~/.config/c3                     # CONFIG; remove only if you don't want to keep mappings/topics
-$GOBIN/c3-broker --uninstall-binaries   # removes binaries from $GOBIN (or just `rm $GOBIN/c3-* $GOBIN/codex` manually)
+/plugin uninstall c3@c3                          # removes the plugin from Claude Code
+pkill c3-broker                                  # stop the daemon
+rm ~/.local/bin/codex 2>/dev/null                # restore your real codex (if you'd installed the shim)
+find ~/.nvm/versions/node -name codex -type l -delete 2>/dev/null   # remove NVM-side symlinks (CAUTION: only if they pointed at the C3 launcher)
+rm -f "${XDG_RUNTIME_DIR:-/tmp}/c3.sock" /tmp/c3-$UID.sock "${XDG_RUNTIME_DIR:-/run/user/$UID}/c3-broker.pid" "${XDG_RUNTIME_DIR:-/run/user/$UID}/c3-broker.caps"   # broker scratch files
+rm -f "/tmp/c3-codex-app-server-$UID.json"       # codex launcher scratch (per-uid path)
+rm -rf ~/.config/c3                              # CONFIG; remove only if you don't want to keep mappings/topics
+rm -f $(go env GOBIN)/c3-* $(go env GOBIN)/codex $(go env GOBIN)/migrate-legacy 2>/dev/null   # binaries
 ```
+
+Optionally also remove the source clone (`rm -rf ~/src/c3` or wherever
+you cloned in step 1).
 
 The `~/.config/c3/mappings.json` lives outside both plugins; uninstalling the plugins doesn't touch it. Decide separately whether to keep it (you might reinstall later).
 
