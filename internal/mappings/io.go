@@ -58,6 +58,16 @@ func Write(path string, mf *MappingsFile) error {
 		cleanup()
 		return fmt.Errorf("chmod tempfile: %w", err)
 	}
+	// fsync data to disk BEFORE the rename so a power loss between
+	// rename and journal flush can't leave a zero-byte mappings.json.
+	// Without this, ext4/xfs are allowed to commit the rename before
+	// the inode's data blocks — recovery would lose the bot token.
+	// (daemon.md §5.1)
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return fmt.Errorf("fsync tempfile: %w", err)
+	}
 	if err := tmp.Close(); err != nil {
 		cleanup()
 		return fmt.Errorf("close tempfile: %w", err)
@@ -66,7 +76,26 @@ func Write(path string, mf *MappingsFile) error {
 		cleanup()
 		return fmt.Errorf("rename %s -> %s: %w", tmpPath, path, err)
 	}
+	// fsync the parent directory so the rename itself is durable.
+	// On a crash between rename and the dir's metadata flush, the
+	// rename may be lost even though the new file's data persisted.
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("fsync parent dir of %s: %w", path, err)
+	}
 	return nil
+}
+
+// syncDir fsyncs a directory file descriptor. Required after `rename(2)` so
+// the kernel commits the directory entry, not just the inode data.
+// Per POSIX/Linux this is a no-op for some filesystems but mandatory for
+// ext4/xfs/btrfs guarantees.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // backupFile copies src to dst, mode 0600, overwriting dst if it exists. Uses

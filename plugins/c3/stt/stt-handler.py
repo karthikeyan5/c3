@@ -139,14 +139,22 @@ def send_transcript_to_telegram(token, chat_id, msg_id, thread_id, transcript, t
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    if len(sys.argv) < 5:
+    if len(sys.argv) < 4:
         sys.exit(1)
 
-    token      = sys.argv[1]
-    chat_id    = sys.argv[2]
-    msg_id     = int(sys.argv[3])
-    file_id    = sys.argv[4]
-    thread_raw = sys.argv[5] if len(sys.argv) > 5 else ''
+    # Bot token is supplied on stdin (line 1) — never via argv — so it
+    # doesn't appear in /proc/<pid>/cmdline, ps, or audit logs. The Go
+    # shim writes "<token>\n" to our stdin before calling Run() (see
+    # internal/plugin/builtins/stt/stt.go runHandler).
+    token = sys.stdin.readline().rstrip('\n')
+    if not token:
+        logging.error('stt-handler: empty token on stdin (expected <token>\\n as line 1)')
+        sys.exit(1)
+
+    chat_id    = sys.argv[1]
+    msg_id     = int(sys.argv[2])
+    file_id    = sys.argv[3]
+    thread_raw = sys.argv[4] if len(sys.argv) > 4 else ''
     thread_id  = int(thread_raw) if thread_raw else None
 
     # Download audio

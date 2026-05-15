@@ -54,13 +54,14 @@ type GroupConfig struct {
 // Channel is the Telegram channel implementation. Construct via New, register
 // via the broker's channel registry.
 type Channel struct {
-	bot     *gotgbot.Bot
-	host    channel.Host
-	cfg     Config
-	authBrk *authBreaker
-	offsets *offsetStore
-	dedup   *updateDedup
-	rate    *rateLimiter
+	bot        *gotgbot.Bot
+	host       channel.Host
+	cfg        Config
+	authBrk    *authBreaker
+	offsets    *offsetStore
+	dedup      *updateDedup
+	rate       *rateLimiter
+	httpClient *http.Client // shared transport for non-gotgbot calls (file downloads)
 
 	// lastPollReturn is the unix-nanos of the most recent moment the
 	// pollLoop's GetUpdates call returned (success OR error). The stall
@@ -135,6 +136,14 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 	botClient := &gotgbot.BaseBotClient{
 		Client:             http.Client{Transport: httpTransport},
 		DefaultRequestOpts: &gotgbot.RequestOpts{Timeout: 20 * time.Second},
+	}
+	// Reuse the same transport for file downloads (DownloadAttachment).
+	// http.DefaultClient has Timeout: 0 (infinite) and no transport-layer
+	// timeouts; relying on it would bypass the entire timeout discipline
+	// the gotgbot path goes through (daemon.md §11.1-§11.2).
+	c.httpClient = &http.Client{
+		Transport: httpTransport,
+		Timeout:   60 * time.Second, // Bot API caps at 20MB; a healthy download is seconds.
 	}
 	bot, err := gotgbot.NewBot(c.cfg.BotToken, &gotgbot.BotOpts{
 		BotClient:   botClient,

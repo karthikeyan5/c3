@@ -71,11 +71,39 @@ func (s *offsetStore) Save(offset int64) error {
 		return fmt.Errorf("offsetStore: marshal: %w", err)
 	}
 	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	// fsync the data file then the parent directory so a crash between
+	// rename and journal flush can't leave a zero-byte offset file (it
+	// would silently re-process the last 24h of updates on next start).
+	// (daemon.md §5.1)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("offsetStore: open %s: %w", tmp, err)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return fmt.Errorf("offsetStore: write %s: %w", tmp, err)
 	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("offsetStore: fsync %s: %w", tmp, err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("offsetStore: close %s: %w", tmp, err)
+	}
 	if err := os.Rename(tmp, s.path); err != nil {
+		_ = os.Remove(tmp)
 		return fmt.Errorf("offsetStore: rename %s → %s: %w", tmp, s.path, err)
+	}
+	d, err := os.Open(filepath.Dir(s.path))
+	if err != nil {
+		return fmt.Errorf("offsetStore: open dir for fsync: %w", err)
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("offsetStore: fsync dir: %w", err)
 	}
 	return nil
 }

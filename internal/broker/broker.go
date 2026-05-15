@@ -139,16 +139,32 @@ func (b *Broker) Channels() []string {
 	return out
 }
 
-// Shutdown stops all channels, the worker pool, and signals the broker ctx.
-// Order: channels first (so they can drain in-flight HTTP), then workers
-// (so any tool-call in flight has its channel still alive), then ctx cancel.
+// Shutdown drains in-flight work and stops all subsystems in the order
+// required for clean shutdown:
+//
+//  1. Stop the worker pool so no new outbound tool-calls dispatch.
+//     Workers.Stop() also cancels the per-route worker contexts; any
+//     in-flight dispatchOutbound returns from its channel call (or
+//     drops out of the queue) before the channel is torn down.
+//  2. Stop each channel — by now the worker pool isn't issuing fresh
+//     Telegram calls, so Channel.Stop() can drain whatever's already
+//     in flight (HTTP requests, polling goroutine) without racing new
+//     submissions.
+//  3. Cancel the broker context — propagates to any goroutine that
+//     was holding a derived context (most are already stopped).
+//
+// The previous ordering (channels first, then workers) was the bug:
+// workers held *Channel refs and called Channel.SendReply mid-flight
+// while the channel's Stop was tearing down state, producing 20-second
+// hangs on stale request opts timeouts. Addresses code-review-
+// 2026-05-15 MAJOR #5 (daemon.md §1.3 drain order).
 func (b *Broker) Shutdown() {
+	b.Workers.Stop()
 	b.chMu.Lock()
 	for _, reg := range b.channels {
 		_ = reg.Channel.Stop()
 	}
 	b.chMu.Unlock()
-	b.Workers.Stop()
 	b.cancel()
 }
 

@@ -178,7 +178,7 @@ func runDaemon() error {
 	// removed at clean shutdown so a stale file from a crashed broker
 	// doesn't falsely advertise capabilities for a future older broker.
 	capsPath := broker.CapsFilePath()
-	if err := os.WriteFile(capsPath, []byte("sighup-reload\n"), 0644); err != nil {
+	if err := os.WriteFile(capsPath, []byte("sighup-reload\n"), 0600); err != nil {
 		log.Printf("warn: write caps file %s: %v", capsPath, err)
 	}
 	defer os.Remove(capsPath)

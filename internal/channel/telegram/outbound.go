@@ -215,15 +215,22 @@ func (c *Channel) DownloadAttachment(fileID string) (string, error) {
 		return localPath, nil // cached
 	}
 
-	dlURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s",
-		c.cfg.BotToken, url.PathEscape(strings.TrimPrefix(f.FilePath, "/")))
-	resp, err := http.Get(dlURL)
+	// The download URL contains the bot token; we never include it in
+	// any error or log line. The relative file path is enough for
+	// debugging.
+	filePath := strings.TrimPrefix(f.FilePath, "/")
+	dlURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", c.cfg.BotToken, url.PathEscape(filePath))
+	req, err := http.NewRequestWithContext(c.ctx, http.MethodGet, dlURL, nil)
 	if err != nil {
-		return "", fmt.Errorf("telegram: download %s: %w", dlURL, err)
+		return "", fmt.Errorf("telegram: build download request for %q: %w", filePath, err)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("telegram: download %q: %w", filePath, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("telegram: download %s: HTTP %d", dlURL, resp.StatusCode)
+		return "", fmt.Errorf("telegram: download %q: HTTP %d", filePath, resp.StatusCode)
 	}
 
 	out, err := os.OpenFile(localPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)

@@ -29,15 +29,19 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/karthikeyan5/c3/internal/broker"
@@ -50,7 +54,8 @@ const (
 	mcpProtocolVersion = "2024-11-05"
 	adapterName        = "c3-codex-adapter"
 	adapterVersion     = "0.1.0"
-	inboxCap           = 100 // ring buffer max
+	inboxCap           = 100             // ring buffer max
+	idleStartupTimeout = 60 * time.Second // mirror cmd/c3-claude-adapter behavior
 )
 
 func main() {
@@ -61,11 +66,17 @@ func main() {
 }
 
 func run() error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	installSignalHandlers(cancel)
+
 	a := newAdapter()
 	if err := a.connectBroker(); err != nil {
+		log.Printf("adapter: exit pid=%d reason=connect-broker err=%v", os.Getpid(), err)
 		return fmt.Errorf("connect broker: %w", err)
 	}
 	if err := a.hello(); err != nil {
+		log.Printf("adapter: exit pid=%d reason=hello err=%v", os.Getpid(), err)
 		return fmt.Errorf("hello: %w", err)
 	}
 
@@ -78,7 +89,53 @@ func run() error {
 	a.mcp = mcpSrv
 
 	go a.brokerReader()
-	return mcpSrv.Run(context.Background())
+	go a.idleStartupWatchdog(ctx, cancel)
+
+	err := mcpSrv.Run(ctx)
+	switch {
+	case err == nil:
+		log.Printf("adapter: exit pid=%d reason=stdin-eof (clean)", os.Getpid())
+		return nil
+	case errors.Is(err, context.Canceled):
+		log.Printf("adapter: exit pid=%d reason=context-canceled (signal or idle-startup) (clean)", os.Getpid())
+		return nil
+	default:
+		log.Printf("adapter: exit pid=%d reason=mcp-error err=%v", os.Getpid(), err)
+		return err
+	}
+}
+
+// installSignalHandlers cancels ctx on SIGTERM/SIGINT/SIGHUP. Without this,
+// Go's default behavior is to terminate immediately, leaving no log line
+// explaining why the adapter died — exact same rationale as the Claude
+// adapter (cmd/c3-claude-adapter/main.go installSignalHandlers).
+func installSignalHandlers(cancel context.CancelFunc) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	go func() {
+		sig := <-ch
+		log.Printf("adapter: received signal=%v pid=%d", sig, os.Getpid())
+		cancel()
+	}()
+}
+
+// idleStartupWatchdog cancels ctx if Codex never sends an MCP frame within
+// idleStartupTimeout. Codex's MCP host may abandon a spawned adapter
+// without driving stdin (similar to Claude Code on `--resume`); the
+// watchdog lets us exit cleanly rather than hold a broker conn forever.
+func (a *adapter) idleStartupWatchdog(ctx context.Context, cancel context.CancelFunc) {
+	timer := time.NewTimer(idleStartupTimeout)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+		if !a.dispatched.Load() {
+			log.Printf("adapter: idle-startup timeout pid=%d (no MCP frame in %v) — exiting so Codex can respawn",
+				os.Getpid(), idleStartupTimeout)
+			cancel()
+		}
+	}
 }
 
 type adapter struct {
@@ -96,6 +153,11 @@ type adapter struct {
 	inbox []c3types.Inbound
 
 	helloAck ipc.HelloAckMsg
+
+	// dispatched is set the first time Dispatch is called — i.e. Codex
+	// has sent at least one MCP frame. The idle-startup watchdog uses
+	// this to distinguish "live session" from "orphaned spawn".
+	dispatched atomic.Bool
 }
 
 func newAdapter() *adapter {
@@ -381,6 +443,7 @@ func (a *adapter) dispatchTopicsList(raw []byte) {
 // ─── MCP dispatch ───────────────────────────────────────────────────────────
 
 func (a *adapter) Dispatch(ctx context.Context, req *mcp.Request) *mcp.Response {
+	a.dispatched.Store(true) // disarm idle-startup watchdog
 	switch req.Method {
 	case "initialize":
 		return a.initializeResponse(req)

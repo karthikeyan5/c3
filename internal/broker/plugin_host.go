@@ -239,10 +239,48 @@ func (s *xdgStateDir) Save(name string, target any) error {
 		return err
 	}
 	tmp := filepath.Join(s.base, name+".json.tmp")
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
+	final := filepath.Join(s.base, name+".json")
+	if err := atomicWriteFile(tmp, final, data, 0600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(s.base, name+".json"))
+	return nil
+}
+
+// atomicWriteFile writes data to tmp, fsyncs it, renames to final, then
+// fsyncs the parent directory. Without the two fsyncs, a crash between
+// the rename and the kernel's journal flush can leave a zero-byte file
+// at `final` (the directory entry is durable but the inode data isn't),
+// which means losing plugin state. (daemon.md §5.1)
+func atomicWriteFile(tmp, final string, data []byte, mode os.FileMode) error {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	cleanup := func() { _ = os.Remove(tmp) }
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		cleanup()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		cleanup()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		cleanup()
+		return err
+	}
+	d, err := os.Open(filepath.Dir(final))
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 func stateRoot() string {

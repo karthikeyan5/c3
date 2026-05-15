@@ -6,9 +6,14 @@
 // Python broker installs symlink to. The Go shim defaults to that same path
 // and lets the user override via mappings.json:plugins.stt.handler_path.
 //
-// The handler's argv contract (preserved from the POC):
+// The handler's contract:
 //
-//	python3 stt-handler.py <bot_token> <chat_id> <reply_msg_id> <file_id> [<message_thread_id>]
+//	stdin (line 1):  <bot_token>\n
+//	argv:            python3 stt-handler.py <chat_id> <reply_msg_id> <file_id> [<message_thread_id>]
+//
+// The bot token is supplied on stdin (not argv) so it doesn't appear in
+// `ps`/`/proc/<pid>/cmdline`/audit logs. Addresses code-review-2026-05-15
+// MAJOR #1 (cli.md §1.10).
 //
 // On success: prints transcript to stdout (and may also echo back to Telegram
 // itself — that's POC-side behavior we don't override). On failure: empty
@@ -109,10 +114,10 @@ func sttFailureMarker(reason string) string {
 }
 
 func runHandler(ctx context.Context, host plugin.Host, cfg Config, token string, p c3types.VoicePayload) (string, error) {
-	// argv: <bot_token> <chat_id> <msg_id> <file_id> [<thread_id>]
+	// argv: <chat_id> <msg_id> <file_id> [<thread_id>]
+	// token is fed via stdin (see package doc).
 	args := []string{
 		cfg.HandlerPath,
-		token,
 		strconv.FormatInt(p.ChatID, 10),
 		strconv.FormatInt(p.MessageID, 10),
 		p.FileID,
@@ -129,6 +134,7 @@ func runHandler(ctx context.Context, host plugin.Host, cfg Config, token string,
 
 	start := time.Now()
 	cmd := exec.CommandContext(tctx, "python3", args...)
+	cmd.Stdin = strings.NewReader(token + "\n")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
