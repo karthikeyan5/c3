@@ -78,9 +78,9 @@ func (b *Broker) HandleConn(nc net.Conn) {
 	defer b.Stubs.Unregister(stub.ConnID)
 
 	ack := ipc.HelloAckMsg{Op: ipc.OpHelloAck, ConnID: stub.ConnID}
-	if len(b.Mappings.Channels) == 0 {
+	if len(b.Mappings().Channels) == 0 {
 		ack.NoConfig = true
-	} else if _, ok := b.Mappings.LookupByCwd(hello.CWD); !ok {
+	} else if _, ok := b.Mappings().LookupByCwd(hello.CWD); !ok {
 		ack.NoMapping = true
 	}
 	if err := conn.WriteJSON(ack); err != nil {
@@ -168,7 +168,7 @@ func (b *Broker) handleToolCall(conn *ipc.Conn, stub *Stub, raw []byte) {
 
 func (b *Broker) handleListTopics(conn *ipc.Conn) {
 	resp := ipc.TopicsListMsg{Op: ipc.OpTopicsList}
-	for chanName, cc := range b.Mappings.Channels {
+	for chanName, cc := range b.Mappings().Channels {
 		for _, tp := range cc.Topics {
 			entry := ipc.TopicEntry{
 				Channel: chanName, ChatID: tp.ChatID,
@@ -202,7 +202,7 @@ func (b *Broker) handleListClaims(conn *ipc.Conn) {
 			Connected: e.Stub.IsConnected(),
 		}
 		if e.Key.HasTopic {
-			if tp, ok := b.Mappings.LookupTopicByID(e.Key.Channel, e.Key.ChatID, e.Key.TopicID); ok {
+			if tp, ok := b.Mappings().LookupTopicByID(e.Key.Channel, e.Key.ChatID, e.Key.TopicID); ok {
 				entry.TopicName = tp.Name
 				entry.GroupName = tp.Group
 			}

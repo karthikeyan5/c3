@@ -199,7 +199,7 @@ func TestAttach_NameInDefaultGroup_SilentClaim(t *testing.T) {
 		t.Errorf("TopicID=%v, want &281", ack.TopicID)
 	}
 	// Mapping persisted.
-	if _, ok := b.Mappings.LookupByCwd("/projects/c3"); !ok {
+	if _, ok := b.Mappings().LookupByCwd("/projects/c3"); !ok {
 		t.Error("expected /projects/c3 mapping to be persisted")
 	}
 }
@@ -294,10 +294,10 @@ func TestAttach_CreateTrue_CallsChannelCreateAndPersists(t *testing.T) {
 	if fc.createCalls[0].name != "widget-foo" {
 		t.Errorf("CreateTopic name=%q", fc.createCalls[0].name)
 	}
-	if _, ok := b.Mappings.LookupTopicByID("telegram", -100, 917); !ok {
+	if _, ok := b.Mappings().LookupTopicByID("telegram", -100, 917); !ok {
 		t.Error("topic should have been registered")
 	}
-	if _, ok := b.Mappings.LookupByCwd("/projects/widget-foo"); !ok {
+	if _, ok := b.Mappings().LookupByCwd("/projects/widget-foo"); !ok {
 		t.Error("cwd mapping should have been persisted")
 	}
 }
@@ -324,7 +324,7 @@ func TestAttach_TopicID_ValidatesAndClaims(t *testing.T) {
 	if len(fc.validateCalls) != 1 || fc.validateCalls[0].tid != 999 {
 		t.Errorf("expected one ValidateTopic call for 999, got %+v", fc.validateCalls)
 	}
-	if _, ok := b.Mappings.LookupTopicByID("telegram", -100, 999); !ok {
+	if _, ok := b.Mappings().LookupTopicByID("telegram", -100, 999); !ok {
 		t.Error("placeholder topic should be in registry after attach-by-id")
 	}
 }
@@ -638,13 +638,13 @@ func TestPersistMapping_RefinesToProjectSubdirectory(t *testing.T) {
 	// Second attach: sthapati (same launch root).
 	b.persistMapping(stub, "telegram", -100, 207, "sthapati", "main")
 
-	if got, ok := b.Mappings.LookupByCwd(c3); !ok || got.TopicID != 914 {
+	if got, ok := b.Mappings().LookupByCwd(c3); !ok || got.TopicID != 914 {
 		t.Errorf("expected %s → topic 914, got %+v (ok=%v)", c3, got, ok)
 	}
-	if got, ok := b.Mappings.LookupByCwd(sthapati); !ok || got.TopicID != 207 {
+	if got, ok := b.Mappings().LookupByCwd(sthapati); !ok || got.TopicID != 207 {
 		t.Errorf("expected %s → topic 207, got %+v (ok=%v)", sthapati, got, ok)
 	}
-	if _, ok := b.Mappings.LookupByCwd(root); ok {
+	if _, ok := b.Mappings().LookupByCwd(root); ok {
 		t.Errorf("expected NO mapping at launch root %s, but one was persisted (silent-rebind bug back?)", root)
 	}
 }
@@ -667,7 +667,7 @@ func TestPersistMapping_RebindRefusesToOverwrite(t *testing.T) {
 	// basename → resolveAttachCWD returns root → persisted.
 	name1 := filepath.Base(root)
 	b.persistMapping(stub, "telegram", -100, 914, name1, "main")
-	if got, ok := b.Mappings.LookupByCwd(root); !ok || got.TopicID != 914 {
+	if got, ok := b.Mappings().LookupByCwd(root); !ok || got.TopicID != 914 {
 		t.Fatalf("first attach should persist topic 914: got %+v ok=%v", got, ok)
 	}
 
@@ -675,7 +675,7 @@ func TestPersistMapping_RebindRefusesToOverwrite(t *testing.T) {
 	// back to root). Should NOT clobber.
 	b.persistMapping(stub, "telegram", -100, 207, "other", "main")
 
-	got, ok := b.Mappings.LookupByCwd(root)
+	got, ok := b.Mappings().LookupByCwd(root)
 	if !ok {
 		t.Fatal("first mapping should still be in place after refused rebind")
 	}

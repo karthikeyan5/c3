@@ -429,10 +429,10 @@ func hasVoice(in *c3types.Inbound) bool {
 }
 
 func (w *RouteWorker) sttPrefix(chanName string) string {
-	if w.broker == nil || w.broker.Mappings == nil {
+	if w.broker == nil || w.broker.Mappings() == nil {
 		return "[Transcribed voice]: "
 	}
-	cc, ok := w.broker.Mappings.Channels[chanName]
+	cc, ok := w.broker.Mappings().Channels[chanName]
 	if !ok || cc.STTPrefix == "" {
 		return "[Transcribed voice]: "
 	}
@@ -440,10 +440,10 @@ func (w *RouteWorker) sttPrefix(chanName string) string {
 }
 
 func (w *RouteWorker) debounceWindow() time.Duration {
-	if w.broker == nil || w.broker.Mappings == nil {
+	if w.broker == nil || w.broker.Mappings() == nil {
 		return defaultDebounceWindow
 	}
-	cc, ok := w.broker.Mappings.Channels[w.key.Channel]
+	cc, ok := w.broker.Mappings().Channels[w.key.Channel]
 	if !ok || cc.DebounceMS <= 0 {
 		return defaultDebounceWindow
 	}
@@ -451,10 +451,10 @@ func (w *RouteWorker) debounceWindow() time.Duration {
 }
 
 func (w *RouteWorker) debounceMaxMessages() int {
-	if w.broker == nil || w.broker.Mappings == nil {
+	if w.broker == nil || w.broker.Mappings() == nil {
 		return defaultDebounceMaxMsgs
 	}
-	cc, ok := w.broker.Mappings.Channels[w.key.Channel]
+	cc, ok := w.broker.Mappings().Channels[w.key.Channel]
 	if !ok || cc.DebounceMaxMessages <= 0 {
 		return defaultDebounceMaxMsgs
 	}

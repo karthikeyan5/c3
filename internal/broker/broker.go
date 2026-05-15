@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/karthikeyan5/c3/internal/channel"
@@ -13,14 +14,30 @@ import (
 
 // Broker holds the in-memory state shared by all connections: stubs registry,
 // routes table, worker pool, channel registry, fallback tracker, and a
-// snapshot of the mappings.json config.
+// copy-on-write atomic pointer to the mappings.json config snapshot.
+//
+// Concurrency model for the mappings pointer:
+//   - Readers call Mappings() — atomic Load, lock-free, always returns a
+//     consistent immutable snapshot.
+//   - Writers (UpsertTopic/UpsertMapping during attach, SetMappings on
+//     SIGHUP reload) go through mutateMappings(), which holds mutationMu
+//     across a Clone → mutate → Store cycle. Concurrent mutations
+//     serialize; readers never see a half-updated state.
+//
+// Previously Mappings was a public *MappingsFile field accessed directly
+// by ~20 call sites across attach/handler/worker. Concurrent
+// HandleConn goroutines mutated the inner maps via UpsertTopic while
+// other goroutines iterated them via range — classic Go data race
+// (BLOCKER, code-review 2026-05-15).
 type Broker struct {
-	Mappings  *mappings.MappingsFile
 	Stubs     *StubRegistry
 	Routes    *Routes
 	Workers   *WorkerPool
 	Fallbacks *fallbackTracker
 	Plugins   *PluginHost
+
+	mappings   atomic.Pointer[mappings.MappingsFile]
+	mutationMu sync.Mutex
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -35,7 +52,6 @@ const defaultWorkerIdle = 60 * time.Second
 func New(mf *mappings.MappingsFile) *Broker {
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &Broker{
-		Mappings:  mf,
 		Stubs:     NewStubRegistry(),
 		Routes:    NewRoutes(),
 		Fallbacks: newFallbackTracker(defaultFallbackCooldown),
@@ -43,9 +59,30 @@ func New(mf *mappings.MappingsFile) *Broker {
 		cancel:    cancel,
 		channels:  map[string]*channelRegistration{},
 	}
+	b.mappings.Store(mf)
 	b.Workers = NewWorkerPool(ctx, defaultWorkerIdle, b)
 	b.Plugins = newPluginHost(b)
 	return b
+}
+
+// Mappings returns a read-only snapshot of the current mappings file.
+// Always returns a consistent (atomically-loaded) pointer; callers may
+// read fields and iterate inner maps without locking. NEVER mutate the
+// returned struct — use mutateMappings for that.
+func (b *Broker) Mappings() *mappings.MappingsFile {
+	return b.mappings.Load()
+}
+
+// mutateMappings applies fn to a cloned snapshot and atomically swaps in
+// the result. Serializes against other mutations; readers proceed
+// concurrently against the old snapshot until the Store completes.
+func (b *Broker) mutateMappings(fn func(*mappings.MappingsFile)) {
+	b.mutationMu.Lock()
+	defer b.mutationMu.Unlock()
+	current := b.mappings.Load()
+	next := current.Clone()
+	fn(next)
+	b.mappings.Store(next)
 }
 
 // RegisterBuiltinPlugins calls each builtin plugin's Register with the
@@ -116,21 +153,22 @@ func (b *Broker) Shutdown() {
 }
 
 // SetMappings atomically swaps the in-memory mappings pointer. Called on
-// SIGHUP to reload config from disk without restarting the daemon. Pointer
-// assignment on every architecture Go supports is a single instruction,
-// so concurrent readers never see a torn value — they see either the old
-// pointer or the new pointer.
+// SIGHUP to reload config from disk without restarting the daemon. Holds
+// the mutation lock so concurrent UpsertTopic/UpsertMapping calls
+// serialize against the swap rather than racing it.
 //
 // Caveats:
-//   - In-flight writes to the OLD pointer (UpsertTopic / UpsertMapping in
-//     attach handlers) won't be reflected in the NEW pointer. SIGHUP after
-//     a manual mappings.json edit is the expected use case; running it
-//     in the middle of an attach race is a user error.
+//   - In-flight Upsert mutations that landed BEFORE this call are
+//     overwritten by the freshly-loaded file. SIGHUP after a manual
+//     mappings.json edit is the expected use case; running it in the
+//     middle of an attach race is a user error.
 //   - Channel-level config (bot_token, group chat_ids, debounce_ms)
 //     is consumed by the Telegram channel ONCE at Start; swapping
 //     mappings doesn't re-init the channel. Adding new topics or
 //     cwd→topic mappings works fine; changing the bot token requires
 //     a full broker restart.
 func (b *Broker) SetMappings(mf *mappings.MappingsFile) {
-	b.Mappings = mf
+	b.mutationMu.Lock()
+	defer b.mutationMu.Unlock()
+	b.mappings.Store(mf)
 }

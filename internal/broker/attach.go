@@ -137,7 +137,7 @@ func applyExprToAttachReq(req *ipc.AttachReq) {
 // or just agrees by sending steal=true to bypass. For now: agent re-issues
 // using the explicit form the user chose.
 func (b *Broker) attachDM(conn *ipc.Conn, stub *Stub, chanName string, steal, replay bool) {
-	cc, ok := b.Mappings.Channels[chanName]
+	cc, ok := b.Mappings().Channels[chanName]
 	if !ok || cc.DMChatID == 0 {
 		_ = conn.WriteJSON(ipc.AttachedMsg{
 			Op: ipc.OpAttached, OK: false,
@@ -189,7 +189,7 @@ func (b *Broker) attachDM(conn *ipc.Conn, stub *Stub, chanName string, steal, re
 // action) and, if valid, claims it. Adds to topics registry as `topic-<n>`
 // if not already known. Persists cwd mapping if cwd is provided.
 func (b *Broker) attachByTopicID(conn *ipc.Conn, stub *Stub, chanName string, topicID int64, groupName string, steal, replay bool) {
-	cc, ok := b.Mappings.Channels[chanName]
+	cc, ok := b.Mappings().Channels[chanName]
 	if !ok {
 		_ = conn.WriteJSON(ipc.AttachedMsg{
 			Op: ipc.OpAttached, OK: false,
@@ -218,20 +218,25 @@ func (b *Broker) attachByTopicID(conn *ipc.Conn, stub *Stub, chanName string, to
 		return
 	}
 
-	// Register topic in registry if absent.
-	if _, exists := b.Mappings.LookupTopicByID(chanName, gCfg.ChatID, topicID); !exists {
-		b.Mappings.UpsertTopic(chanName, mappings.Topic{
+	// Register topic in registry if absent. Check-then-upsert under the
+	// mutation lock so a concurrent attach for the same (chat, topic_id)
+	// can't double-register.
+	b.mutateMappings(func(mf *mappings.MappingsFile) {
+		if _, exists := mf.LookupTopicByID(chanName, gCfg.ChatID, topicID); exists {
+			return
+		}
+		mf.UpsertTopic(chanName, mappings.Topic{
 			ChatID: gCfg.ChatID, TopicID: topicID,
 			Name: fmt.Sprintf("topic-%d", topicID), Group: gName,
 		})
-	}
+	})
 
 	tid := topicID
 	key := MakeRouteKey(chanName, gCfg.ChatID, &tid)
 	if !b.tryClaim(conn, stub, key, fmt.Sprintf("topic %d", topicID), steal, replay) {
 		return
 	}
-	tp, _ := b.Mappings.LookupTopicByID(chanName, gCfg.ChatID, topicID)
+	tp, _ := b.Mappings().LookupTopicByID(chanName, gCfg.ChatID, topicID)
 	b.persistMapping(stub, chanName, gCfg.ChatID, topicID, tp.Name, gName)
 
 	_ = conn.WriteJSON(ipc.AttachedMsg{
@@ -259,7 +264,7 @@ func (b *Broker) attachByTopicID(conn *ipc.Conn, stub *Stub, chanName string, to
 // On any "propose" outcome the response carries needs_confirmation=true and
 // a Proposal payload; the agent re-calls attach with create=true to confirm.
 func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, groupName string, create, steal, replay bool) {
-	cc, ok := b.Mappings.Channels[chanName]
+	cc, ok := b.Mappings().Channels[chanName]
 	if !ok {
 		_ = conn.WriteJSON(ipc.AttachedMsg{Op: ipc.OpAttached, OK: false,
 			Err: fmt.Sprintf("attach: channel %q not in mappings.json", chanName)})
@@ -276,7 +281,7 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 	// is treated as "no explicit choice" rather than "explicit choice
 	// equal to cwd basename".
 	if cwd != "" {
-		if m, ok := b.Mappings.LookupByCwd(cwd); ok && m.Channel == chanName {
+		if m, ok := b.Mappings().LookupByCwd(cwd); ok && m.Channel == chanName {
 			explicitOverride := name != "" && name != m.Name
 			if !explicitOverride {
 				tid := m.TopicID
@@ -319,7 +324,7 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 	}
 
 	// 2. Default-group search.
-	if tp, ok := b.Mappings.LookupTopicInDefaultGroup(chanName, name); ok && tp.Group == gName {
+	if tp, ok := b.Mappings().LookupTopicInDefaultGroup(chanName, name); ok && tp.Group == gName {
 		// In the default group already — silent claim.
 		tid := tp.TopicID
 		key := MakeRouteKey(chanName, tp.ChatID, &tid)
@@ -336,7 +341,7 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 	}
 
 	// 3. Cross-group search.
-	allHits := b.Mappings.LookupTopicAcrossGroups(chanName, name)
+	allHits := b.Mappings().LookupTopicAcrossGroups(chanName, name)
 	otherGroupHits := allHits[:0:0]
 	for _, h := range allHits {
 		if h.Group != gName {
@@ -393,8 +398,10 @@ func (b *Broker) createAndClaim(conn *ipc.Conn, stub *Stub, chanName, gName stri
 			Err: fmt.Sprintf("create topic %q: %v", name, err)})
 		return
 	}
-	b.Mappings.UpsertTopic(chanName, mappings.Topic{
-		ChatID: chatID, TopicID: topicID, Name: name, Group: gName,
+	b.mutateMappings(func(mf *mappings.MappingsFile) {
+		mf.UpsertTopic(chanName, mappings.Topic{
+			ChatID: chatID, TopicID: topicID, Name: name, Group: gName,
+		})
 	})
 	tid := topicID
 	key := MakeRouteKey(chanName, chatID, &tid)
@@ -564,23 +571,31 @@ func (b *Broker) persistMapping(stub *Stub, chanName string, chatID, topicID int
 	if cwd == "" {
 		return
 	}
-	if existing, ok := b.Mappings.LookupByCwd(cwd); ok {
-		if existing.ChatID != chatID || existing.TopicID != topicID {
-			log.Printf("attach: REFUSED to rebind cwd=%q (saved=topic-%d %q → requested=topic-%d %q); live claim proceeds but saved default unchanged. To rebind, edit ~/.config/c3/mappings.json.",
-				cwd, existing.TopicID, existing.Name, topicID, name)
-			return
+	// Read existing-mapping check and the Upsert under the same mutation
+	// lock — otherwise a concurrent persistMapping for the same cwd could
+	// race past the refusal check.
+	var persisted bool
+	b.mutateMappings(func(mf *mappings.MappingsFile) {
+		if existing, ok := mf.LookupByCwd(cwd); ok {
+			if existing.ChatID != chatID || existing.TopicID != topicID {
+				log.Printf("attach: REFUSED to rebind cwd=%q (saved=topic-%d %q → requested=topic-%d %q); live claim proceeds but saved default unchanged. To rebind, edit ~/.config/c3/mappings.json.",
+					cwd, existing.TopicID, existing.Name, topicID, name)
+				return
+			}
 		}
-	}
-	now := time.Now().UTC()
-	b.Mappings.UpsertMapping(cwd, mappings.Mapping{
-		Channel:        chanName,
-		ChatID:         chatID,
-		TopicID:        topicID,
-		Name:           name,
-		Group:          group,
-		LastAttachedAt: now,
+		mf.UpsertMapping(cwd, mappings.Mapping{
+			Channel:        chanName,
+			ChatID:         chatID,
+			TopicID:        topicID,
+			Name:           name,
+			Group:          group,
+			LastAttachedAt: time.Now().UTC(),
+		})
+		persisted = true
 	})
-	_ = b.SaveMappings()
+	if persisted {
+		_ = b.SaveMappings()
+	}
 }
 
 // resolveAttachCWD picks the cwd to persist for a `cwd → topic` mapping.
@@ -621,7 +636,7 @@ func (b *Broker) SaveMappings() error {
 	if err != nil {
 		return err
 	}
-	return mappings.Write(path, b.Mappings)
+	return mappings.Write(path, b.Mappings())
 }
 
 // resolveGroup returns the group name + config for the attach's group choice.
@@ -641,7 +656,7 @@ func (b *Broker) resolveGroup(cc mappings.ChannelConfig, groupName string) (stri
 // defaultChannel returns the first channel name in mappings, or "" if none.
 // In v1 there's typically only one channel (telegram), so this is unambiguous.
 func (b *Broker) defaultChannel() string {
-	for name := range b.Mappings.Channels {
+	for name := range b.Mappings().Channels {
 		return name
 	}
 	return ""

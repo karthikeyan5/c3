@@ -27,10 +27,10 @@ func NewBrokerHost(b *Broker, chanName string) *BrokerHost {
 // Config marshals mappings.json:channels.<name> via JSON-roundtrip into target.
 // Returns error if the channel section is missing.
 func (h *BrokerHost) Config(name string, target any) error {
-	if h.broker.Mappings == nil || h.broker.Mappings.Channels == nil {
+	if h.broker.Mappings() == nil || h.broker.Mappings().Channels == nil {
 		return fmt.Errorf("broker host: no channels in mappings.json")
 	}
-	cc, ok := h.broker.Mappings.Channels[name]
+	cc, ok := h.broker.Mappings().Channels[name]
 	if !ok {
 		return fmt.Errorf("broker host: channel %q not in mappings.json", name)
 	}

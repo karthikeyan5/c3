@@ -14,11 +14,7 @@ import (
 func runHandlerWithPeer(t *testing.T, mf *mappings.MappingsFile) (*ipc.Conn, func()) {
 	t.Helper()
 	a, b := net.Pipe()
-	br := &Broker{
-		Mappings: mf,
-		Stubs:    NewStubRegistry(),
-		Routes:   NewRoutes(),
-	}
+	br := New(mf)
 	go br.HandleConn(a)
 	return ipc.NewConn(b), func() {
 		_ = a.Close()

@@ -72,10 +72,10 @@ func (h *PluginHost) RegisterTools(fn func(*plugin.ToolRegistry)) {
 }
 
 func (h *PluginHost) Config(name string, target any) error {
-	if h.broker == nil || h.broker.Mappings == nil {
+	if h.broker == nil || h.broker.Mappings() == nil {
 		return fmt.Errorf("plugin host: no mappings")
 	}
-	cfg, ok := h.broker.Mappings.Plugins[name]
+	cfg, ok := h.broker.Mappings().Plugins[name]
 	if !ok {
 		// Empty config is valid — plugin uses its defaults.
 		return nil
@@ -91,10 +91,10 @@ func (h *PluginHost) Config(name string, target any) error {
 }
 
 func (h *PluginHost) ChannelConfig(name string, target any) error {
-	if h.broker == nil || h.broker.Mappings == nil {
+	if h.broker == nil || h.broker.Mappings() == nil {
 		return fmt.Errorf("plugin host: no mappings")
 	}
-	cc, ok := h.broker.Mappings.Channels[name]
+	cc, ok := h.broker.Mappings().Channels[name]
 	if !ok {
 		return fmt.Errorf("plugin host: channel %q not in mappings", name)
 	}
