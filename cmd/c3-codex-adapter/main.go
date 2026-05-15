@@ -36,7 +36,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -874,6 +873,3 @@ func mcpTextResp(id json.RawMessage, text string) *mcp.Response {
 		},
 	}
 }
-
-// ensure filepath is referenced (used in commented TODO).
-var _ = filepath.Base

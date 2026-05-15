@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 )
 
 // LogPath returns the broker log file path:
@@ -69,26 +70,10 @@ func TopicPtrStr(t *int64) string {
 	return formatInt64(*t)
 }
 
+// formatInt64 stringifies an int64 in base 10. Thin wrapper over
+// strconv.FormatInt; the hand-rolled version this replaced was premature
+// optimization (strconv is already imported in five sibling files in
+// this package).
 func formatInt64(v int64) string {
-	// Avoid pulling strconv into the broker package's hot paths; do it here.
-	const max = 20
-	var buf [max]byte
-	i := max
-	neg := v < 0
-	if neg {
-		v = -v
-	}
-	if v == 0 {
-		return "0"
-	}
-	for v > 0 {
-		i--
-		buf[i] = byte('0' + v%10)
-		v /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
+	return strconv.FormatInt(v, 10)
 }

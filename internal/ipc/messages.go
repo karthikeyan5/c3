@@ -206,7 +206,6 @@ type AttachedMsg struct {
 // Action is one of:
 //   - "create" — create a new topic with the given Name in Group
 //   - "use_existing_other_group" — adopt Existing topic from a different group
-//   - "claim_existing" — claim the Existing topic (same group)
 //   - "disambiguate_dm" — a topic named "dm" exists; agent asks user
 //     whether they meant the topic or the actual Telegram DM (Existing
 //     describes the topic; pass target="dm" to confirm DM, or topic_id to
