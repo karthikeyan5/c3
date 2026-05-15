@@ -1,3 +1,4 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -6,11 +7,6 @@ __pycache__/
 *.egg-info/
 build/
 dist/
-.DS_Store
-*.swp
-
-# Internal review notes — not part of the public documentation set.
-docs/.loop/
 
 # Go
 *.exe
@@ -24,4 +20,22 @@ docs/.loop/
 /c3-broker
 /c3-claude-adapter
 /c3-codex-adapter
+/codex
 /migrate-legacy
+
+# Editors / OS
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Internal review notes — not part of the public documentation set.
+docs/.loop/
+
+# Local config + secrets (never commit these)
+mappings.json
+mappings.json.bak
+*.env
+.envrc

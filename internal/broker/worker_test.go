@@ -133,7 +133,7 @@ func TestForwardOrFallback_StaleClaim_ReleasesAndFallsThrough(t *testing.T) {
 	defer b.Shutdown()
 
 	tid := int64(914)
-	key := MakeRouteKey("telegram", -1003990699908, &tid)
+	key := MakeRouteKey("telegram", -1001234567890, &tid)
 
 	// Stub with a PID that's definitively dead. PIDs above PID_MAX
 	// (typically 4194304 on Linux, 99999 on macOS) reliably return
@@ -153,7 +153,7 @@ func TestForwardOrFallback_StaleClaim_ReleasesAndFallsThrough(t *testing.T) {
 
 	in := &c3types.Inbound{
 		Channel:   "telegram",
-		ChatID:    -1003990699908,
+		ChatID:    -1001234567890,
 		TopicID:   &tid,
 		MessageID: 1133,
 		Text:      "Hi",
@@ -181,7 +181,7 @@ func TestForwardOrFallback_AliveButDisconnectedHolder_SkipsDelivery(t *testing.T
 	defer b.Shutdown()
 
 	tid := int64(914)
-	key := MakeRouteKey("telegram", -1003990699908, &tid)
+	key := MakeRouteKey("telegram", -1001234567890, &tid)
 
 	// Use this test process's PID — guaranteed alive.
 	aliveStub := &Stub{
@@ -194,7 +194,7 @@ func TestForwardOrFallback_AliveButDisconnectedHolder_SkipsDelivery(t *testing.T
 	defer w.Stop()
 
 	in := &c3types.Inbound{
-		Channel: "telegram", ChatID: -1003990699908, TopicID: &tid,
+		Channel: "telegram", ChatID: -1001234567890, TopicID: &tid,
 		MessageID: 1134, Text: "Hi",
 	}
 	w.forwardOrFallback(context.Background(), in)
