@@ -686,19 +686,33 @@ func (a *adapter) initializeResponse(req *mcp.Request) *mcp.Response {
 	}
 }
 
+// modeProtocol is the per-session output-mode contract every agent using
+// c3 must honor. Appended to every adapter MCP-initialize instructions
+// variant so the rule travels with the plugin, not with the user's
+// AGENTS.md. Karthi's standing instruction (2026-05-15): make this part
+// of the plugin contract so any agent using c3 understands the protocol
+// without per-user setup.
+const modeProtocol = "\n\n" +
+	"OUTPUT MODE PROTOCOL (per-session, agent-only state — default CLI mode on every fresh session):\n" +
+	"• CLI mode (DEFAULT): your replies go to the CLI terminal. Telegram is INPUT-ONLY — voice and replies from Telegram arrive as `<channel>` blocks. DO NOT call the `reply` tool to respond unless the user explicitly asks.\n" +
+	"• Telegram mode: your substantive replies go to Telegram via the `reply` tool. Switch when the user says \"switch to Telegram\", \"Telegram mode\", or steps away from the laptop. Switch back to CLI when they say \"switch to CLI\" or return to the terminal.\n" +
+	"• The mode is your responsibility to track — the broker doesn't store it. Always start in CLI mode; honor the user's switch instructions immediately."
+
 func (a *adapter) buildInstructions() string {
+	var head string
 	switch {
 	case a.helloAck.NoConfig:
-		return "C3 not yet configured. Run `/c3-setup` (or `c3-broker setup`) to provide your Telegram bot token, DM chat id, and at least one group chat id, then restart this session."
+		head = "C3 not yet configured. Run `/c3:setup` (or `c3-broker setup`) to provide your Telegram bot token, DM chat id, and at least one group chat id, then restart this session."
 	case a.helloAck.NoMapping:
 		cwd, _ := os.Getwd()
-		return fmt.Sprintf("No C3 mapping for %q. Type `attach` to set one up — broker proposes a topic named %q in the default group; confirm to create.", cwd, filepath.Base(cwd))
+		head = fmt.Sprintf("No C3 mapping for %q. Use the `attach` tool to set one up — the broker proposes a topic named %q in the default group; confirm to create.", cwd, filepath.Base(cwd))
 	case a.helloAck.AutoAttached && a.helloAck.Mapping != nil:
 		m := a.helloAck.Mapping
-		return fmt.Sprintf("Auto-attached to %q (%s). Inbound messages render here as `<channel>` blocks.", m.Name, m.Channel)
+		head = fmt.Sprintf("Auto-attached to %q (%s). Inbound messages render here as `<channel>` blocks.", m.Name, m.Channel)
 	default:
-		return "C3 connected. Use the `attach` tool to claim a Telegram topic for this session."
+		head = "C3 connected. Use the `attach` tool to claim a Telegram topic for this session."
 	}
+	return head + modeProtocol
 }
 
 func (a *adapter) toolsListResponse(req *mcp.Request) *mcp.Response {

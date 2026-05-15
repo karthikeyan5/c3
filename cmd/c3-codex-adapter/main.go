@@ -497,19 +497,29 @@ func (a *adapter) initializeResponse(req *mcp.Request) *mcp.Response {
 	}
 }
 
+// modeProtocol mirrors the Claude adapter (same rule for any agent
+// using c3 — see cmd/c3-claude-adapter/main.go for rationale).
+const modeProtocol = "\n\n" +
+	"OUTPUT MODE PROTOCOL (per-session, agent-only state — default CLI mode on every fresh session):\n" +
+	"• CLI mode (DEFAULT): your replies go to the CLI terminal. Telegram is INPUT-ONLY — voice and replies from Telegram arrive as buffered inbound. DO NOT call the `reply` tool to respond unless the user explicitly asks.\n" +
+	"• Telegram mode: your substantive replies go to Telegram via the `reply` tool. Switch when the user says \"switch to Telegram\", \"Telegram mode\", or steps away from the laptop. Switch back to CLI when they say \"switch to CLI\" or return to the terminal.\n" +
+	"• The mode is your responsibility to track — the broker doesn't store it. Always start in CLI mode; honor the user's switch instructions immediately."
+
 func (a *adapter) buildInstructions() string {
+	var head string
 	switch {
 	case a.helloAck.NoConfig:
-		return "C3 not yet configured. Run `c3-broker setup` from a shell to provide your Telegram bot token, DM chat id, and at least one group chat id, then restart this Codex session."
+		head = "C3 not yet configured. Run `c3-broker setup` from a shell to provide your Telegram bot token, DM chat id, and at least one group chat id, then restart this Codex session."
 	case a.helloAck.NoMapping:
 		cwd := os.Getenv("C3_CODEX_CWD")
 		if cwd == "" {
 			cwd, _ = os.Getwd()
 		}
-		return fmt.Sprintf("No C3 mapping for %q. Use the `attach` tool to set one up. Inbound Telegram messages are buffered for the `inbox` tool until your TUI is bound (`--remote`).", cwd)
+		head = fmt.Sprintf("No C3 mapping for %q. Use the `attach` tool to set one up. Inbound Telegram messages are buffered for the `inbox` tool until your TUI is bound (`--remote`).", cwd)
 	default:
-		return "C3 connected. Use `attach` to claim a Telegram topic, `inbox` to drain buffered inbound, `reply` to send. Codex doesn't render unsolicited MCP notifications today; check `inbox` periodically."
+		head = "C3 connected. Use `attach` to claim a Telegram topic, `inbox` to drain buffered inbound, `reply` to send. Codex doesn't render unsolicited MCP notifications today; check `inbox` periodically."
 	}
+	return head + modeProtocol
 }
 
 func (a *adapter) toolsListResponse(req *mcp.Request) *mcp.Response {

@@ -28,35 +28,58 @@ PROVIDERS_DIR = os.path.join(SCRIPT_DIR, "providers")
 # --- Domain vocabulary ---
 # Shared across all providers. Each provider adapts this into its own format
 # (system prompt, hotwords parameter, etc.)
-# Supports vocabulary.txt (simple, one term per line) or vocabulary.json (advanced).
-VOCAB_TXT_PATH = os.path.join(SCRIPT_DIR, "vocabulary.txt")
+#
+# Resolution order (first found wins):
+#   1. $C3_STT_VOCAB (explicit override path)
+#   2. $XDG_CONFIG_HOME/c3/stt-vocabulary.txt
+#   3. ~/.config/c3/stt-vocabulary.txt
+#   4. <stt-pkg>/vocabulary.txt (bundled default, generic-tech-only)
+#   5. <stt-pkg>/vocabulary.json (legacy advanced format)
+#
+# Users keep personal/project terms in the override path so they don't
+# get clobbered on c3 upgrades and don't ship to other installers.
+def _vocab_search_paths():
+    paths = []
+    if env := os.environ.get("C3_STT_VOCAB"):
+        paths.append(env)
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    paths.append(os.path.join(xdg, "c3", "stt-vocabulary.txt"))
+    paths.append(os.path.join(SCRIPT_DIR, "vocabulary.txt"))
+    return paths
+
 VOCAB_JSON_PATH = os.path.join(SCRIPT_DIR, "vocabulary.json")
 
 def load_vocabulary():
     """Load domain vocabulary.
-    
-    Tries vocabulary.txt first (simple format):
+
+    Tries vocabulary.txt at the user override path first, then the
+    bundled default. Format:
       - First line starting with # context: is the context description
       - Other lines starting with # are ignored (comments)
       - Each non-empty line is a preferred term
       - Optional: "Vel != whale, well, veil" to specify common misheard alternatives
       - Optional: "Vel -- a software framework" to add a note
-    
-    Falls back to vocabulary.json (advanced format) if txt doesn't exist.
+
+    Falls back to vocabulary.json (advanced format) if no txt exists.
     Returns dict with 'terms' (list) and 'context' (string).
     """
-    if os.path.exists(VOCAB_TXT_PATH):
-        try:
-            return _parse_vocab_txt(VOCAB_TXT_PATH)
-        except:
-            pass
+    for p in _vocab_search_paths():
+        if os.path.exists(p):
+            try:
+                vocab = _parse_vocab_txt(p)
+                vocab["source"] = p
+                return vocab
+            except Exception:
+                continue
     if os.path.exists(VOCAB_JSON_PATH):
         try:
             with open(VOCAB_JSON_PATH) as f:
-                return json.load(f)
-        except:
+                v = json.load(f)
+                v.setdefault("source", VOCAB_JSON_PATH)
+                return v
+        except Exception:
             pass
-    return {"terms": [], "context": ""}
+    return {"terms": [], "context": "", "source": ""}
 
 def _parse_vocab_txt(path):
     """Parse simple vocabulary.txt format."""
@@ -125,7 +148,8 @@ def main():
     # Load domain vocabulary
     vocab = load_vocabulary()
     if vocab.get("terms"):
-        print(f"[stt] loaded {len(vocab['terms'])} vocabulary terms", file=sys.stderr)
+        src = vocab.get("source") or "?"
+        print(f"[stt] loaded {len(vocab['terms'])} vocabulary terms from {src}", file=sys.stderr)
 
     # Load all providers upfront
     providers = []
