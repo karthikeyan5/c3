@@ -170,6 +170,19 @@ func runDaemon() error {
 		fmt.Fprintln(os.Stderr, "c3-broker: no telegram bot_token in mappings.json — running without inbound transport")
 	}
 
+	// Capability marker: tells `/c3:reload-config` we support SIGHUP-driven
+	// config reload. Old brokers (pre-2026-05-15) lack this file and the
+	// slash command refuses to fire — sending SIGHUP to a broker without
+	// a handler terminates it (Go default) and indirectly kills the MCP
+	// adapter via CC's recycle behavior. Rewritten on every startup;
+	// removed at clean shutdown so a stale file from a crashed broker
+	// doesn't falsely advertise capabilities for a future older broker.
+	capsPath := broker.CapsFilePath()
+	if err := os.WriteFile(capsPath, []byte("sighup-reload\n"), 0644); err != nil {
+		log.Printf("warn: write caps file %s: %v", capsPath, err)
+	}
+	defer os.Remove(capsPath)
+
 	srv, err := broker.Listen(broker.SocketPath(), br)
 	if err != nil {
 		// Sibling broker already serving the socket — same silent exit as

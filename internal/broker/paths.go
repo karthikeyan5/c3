@@ -52,6 +52,18 @@ func PidFilePath() string {
 	return filepath.Join(runtimeDir(), "c3-broker.pid")
 }
 
+// CapsFilePath returns the broker's capabilities-marker file path.
+// Written by the broker at daemon startup with one capability per line
+// (e.g. "sighup-reload\n"). The /c3:reload-config slash command reads
+// this file to decide whether the running broker supports SIGHUP-driven
+// config reload — sending SIGHUP to a pre-2026-05-15 broker terminates
+// the process (Go's default handler) and indirectly kills the MCP
+// adapter via CC's recycle behavior, so the slash command refuses to
+// fire when the capability isn't advertised.
+func CapsFilePath() string {
+	return filepath.Join(runtimeDir(), "c3-broker.caps")
+}
+
 func ensureParentDir(path string) error {
 	dir := filepath.Dir(path)
 	return os.MkdirAll(dir, 0700)
