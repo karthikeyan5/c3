@@ -6,4 +6,4 @@ Run `c3-broker setup` and let the user type their answers at the terminal. The s
 
 !c3-broker setup
 
-After it completes, if it succeeded, tell the user: "setup complete. Run `/c3:restart-broker` and then `/c3:attach` in any project directory."
+After it completes, if it succeeded, tell the user: "setup complete. If the broker is already running, run `/c3:reload-config` to pick up the new mappings.json. If not, the broker auto-spawns on first attach. Then `/c3:attach` in any project directory."

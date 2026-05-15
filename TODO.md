@@ -59,6 +59,20 @@ Surfaced during install/attach pilot. Must fix before the public push.
   already dead at conn-drop time. Regression tests:
   `TestForwardOrFallback_StaleClaim_ReleasesAndFallsThrough`,
   `TestForwardOrFallback_AliveButDisconnectedHolder_SkipsDelivery`.
+- [x] **`/c3:restart-broker` kills this session's MCP adapter as a side
+  effect.** Done 2026-05-14. Empirically confirmed via two consecutive
+  test bounces: pid 25193 and pid 34696 (both running the Phase-1-
+  hardened binary with quieted stderr + nil-conn guards) still exited
+  via `stdin-eof` immediately on every `/c3:restart-broker`. Claude
+  Code's MCP host closes the adapter's stdin on broker-process death,
+  for reasons we couldn't pin down without inspecting CC internals.
+  Rather than fight CC's recycle behavior (Phase 2 SIGTERM coordination
+  or Phase 3 fd-passing handoff), removed the broken primitive. The
+  slash command is now `/c3:reload-config` — sends SIGHUP, broker
+  re-reads mappings.json in-place, no process churn, MCP adapter
+  unaffected. For binary updates, the right action is `quit` +
+  `claude --resume` (the new adapter spawn auto-spawns a fresh broker
+  with new binaries; no manual bounce needed).
 
 - [x] **Welcome message on attach.** Done 2026-05-14
   (`internal/broker/attach.go:sendWelcome`). Friendly tone, no PID, async,

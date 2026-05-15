@@ -16,6 +16,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -183,8 +184,32 @@ func runDaemon() error {
 	fmt.Fprintf(os.Stderr, "c3-broker: listening on %s (pid %d)\n", broker.SocketPath(), os.Getpid())
 
 	sigC := make(chan os.Signal, 1)
-	signal.Notify(sigC, syscall.SIGTERM, syscall.SIGINT)
-	<-sigC
+	signal.Notify(sigC, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	for sig := range sigC {
+		if sig == syscall.SIGHUP {
+			// Config reload — re-read mappings.json from disk and swap
+			// the in-memory pointer. The /c3:reload-config slash command
+			// sends this. Replaces the old /c3:restart-broker bounce
+			// (which killed the adapter as a side effect — see
+			// 2026-05-14 RESUME notes).
+			newMF, err := mappings.Read(mfPath)
+			if err != nil {
+				log.Printf("SIGHUP: reload %s failed: %v — keeping existing config", mfPath, err)
+				continue
+			}
+			if err := newMF.Validate(); err != nil {
+				log.Printf("SIGHUP: validate %s failed: %v — keeping existing config", mfPath, err)
+				continue
+			}
+			br.SetMappings(newMF)
+			log.Printf("SIGHUP: reloaded mappings from %s (channels=%d, mappings=%d, plugins=%d)",
+				mfPath, len(newMF.Channels), len(newMF.Mappings), len(newMF.Plugins))
+			continue
+		}
+		// SIGTERM / SIGINT — shut down.
+		log.Printf("received signal=%v, shutting down", sig)
+		break
+	}
 
 	srv.Stop()
 	br.Shutdown()

@@ -114,3 +114,23 @@ func (b *Broker) Shutdown() {
 	b.Workers.Stop()
 	b.cancel()
 }
+
+// SetMappings atomically swaps the in-memory mappings pointer. Called on
+// SIGHUP to reload config from disk without restarting the daemon. Pointer
+// assignment on every architecture Go supports is a single instruction,
+// so concurrent readers never see a torn value — they see either the old
+// pointer or the new pointer.
+//
+// Caveats:
+//   - In-flight writes to the OLD pointer (UpsertTopic / UpsertMapping in
+//     attach handlers) won't be reflected in the NEW pointer. SIGHUP after
+//     a manual mappings.json edit is the expected use case; running it
+//     in the middle of an attach race is a user error.
+//   - Channel-level config (bot_token, group chat_ids, debounce_ms)
+//     is consumed by the Telegram channel ONCE at Start; swapping
+//     mappings doesn't re-init the channel. Adding new topics or
+//     cwd→topic mappings works fine; changing the bot token requires
+//     a full broker restart.
+func (b *Broker) SetMappings(mf *mappings.MappingsFile) {
+	b.Mappings = mf
+}

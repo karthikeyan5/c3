@@ -19,7 +19,7 @@ support.
 | `topics`        | `c3-broker topics` (CLI)          | pure shell    | List every topic in mappings.json + which session (if any) currently claims it.                                       |
 | `build`         | `go install ./cmd/...` (shell)    | pure shell    | Rebuild C3 binaries from the plugin source dir.                                                                       |
 | `setup`         | `c3-broker setup` (CLI)           | interactive   | Prompt the user for bot token + chat IDs; validate token via Telegram getMe; write mappings.json (mode 0600).         |
-| `restart-broker`| `pkill -9 c3-broker && spawn`     | pure shell    | Kill the daemon. Adapter conn drops are tolerated by the new claim-survives-PID-alive logic; no claim loss.            |
+| `reload-config` | `pkill -HUP c3-broker`            | pure shell    | Signal the broker to re-read mappings.json. Non-disruptive — no process restart, in-memory pointer swap, live claims preserved. Replaces the old `restart-broker` (which killed the CLI's MCP server as a side effect — see 2026-05-14 RESUME). For binary updates, restart Claude Code instead. |
 | `attach`        | `mcp_attach(expr=…)` (MCP tool)   | LLM dispatch  | Attach this session's adapter to a Telegram topic. Broker parses `expr` and either silent-claims or proposes.          |
 | `detach`        | `mcp_detach()` (MCP tool)         | LLM dispatch  | Release the session's current claim (sends `OpRelease`).                                                              |
 
@@ -62,7 +62,7 @@ flag set.
 | `topics`        | `plugins/c3/commands/topics.md`                    | _todo_                                 |
 | `build`         | `plugins/c3/commands/build.md`                     | _todo_                                 |
 | `setup`         | `plugins/c3/commands/setup.md`                     | _todo_                                 |
-| `restart-broker`| `plugins/c3/commands/restart-broker.md`            | _todo_                                 |
+| `reload-config` | `plugins/c3/commands/reload-config.md`             | _todo_                                 |
 | `attach`        | `plugins/c3/commands/attach.md`                    | _todo (codex MCP attach tool exists)_  |
 | `detach`        | `plugins/c3/commands/detach.md`                    | _todo (codex MCP detach tool not yet)_ |
 

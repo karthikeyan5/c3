@@ -39,7 +39,7 @@ before sharing the repo publicly. Tests are green across the board.
   threaded through every chunk).
 - **Install plumbing** — `karthikeyan5/c3` marketplace, `c3@c3` plugin,
   `/c3:build`, `/c3:setup`, `/c3:status`, `/c3:attach`, `/c3:detach`,
-  `/c3:topics`, `/c3:restart-broker` slash commands. Single-line
+  `/c3:topics`, `/c3:reload-config` slash commands. Single-line
   install via [`INSTALL.md`](INSTALL.md) at repo root.
 
 ### Pre-release fixes since v0.1.0 functional complete
