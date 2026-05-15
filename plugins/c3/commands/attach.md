@@ -1,6 +1,7 @@
 ---
 description: Attach this session to a Telegram topic. Empty = cwd-saved silent claim. "dm" = actual DM. "<int>" = topic_id. "<name>" = topic by name. "create <name>" or "-y <name>" = create that topic immediately.
 argument-hint: "[empty | dm | <topic-id> | <name> | \"create <name>\" | \"-y <name>\"]"
+allowed-tools: ["mcp__plugin_c3_c3__attach", "AskUserQuestion"]
 ---
 
 User typed: $ARGUMENTS

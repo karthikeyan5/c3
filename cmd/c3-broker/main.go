@@ -36,54 +36,71 @@ var builtinPlugins = []broker.BuiltinPlugin{
 	{Name: stt.Name, Register: func(h plugin.Host) error { return stt.Register(h) }},
 }
 
+// Exit codes follow BSD sysexits(3) where applicable so shell scripts can
+// branch on the cause. Generic runtime failures still use 1 (EX_GENERIC).
+const (
+	exitOK       = 0  // success
+	exitFailure  = 1  // generic runtime error
+	exitUsage    = 2  // unknown subcommand / malformed args
+	exitDataErr  = 65 // EX_DATAERR — mappings.json invalid
+	exitNoInput  = 66 // EX_NOINPUT — mappings.json missing/unreadable
+	exitConfig   = 78 // EX_CONFIG — config-time failure (setup, install-codex-shim)
+)
+
 func main() {
 	if len(os.Args) >= 2 {
 		switch os.Args[1] {
 		case "setup":
 			if err := runSetup(); err != nil {
 				fmt.Fprintf(os.Stderr, "c3-broker setup: %v\n", err)
-				os.Exit(1)
+				os.Exit(exitConfig)
 			}
 			return
 		case "status":
 			if err := runStatus(); err != nil {
 				fmt.Fprintf(os.Stderr, "c3-broker status: %v\n", err)
-				os.Exit(1)
+				os.Exit(exitFailure)
 			}
 			return
 		case "topics":
 			if err := runTopics(); err != nil {
 				fmt.Fprintf(os.Stderr, "c3-broker topics: %v\n", err)
-				os.Exit(1)
+				os.Exit(exitFailure)
 			}
 			return
 		case "validate":
 			if err := runValidate(os.Args[2:]); err != nil {
 				fmt.Fprintf(os.Stderr, "c3-broker validate: %v\n", err)
-				os.Exit(1)
+				// validate's job is exactly to test config integrity, so
+				// surface EX_DATAERR (invalid contents) when we can't
+				// even read/parse it.
+				os.Exit(exitDataErr)
 			}
 			return
 		case "release":
 			if err := runRelease(os.Args[2:]); err != nil {
 				fmt.Fprintf(os.Stderr, "c3-broker release: %v\n", err)
-				os.Exit(1)
+				os.Exit(exitFailure)
 			}
 			return
 		case "install-codex-shim":
 			if err := runInstallCodexShim(); err != nil {
 				fmt.Fprintf(os.Stderr, "c3-broker install-codex-shim: %v\n", err)
-				os.Exit(1)
+				os.Exit(exitConfig)
 			}
 			return
 		case "--help", "-h", "help":
 			fmt.Print(usage)
 			return
+		default:
+			fmt.Fprintf(os.Stderr, "c3-broker: unknown subcommand %q\n%s", os.Args[1], usage)
+			os.Exit(exitUsage)
 		}
 	}
 
 	if err := runDaemon(); err != nil {
 		fmt.Fprintf(os.Stderr, "c3-broker: %v\n", err)
-		os.Exit(1)
+		os.Exit(exitFailure)
 	}
 }
 

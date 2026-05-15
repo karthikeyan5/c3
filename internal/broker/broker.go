@@ -85,15 +85,20 @@ func (b *Broker) mutateMappings(fn func(*mappings.MappingsFile)) {
 	b.mappings.Store(next)
 }
 
-// RegisterBuiltinPlugins calls each builtin plugin's Register with the
-// broker's plugin host. Should be called by main() after the broker is
-// constructed but BEFORE channels are registered (so plugins are subscribed
-// before any inbound flows).
+// BuiltinPlugin describes one compiled-in plugin: a Name (used for log
+// lines and to scope mappings.json:plugins.<name>) and a Register
+// function the broker invokes with the plugin Host at startup.
+// The broker's main() builds the slice of BuiltinPlugin and passes it
+// to RegisterBuiltinPlugins.
 type BuiltinPlugin struct {
 	Name     string
 	Register func(plugin.Host) error
 }
 
+// RegisterBuiltinPlugins calls each builtin plugin's Register with the
+// broker's plugin host. Should be called by main() after the broker is
+// constructed but BEFORE channels are registered (so plugins are subscribed
+// before any inbound flows).
 func (b *Broker) RegisterBuiltinPlugins(builtins []BuiltinPlugin) error {
 	for _, bp := range builtins {
 		if err := bp.Register(b.Plugins); err != nil {

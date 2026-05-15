@@ -103,7 +103,7 @@ func run() error {
 	mcpSrv := mcp.New(os.Stdin, os.Stdout, a)
 	a.mcp = mcpSrv
 
-	go a.brokerReader()
+	go a.brokerReader(ctx)
 	go a.idleStartupWatchdog(ctx, cancel)
 
 	err := mcpSrv.Run(ctx)
@@ -290,7 +290,7 @@ func (a *adapter) hello() error {
 // Reconnect-once semantics from spec §4.4 are upgraded to reconnect-forever
 // (with backoff) — the original behavior turned a 30-second broker rebuild
 // into a permanently dead adapter that required restarting the CLI session.
-func (a *adapter) brokerReader() {
+func (a *adapter) brokerReader(ctx context.Context) {
 	for {
 		conn := a.currentConn()
 		if conn == nil {
@@ -302,7 +302,7 @@ func (a *adapter) brokerReader() {
 			// "distressed plugin → recycle me". Broker bounces are
 			// expected and recoverable; don't telegraph them to CC.
 			log.Printf("broker read err: %v — recovering", err)
-			if !a.recoverBroker() {
+			if !a.recoverBroker(ctx) {
 				log.Printf("broker recovery aborted")
 				return
 			}
@@ -350,17 +350,24 @@ func (a *adapter) reconnectBroker() error {
 }
 
 // recoverBroker loops with exponential backoff until reconnectBroker
-// succeeds (or returns false on persistent ctx-cancel — currently unused
-// since the adapter has no top-level ctx). After a successful reconnect,
-// replays the last successful attach (best-effort) so the route claim is
-// restored. Returns true on success, false if recovery is impossible.
-func (a *adapter) recoverBroker() bool {
+// succeeds, or ctx cancellation aborts the loop (returns false).
+// After a successful reconnect, replays the last successful attach
+// (best-effort) so the route claim is restored.
+//
+// ctx-aware sleep ensures SIGTERM mid-reconnect actually aborts the
+// loop — Go's default time.Sleep would have us stuck in 30s waits
+// long after the user wanted us to exit.
+func (a *adapter) recoverBroker(ctx context.Context) bool {
 	const (
-		base = 500 * time.Millisecond
-		cap  = 30 * time.Second
+		base       = 500 * time.Millisecond
+		maxBackoff = 30 * time.Second
 	)
 	backoff := base
 	for attempt := 1; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			log.Printf("broker recovery canceled (ctx done): %v", err)
+			return false
+		}
 		err := a.reconnectBroker()
 		if err == nil {
 			log.Printf("broker reconnected (attempt %d)", attempt)
@@ -368,10 +375,15 @@ func (a *adapter) recoverBroker() bool {
 			return true
 		}
 		log.Printf("broker reconnect attempt %d failed: %v (retry in %v)", attempt, err, backoff)
-		time.Sleep(backoff)
+		select {
+		case <-ctx.Done():
+			log.Printf("broker recovery canceled mid-backoff: %v", ctx.Err())
+			return false
+		case <-time.After(backoff):
+		}
 		backoff *= 2
-		if backoff > cap {
-			backoff = cap
+		if backoff > maxBackoff {
+			backoff = maxBackoff
 		}
 	}
 }
@@ -1018,13 +1030,3 @@ func mcpTextResp(id json.RawMessage, text string) *mcp.Response {
 	}
 }
 
-// recoverError silences ESRCH and similar harmless errors from broker spawn.
-func recoverError(err error) error {
-	if err == nil {
-		return nil
-	}
-	if errors.Is(err, exec.ErrNotFound) {
-		return fmt.Errorf("c3-broker not on PATH (run /c3-build to install)")
-	}
-	return err
-}

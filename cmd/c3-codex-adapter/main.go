@@ -52,8 +52,14 @@ import (
 
 const (
 	mcpProtocolVersion = "2024-11-05"
-	adapterName        = "c3-codex-adapter"
-	adapterVersion     = "0.1.0"
+	// adapterName MUST match the mcp_servers.<key>.* registration the
+	// launcher writes into Codex's config (cmd/codex/main.go uses
+	// `c3_codex`). Codex's channel/notification dispatch keys on this
+	// name; using a different one (e.g. the binary name) silently
+	// drops channel frames the same way Claude Code does
+	// (see cmd/c3-claude-adapter/main.go's same comment).
+	adapterName    = "c3_codex"
+	adapterVersion = "0.1.0"
 	inboxCap           = 100             // ring buffer max
 	idleStartupTimeout = 60 * time.Second // mirror cmd/c3-claude-adapter behavior
 )
@@ -229,10 +235,18 @@ func (a *adapter) autoAttach(name string) {
 	a.pmu.Lock()
 	a.pending["attached"] = ch
 	a.pmu.Unlock()
-	if err := a.currentConn().WriteJSON(ipc.AttachReq{
+	conn := a.currentConn()
+	if conn == nil {
+		a.pmu.Lock()
+		delete(a.pending, "attached")
+		a.pmu.Unlock()
+		log.Printf("auto-attach skipped: broker not yet connected")
+		return
+	}
+	if err := conn.WriteJSON(ipc.AttachReq{
 		Op: ipc.OpAttach, CWD: cwd, Name: name,
 	}); err != nil {
-		fmt.Fprintf(os.Stderr, "c3-codex-adapter: auto-attach write failed: %v\n", err)
+		log.Printf("auto-attach write failed: %v", err)
 		return
 	}
 	// Drain (the brokerReader routes to this channel via dispatchAttached).
@@ -658,7 +672,14 @@ func (a *adapter) handleAttachLocal(ctx context.Context, req *mcp.Request, args 
 	a.pending["attached"] = ch
 	a.pmu.Unlock()
 
-	if err := a.currentConn().WriteJSON(attachReq); err != nil {
+	conn := a.currentConn()
+	if conn == nil {
+		a.pmu.Lock()
+		delete(a.pending, "attached")
+		a.pmu.Unlock()
+		return errResp(req.ID, -32000, "broker reconnecting — retry attach in a moment")
+	}
+	if err := conn.WriteJSON(attachReq); err != nil {
 		a.pmu.Lock()
 		delete(a.pending, "attached")
 		a.pmu.Unlock()
@@ -709,7 +730,14 @@ func (a *adapter) handleTopicsLocal(ctx context.Context, req *mcp.Request) *mcp.
 	a.pmu.Lock()
 	a.pending["topics_list"] = ch
 	a.pmu.Unlock()
-	if err := a.currentConn().WriteJSON(ipc.ListTopicsReq{Op: ipc.OpListTopics}); err != nil {
+	conn := a.currentConn()
+	if conn == nil {
+		a.pmu.Lock()
+		delete(a.pending, "topics_list")
+		a.pmu.Unlock()
+		return errResp(req.ID, -32000, "broker reconnecting — retry topics in a moment")
+	}
+	if err := conn.WriteJSON(ipc.ListTopicsReq{Op: ipc.OpListTopics}); err != nil {
 		a.pmu.Lock()
 		delete(a.pending, "topics_list")
 		a.pmu.Unlock()
@@ -803,7 +831,14 @@ func (a *adapter) forwardToBroker(req *mcp.Request, name string, args map[string
 	a.pmu.Unlock()
 
 	tcReq := ipc.ToolCallReq{Op: ipc.OpToolCall, ID: id, Name: name, Args: args}
-	if err := a.currentConn().WriteJSON(tcReq); err != nil {
+	conn := a.currentConn()
+	if conn == nil {
+		a.pmu.Lock()
+		delete(a.pending, id)
+		a.pmu.Unlock()
+		return errResp(req.ID, -32000, "broker reconnecting — retry tool call in a moment")
+	}
+	if err := conn.WriteJSON(tcReq); err != nil {
 		a.pmu.Lock()
 		delete(a.pending, id)
 		a.pmu.Unlock()

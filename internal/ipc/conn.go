@@ -25,12 +25,21 @@ type Conn struct {
 	r   *bufio.Reader
 }
 
+// maxFrameSize bounds the largest IPC frame we'll accept on a single
+// ReadFrame call. Without a cap a peer (broker, adapter, or any process
+// that opened the socket) could stream bytes without a newline and
+// exhaust memory. 4 MiB is well above any legitimate frame: the largest
+// real frames are MCP tool-call results that embed Telegram message
+// content, on the order of tens of KB. Mirrors mcp.Server's bufio buffer
+// size (internal/mcp/server.go).
+const maxFrameSize = 4 * 1024 * 1024
+
 // NewConn wraps a net.Conn. Owner is responsible for calling Close.
 func NewConn(c net.Conn) *Conn {
 	return &Conn{
 		c: c,
 		w: bufio.NewWriter(c),
-		r: bufio.NewReader(c),
+		r: bufio.NewReaderSize(c, maxFrameSize),
 	}
 }
 
@@ -53,12 +62,17 @@ func (c *Conn) WriteJSON(v any) error {
 }
 
 // ReadFrame reads one \n-terminated frame and returns its bytes (without the
-// trailing newline). Returns io.EOF when the peer closes cleanly.
+// trailing newline). Returns io.EOF when the peer closes cleanly. Returns
+// an error if the frame exceeds maxFrameSize (defense against a peer
+// streaming bytes without a newline).
 //
 // NOT safe for concurrent use — only one reader goroutine per Conn.
 func (c *Conn) ReadFrame() ([]byte, error) {
 	line, err := c.r.ReadBytes('\n')
 	if err != nil {
+		if errors.Is(err, bufio.ErrBufferFull) {
+			return nil, fmt.Errorf("ipc: frame exceeds %d bytes (peer not respecting newline framing)", maxFrameSize)
+		}
 		if errors.Is(err, io.EOF) && len(line) == 0 {
 			return nil, io.EOF
 		}

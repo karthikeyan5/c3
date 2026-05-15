@@ -16,6 +16,7 @@ import (
 	"github.com/PaulSonOfLars/gotgbot/v2"
 
 	"github.com/karthikeyan5/c3/internal/channel"
+	"github.com/karthikeyan5/c3/internal/mappings"
 )
 
 // longPollTimeoutSeconds is the server-side hold for getUpdates. Telegram
@@ -33,22 +34,15 @@ const Name = "telegram"
 
 // Config is the channel-specific config under mappings.json:channels.telegram.
 type Config struct {
-	BotToken            string                       `json:"bot_token"`
-	DefaultGroup        string                       `json:"default_group"`
-	Groups              map[string]GroupConfig       `json:"groups"`
-	DMChatID            int64                        `json:"dm_chat_id"`
-	MasterUserID        int64                        `json:"master_user_id"`
-	DebounceMS          int                          `json:"debounce_ms"`
-	DebounceMaxMessages int                          `json:"debounce_max_messages"`
-	FallbackCooldownS   int                          `json:"fallback_cooldown_s"`
-	STTPrefix           string                       `json:"stt_prefix"`
-}
-
-// GroupConfig matches mappings.GroupConfig but lives in the telegram package
-// to avoid an import cycle.
-type GroupConfig struct {
-	ChatID int64  `json:"chat_id"`
-	Title  string `json:"title,omitempty"`
+	BotToken            string                          `json:"bot_token"`
+	DefaultGroup        string                          `json:"default_group"`
+	Groups              map[string]mappings.GroupConfig `json:"groups"`
+	DMChatID            int64                           `json:"dm_chat_id"`
+	MasterUserID        int64                           `json:"master_user_id"`
+	DebounceMS          int                             `json:"debounce_ms"`
+	DebounceMaxMessages int                             `json:"debounce_max_messages"`
+	FallbackCooldownS   int                             `json:"fallback_cooldown_s"`
+	STTPrefix           string                          `json:"stt_prefix"`
 }
 
 // Channel is the Telegram channel implementation. Construct via New, register

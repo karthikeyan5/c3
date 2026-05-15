@@ -11,7 +11,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
+
+	"golang.org/x/term"
 
 	"github.com/karthikeyan5/c3/internal/mappings"
 )
@@ -39,7 +42,11 @@ func runSetup() error {
 	r := bufio.NewReader(os.Stdin)
 
 	fmt.Print("Telegram bot token (from @BotFather): ")
-	token := readLine(r)
+	token, err := readPassword(r)
+	if err != nil {
+		return fmt.Errorf("read token: %w", err)
+	}
+	fmt.Println() // newline after the silent prompt
 	if token == "" {
 		return errors.New("bot token is required")
 	}
@@ -127,6 +134,21 @@ func validateBotToken(token string) (string, error) {
 func readLine(r *bufio.Reader) string {
 	line, _ := r.ReadString('\n')
 	return strings.TrimSpace(line)
+}
+
+// readPassword reads a single line of input with terminal echo disabled
+// when stdin is a TTY (so the bot token doesn't end up in scroll-back
+// or screen-recording footage). Falls back to plain reads when stdin is
+// piped/redirected (CI, automation), since there's no terminal to mute.
+func readPassword(r *bufio.Reader) (string, error) {
+	if term.IsTerminal(int(syscall.Stdin)) {
+		b, err := term.ReadPassword(int(syscall.Stdin))
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(b)), nil
+	}
+	return readLine(r), nil
 }
 
 func readBool(def bool) bool {
