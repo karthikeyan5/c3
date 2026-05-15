@@ -1,8 +1,7 @@
 # STT Package — Pluggable Speech-to-Text Chain
 
-Modular STT with provider chaining, retry, and automatic fallback.
-
-**Replaces:** `gemini-stt.py` and `sarvam-stt.py` standalone scripts.
+Modular STT with provider chaining, retry, and automatic fallback. Used
+by c3 as its bundled speech-to-text engine; also runnable standalone.
 
 ## Quick Start
 
@@ -13,6 +12,9 @@ python3 stt.py audio.ogg
 # Sarvam only
 python3 stt.py audio.ogg --chain sarvam-saaras-v3
 
+# ElevenLabs Scribe v2 first, gemini then sarvam as fallbacks
+python3 stt.py audio.ogg --chain elevenlabs-scribe-v2,gemini-3-flash-openrouter,sarvam-saaras-v3
+
 # Custom chain with extra retries
 python3 stt.py audio.ogg --chain gemini-3-flash-openrouter,sarvam-saaras-v3 --retries 2 --retry-delay 3
 ```
@@ -22,12 +24,19 @@ python3 stt.py audio.ogg --chain gemini-3-flash-openrouter,sarvam-saaras-v3 --re
 ```
 stt-pkg/
 ├── stt.py                                  # Main entry point
+├── vocabulary.txt                          # Optional domain-vocabulary biasing
 ├── providers/
-│   ├── gemini-3-flash-openrouter.py        # Gemini 3 Flash via OpenRouter
-│   ├── sarvam-saaras-v3.py                 # Sarvam AI Saaras v3
+│   ├── gemini-3-flash-openrouter.py        # Gemini 3 Flash via OpenRouter (default)
+│   ├── sarvam-saaras-v3.py                 # Sarvam AI Saaras v3 (default fallback)
+│   ├── elevenlabs-scribe-v2.py             # ElevenLabs Scribe v2 (opt-in via --chain)
 │   └── __init__.py
 └── README.md
 ```
+
+All three providers ship bundled. The default chain
+(`gemini-3-flash-openrouter,sarvam-saaras-v3`) keeps the API-key surface
+minimal for the typical install; `elevenlabs-scribe-v2` is wired and
+ready — just add it to your `--chain` and set `ELEVENLABS_API_KEY`.
 
 ## How It Works
 
@@ -86,42 +95,25 @@ Then use it:
 python3 stt.py audio.ogg --chain gemini-3-flash-openrouter,your-model-name,sarvam-saaras-v3
 ```
 
-## OpenClaw Integration
+## How c3 Wires This Up
 
-Replace the old `gemini-stt.py` reference in your audio config:
+c3's broker subprocesses `plugins/c3/stt/stt-handler.py` for each voice
+attachment. That handler in turn subprocesses `stt.py` from this
+directory. The chain is whatever the handler passes via `--chain`
+(defaults to gemini → sarvam). To change the chain c3 uses globally,
+set `plugins.stt.handler_path` in `~/.config/c3/mappings.json` to a
+custom handler that calls `stt.py` with your preferred `--chain`.
 
-```json
-{
-  "tools": {
-    "media": {
-      "audio": {
-        "models": [{
-          "type": "cli",
-          "command": "python3",
-          "args": ["/path/to/stt-pkg/stt.py", "{{MediaPath}}"],
-          "timeoutSeconds": 120
-        }]
-      }
-    }
-  }
-}
-```
-
-**Old (replace this):**
-```json
-"args": ["/path/to/gemini-stt.py", "{{MediaPath}}"]
-```
-
-**New:**
-```json
-"args": ["/path/to/stt-pkg/stt.py", "{{MediaPath}}"]
-```
+To use this package outside of c3 (e.g. from another voice-input tool),
+just invoke `python3 stt.py <audio>` directly — stdout is the transcript,
+stderr is the trace.
 
 ## Requirements
 
 - Python 3.8+
-- **Gemini provider:** OPENROUTER_API_KEY (env or openclaw.json)
-- **Sarvam provider:** SARVAM_API_KEY (env, openclaw.json, or .env file)
+- **Gemini provider:** OPENROUTER_API_KEY (env or `~/.claude/stt.env`)
+- **Sarvam provider:** SARVAM_API_KEY (env or `~/.claude/stt.env`)
+- **ElevenLabs provider:** ELEVENLABS_API_KEY (env or `~/.claude/stt.env`)
 - **Sarvam >30s audio:** `pip install sarvamai` + `ffprobe`
 
 ## Why This Exists
