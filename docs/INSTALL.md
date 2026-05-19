@@ -7,8 +7,16 @@ Set-up steps for someone who has never run C3 before. Five minutes if everything
 You need:
 
 - **Go ≥1.22** on your `PATH`. C3 is built from source on first install. `go version` should print `go1.22` or newer.
-- **A Telegram bot token.** Open Telegram, message `@BotFather`, send `/newbot`, follow prompts. You'll get a token shaped like `1234567:abcdefg...`. Keep it private.
-- **A Telegram supergroup** where your bot will create forum topics. Make a new one (or repurpose one). Convert it to a supergroup if needed (Telegram does this automatically when you give it more than ~200 members or enable topics). Enable topics in group settings. Add your bot. Make the bot **an admin with `Manage Topics`** permission.
+- **A Telegram bot + group, set up per the checklist below.** Five minutes if you've done it before, ten if not. See [docs/research/2026-05-18-telegram-bot-setup.md](research/2026-05-18-telegram-bot-setup.md) for the "why" on each step.
+
+  Use **Telegram Desktop, iOS, Android, or macOS** for the group-side steps — *not Telegram Web*. Web's Topics-enable and admin-rights UIs are incomplete.
+
+  1. **Create the bot.** Message `@BotFather` → `/newbot` → pick a display name and a username ending in `bot`. Copy the HTTP token (`1234567:abcdefg...`). Keep it private.
+  2. **Disable privacy mode.** Same chat: `/setprivacy` → pick your bot → `Disable`. Without this, the bot only sees messages that mention or reply to it. (Not exposed via the Bot API — must be done in BotFather.)
+  3. **Create a Telegram group** (a regular group is fine; it auto-promotes to a supergroup when you turn Topics on).
+  4. **Add your bot** to the group.
+  5. **Enable Topics** in group settings. Do this *before* the next step — "Allow create topics" only appears in the admin checklist once Topics are on.
+  6. **Promote the bot to admin** with these rights checked: **Manage Topics**, **Send Messages**, **Delete Messages**, **Pin Messages**. Everything else off.
 - **Your Telegram user id** for DMs. Message `@userinfobot` from your phone; it replies with your user id (a positive integer).
 - **The supergroup's chat id.** Send any message in the group; the bot now sees it. Or use `@username_to_id_bot`-style helpers. Group chat ids are negative integers starting with `-100`.
 - **For Codex integration:** Codex CLI installed (typically via `npm install -g @openai/codex` or similar). The C3 launcher will detect it. NVM users: take note — long-running shells hash `codex` to your NVM path, so the install step below symlinks both `~/.local/bin/codex` and the NVM bin path.
@@ -129,6 +137,34 @@ also gates local-marketplace plugins behind the dev flag (so the c3
 adapter's `notifications/claude/channel` frames get silently dropped).
 The official-marketplace plugin distribution flow doesn't need this
 flag; we do, until c3 is published through Anthropic's marketplace.
+
+## Step 4.5: Install the Claude wrapper
+
+`/c3:setup` runs this automatically when invoked from a Claude Code
+session — it is COMPULSORY under HostClaude per the locked 2026-05-18
+design. The standalone command is for **manual** install, re-install
+(after a `claude` binary upgrade clobbered the symlink), or
+`--force` scenarios:
+
+```
+c3-broker install-claude-shim
+```
+
+The shim is a tiny launcher symlinked at `~/.local/bin/claude` that
+transparently adds `--dangerously-load-development-channels plugin:c3@c3`
+to every `claude` invocation. Without it you have to type the long flag
+form by hand on every session start (which the maintainer prefers but
+new users typically forget — leading to the silent-channel-drops failure
+mode #18 was meant to close).
+
+The most common manual-install hiccup is an existing non-shim
+`~/.local/bin/claude` (often from NVM, npm, or a hand-edited symlink to
+the real claude binary). The installer refuses to overwrite it without
+`--force`. Verify a successful one-time install **without** `--force`
+first — that path persists the resolved real-claude target to
+`~/.config/c3/claude-shim.json` so the shim's fallback lookup chain
+still finds your binary. Use `--force` only if the standard install
+already wrote that config or you know the real-claude target by hand.
 
 ## Step 5 (optional): Enable Codex integration
 

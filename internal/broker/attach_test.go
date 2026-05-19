@@ -749,3 +749,463 @@ func TestTryClaim_ReplayFlagSuppressesWelcomeAfterBrokerBounce(t *testing.T) {
 		t.Errorf("replay attach sent %d welcomes, want 0 (user didn't initiate)", got)
 	}
 }
+
+// TestPing_SendsReplyToAttachedRoute is the happy-path for the
+// `/c3:ping` slash command. Attach a fake adapter to a topic; then a
+// separate transient client (mimicking `c3-broker ping`) connects with
+// the SAME cwd and issues PingThisSessionReq. The broker must locate
+// the attached stub by CWD and dispatch one SendReply on its claimed
+// route. TODO #19(b).
+func TestPing_SendsReplyToAttachedRoute(t *testing.T) {
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	// First adapter — the "user session" — attaches to topic c3.
+	adapter, doneA := peerPair(t, b)
+	defer doneA()
+	if err := adapter.WriteJSON(ipc.HelloMsg{Op: ipc.OpHello, CLI: "claude", PID: 99, CWD: "/projects/c3"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+	if err := adapter.WriteJSON(ipc.AttachReq{Op: ipc.OpAttach, CWD: "/projects/c3", Name: "c3"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+	// Wait for the welcome SendReply so we can distinguish it from the
+	// ping reply.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(fc.sendRepliesSnapshot()) >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	beforePing := len(fc.sendRepliesSnapshot())
+
+	// Transient ping client — different ConnID, different CLI label,
+	// SAME CWD as the user's adapter.
+	pinger, doneP := peerPair(t, b)
+	defer doneP()
+	if err := pinger.WriteJSON(ipc.HelloMsg{Op: ipc.OpHello, CLI: "c3-broker-cli", PID: 100, CWD: "/projects/c3"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pinger.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := pinger.WriteJSON(ipc.PingThisSessionReq{Op: ipc.OpPingThisSession, CWD: "/projects/c3"}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := pinger.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp ipc.PingThisSessionReplyMsg
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("parse ping reply: %v", err)
+	}
+	if !resp.OK {
+		t.Fatalf("ping reply not OK: %q", resp.Err)
+	}
+	if resp.Channel != "telegram" || resp.Topic != "c3" {
+		t.Errorf("ping reply channel=%q topic=%q, want telegram/c3", resp.Channel, resp.Topic)
+	}
+	if !strings.Contains(resp.SentText, "c3-ping") {
+		t.Errorf("ping SentText missing c3-ping marker: %q", resp.SentText)
+	}
+
+	// Exactly one new SendReply, going to the attached route, content
+	// mentions cwd + cli.
+	calls := fc.sendRepliesSnapshot()
+	if len(calls) != beforePing+1 {
+		t.Fatalf("expected exactly one ping SendReply (was %d, now %d)", beforePing, len(calls))
+	}
+	r := calls[len(calls)-1]
+	if r.ChatID != -100 || r.TopicID == nil || *r.TopicID != 281 {
+		t.Errorf("ping went to wrong destination: chat=%d topic=%v", r.ChatID, r.TopicID)
+	}
+	for _, want := range []string{"c3-ping", "/projects/c3", "claude"} {
+		if !strings.Contains(r.Text, want) {
+			t.Errorf("ping text missing %q: %s", want, r.Text)
+		}
+	}
+}
+
+// TestPing_NoAttachedStubReturnsError covers the user-error case where
+// the calling session has no current route claim. The broker must
+// reply OK=false with an error message that the slash command can
+// surface — and NOT call SendReply.
+func TestPing_NoAttachedStubReturnsError(t *testing.T) {
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	pinger, done := peerPair(t, b)
+	defer done()
+	if err := pinger.WriteJSON(ipc.HelloMsg{Op: ipc.OpHello, CLI: "c3-broker-cli", PID: 1, CWD: "/nowhere"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pinger.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := pinger.WriteJSON(ipc.PingThisSessionReq{Op: ipc.OpPingThisSession, CWD: "/nowhere"}); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := pinger.ReadFrame()
+	var resp ipc.PingThisSessionReplyMsg
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("parse ping reply: %v", err)
+	}
+	if resp.OK {
+		t.Fatalf("ping should fail when no stub matches cwd, got OK=true: %+v", resp)
+	}
+	if resp.Err == "" {
+		t.Error("ping reply missing Err message")
+	}
+	if !strings.Contains(strings.ToLower(resp.Err), "not attached") {
+		t.Errorf("ping Err should mention 'not attached', got %q", resp.Err)
+	}
+	if got := len(fc.sendRepliesSnapshot()); got != 0 {
+		t.Errorf("ping should not SendReply on the unattached error path, got %d calls", got)
+	}
+}
+
+// TestPing_MultipleStubsAtCWD_TargetsMostRecent is the determinism guard
+// for `/c3:ping` when >1 stub matches the calling CWD. Registers two
+// stubs at the same cwd, each holding its own claim (different topics
+// in the same group), then issues a PingThisSessionReq. The broker
+// MUST pick the most-recently-registered stub (highest ConnID), not
+// whichever map iteration happens to visit first. Closes report
+// MINOR m1 (2026-05-19).
+func TestPing_MultipleStubsAtCWD_TargetsMostRecent(t *testing.T) {
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	const cwd = "/projects/shared"
+
+	// First stub at the cwd — claims topic 281 ("c3").
+	older := b.Stubs.Register("claude", 1001, cwd, nil)
+	tid1 := int64(281)
+	key1 := MakeRouteKey("telegram", -100, &tid1)
+	if !b.tryClaim(nil, older, key1, "c3", false, false) {
+		t.Fatal("older stub: claim failed")
+	}
+
+	// Second stub at the SAME cwd — different PID, claims topic 412
+	// ("feature-x" in group "work").
+	newer := b.Stubs.Register("codex", 1002, cwd, nil)
+	tid2 := int64(412)
+	key2 := MakeRouteKey("telegram", -200, &tid2)
+	if !b.tryClaim(nil, newer, key2, "feature-x", false, false) {
+		t.Fatal("newer stub: claim failed")
+	}
+	if newer.ConnID <= older.ConnID {
+		t.Fatalf("test setup wrong: newer.ConnID=%d not > older.ConnID=%d",
+			newer.ConnID, older.ConnID)
+	}
+
+	// Give the async sendWelcome calls a chance to land — they're
+	// goroutines and we don't want them to be counted as the ping reply.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(fc.sendRepliesSnapshot()) >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	beforePing := len(fc.sendRepliesSnapshot())
+
+	// Now issue the ping from a transient client at the same cwd.
+	pinger, done := peerPair(t, b)
+	defer done()
+	if err := pinger.WriteJSON(ipc.HelloMsg{Op: ipc.OpHello, CLI: "c3-broker-cli", PID: 9999, CWD: cwd}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pinger.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+	if err := pinger.WriteJSON(ipc.PingThisSessionReq{Op: ipc.OpPingThisSession, CWD: cwd}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := pinger.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp ipc.PingThisSessionReplyMsg
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("parse ping reply: %v", err)
+	}
+	if !resp.OK {
+		t.Fatalf("ping reply not OK: %q", resp.Err)
+	}
+
+	// Reply must reference the NEWER stub's topic (feature-x), not the
+	// older one (c3).
+	if resp.Topic != "feature-x" {
+		t.Errorf("ping targeted wrong stub: topic=%q, want %q (most-recent stub's claim)",
+			resp.Topic, "feature-x")
+	}
+
+	// The new SendReply must go to the NEWER stub's destination
+	// (chat=-200, topic=412), not (chat=-100, topic=281).
+	calls := fc.sendRepliesSnapshot()
+	if len(calls) != beforePing+1 {
+		t.Fatalf("expected exactly one ping SendReply (was %d, now %d)", beforePing, len(calls))
+	}
+	r := calls[len(calls)-1]
+	if r.ChatID != -200 || r.TopicID == nil || *r.TopicID != 412 {
+		t.Errorf("ping went to older stub's destination: chat=%d topic=%v; want chat=-200 topic=412",
+			r.ChatID, r.TopicID)
+	}
+	if !strings.Contains(r.Text, "codex") {
+		t.Errorf("ping text should mention CLI=codex (newer stub's CLI): %q", r.Text)
+	}
+}
+
+// ─── 3-state attach status (2026-05-19) ────────────────────────────────────
+//
+// Every success path must emit Status=ok so the adapter formatter can
+// distinguish success from the new structured failure states
+// (no_topics_configured, policy_rejected). See
+// docs/plans/2026-05-19-codex-policy-3state.md.
+
+func TestAttach_DM_EmitsStatusOK(t *testing.T) {
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	peer, done := peerPair(t, b)
+	defer done()
+	helloAck(t, peer, "/x")
+
+	_ = peer.WriteJSON(ipc.AttachReq{Op: ipc.OpAttach, Target: "dm"})
+	raw, _ := peer.ReadFrame()
+	var ack ipc.AttachedMsg
+	_ = json.Unmarshal(raw, &ack)
+
+	if !ack.OK {
+		t.Fatalf("attach failed: %s", ack.Err)
+	}
+	if ack.Status != ipc.AttachStatusOK {
+		t.Errorf("Status=%q want %q", ack.Status, ipc.AttachStatusOK)
+	}
+}
+
+func TestAttach_ByName_EmitsStatusOK(t *testing.T) {
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	peer, done := peerPair(t, b)
+	defer done()
+	helloAck(t, peer, "/projects/c3")
+
+	_ = peer.WriteJSON(ipc.AttachReq{Op: ipc.OpAttach, CWD: "/projects/c3", Name: "c3"})
+	raw, _ := peer.ReadFrame()
+	var ack ipc.AttachedMsg
+	_ = json.Unmarshal(raw, &ack)
+
+	if !ack.OK {
+		t.Fatalf("attach failed: %s", ack.Err)
+	}
+	if ack.Status != ipc.AttachStatusOK {
+		t.Errorf("Status=%q want %q", ack.Status, ipc.AttachStatusOK)
+	}
+}
+
+func TestAttach_ByTopicID_EmitsStatusOK(t *testing.T) {
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	peer, done := peerPair(t, b)
+	defer done()
+	helloAck(t, peer, "/x")
+
+	tid := int64(999)
+	_ = peer.WriteJSON(ipc.AttachReq{Op: ipc.OpAttach, CWD: "/x", TopicID: &tid})
+	raw, _ := peer.ReadFrame()
+	var ack ipc.AttachedMsg
+	_ = json.Unmarshal(raw, &ack)
+
+	if !ack.OK {
+		t.Fatalf("attach failed: %s", ack.Err)
+	}
+	if ack.Status != ipc.AttachStatusOK {
+		t.Errorf("Status=%q want %q", ack.Status, ipc.AttachStatusOK)
+	}
+}
+
+func TestAttach_CreateTrue_EmitsStatusOK(t *testing.T) {
+	mf := mfWithTelegram()
+	fc := &fakeChannel{createReturnID: 917}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	peer, done := peerPair(t, b)
+	defer done()
+	helloAck(t, peer, "/projects/widget-foo")
+
+	_ = peer.WriteJSON(ipc.AttachReq{
+		Op: ipc.OpAttach, CWD: "/projects/widget-foo",
+		Name: "widget-foo", Create: true,
+	})
+	raw, _ := peer.ReadFrame()
+	var ack ipc.AttachedMsg
+	_ = json.Unmarshal(raw, &ack)
+
+	if !ack.OK {
+		t.Fatalf("create failed: %s", ack.Err)
+	}
+	if ack.Status != ipc.AttachStatusOK {
+		t.Errorf("Status=%q want %q", ack.Status, ipc.AttachStatusOK)
+	}
+}
+
+func TestAttach_NoChannelsConfigured_EmitsStatusNoTopicsConfigured(t *testing.T) {
+	// Broker has zero channels in mappings — user hasn't run setup yet.
+	// Should surface AttachStatusNoTopicsConfigured so the formatter can
+	// tell the user "run c3-broker setup", not the generic "attach failed".
+	mf := &mappings.MappingsFile{
+		SchemaVersion: 1,
+		Channels:      map[string]mappings.ChannelConfig{},
+		Mappings:      map[string]mappings.Mapping{},
+	}
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	peer, done := peerPair(t, b)
+	defer done()
+	helloAck(t, peer, "/x")
+
+	_ = peer.WriteJSON(ipc.AttachReq{Op: ipc.OpAttach, Target: "dm"})
+	raw, _ := peer.ReadFrame()
+	var ack ipc.AttachedMsg
+	_ = json.Unmarshal(raw, &ack)
+
+	if ack.OK {
+		t.Error("attach with no channels should fail")
+	}
+	if ack.Status != ipc.AttachStatusNoTopicsConfigured {
+		t.Errorf("Status=%q want %q", ack.Status, ipc.AttachStatusNoTopicsConfigured)
+	}
+}
+
+func TestAttach_DM_ChannelWithoutDMChatID_EmitsStatusNoTopicsConfigured(t *testing.T) {
+	// Channel exists but DMChatID is unset (Topics may or may not exist).
+	// Targeted "DM" attach should report the structured status so the
+	// formatter can render the actionable next-step.
+	mf := &mappings.MappingsFile{
+		SchemaVersion: 1,
+		Channels: map[string]mappings.ChannelConfig{
+			"telegram": {
+				DefaultGroup: "main",
+				Groups: map[string]mappings.GroupConfig{
+					"main": {ChatID: -100},
+				},
+				DMChatID: 0,
+				Topics:   nil,
+			},
+		},
+		Mappings: map[string]mappings.Mapping{},
+	}
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	peer, done := peerPair(t, b)
+	defer done()
+	helloAck(t, peer, "/x")
+
+	_ = peer.WriteJSON(ipc.AttachReq{Op: ipc.OpAttach, Target: "dm"})
+	raw, _ := peer.ReadFrame()
+	var ack ipc.AttachedMsg
+	_ = json.Unmarshal(raw, &ack)
+
+	if ack.OK {
+		t.Error("attach DM with no DMChatID should fail")
+	}
+	if ack.Status != ipc.AttachStatusNoTopicsConfigured {
+		t.Errorf("Status=%q want %q (DM=0 should be 'no destinations configured')",
+			ack.Status, ipc.AttachStatusNoTopicsConfigured)
+	}
+}
+
+func TestAttach_PolicyRejectedHint_ShortCircuitsToStatusPolicyRejected(t *testing.T) {
+	// Codex adapter sets PolicyRejected=true on a re-invoke after the
+	// agent observed the host's policy layer reject the prior attach.
+	// Broker MUST short-circuit: don't validate, don't claim, don't
+	// register topics. Just surface the structured status so the
+	// adapter formatter renders the actionable user message.
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	peer, done := peerPair(t, b)
+	defer done()
+	helloAck(t, peer, "/x")
+
+	_ = peer.WriteJSON(ipc.AttachReq{
+		Op: ipc.OpAttach, CWD: "/x", Name: "c3",
+		PolicyRejected: true,
+	})
+	raw, _ := peer.ReadFrame()
+	var ack ipc.AttachedMsg
+	_ = json.Unmarshal(raw, &ack)
+
+	if ack.OK {
+		t.Error("attach with PolicyRejected hint must not return OK")
+	}
+	if ack.Status != ipc.AttachStatusPolicyRejected {
+		t.Errorf("Status=%q want %q", ack.Status, ipc.AttachStatusPolicyRejected)
+	}
+	if ack.NeedsConfirmation {
+		t.Error("policy_rejected is terminal, not a proposal")
+	}
+	if len(fc.createCalls) > 0 || len(fc.validateCalls) > 0 {
+		t.Errorf("policy_rejected must short-circuit; got create=%d validate=%d",
+			len(fc.createCalls), len(fc.validateCalls))
+	}
+}
+
+func TestAttach_SavedMapping_EmitsStatusOK(t *testing.T) {
+	mf := mfWithTelegram()
+	mf.Mappings["/projects/widget"] = mappings.Mapping{
+		Channel: "telegram", ChatID: -100, TopicID: 281,
+		Name: "c3", Group: "main",
+	}
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	peer, done := peerPair(t, b)
+	defer done()
+	helloAck(t, peer, "/projects/widget")
+
+	_ = peer.WriteJSON(ipc.AttachReq{Op: ipc.OpAttach, CWD: "/projects/widget"})
+	raw, _ := peer.ReadFrame()
+	var ack ipc.AttachedMsg
+	_ = json.Unmarshal(raw, &ack)
+
+	if !ack.OK {
+		t.Fatalf("attach failed: %s", ack.Err)
+	}
+	if ack.Status != ipc.AttachStatusOK {
+		t.Errorf("Status=%q want %q", ack.Status, ipc.AttachStatusOK)
+	}
+}

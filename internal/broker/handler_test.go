@@ -106,6 +106,64 @@ func TestHandle_ListTopics(t *testing.T) {
 	}
 }
 
+// TestConnDrop_ReleasesClaimWhenPIDDead exercises the conn-drop defer
+// in HandleConn: when the adapter's PID is no longer alive at conn-
+// close time, every claim held by that stub must be released so a
+// future attach (or fallback delivery) isn't blocked by a ghost
+// holder. The trick is feeding a sentinel PID (-1) that isPIDAlive
+// rejects via its `pid <= 0` short-circuit; the defer then takes the
+// dead-PID branch and calls Routes.ReleaseAllByConnID. TODO #19(d) —
+// Karthi 2026-05-18.
+func TestConnDrop_ReleasesClaimWhenPIDDead(t *testing.T) {
+	mf := emptyMappings()
+	mf.Channels["telegram"] = mappings.ChannelConfig{
+		DefaultGroup: "main",
+		Groups:       map[string]mappings.GroupConfig{"main": {ChatID: -100}},
+		DMChatID:     42,
+	}
+	br := New(mf)
+	defer br.Shutdown()
+
+	a, b := net.Pipe()
+	handlerDone := make(chan struct{})
+	go func() {
+		br.HandleConn(a)
+		close(handlerDone)
+	}()
+	peer := ipc.NewConn(b)
+	defer peer.Close()
+
+	if err := peer.WriteJSON(ipc.HelloMsg{Op: ipc.OpHello, CLI: "claude", PID: -1, CWD: "/x"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := peer.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.WriteJSON(ipc.AttachReq{Op: ipc.OpAttach, Target: "dm"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := peer.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+	// Sanity: the claim is registered.
+	if got := len(br.Routes.Snapshot()); got != 1 {
+		t.Fatalf("post-attach Routes size = %d, want 1", got)
+	}
+
+	// Drop the conn — closing the broker-side pipe triggers ReadFrame
+	// error and the deferred PID-dead branch.
+	_ = b.Close()
+	_ = a.Close()
+	select {
+	case <-handlerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandleConn did not return within 2s after conn drop")
+	}
+	if got := len(br.Routes.Snapshot()); got != 0 {
+		t.Errorf("post-conn-drop Routes size = %d, want 0 (claims must be released when PID is dead)", got)
+	}
+}
+
 func TestHandle_ByeClosesCleanly(t *testing.T) {
 	mf := emptyMappings()
 	peer, done := runHandlerWithPeer(t, mf)

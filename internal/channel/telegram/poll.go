@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/PaulSonOfLars/gotgbot/v2"
+
+	"github.com/karthikeyan5/c3/internal/channel"
 )
 
 // allowedUpdates is the conservative default opt-in. message_reaction is
@@ -199,6 +201,14 @@ func (c *Channel) dispatchUpdate(u *gotgbot.Update) {
 
 // dispatchMessage converts and emits one message. Logs metadata only —
 // see DEBUGGING.md for the content policy.
+//
+// Default-deny gate (TODO #1, locked 2026-05-18): every inbound runs
+// through host.GateInbound BEFORE host.Emit. Non-allowlisted senders
+// see their messages silently dropped (no broker worker invoked, no
+// log of the body — strangers see a dead bot). The only exception is
+// during an active pairing window, where a body matching the 4-digit
+// code is consumed by the broker (allowlist updated + persisted) and
+// the message itself is not forwarded.
 func (c *Channel) dispatchMessage(updateID int64, msg *gotgbot.Message, edited bool) {
 	in := convertInbound(c.Name(), msg, c.cfg.STTPrefix)
 	if in == nil {
@@ -209,6 +219,23 @@ func (c *Channel) dispatchMessage(updateID int64, msg *gotgbot.Message, edited b
 	kind := "text"
 	if len(in.Attachments) > 0 && in.Attachments[0].Kind != "" {
 		kind = in.Attachments[0].Kind
+	}
+	switch c.host.GateInbound(in) {
+	case channel.GateInboundDrop:
+		// Silent drop. Do NOT log content; metadata only — surface enough
+		// to debug a misconfigured allowlist via broker.log without
+		// echoing message text or sender handle. See default-deny posture
+		// in TODO #1.
+		c.host.Logf("telegram: GATE drop update=%d msg=%d chat=%d thread=%d sender=%d kind=%s",
+			updateID, msg.MessageId, msg.Chat.Id, msg.MessageThreadId, in.Sender.UserID, kind)
+		return
+	case channel.GateInboundPairConsumed:
+		// Body matched an active pairing code; allowlist already updated
+		// by the broker. Message itself is a control-plane signal — do
+		// NOT forward as inbound content.
+		c.host.Logf("telegram: GATE pair-consumed update=%d msg=%d chat=%d thread=%d sender=%d (allowlist updated)",
+			updateID, msg.MessageId, msg.Chat.Id, msg.MessageThreadId, in.Sender.UserID)
+		return
 	}
 	c.host.Logf("telegram: inbound update=%d msg=%d chat=%d thread=%d kind=%s edited=%v",
 		updateID, msg.MessageId, msg.Chat.Id, msg.MessageThreadId, kind, edited)

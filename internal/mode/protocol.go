@@ -1,0 +1,67 @@
+// Package mode is the single source of truth for the per-session protocol
+// text that c3 surfaces to any agent driving the adapter.
+//
+// Karthi's standing principle (2026-05-18, TODO #20): anything duplicated
+// between Claude and Codex adapters / install paths (protocol text, install
+// instructions, restart commands, tool descriptions, setup-time effects)
+// must have ONE source of truth. Implementation surface can differ
+// (e.g. Claude reads this from the MCP `instructions` field; Codex reads
+// it from a delimited block in `~/.codex/AGENTS.md`) but the underlying
+// string must be defined once.
+//
+// First concrete extraction: ModeProtocol (CLI vs Telegram mode contract)
+// and MultipartProtocol (the "start multi-part reply" voice-dictation
+// convention) — both previously duplicated as Go constants in each adapter.
+//
+// Three consumers as of 2026-05-19 (NIT n5):
+//  1. Claude adapter — splices Combined() onto its MCP-initialize
+//     `instructions` field; see cmd/c3-claude-adapter/main.go.
+//  2. Codex adapter — splices Combined() onto its MCP-initialize
+//     `instructions` field as well (best-effort: Codex's MCP host
+//     does not currently surface this field — see (3)); see
+//     cmd/c3-codex-adapter/main.go.
+//  3. c3-broker setup's AGENTS.md installer — writes Combined() into
+//     a delimited block in `~/.codex/AGENTS.md`, which Codex DOES
+//     concatenate into developer_instructions. Lives at
+//     cmd/c3-broker/cli_host.go::ensureCodexAgentsMd (+
+//     codexAgentsMdBlock).
+//
+// If you extend the protocol, update all three call sites' tests, not
+// just this package's.
+package mode
+
+// ModeProtocol is the per-session output-mode contract every agent using
+// c3 must honor. Appended to every adapter MCP-initialize instructions
+// variant so the rule travels with the plugin, not with the user's
+// AGENTS.md. Karthi's standing instruction (2026-05-15): make this part
+// of the plugin contract so any agent using c3 understands the protocol
+// without per-user setup.
+const ModeProtocol = "OUTPUT MODE PROTOCOL (per-session, agent-only state — default CLI mode on every fresh session):\n" +
+	"• CLI mode (DEFAULT): your replies go to the CLI terminal. Telegram is INPUT-ONLY — voice and replies from Telegram arrive as `<channel>` blocks. DO NOT call the `reply` tool to respond unless the user explicitly asks.\n" +
+	"• Telegram mode: your substantive replies go to Telegram via the `reply` tool. Switch when the user says \"switch to Telegram\", \"Telegram mode\", or steps away from the laptop. Switch back to CLI when they say \"switch to CLI\" or return to the terminal.\n" +
+	"• The mode is your responsibility to track — the broker doesn't store it. Always start in CLI mode; honor the user's switch instructions immediately.\n" +
+	"• After attach completes, briefly announce your current output mode (\"currently in CLI mode\" / \"currently in Telegram mode\") so the human has explicit confirmation of where replies will land."
+
+// MultipartProtocol is the voice-dictation convention: the user announces
+// "start multi-part reply", fires a series of short voice bursts that each
+// individually look like complete prompts, and the agent must wait for
+// "end of multi-part reply" before reasoning over the collected set.
+//
+// Without this protocol, agents respond to each voice burst as a standalone
+// prompt and the user can't dictate a complex thought across multiple short
+// utterances. Surfaced to every c3-driven agent via the same path as
+// ModeProtocol (MCP `instructions` for Claude, AGENTS.md block for Codex).
+const MultipartProtocol = "MULTI-PART REPLY PROTOCOL:\n" +
+	"• When the user says \"start multi-part reply\" / \"multi-part reply\", do NOT respond to subsequent messages individually. Acknowledge each with one word (\"Waiting.\") only.\n" +
+	"• Process and respond to ALL collected messages at once when the user says \"end of multi-part reply\".\n" +
+	"• Reason: lets the user dictate complex thoughts as short voice bursts without intermediate interruption."
+
+// Combined returns the concatenation that adapters splice onto the tail
+// of their MCP-initialize `instructions` string. Leading "\n\n" preserves
+// the historical wire shape — every adapter previously hard-coded its
+// modeProtocol const with that exact prefix, so existing tests / live
+// behaviour stay byte-identical for the ModeProtocol section. Between
+// the two protocols we use a single "\n\n" for separation.
+func Combined() string {
+	return "\n\n" + ModeProtocol + "\n\n" + MultipartProtocol
+}

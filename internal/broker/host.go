@@ -24,6 +24,9 @@ func NewBrokerHost(b *Broker, chanName string) *BrokerHost {
 	return &BrokerHost{broker: b, channel: chanName}
 }
 
+// Compile-time check: BrokerHost implements channel.Host.
+var _ channel.Host = (*BrokerHost)(nil)
+
 // Config marshals mappings.json:channels.<name> via JSON-roundtrip into target.
 // Returns error if the channel section is missing.
 func (h *BrokerHost) Config(name string, target any) error {
@@ -66,6 +69,20 @@ func (h *BrokerHost) Logf(format string, args ...any) {
 // Done returns the broker's shutdown channel.
 func (h *BrokerHost) Done() <-chan struct{} {
 	return h.broker.ctx.Done()
+}
+
+// GateInbound runs the inbound through the broker's allowlist + pairing
+// gate. The channel layer calls this before Emit; only GateInboundAllow
+// proceeds downstream. See internal/broker/pairing.go.
+func (h *BrokerHost) GateInbound(in *c3types.Inbound) channel.GateInboundDecision {
+	switch h.broker.Gate(in) {
+	case GateAllow:
+		return channel.GateInboundAllow
+	case GatePairConsumed:
+		return channel.GateInboundPairConsumed
+	default:
+		return channel.GateInboundDrop
+	}
 }
 
 // channelRegistration entries inside the broker.

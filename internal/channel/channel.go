@@ -28,10 +28,29 @@ type Channel interface {
 }
 
 // Host is what the broker passes to a Channel. Subset of plugin.Host scoped
-// to channel concerns (config + emit + log + done).
+// to channel concerns (config + emit + log + done + gate).
 type Host interface {
 	Config(name string, target any) error
 	Emit(in *c3types.Inbound)
 	Logf(format string, args ...any)
 	Done() <-chan struct{}
+
+	// GateInbound runs an inbound through the allowlist + pairing gate.
+	// Channels MUST call this before Emit and act on the decision:
+	//   - GateInboundAllow:        forward to Emit.
+	//   - GateInboundDrop:         silently discard (do NOT log content).
+	//   - GateInboundPairConsumed: silently discard; the broker has
+	//     already mutated state (allowlist + pairing window).
+	// See internal/broker/pairing.go for the policy.
+	GateInbound(in *c3types.Inbound) GateInboundDecision
 }
+
+// GateInboundDecision mirrors broker.GateDecision but lives at the channel
+// boundary so internal/channel doesn't import internal/broker.
+type GateInboundDecision int
+
+const (
+	GateInboundAllow GateInboundDecision = iota
+	GateInboundDrop
+	GateInboundPairConsumed
+)

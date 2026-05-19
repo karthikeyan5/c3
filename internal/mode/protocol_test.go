@@ -1,0 +1,112 @@
+package mode
+
+import (
+	"strings"
+	"testing"
+)
+
+// TestModeProtocol_HasCanonicalKeyPhrases guards against accidental drift
+// of the user-facing protocol strings. We can't pin the whole text (it'll
+// keep getting wordsmithed) but the load-bearing phrases must survive.
+func TestModeProtocol_HasCanonicalKeyPhrases(t *testing.T) {
+	for _, want := range []string{
+		"OUTPUT MODE PROTOCOL",
+		"CLI mode (DEFAULT)",
+		"Telegram mode",
+		"reply", // the tool name we tell agents NOT to call by default
+		"switch to Telegram",
+		"switch to CLI",
+	} {
+		if !strings.Contains(ModeProtocol, want) {
+			t.Errorf("ModeProtocol missing %q:\n%s", want, ModeProtocol)
+		}
+	}
+}
+
+// TestModeProtocol_HasAnnounceModeAfterAttach guards the rule that the
+// agent must announce its current output mode immediately after every
+// successful attach. TODO #15 (Karthi 2026-05-18): broker does not
+// persist mode, so the protocol mandates an explicit confirmation so
+// the human knows which surface owns the next reply.
+func TestModeProtocol_HasAnnounceModeAfterAttach(t *testing.T) {
+	for _, want := range []string{
+		"After attach",
+		"currently in CLI mode",
+		"currently in Telegram mode",
+	} {
+		if !strings.Contains(ModeProtocol, want) {
+			t.Errorf("ModeProtocol missing %q:\n%s", want, ModeProtocol)
+		}
+	}
+}
+
+// TestMultipartProtocol_HasCanonicalKeyPhrases — same shape as above.
+func TestMultipartProtocol_HasCanonicalKeyPhrases(t *testing.T) {
+	for _, want := range []string{
+		"MULTI-PART REPLY PROTOCOL",
+		"start multi-part reply",
+		"end of multi-part reply",
+		"Waiting.",
+	} {
+		if !strings.Contains(MultipartProtocol, want) {
+			t.Errorf("MultipartProtocol missing %q:\n%s", want, MultipartProtocol)
+		}
+	}
+}
+
+// TestCombined_PreservesLeadingNewlines locks in the wire shape every
+// existing adapter relies on (their previous modeProtocol consts opened
+// with "\n\n" — head text concatenated directly).
+func TestCombined_PreservesLeadingNewlines(t *testing.T) {
+	got := Combined()
+	if !strings.HasPrefix(got, "\n\n") {
+		t.Errorf("Combined() must start with \\n\\n so it splices onto head text; got %q", got[:min(10, len(got))])
+	}
+}
+
+// TestCombined_ContainsBothProtocols — the whole point of Combined() is
+// that callers don't have to remember to concatenate both protocols
+// themselves.
+func TestCombined_ContainsBothProtocols(t *testing.T) {
+	got := Combined()
+	if !strings.Contains(got, ModeProtocol) {
+		t.Error("Combined() missing ModeProtocol body")
+	}
+	if !strings.Contains(got, MultipartProtocol) {
+		t.Error("Combined() missing MultipartProtocol body")
+	}
+}
+
+// TestCombined_ProtocolsSeparated guards against the two protocols being
+// fused with no blank line between them (which would make the rendered
+// text harder to read for the agent and for humans inspecting the MCP
+// initialize response during debugging).
+func TestCombined_ProtocolsSeparated(t *testing.T) {
+	got := Combined()
+	// Find where ModeProtocol ends and MultipartProtocol begins, assert
+	// there's at least one blank line of separation.
+	idx := strings.Index(got, MultipartProtocol)
+	if idx < 0 {
+		t.Fatal("MultipartProtocol not found in Combined()")
+	}
+	// Everything before idx should end with at least "\n\n".
+	prefix := got[:idx]
+	if !strings.HasSuffix(prefix, "\n\n") {
+		t.Errorf("ModeProtocol → MultipartProtocol transition missing blank-line separator; tail = %q",
+			prefix[max(0, len(prefix)-10):])
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}

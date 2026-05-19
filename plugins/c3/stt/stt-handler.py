@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 """Voice STT handler for the Telegram channel.
 
-Called by server.ts for every incoming voice message:
-  python3 stt-handler.py <bot_token> <chat_id> <reply_msg_id> <file_id> [<message_thread_id>]
+Called by the Go-side STT plugin (internal/plugin/builtins/stt/stt.go) for
+every incoming voice message:
+
+    stdin (line 1):  <bot_token>\\n
+    argv:            python3 stt-handler.py <chat_id> <reply_msg_id> <file_id> [<message_thread_id>]
+
+The bot token is supplied on stdin — never via argv — so it doesn't appear
+in `ps` / `/proc/<pid>/cmdline` / audit logs (addresses code-review
+2026-05-15 MAJOR #1, cli.md §1.10). The Go shim writes `<token>\\n` to our
+stdin before invoking us.
 
 The optional <message_thread_id> is the forum topic the voice was sent in;
 when present, the echo-back sendMessage calls pass it so every chunk of a
 long transcript lands in the right topic instead of leaking to General.
 
 On success: prints transcript to stdout and sends it back to Telegram.
-On failure: prints nothing (server.ts falls back to raw voice attachment).
+On failure: prints nothing (Go shim falls back to raw voice attachment).
 
-All configuration lives here — server.ts only has a 10-line shim.
+All configuration lives here — the Go shim is a thin spawn-and-wait wrapper.
 """
 import sys
 import os
@@ -30,12 +38,38 @@ ENV_FILE   = os.environ.get('STT_ENV_FILE',  os.path.expanduser('~/.claude/stt.e
 INBOX_DIR  = os.environ.get('STT_INBOX_DIR', os.path.expanduser('~/.claude/channels/telegram/inbox'))
 LOG_FILE   = os.environ.get('STT_LOG_FILE',  os.path.expanduser('~/.claude/channels/telegram/stt-handler.log'))
 
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.DEBUG,
-    format='%(asctime)s %(levelname)s %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-)
+# TODO #12 (2026-05-16): on a fresh install ~/.claude/channels/telegram/
+# doesn't exist, and logging.basicConfig(filename=...) does NOT create
+# parent dirs — import would FileNotFoundError before any provider code
+# ran, and the broker only surfaced "[STT FAILED: error]" (byte-identical
+# with or without an API key, undiagnosable). Belt-and-suspenders: mkdir
+# both parents up front, then try basicConfig with a stderr fallback so
+# a read-only / no-perms FS still gets logs into broker.log (the broker
+# captures stderr).
+_LOG_DIR = os.path.dirname(LOG_FILE)
+if _LOG_DIR:
+    os.makedirs(_LOG_DIR, exist_ok=True)
+os.makedirs(INBOX_DIR, exist_ok=True)
+
+_LOG_FORMAT  = '%(asctime)s %(levelname)s %(message)s'
+_LOG_DATEFMT = '%Y-%m-%d %H:%M:%S'
+try:
+    logging.basicConfig(
+        filename=LOG_FILE,
+        level=logging.DEBUG,
+        format=_LOG_FORMAT,
+        datefmt=_LOG_DATEFMT,
+    )
+except Exception:
+    # File handler couldn't be opened (read-only FS, perms, race, etc.).
+    # Fall back to stderr — the broker pipes our stderr into broker.log,
+    # so logs still land somewhere the operator can find.
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=logging.DEBUG,
+        format=_LOG_FORMAT,
+        datefmt=_LOG_DATEFMT,
+    )
 
 # ── Load API keys ─────────────────────────────────────────────────────────────
 
@@ -200,9 +234,9 @@ def main():
     except Exception as e:
         logging.warning(f'Telegram echo failed (non-fatal): {e}')
         print(f'[stt-handler] telegram reply failed: {e}', file=sys.stderr)
-        # Non-fatal — Claude still gets the transcript
+        # Non-fatal — the CLI side still gets the transcript via stdout
 
-    # Print transcript to stdout for server.ts to read
+    # Print transcript to stdout for the Go-side STT shim to read
     print(transcript)
 
 if __name__ == '__main__':

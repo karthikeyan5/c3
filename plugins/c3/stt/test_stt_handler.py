@@ -5,7 +5,9 @@ Run with: python3 -m unittest plugins/c3/stt/test_stt_handler.py
 """
 import importlib.util
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -106,6 +108,61 @@ class TestSendTranscriptToTelegram(unittest.TestCase):
             "tok", "-100", 42, 914, transcript, tg_fn=self.fake_tg
         )
         self.assertEqual(n, 2)
+
+
+class TestImportCreatesParentDirs(unittest.TestCase):
+    """TODO #12 (2026-05-16): on a fresh install
+    ~/.claude/channels/telegram/ doesn't exist; logging.basicConfig(
+    filename=...) does not create parent dirs, so import crashed with
+    FileNotFoundError and the broker only surfaced [STT FAILED: error].
+
+    These tests guard the fix: import must mkdir LOG_FILE's parent and
+    INBOX_DIR up front, regardless of where STT_LOG_FILE/STT_INBOX_DIR
+    point. We point them at fresh, deeply-nested temp dirs and confirm
+    the handler imports cleanly and both dirs exist afterward.
+    """
+
+    def setUp(self):
+        # sys.modules cache must be cleared so the next import re-runs
+        # the module-level mkdir + basicConfig with our patched env.
+        sys.modules.pop("stt_handler", None)
+        self._saved_env = {
+            k: os.environ.get(k)
+            for k in ("STT_LOG_FILE", "STT_INBOX_DIR")
+        }
+        self.tmp = tempfile.mkdtemp(prefix="c3-stt-test-")
+        # Use deeply-nested paths to make sure mkdir is recursive
+        # (the fresh-install bug was specifically about the parent dir
+        # not existing — not just the leaf).
+        self.log_path = os.path.join(self.tmp, "deeply", "nested", "logs", "stt.log")
+        self.inbox_path = os.path.join(self.tmp, "deeply", "nested", "inbox")
+        os.environ["STT_LOG_FILE"] = self.log_path
+        os.environ["STT_INBOX_DIR"] = self.inbox_path
+
+    def tearDown(self):
+        sys.modules.pop("stt_handler", None)
+        for k, v in self._saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_import_creates_log_and_inbox_dirs(self):
+        # Sanity: neither dir exists yet.
+        self.assertFalse(os.path.isdir(os.path.dirname(self.log_path)))
+        self.assertFalse(os.path.isdir(self.inbox_path))
+        # Import must succeed (no FileNotFoundError) AND the dirs must
+        # have been created during module load — both halves of the fix.
+        load_handler()
+        self.assertTrue(
+            os.path.isdir(os.path.dirname(self.log_path)),
+            "LOG_FILE parent dir should be mkdir'd at import time",
+        )
+        self.assertTrue(
+            os.path.isdir(self.inbox_path),
+            "INBOX_DIR should be mkdir'd at import time",
+        )
 
 
 if __name__ == "__main__":

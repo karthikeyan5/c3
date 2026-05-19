@@ -7,6 +7,8 @@
 //	c3-broker release CWD — drop the claim on a route bound to CWD
 //	c3-broker reload-config — re-read mappings.json without dropping live claims (running broker only)
 //	c3-broker install-codex-shim — install Codex launcher symlinks
+//	c3-broker install-claude-shim — install Claude Code launcher wrapper
+//	c3-broker uninstall-claude-shim — remove the installed Claude Code wrapper
 //
 // Singleton-per-machine via flock on $XDG_RUNTIME_DIR/c3-broker.pid (or
 // fallback). Spawned by adapters via exec.Command + setsid; runs until its
@@ -89,6 +91,36 @@ func main() {
 				os.Exit(exitConfig)
 			}
 			return
+		case "pair":
+			if err := runPair(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "c3-broker pair: %v\n", err)
+				os.Exit(exitFailure)
+			}
+			return
+		case "ping":
+			if err := runPing(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "c3-broker ping: %v\n", err)
+				os.Exit(exitFailure)
+			}
+			return
+		case "sessions":
+			if err := runSessions(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "c3-broker sessions: %v\n", err)
+				os.Exit(exitFailure)
+			}
+			return
+		case "install-claude-shim":
+			if err := runInstallClaudeShim(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "c3-broker install-claude-shim: %v\n", err)
+				os.Exit(exitConfig)
+			}
+			return
+		case "uninstall-claude-shim":
+			if err := runUninstallClaudeShim(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "c3-broker uninstall-claude-shim: %v\n", err)
+				os.Exit(exitConfig)
+			}
+			return
 		case "--help", "-h", "help":
 			fmt.Print(usage)
 			return
@@ -124,6 +156,25 @@ Usage:
   c3-broker install-codex-shim
                         Symlink the Go Codex launcher into ~/.local/bin and
                         Node-manager bin directories.
+  c3-broker install-claude-shim [--force] [--path PATH]
+                        Install a Claude Code wrapper at PATH (default
+                        ~/.local/bin/claude) that auto-injects
+                        --dangerously-load-development-channels plugin:c3@c3
+                        when the user runs claude. Idempotent — preserves
+                        the flag if already passed.
+  c3-broker uninstall-claude-shim [--force] [--path PATH]
+                        Remove the installed Claude Code wrapper.
+  c3-broker pair [dm|group <chat_id>]
+                        Arm a pairing window on the running broker and print
+                        the generated 4-digit code. Default target is "dm".
+  c3-broker ping        Send a one-shot "this is me" reply to the Telegram
+                        route the calling session currently holds, so the
+                        human reading Telegram can identify which CLI tab
+                        owns the topic. Matches by CWD against live stubs.
+  c3-broker sessions    List every live Claude Code / Codex session the
+                        broker is currently tracking, with its CWD and
+                        attached topic. Marks the calling session if it
+                        can be matched via a parent-PID walk.
   c3-broker --help      This text.
 `
 
@@ -187,6 +238,17 @@ func runDaemon() error {
 		fmt.Fprintln(os.Stderr, "c3-broker: no telegram bot_token in mappings.json — running without inbound transport")
 	}
 
+	// Default-deny posture (TODO #1): if no users are allowlisted yet,
+	// auto-arm DM pairing so the operator can register their account
+	// without manually editing mappings.json. The code is logged to
+	// broker.log and echoed on stderr so the human sees it on a fresh
+	// install. No auto re-arm on TTL expiry — manual /c3:pair after that.
+	if code := br.AutoStartDMPairingIfEmpty(); code != "" {
+		fmt.Fprintf(os.Stderr,
+			"c3-broker: PAIRING — send `%s` to your bot within %v to pair (DM)\n",
+			code, broker.PairTTL)
+	}
+
 	// Capability marker: tells `/c3:reload-config` we support SIGHUP-driven
 	// config reload. Old brokers (pre-2026-05-15) lack this file and the
 	// slash command refuses to fire — sending SIGHUP to a broker without
@@ -195,7 +257,7 @@ func runDaemon() error {
 	// removed at clean shutdown so a stale file from a crashed broker
 	// doesn't falsely advertise capabilities for a future older broker.
 	capsPath := broker.CapsFilePath()
-	if err := os.WriteFile(capsPath, []byte("sighup-reload\n"), 0600); err != nil {
+	if err := os.WriteFile(capsPath, []byte("sighup-reload\npair-mode-start\n"), 0600); err != nil {
 		log.Printf("warn: write caps file %s: %v", capsPath, err)
 	}
 	defer os.Remove(capsPath)

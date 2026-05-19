@@ -289,6 +289,54 @@ don't refuse creating DM or anything; whenever there's an attach and
 there's an ambiguity, just show it as a question. The disambiguation
 happens at attach time, not creation time.
 
+## Multi-session: alive-but-abandoned tabs
+
+**The case.** A `claude --resume <id>` session left open in another
+terminal still holds the route claim on a topic. A new session in a
+third tab tries `/c3:attach <same topic>` and the broker rejects with
+a `force_steal` proposal because the prior holder's PID is still
+alive. The user is confused — they thought they'd closed it.
+
+**Why the broker doesn't auto-detect.** The broker doesn't
+periodically ping each adapter asking "is a human still driving
+you?" — intentional (Karthi 2026-05-18, TODO #19(d) Out of scope).
+Adding heartbeats for an edge case adds plumbing and false-positive
+risk that outweighs the papercut. The PID-liveness check
+(`stubs.go::isPIDAlive`) only releases when the OS process is
+actually gone; an idle-but-alive tab keeps its claim by design.
+
+**Workaround.**
+
+1. In the new session, run `/c3:attach <topic>`; when the broker
+   surfaces the `force_steal` proposal naming the prior holder, accept
+   it. The broker calls `ForceReleaseKey` on the abandoned route
+   before granting the new claim — see
+   `internal/broker/attach.go::tryClaim` (`steal=true` branch).
+2. Alternatively kill the abandoned `claude` PID from another shell.
+   The next inbound to that route triggers fallback / re-route after
+   the broker's PID-liveness defense-in-depth check
+   (`internal/broker/handler.go` conn-drop defer + worker dispatch
+   check).
+3. To identify which terminal currently owns the topic **before
+   evicting**, run `/c3:ping` in each candidate tab. The session that
+   actually holds the claim posts a one-shot identification message
+   (cwd / cli / pid / timestamp) to the Telegram topic; tabs that
+   aren't holders get `not attached` and stay silent. See
+   `plugins/c3/commands/c3-ping.md` for the slash command and
+   `internal/broker/handler.go::handlePingThisSession` for wire
+   semantics.
+
+**Related verifications** (TODO #19(d) covered them as tests so the
+behaviour can't regress silently):
+
+- `internal/broker/handler_test.go::TestConnDrop_ReleasesClaimWhenPIDDead`
+  — closing a conn whose stub's PID is already dead releases the
+  claim.
+- `cmd/c3-claude-adapter/lifecycle_test.go::TestReplayLastAttach_ResendsLastAttachWithReplayFlag`
+  — `--resume` re-attach replays the last `AttachReq` with
+  `Replay=true` so the broker re-grants the claim silently (no spam
+  welcome).
+
 ## Things we've found and fixed (history)
 
 - **2026-05-09 — getUpdates always timing out.** gotgbot's
@@ -308,6 +356,71 @@ happens at attach time, not creation time.
   CLI session. Replaced with `recoverBroker` (exponential backoff, no
   give-up) plus `replayLastAttach` so the route claim is restored
   automatically. See `cmd/c3-claude-adapter/main.go`.
+
+## Codex policy layer rejected attach
+
+**Failure mode (Sakthi's install pilot, 2026-05-16).** Codex was
+configured with `approvals_reviewer = "auto_review"` (or
+`"guardian_subagent"`) in `~/.codex/config.toml`. A fresh `attach`
+tool call from a Codex session was silently classified as an
+"unacceptable risk" (data-export class — bot tokens, chat ids in the
+response) and rejected by Codex's policy layer **before reaching the
+spawned `c3-codex-adapter`**. The agent observed the rejection in the
+Codex UI but didn't relay an actionable next-step to the user. Manual
+retry succeeded only after the tenant admin approved the Telegram
+destination tenant-side.
+
+Note: `C3_CODEX_REMOTE_BRIDGE` and `C3_CODEX_ALLOW_MANUAL_FORWARD`
+are **not** involved. Those env vars gate the WebSocket forwarder to
+the codex-app-server; the policy layer sits well upstream of any C3
+wire.
+
+**How c3 surfaces it (2026-05-19).** The `attach` MCP tool accepts an
+explicit `policy_rejected=true` argument. When the agent observes
+the host's rejection (e.g. tool call comes back with "unacceptable
+risk" / "tool call rejected" in the Codex UI), the agent re-invokes
+`attach(policy_rejected=true, …)`. The broker short-circuits with
+`AttachedMsg.Status = "policy_rejected"` and the adapter formats:
+
+> "Attach rejected by your CLI host's policy layer. The Telegram
+> destination needs tenant-admin approval before this CLI can
+> attach. Ask the tenant admin to approve the destination, then
+> retry attach."
+
+This replaces the prior silent-fail / generic-error mode where the
+user couldn't distinguish "broker isn't configured" from "tenant
+policy blocked the call" from "broker succeeded but delivery
+dropped."
+
+**Why the adapter can't detect it itself.** Investigated 2026-05-19;
+see `docs/plans/2026-05-19-codex-policy-3state.md` (Phase 0).
+`approvals_reviewer` and `mcp_servers.<name>.tools.<tool>.approval_mode`
+live in `~/.codex/config.toml` — host-owned, not exposed via env or
+the MCP initialize handshake to spawned MCP servers. Any per-request
+decision happens upstream of the spawned MCP server; when Codex
+rejects, our adapter never receives the tool call. Only the agent
+(LLM) sees the rejection in its turn output, so the agent is the
+right vector to surface the structured hint.
+
+**How the user resolves:**
+
+1. Tenant admin reviews the request and approves the Telegram
+   destination (chat id + bot token) for the specific Codex tenant /
+   project.
+2. After approval, the agent retries `attach` (this time **without**
+   the `policy_rejected` hint — that hint is only for surfacing the
+   prior failure, not for the retry itself).
+3. If retry still rejects: confirm `approvals_reviewer` in
+   `~/.codex/config.toml` and the per-tool `approval_mode` for
+   `mcp_servers.c3_codex.tools.attach` aren't set to a stricter
+   policy than the approved destination warrants.
+
+**Distinguishing from "no topics configured".** That's a separate
+state (`AttachedMsg.Status = "no_topics_configured"`) — the broker
+has zero channels or destinations registered yet. Fix is
+`c3-broker setup`, not tenant approval. The adapter formatter
+renders both cases with distinguishable user-facing prose so the
+agent can give the user the right next-step.
 
 ## Persistent state files
 

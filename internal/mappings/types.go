@@ -11,6 +11,22 @@ type MappingsFile struct {
 	Codex         *CodexConfig              `json:"codex,omitempty"`
 	Mappings      map[string]Mapping        `json:"mappings"`
 	Plugins       map[string]map[string]any `json:"plugins,omitempty"`
+	Allowlist     *Allowlist                `json:"allowlist,omitempty"`
+}
+
+// Allowlist enforces default-deny inbound traffic. The channel layer drops
+// any inbound that doesn't match either the user_id set (DM-cleared users)
+// or the chat_id set (group-cleared chats). Populated by the pairing flow;
+// see broker.PairingState and the /c3:pair slash command.
+//
+// Per Karthi's 2026-05-18 design:
+//   - DM pairing allowlists the user_id (DM with that user is now cleared).
+//   - Group pairing allowlists the chat_id (the whole group is cleared;
+//     the user_id who happened to type the code is incidental — we trust
+//     the group, not the member).
+type Allowlist struct {
+	Users  []int64 `json:"users,omitempty"`
+	Groups []int64 `json:"groups,omitempty"`
 }
 
 // ChannelConfig holds per-channel state. v1 only uses telegram.

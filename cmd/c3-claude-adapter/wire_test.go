@@ -2,46 +2,107 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/karthikeyan5/c3/internal/c3types"
 	"github.com/karthikeyan5/c3/internal/ipc"
-	"github.com/karthikeyan5/c3/internal/mcp"
 )
+
+// note: io.NopCloserReader/Writer wrappers are defined in testhelpers_test.go
 
 // TestServerInfoName guards the lesson from 2026-05-09: serverInfo.name MUST
 // match the .mcp.json key ("c3") so Claude Code's channel dispatch can route
 // notifications/claude/channel frames from this server. Both reference
 // implementations (~/.claude/plugins/.../fakechat/server.ts:60 and
 // .../telegram/0.0.6/server.ts:371) follow this convention.
+//
+// Post-SDK-migration the assertion is structural — we exercise the same
+// code path that constructs the live MCP server (buildMCPServer) and
+// confirm Implementation.Name + experimental capability declaration.
 func TestServerInfoName(t *testing.T) {
 	if adapterName != "c3" {
 		t.Fatalf("adapterName must be %q to match .mcp.json key; got %q", "c3", adapterName)
 	}
+
+	// buildMCPServer wires Implementation + Capabilities; if either drifts
+	// from what Claude Code expects, channel dispatch silently breaks.
+	// Construct the server and inspect what the SDK will emit on initialize
+	// by exercising in-memory transports end-to-end.
 	a := newAdapter()
-	resp := a.initializeResponse(&mcp.Request{ID: json.RawMessage(`1`)})
-	if resp == nil {
-		t.Fatal("initializeResponse returned nil")
+	srv := a.buildMCPServer()
+	if srv == nil {
+		t.Fatal("buildMCPServer returned nil")
 	}
-	result := resp.Result.(map[string]any)
-	si := result["serverInfo"].(map[string]any)
-	if si["name"] != "c3" {
-		t.Fatalf("serverInfo.name = %v; want %q", si["name"], "c3")
+
+	clientT, serverT := mcp.NewInMemoryTransports()
+	a.notifyTx = newNotifyTransport(serverT)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() { _ = srv.Run(ctx, a.notifyTx) }()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0.0.0"}, nil)
+	sess, err := client.Connect(ctx, clientT, nil)
+	if err != nil {
+		t.Fatalf("client.Connect: %v", err)
 	}
-	caps := result["capabilities"].(map[string]any)
-	exp := caps["experimental"].(map[string]any)
-	if _, ok := exp["claude/channel"]; !ok {
+	defer sess.Close()
+
+	params := sess.InitializeResult()
+	if params == nil {
+		t.Fatal("InitializeResult is nil")
+	}
+	if params.ServerInfo == nil || params.ServerInfo.Name != "c3" {
+		var got string
+		if params.ServerInfo != nil {
+			got = params.ServerInfo.Name
+		}
+		t.Fatalf("serverInfo.name = %q; want %q", got, "c3")
+	}
+	if params.Capabilities == nil || params.Capabilities.Experimental == nil {
+		t.Fatal("capabilities.experimental missing")
+	}
+	if _, ok := params.Capabilities.Experimental["claude/channel"]; !ok {
 		t.Fatal("capabilities.experimental missing claude/channel")
+	}
+	if params.Instructions == "" {
+		t.Fatal("instructions empty in initialize response")
+	}
+
+	// Verify tools/list returns the 8 tools the pre-migration adapter
+	// exposed (attach, detach, topics, reply, react, edit_message,
+	// send_typing, download_attachment) — Claude Code displays tool
+	// presence per-server and a regression here turns a working session
+	// into "tool not found" for every adapter operation.
+	listResult, err := sess.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	wantTools := []string{
+		"attach", "detach", "topics", "reply", "react",
+		"edit_message", "send_typing", "download_attachment",
+	}
+	got := map[string]bool{}
+	for _, tool := range listResult.Tools {
+		got[tool.Name] = true
+	}
+	for _, name := range wantTools {
+		if !got[name] {
+			t.Errorf("tools/list missing %q (got %v)", name, got)
+		}
 	}
 }
 
 // TestHandleInboundEndToEnd drives the full path inside the adapter:
 // receive a serialized OpInbound frame from the (mocked) broker, run
-// handleInbound, and verify the bytes written to the MCP server's "stdout"
-// match the channel-notification shape Claude Code expects.
+// handleInbound, and verify the bytes written to the SDK's stdout match
+// the channel-notification shape Claude Code expects.
 func TestHandleInboundEndToEnd(t *testing.T) {
 	tid := int64(914)
 	in := c3types.Inbound{
@@ -61,11 +122,21 @@ func TestHandleInboundEndToEnd(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 
-	var buf bytes.Buffer
+	// Capture the wire bytes by wrapping an IOTransport with a buffer
+	// writer. Connection.Write goes straight to this buffer.
+	var buf safeBuffer
 	a := newAdapter()
-	a.mcp = mcp.New(strings.NewReader(""), &buf, a)
+	a.notifyTx = newNotifyTransport(&mcp.IOTransport{
+		Reader: nopCloseReader{strings.NewReader("")},
+		Writer: nopCloseWriter{&buf},
+	})
+	// Establish the connection (drives Connect on the wrapped transport
+	// and captures the live Connection inside notifyTx).
+	if _, err := a.notifyTx.Connect(context.Background()); err != nil {
+		t.Fatalf("notifyTx.Connect: %v", err)
+	}
 
-	a.handleInbound(raw)
+	a.handleInbound(context.Background(), raw)
 
 	out := buf.Bytes()
 	t.Logf("WIRE: %s", string(out))
@@ -75,7 +146,7 @@ func TestHandleInboundEndToEnd(t *testing.T) {
 	}
 	var msg map[string]any
 	if err := json.Unmarshal(bytes.TrimRight(out, "\n"), &msg); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+		t.Fatalf("unmarshal: %v\nwire: %s", err, out)
 	}
 	if msg["method"] != "notifications/claude/channel" {
 		t.Errorf("method = %v; want notifications/claude/channel", msg["method"])
@@ -85,26 +156,23 @@ func TestHandleInboundEndToEnd(t *testing.T) {
 		t.Errorf("params.content = %T; want string", params["content"])
 	}
 	meta := params["meta"].(map[string]any)
-	// Per channels-reference.md, meta is Record<string, string>: every value
-	// must be a string. We previously sent chat_id as int (matching the
-	// official Telegram plugin's accidental shape) but the doc spec is
-	// string and Claude Code may silently drop non-conforming meta values.
 	if _, isString := meta["chat_id"].(string); !isString {
 		t.Errorf("meta.chat_id = %T; want string per docs", meta["chat_id"])
 	}
 }
 
-// TestChannelFrameWireBytes exercises buildClaudeChannelFrame + mcp.Server.Notify
-// the same way the live adapter does, captures the bytes written to "stdout",
-// and asserts the wire format byte-by-byte against the shape the official
-// Telegram plugin emits (~/.claude/plugins/.../telegram/0.0.6/server.ts:978).
+// TestChannelFrameWireBytes exercises buildClaudeChannelFrame +
+// notifyTransport.Notify the same way the live adapter does, captures the
+// bytes written to "stdout", and asserts the wire format against the
+// official Telegram plugin's frame shape.
 //
-// Reference frame (golden) — derived from server.ts at line 978-1000:
+// Reference frame (golden) — derived from
+// ~/.claude/plugins/.../telegram/0.0.6/server.ts at line 978-1000:
 //
 //	{"jsonrpc":"2.0","method":"notifications/claude/channel","params":{
 //	  "content":"hi inbound",
 //	  "meta":{
-//	    "chat_id": -1001234567890,
+//	    "chat_id": "-1001234567890",
 //	    "message_thread_id": "914",
 //	    "message_id": "933",
 //	    "user": "alice",
@@ -115,8 +183,8 @@ func TestHandleInboundEndToEnd(t *testing.T) {
 //
 // Map iteration order in Go is randomised so we compare by parsed struct, not
 // raw bytes. But we DO assert: (a) `content` is a string not an array, (b)
-// `chat_id` is a raw int, (c) message_thread_id / message_id / user_id are
-// strings, (d) no spurious fields, (e) one trailing newline (line-framed).
+// meta values are strings (per channels-reference.md), (c) no spurious fields,
+// (d) one trailing newline (line-framed).
 func TestChannelFrameWireBytes(t *testing.T) {
 	tid := int64(914)
 	in := &c3types.Inbound{
@@ -132,10 +200,16 @@ func TestChannelFrameWireBytes(t *testing.T) {
 		Timestamp: time.Date(2026, 5, 9, 9, 17, 55, 0, time.UTC),
 	}
 
-	var buf bytes.Buffer
-	srv := mcp.New(strings.NewReader(""), &buf, nil) // handler nil — we won't Run
+	var buf safeBuffer
+	tx := newNotifyTransport(&mcp.IOTransport{
+		Reader: nopCloseReader{strings.NewReader("")},
+		Writer: nopCloseWriter{&buf},
+	})
+	if _, err := tx.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
 	frame := buildClaudeChannelFrame(in)
-	if err := srv.Notify("notifications/claude/channel", frame); err != nil {
+	if err := tx.Notify(context.Background(), "notifications/claude/channel", frame); err != nil {
 		t.Fatalf("Notify: %v", err)
 	}
 
@@ -166,7 +240,6 @@ func TestChannelFrameWireBytes(t *testing.T) {
 		t.Errorf("method: want notifications/claude/channel, got %q", msg.Method)
 	}
 
-	// content MUST be a plain string per official plugin server.ts:980.
 	content, ok := msg.Params["content"].(string)
 	if !ok {
 		t.Fatalf("params.content: want string, got %T (value: %v)",
@@ -181,8 +254,6 @@ func TestChannelFrameWireBytes(t *testing.T) {
 		t.Fatalf("params.meta: want object, got %T", msg.Params["meta"])
 	}
 
-	// chat_id is a STRING per channels-reference.md (meta is
-	// Record<string, string>). All values must be strings.
 	chatIDStr, ok := meta["chat_id"].(string)
 	if !ok {
 		t.Fatalf("meta.chat_id: want string, got %T (value: %v)",
@@ -192,7 +263,6 @@ func TestChannelFrameWireBytes(t *testing.T) {
 		t.Errorf("meta.chat_id: want %q, got %q", "-1001234567890", chatIDStr)
 	}
 
-	// String fields.
 	for _, k := range []string{"chat_id", "message_thread_id", "message_id", "user", "user_id", "ts"} {
 		v, ok := meta[k]
 		if !ok {
@@ -204,7 +274,6 @@ func TestChannelFrameWireBytes(t *testing.T) {
 		}
 	}
 
-	// Spot-check values.
 	if meta["message_thread_id"] != "914" {
 		t.Errorf("meta.message_thread_id: want %q, got %v", "914", meta["message_thread_id"])
 	}
@@ -218,8 +287,6 @@ func TestChannelFrameWireBytes(t *testing.T) {
 		t.Errorf("meta.user_id: want %q, got %v", "12345678", meta["user_id"])
 	}
 
-	// Reject any spurious fields the official plugin doesn't send. This is the
-	// most likely cause of silent rejection by Claude Code's MCP receiver.
 	allowed := map[string]bool{
 		"chat_id":             true,
 		"message_thread_id":   true,
@@ -241,5 +308,48 @@ func TestChannelFrameWireBytes(t *testing.T) {
 		if !allowed[k] {
 			t.Errorf("meta.%s: SPURIOUS field — official plugin doesn't send it", k)
 		}
+	}
+}
+
+// ─── 3-state attach formatter tests moved 2026-05-19 ───────────────────────
+//
+// formatAttached was extracted to internal/ipc/format.go as part of the
+// audit-triage extraction (docs/plans/2026-05-19-audit-triage.md).
+// All formatter assertions (3-state Status, proposal-parity, OK + Err
+// fallbacks) live in internal/ipc/format_test.go now — single source of
+// truth for the formatter, single source of truth for its tests. The
+// adapter call-sites just call ipc.FormatAttached / ipc.FormatTopics.
+
+// TestNotifyTransport_DisconnectClearsConn exercises the preventative
+// Disconnect() method documented in notify_transport.go: after a
+// successful Connect+Notify, calling Disconnect must clear the stored
+// Connection so the NEXT Notify returns the "connection not yet
+// established" sentinel error rather than silently writing to a stale
+// reference. Closes report MINOR m2 (2026-05-19).
+func TestNotifyTransport_DisconnectClearsConn(t *testing.T) {
+	var buf safeBuffer
+	tx := newNotifyTransport(&mcp.IOTransport{
+		Reader: nopCloseReader{strings.NewReader("")},
+		Writer: nopCloseWriter{&buf},
+	})
+	if _, err := tx.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	// First Notify works.
+	if err := tx.Notify(context.Background(), "test/method", map[string]string{"k": "v"}); err != nil {
+		t.Fatalf("first Notify: %v", err)
+	}
+
+	// After Disconnect, the wrapper's stored conn is cleared.
+	tx.Disconnect()
+
+	// Subsequent Notify returns the sentinel error (caller must Connect
+	// again before writing).
+	err := tx.Notify(context.Background(), "test/method", map[string]string{"k": "v"})
+	if err == nil {
+		t.Fatal("Notify after Disconnect: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "not yet established") {
+		t.Errorf("Notify after Disconnect: want 'not yet established' sentinel, got %v", err)
 	}
 }

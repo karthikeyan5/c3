@@ -139,6 +139,37 @@ type TopicEntry struct {
 	ClaimedBy *Holder `json:"claimed_by,omitempty"`
 }
 
+// AttachStatus is a typed enum describing the outcome of an attach IPC
+// op. Added 2026-05-19 so calling agents can distinguish "user must
+// configure C3" (no_topics_configured) from "CLI host policy layer
+// rejected the call before it reached the adapter" (policy_rejected)
+// from "success" (ok). Pre-2026-05-19 messages omit the field;
+// consumers treat absence as "interpret OK/Err/Proposal as before."
+//
+// See docs/plans/2026-05-19-codex-policy-3state.md for the full design.
+type AttachStatus string
+
+const (
+	// AttachStatusOK indicates the attach succeeded; topic + welcome flow.
+	AttachStatusOK AttachStatus = "ok"
+
+	// AttachStatusNoTopicsConfigured indicates the broker's mappings has
+	// no channels / DM / topics — the user hasn't run `c3-broker setup`
+	// yet. Emitted by the broker directly.
+	AttachStatusNoTopicsConfigured AttachStatus = "no_topics_configured"
+
+	// AttachStatusPolicyRejected indicates the CLI host's policy layer
+	// rejected the call. ONLY ever set in response to
+	// AttachReq.PolicyRejected — the broker can't detect the underlying
+	// signal (it lives upstream of the adapter in the CLI host). The
+	// Codex adapter exposes a `policy_rejected` tool argument the agent
+	// passes on a re-invoke after observing the rejection in the Codex
+	// UI; the broker then short-circuits and surfaces this status so the
+	// adapter formatter can render an actionable next-step (ask tenant
+	// admin to approve the Telegram destination, then retry).
+	AttachStatusPolicyRejected AttachStatus = "policy_rejected"
+)
+
 // AttachReq is the adapter → broker attach request. Spec §4.4.1.
 //
 // Two ways to specify the target:
@@ -186,6 +217,17 @@ type AttachReq struct {
 	// (spec §4.4.1). Optional; v1 broker doesn't yet validate it but the
 	// field is plumbed for forward-compat.
 	Confirm *Proposal `json:"confirm,omitempty"`
+
+	// PolicyRejected: hint set true by the calling agent on a re-invoke
+	// after observing the CLI host's policy layer reject a prior attach
+	// (e.g. Codex's approvals_reviewer="auto_review" surfacing an
+	// "unacceptable risk rejection"). The broker treats this as a pure
+	// surface-state request: it short-circuits with
+	// AttachStatusPolicyRejected so the adapter formatter can render
+	// the actionable next-step (ask tenant admin to approve the Telegram
+	// destination, then retry). The broker NEVER infers this on its own;
+	// only the agent can observe the upstream rejection.
+	PolicyRejected bool `json:"policy_rejected,omitempty"`
 }
 
 // AttachedMsg is the broker → adapter response.
@@ -200,6 +242,11 @@ type AttachedMsg struct {
 	NeedsConfirmation bool      `json:"needs_confirmation,omitempty"`
 	Proposal          *Proposal `json:"proposal,omitempty"`
 	Err               string    `json:"err,omitempty"`
+
+	// Status disambiguates the outcome. See AttachStatus godoc. Omitted
+	// for backward compat with pre-2026-05-19 consumers that switch on
+	// OK / NeedsConfirmation / Err.
+	Status AttachStatus `json:"status,omitempty"`
 }
 
 // Proposal describes what the broker would do if the agent confirms.
@@ -221,6 +268,108 @@ type Proposal struct {
 	Existing    *TopicEntry `json:"existing,omitempty"`    // populated for use_existing_* / disambiguate_dm
 	Alternative *Proposal   `json:"alternative,omitempty"` // recursion: e.g. "or create new in default group"
 	Holder      *Holder     `json:"holder,omitempty"`      // populated for force_steal
+}
+
+// PairModeStartReq is the adapter → broker request to arm a pairing
+// window. Target is "dm" or "group". For "group", ChatID must be set
+// (the Telegram group's chat_id, typically a -100… supergroup id).
+//
+// On success the broker returns a PairModeReplyMsg carrying the freshly
+// generated 4-digit code and TTL. The CLI displays the code so the
+// human can type it into the bot.
+type PairModeStartReq struct {
+	Op     Op     `json:"op"` // = OpPairModeStart
+	Target string `json:"target"` // "dm" or "group"
+	ChatID int64  `json:"chat_id,omitempty"`
+}
+
+// PairModeReplyMsg is the broker's response to PairModeStartReq.
+type PairModeReplyMsg struct {
+	Op     Op     `json:"op"` // = OpPairModeReply
+	OK     bool   `json:"ok"`
+	Code   string `json:"code,omitempty"`
+	Target string `json:"target,omitempty"` // echoed: "dm" or "group"
+	ChatID int64  `json:"chat_id,omitempty"`
+	TTLSec int    `json:"ttl_sec,omitempty"`
+	Err    string `json:"err,omitempty"`
+}
+
+// PingThisSessionReq is sent by the `c3-broker ping` transient client
+// (slash command `/c3:ping`) to ask the broker to send a one-shot
+// identification message to whichever Telegram route the calling
+// session currently holds. The transient client itself doesn't hold a
+// route — the broker matches by CWD against the adapter stubs to
+// locate the user's actual session.
+//
+// CWD: the calling client's working directory (typically inherited
+// from the user's shell / slash-command invocation). The broker
+// scans live stubs for one whose CWD matches AND whose CurrentRoute
+// is non-nil; that stub's claim is the target of the ping reply.
+type PingThisSessionReq struct {
+	Op  Op     `json:"op"` // = OpPingThisSession
+	CWD string `json:"cwd"`
+}
+
+// PingThisSessionReplyMsg is the broker's response to PingThisSessionReq.
+// On success: OK=true and the broker has already dispatched a one-shot
+// reply to the matched route via the channel's SendReply. On failure
+// (no matching attached stub, channel send error, etc.): OK=false and
+// Err carries the cause for the CLI to surface.
+type PingThisSessionReplyMsg struct {
+	Op       Op     `json:"op"` // = OpPingThisSessionReply
+	OK       bool   `json:"ok"`
+	Channel  string `json:"channel,omitempty"`
+	Topic    string `json:"topic,omitempty"`     // human label ("dm", "<name>", "topic-<id>")
+	SentText string `json:"sent_text,omitempty"` // text the broker actually sent
+	Err      string `json:"err,omitempty"`
+}
+
+// ListSessionsReq is sent by the `c3-broker sessions` transient client
+// (slash command `/c3:sessions`) to fetch a snapshot of every live
+// adapter the broker is currently tracking. The CLI passes its
+// best-effort guess at the calling CLI session's PID (walked up the
+// PPID chain from the slash command's shell-out) so the broker can
+// tag the matching stub with IsThisSession=true; if the walk fails
+// (non-Linux / missing /proc / parents already exited) PID==0 and
+// no entry will be flagged.
+//
+// CWD: the calling client's working directory. Plumbed but not
+// currently consumed by the broker — included for parity with the
+// other transient-client requests and for future
+// "match by cwd when PID walk fails" extensions.
+//
+// TODO #19(e) — Karthi 2026-05-19.
+type ListSessionsReq struct {
+	Op  Op     `json:"op"` // = OpListSessions
+	PID int    `json:"pid,omitempty"`
+	CWD string `json:"cwd,omitempty"`
+}
+
+// ListSessionsReplyMsg is the broker's response to ListSessionsReq.
+// Sessions is ordered descending by ConnID (most-recently-registered
+// first). The transient client stub itself (CLI=="c3-broker-cli") is
+// filtered out — we never want to list ourselves.
+type ListSessionsReplyMsg struct {
+	Op       Op             `json:"op"` // = OpListSessionsReply
+	Sessions []SessionEntry `json:"sessions"`
+}
+
+// SessionEntry is one row of ListSessionsReplyMsg.Sessions. Mirrors
+// what the user would see in the rendered table.
+type SessionEntry struct {
+	CLI    string `json:"cli"`
+	PID    int    `json:"pid"`
+	CWD    string `json:"cwd"`
+	ConnID uint64 `json:"conn_id"`
+	// AttachedTo is the human-formatted topic label — "<name> (<group>)"
+	// for a regular topic, "dm" for a DM route, "topic-<id>" when the
+	// route refers to an unknown topic id, or "" when the stub has no
+	// current route claim.
+	AttachedTo string `json:"attached_to,omitempty"`
+	// IsThisSession is true when the stub's PID matches the calling
+	// client's PPID-walk seed — i.e. the user pressed enter on
+	// `/c3:sessions` from THIS terminal.
+	IsThisSession bool `json:"is_this_session,omitempty"`
 }
 
 // ErrorMsg is sent by either side on an unrecoverable error.

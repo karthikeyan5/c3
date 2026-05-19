@@ -197,7 +197,9 @@ func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inboun
 				// message has no caption. Without this, the adapter falls
 				// back to a silent "(voice message)" placeholder. Marker
 				// shape matches sttFailureMarker() in plugins/builtins/stt.
-				in.Text = w.sttPrefix(in.Channel) + "[STT FAILED: no_transcript_plugin]"
+				// 2026-05-18 (#13): append broker log path so a fresh
+				// install user knows where the actual traceback lives.
+				in.Text = w.sttPrefix(in.Channel) + "[STT FAILED: no_transcript_plugin — see " + LogPath() + "]"
 			}
 		}
 	}

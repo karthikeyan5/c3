@@ -35,6 +35,7 @@ type Broker struct {
 	Workers   *WorkerPool
 	Fallbacks *fallbackTracker
 	Plugins   *PluginHost
+	Pairing   *pairingState
 
 	mappings   atomic.Pointer[mappings.MappingsFile]
 	mutationMu sync.Mutex
@@ -55,6 +56,7 @@ func New(mf *mappings.MappingsFile) *Broker {
 		Stubs:     NewStubRegistry(),
 		Routes:    NewRoutes(),
 		Fallbacks: newFallbackTracker(defaultFallbackCooldown),
+		Pairing:   newPairingState(),
 		ctx:       ctx,
 		cancel:    cancel,
 		channels:  map[string]*channelRegistration{},

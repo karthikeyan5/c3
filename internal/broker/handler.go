@@ -3,10 +3,16 @@ package broker
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
+	"sort"
+	"strings"
+	"time"
 
+	"github.com/karthikeyan5/c3/internal/c3types"
 	"github.com/karthikeyan5/c3/internal/ipc"
 )
 
@@ -113,6 +119,12 @@ func (b *Broker) HandleConn(nc net.Conn) {
 			stub.SetRoute(nil)
 		case ipc.OpToolCall:
 			b.handleToolCall(conn, stub, raw)
+		case ipc.OpPairModeStart:
+			b.handlePairModeStart(conn, raw)
+		case ipc.OpPingThisSession:
+			b.handlePingThisSession(conn, raw)
+		case ipc.OpListSessions:
+			b.handleListSessions(conn, raw)
 		case ipc.OpBye:
 			return
 		default:
@@ -210,6 +222,256 @@ func (b *Broker) handleListClaims(conn *ipc.Conn) {
 		resp.Claims = append(resp.Claims, entry)
 	}
 	_ = conn.WriteJSON(resp)
+}
+
+// handlePairModeStart arms a pairing window and returns the generated
+// 4-digit code so the CLI can display it. Idempotent in the sense that
+// re-arming the same surface generates a NEW code and extends the TTL —
+// users running /c3:pair twice get fresh codes, no leftover stale ones.
+func (b *Broker) handlePairModeStart(conn *ipc.Conn, raw []byte) {
+	var req ipc.PairModeStartReq
+	if err := json.Unmarshal(raw, &req); err != nil {
+		_ = conn.WriteJSON(ipc.PairModeReplyMsg{
+			Op: ipc.OpPairModeReply, OK: false,
+			Err: "malformed pair_mode_start: " + err.Error(),
+		})
+		return
+	}
+	resp := ipc.PairModeReplyMsg{Op: ipc.OpPairModeReply, Target: req.Target, ChatID: req.ChatID}
+	switch req.Target {
+	case "dm":
+		code, err := b.Pairing.StartDM()
+		if err != nil {
+			resp.Err = err.Error()
+			_ = conn.WriteJSON(resp)
+			return
+		}
+		resp.OK = true
+		resp.Code = code
+		resp.TTLSec = int(PairTTL.Seconds())
+		log.Printf("pairing: DM ARMED via IPC — code=%s ttl=%v", code, PairTTL)
+	case "group":
+		if req.ChatID == 0 {
+			resp.Err = "group pair requires chat_id"
+			_ = conn.WriteJSON(resp)
+			return
+		}
+		code, err := b.Pairing.StartGroup(req.ChatID)
+		if err != nil {
+			resp.Err = err.Error()
+			_ = conn.WriteJSON(resp)
+			return
+		}
+		resp.OK = true
+		resp.Code = code
+		resp.TTLSec = int(PairTTL.Seconds())
+		log.Printf("pairing: group ARMED via IPC — chat=%d code=%s ttl=%v", req.ChatID, code, PairTTL)
+	default:
+		resp.Err = "target must be \"dm\" or \"group\""
+	}
+	_ = conn.WriteJSON(resp)
+}
+
+// handlePingThisSession dispatches a one-shot "this is me" reply on
+// behalf of the slash command `/c3:ping` (TODO #19(b)). The calling
+// client is the transient `c3-broker ping` subcommand, NOT the user's
+// adapter — so we match the user's actual session by CWD against the
+// live stub registry. The matched stub's claimed route is the target.
+//
+// Synchronous on the channel send so the slash command can surface
+// failures (channel down, send error). Ping is rare; latency is fine.
+func (b *Broker) handlePingThisSession(conn *ipc.Conn, raw []byte) {
+	var req ipc.PingThisSessionReq
+	if err := json.Unmarshal(raw, &req); err != nil {
+		_ = conn.WriteJSON(ipc.PingThisSessionReplyMsg{
+			Op: ipc.OpPingThisSessionReply, OK: false,
+			Err: "malformed ping_this_session: " + err.Error(),
+		})
+		return
+	}
+
+	// Find the attached user session by CWD. Skip the transient client
+	// itself by requiring CurrentRoute != nil; the c3-broker-cli stub
+	// never attaches.
+	//
+	// Determinism: when >1 stub matches (rare — two adapters in the same
+	// project directory both attached), pick the one with the highest
+	// ConnID. The registry mints monotonic ConnIDs via atomic.Uint64, so
+	// "highest" == "most recently registered" == "the session the user
+	// most likely meant" when they fired the ping from that cwd. Map-
+	// iteration order over Stubs.Snapshot() would otherwise make the
+	// target nondeterministic. Closes report MINOR m1 (2026-05-19).
+	var target *Stub
+	candidateCount := 0
+	for _, s := range b.Stubs.Snapshot() {
+		if s.CWD != req.CWD {
+			continue
+		}
+		if s.CurrentRoute() == nil {
+			continue
+		}
+		candidateCount++
+		if target == nil || s.ConnID > target.ConnID {
+			target = s
+		}
+	}
+	if candidateCount > 1 && target != nil {
+		log.Printf("ping: multiple stubs at cwd=%q; targeting most recent (PID %d, conn=%d)",
+			req.CWD, target.PID, target.ConnID)
+	}
+	if target == nil {
+		_ = conn.WriteJSON(ipc.PingThisSessionReplyMsg{
+			Op: ipc.OpPingThisSessionReply, OK: false,
+			Err: "not attached; use /c3:attach first",
+		})
+		return
+	}
+
+	key := target.CurrentRoute()
+	ch, err := b.Channel(key.Channel)
+	if err != nil {
+		_ = conn.WriteJSON(ipc.PingThisSessionReplyMsg{
+			Op: ipc.OpPingThisSessionReply, OK: false,
+			Err: fmt.Sprintf("channel lookup: %v", err),
+		})
+		return
+	}
+
+	label := pingTopicLabel(b, *key)
+	text := pingText(target, label)
+	var topicID *int64
+	if key.HasTopic {
+		t := key.TopicID
+		topicID = &t
+	}
+	if _, err := ch.SendReply(c3types.ReplyArgs{
+		Channel: key.Channel,
+		ChatID:  key.ChatID,
+		TopicID: topicID,
+		Text:    text,
+	}); err != nil {
+		log.Printf("ping: send failed for %s: %v", routeKeyStr(*key), err)
+		_ = conn.WriteJSON(ipc.PingThisSessionReplyMsg{
+			Op: ipc.OpPingThisSessionReply, OK: false,
+			Err: fmt.Sprintf("send: %v", err),
+		})
+		return
+	}
+	log.Printf("ping: sent for %s cli=%s cwd=%q", routeKeyStr(*key), target.CLI, target.CWD)
+	_ = conn.WriteJSON(ipc.PingThisSessionReplyMsg{
+		Op: ipc.OpPingThisSessionReply, OK: true,
+		Channel: key.Channel, Topic: label, SentText: text,
+	})
+}
+
+// pingTopicLabel returns the human label for a route key — "dm" for
+// non-topic routes, the topic's mapped name when known, else a
+// "topic-<id>" fallback so we never surface a bare integer.
+func pingTopicLabel(b *Broker, key RouteKey) string {
+	if !key.HasTopic {
+		return "dm"
+	}
+	if tp, ok := b.Mappings().LookupTopicByID(key.Channel, key.ChatID, key.TopicID); ok && tp.Name != "" {
+		return tp.Name
+	}
+	return fmt.Sprintf("topic-%d", key.TopicID)
+}
+
+// pingText renders the one-shot identification message. Same
+// home-shorten + cli-fallback conventions as welcomeText so the two
+// messages look like siblings in the Telegram view.
+func pingText(stub *Stub, label string) string {
+	cwd := stub.CWD
+	if home, err := os.UserHomeDir(); err == nil && home != "" && strings.HasPrefix(cwd, home) {
+		cwd = "~" + cwd[len(home):]
+	}
+	cli := stub.CLI
+	if cli == "" {
+		cli = "cli"
+	}
+	ts := time.Now().UTC().Format(time.RFC3339)
+	if cwd == "" {
+		return fmt.Sprintf("📍 c3-ping — %s attached to **%s** · pid %d · %s", cli, label, stub.PID, ts)
+	}
+	return fmt.Sprintf("📍 c3-ping\n📁 `%s`\n🤖 `%s` → **%s**\nPID %d · %s", cwd, cli, label, stub.PID, ts)
+}
+
+// handleListSessions returns a snapshot of every live adapter stub
+// for the `/c3:sessions` slash command (TODO #19e, 2026-05-19). The
+// transient client itself — CLI=="c3-broker-cli", set by dialBroker —
+// is filtered out so the caller doesn't see itself listed. Entries
+// are ordered descending by ConnID (most-recently-registered first)
+// so the listing is deterministic regardless of map-iteration order.
+//
+// The handler also tags the entry whose PID matches the caller's PID
+// hint (set by the CLI to its best-effort walk up the PPID chain from
+// the slash command's shell-out — see cmd/c3-broker/sessions.go) with
+// IsThisSession=true so the rendered table can mark "you are here".
+func (b *Broker) handleListSessions(conn *ipc.Conn, raw []byte) {
+	var req ipc.ListSessionsReq
+	// Tolerate empty body: PID and CWD are both optional hints.
+	_ = json.Unmarshal(raw, &req)
+
+	snap := b.Stubs.Snapshot()
+	entries := make([]ipc.SessionEntry, 0, len(snap))
+	for _, s := range snap {
+		// The transient sessions/topics/status/pair CLI connections
+		// all hello as "c3-broker-cli" (see cmd/c3-broker/client.go::
+		// dialBroker). We never want to list those — including the
+		// /c3:sessions invocation itself, which is exactly such a
+		// transient.
+		if s.CLI == "c3-broker-cli" {
+			continue
+		}
+		cli := s.CLI
+		if cli == "" {
+			// Defensive: an adapter that sent a blank CLI string would
+			// otherwise render as a blank table column. Normalize to
+			// "?" so the column always has SOMETHING.
+			cli = "?"
+		}
+		e := ipc.SessionEntry{
+			CLI:    cli,
+			PID:    s.PID,
+			CWD:    s.CWD,
+			ConnID: s.ConnID,
+		}
+		if rk := s.CurrentRoute(); rk != nil {
+			e.AttachedTo = sessionTopicLabel(b, *rk)
+		}
+		if req.PID != 0 && req.PID == s.PID {
+			e.IsThisSession = true
+		}
+		entries = append(entries, e)
+	}
+	// Most-recent first.
+	sort.SliceStable(entries, func(i, j int) bool {
+		return entries[i].ConnID > entries[j].ConnID
+	})
+	_ = conn.WriteJSON(ipc.ListSessionsReplyMsg{
+		Op:       ipc.OpListSessionsReply,
+		Sessions: entries,
+	})
+}
+
+// sessionTopicLabel formats the AttachedTo cell for /c3:sessions.
+// Same conventions as pingTopicLabel for the "dm" / "topic-<id>"
+// fallbacks; adds a "(group)" suffix when the topic has a non-empty
+// Group set in mappings — so the user-visible cell looks like
+// `c3 (main)` instead of just `c3`. Keeps pingTopicLabel unchanged
+// (its consumer doesn't want the group qualifier).
+func sessionTopicLabel(b *Broker, key RouteKey) string {
+	if !key.HasTopic {
+		return "dm"
+	}
+	tp, ok := b.Mappings().LookupTopicByID(key.Channel, key.ChatID, key.TopicID)
+	if !ok || tp.Name == "" {
+		return fmt.Sprintf("topic-%d", key.TopicID)
+	}
+	if tp.Group != "" {
+		return fmt.Sprintf("%s (%s)", tp.Name, tp.Group)
+	}
+	return tp.Name
 }
 
 func ptrI64Val(v int64) *int64 { return &v }

@@ -42,6 +42,24 @@ func (b *Broker) handleAttach(conn *ipc.Conn, stub *Stub, raw []byte) {
 		return
 	}
 
+	// Policy-rejected hint: the CLI host's policy layer rejected the
+	// prior attach (e.g. Codex approvals_reviewer="auto_review"
+	// surfacing an "unacceptable risk rejection"). The adapter is
+	// re-invoking with this hint so we surface a clean structured
+	// status — no claim, no validate, no topic registration, no
+	// channel resolution. The broker can't detect the underlying
+	// rejection itself (it lives upstream of the adapter in the CLI
+	// host); the hint is the agent's observation passed through.
+	// See docs/plans/2026-05-19-codex-policy-3state.md.
+	if req.PolicyRejected {
+		_ = conn.WriteJSON(ipc.AttachedMsg{
+			Op: ipc.OpAttached, OK: false,
+			Status: ipc.AttachStatusPolicyRejected,
+			Err:    "CLI host policy layer rejected attach; tenant admin must approve the Telegram destination before retry",
+		})
+		return
+	}
+
 	chanName := req.Channel
 	if chanName == "" {
 		chanName = b.defaultChannel()
@@ -49,7 +67,8 @@ func (b *Broker) handleAttach(conn *ipc.Conn, stub *Stub, raw []byte) {
 	if chanName == "" {
 		_ = conn.WriteJSON(ipc.AttachedMsg{
 			Op: ipc.OpAttached, OK: false,
-			Err: "no channel registered; configure mappings.json:channels.<name>",
+			Status: ipc.AttachStatusNoTopicsConfigured,
+			Err:    "no channel registered; configure mappings.json:channels.<name>",
 		})
 		return
 	}
@@ -138,10 +157,23 @@ func applyExprToAttachReq(req *ipc.AttachReq) {
 // using the explicit form the user chose.
 func (b *Broker) attachDM(conn *ipc.Conn, stub *Stub, chanName string, steal, replay bool) {
 	cc, ok := b.Mappings().Channels[chanName]
-	if !ok || cc.DMChatID == 0 {
+	if !ok {
 		_ = conn.WriteJSON(ipc.AttachedMsg{
 			Op: ipc.OpAttached, OK: false,
-			Err: fmt.Sprintf("attach dm: channels.%s.dm_chat_id not set in mappings.json", chanName),
+			Status: ipc.AttachStatusNoTopicsConfigured,
+			Err:    fmt.Sprintf("attach: channel %q not in mappings.json", chanName),
+		})
+		return
+	}
+	if cc.DMChatID == 0 {
+		// DM destination unconfigured. Whether topics exist or not, the
+		// user has a partial-config gap; surface the structured status so
+		// the formatter renders the actionable "run `c3-broker setup`"
+		// message instead of the generic Err string.
+		_ = conn.WriteJSON(ipc.AttachedMsg{
+			Op: ipc.OpAttached, OK: false,
+			Status: ipc.AttachStatusNoTopicsConfigured,
+			Err:    fmt.Sprintf("attach dm: channels.%s.dm_chat_id not set in mappings.json", chanName),
 		})
 		return
 	}
@@ -179,6 +211,7 @@ func (b *Broker) attachDM(conn *ipc.Conn, stub *Stub, chanName string, steal, re
 	_ = conn.WriteJSON(ipc.AttachedMsg{
 		Op:      ipc.OpAttached,
 		OK:      true,
+		Status:  ipc.AttachStatusOK,
 		Channel: chanName,
 		ChatID:  cc.DMChatID,
 		Name:    "dm",
@@ -242,6 +275,7 @@ func (b *Broker) attachByTopicID(conn *ipc.Conn, stub *Stub, chanName string, to
 	_ = conn.WriteJSON(ipc.AttachedMsg{
 		Op:      ipc.OpAttached,
 		OK:      true,
+		Status:  ipc.AttachStatusOK,
 		Channel: chanName,
 		ChatID:  gCfg.ChatID,
 		TopicID: &tid,
@@ -296,6 +330,7 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 				b.persistMapping(stub, chanName, m.ChatID, m.TopicID, m.Name, m.Group)
 				_ = conn.WriteJSON(ipc.AttachedMsg{
 					Op: ipc.OpAttached, OK: true,
+					Status:  ipc.AttachStatusOK,
 					Channel: chanName, ChatID: m.ChatID, TopicID: tidPtr,
 					Name: m.Name, Group: m.Group,
 				})
@@ -334,6 +369,7 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 		b.persistMapping(stub, chanName, tp.ChatID, tp.TopicID, tp.Name, tp.Group)
 		_ = conn.WriteJSON(ipc.AttachedMsg{
 			Op: ipc.OpAttached, OK: true,
+			Status:  ipc.AttachStatusOK,
 			Channel: chanName, ChatID: tp.ChatID, TopicID: &tid,
 			Name: tp.Name, Group: tp.Group,
 		})
@@ -415,6 +451,7 @@ func (b *Broker) createAndClaim(conn *ipc.Conn, stub *Stub, chanName, gName stri
 
 	_ = conn.WriteJSON(ipc.AttachedMsg{
 		Op: ipc.OpAttached, OK: true,
+		Status:  ipc.AttachStatusOK,
 		Channel: chanName, ChatID: chatID, TopicID: &tid,
 		Name: name, Group: gName,
 	})

@@ -8,16 +8,28 @@
 //     tools/list, tools/call, ping, notifications/initialized).
 //  2. On the broker socket: connect, send hello, listen for inbound /
 //     tool_result / topics_list frames asynchronously.
-//  3. For tools/call: route adapter-local tools (`attach`, `topics`)
+//  3. For tools/call: route adapter-local tools (`attach`, `topics`, etc.)
 //     directly; forward all other tools to the broker as ipc.OpToolCall and
 //     return the result.
 //  4. For broker-side ipc.OpInbound frames: emit `notifications/claude/channel`
-//     manually framed JSON-RPC over the same stdout the MCP server uses
-//     (writer-mutex shared via mcp.Server.Notify).
+//     via the custom notifyTransport (see notify_transport.go) so the
+//     notification ends up on the same stdout the SDK uses, with a single
+//     newline-terminated JSON frame matching the official Telegram plugin's
+//     wire shape (CC's channel-dispatch validator silently drops malformed
+//     frames; the wire shape must be exact).
 //
-// Reconnect-once policy: if the broker socket drops, attempt one reconnect +
-// re-handshake before bubbling errors to in-flight tool callers. This is
-// captured in spec §4.4 "reconnect once" semantics.
+// Reconnect-once policy from spec §4.4 has been upgraded to reconnect-forever
+// with exponential backoff. The original 1-shot policy turned a 30s broker
+// rebuild into a permanently dead adapter that required restarting the CLI
+// session.
+//
+// MCP wire layer: github.com/modelcontextprotocol/go-sdk (v1.6.0+). All
+// hand-rolled JSON-RPC framing has been migrated to the SDK; the only
+// adapter-owned framing is the custom `notifications/claude/channel`
+// notification, which the SDK's typed Notify API doesn't support (it locks
+// outgoing methods to the spec's known set). For that single path we synthesise
+// `*jsonrpc.Request` notifications via notifyTransport.Notify (see
+// notify_transport.go for the rationale and wire-shape guarantees).
 package main
 
 import (
@@ -33,16 +45,18 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/karthikeyan5/c3/internal/broker"
 	"github.com/karthikeyan5/c3/internal/c3types"
 	"github.com/karthikeyan5/c3/internal/ipc"
-	"github.com/karthikeyan5/c3/internal/mcp"
+	"github.com/karthikeyan5/c3/internal/mode"
+	"github.com/karthikeyan5/c3/internal/termtitle"
 )
 
 // idleStartupTimeout bounds how long the adapter waits for Claude Code to
@@ -56,7 +70,6 @@ import (
 const idleStartupTimeout = 60 * time.Second
 
 const (
-	mcpProtocolVersion = "2024-11-05"
 	// adapterName MUST match the .mcp.json key so Claude Code's channel
 	// dispatch recognises this server as the same one it spawned. Reference
 	// implementations (~/.claude/plugins/.../fakechat/server.ts:60,
@@ -100,19 +113,19 @@ func run() error {
 		return fmt.Errorf("hello: %w", err)
 	}
 
-	mcpSrv := mcp.New(os.Stdin, os.Stdout, a)
-	a.mcp = mcpSrv
+	server := a.buildMCPServer()
+	a.notifyTx = newNotifyTransport(&mcp.StdioTransport{})
 
 	go a.brokerReader(ctx)
 	go a.idleStartupWatchdog(ctx, cancel)
 
-	err := mcpSrv.Run(ctx)
+	err := server.Run(ctx, a.notifyTx)
 	switch {
 	case err == nil:
 		log.Printf("adapter: exit pid=%d reason=stdin-eof (clean)", os.Getpid())
 		return nil
-	case errors.Is(err, context.Canceled):
-		log.Printf("adapter: exit pid=%d reason=context-canceled (signal or idle-startup) (clean)", os.Getpid())
+	case errors.Is(err, context.Canceled) || errors.Is(err, io.EOF):
+		log.Printf("adapter: exit pid=%d reason=context-canceled-or-eof (signal or idle-startup) (clean)", os.Getpid())
 		return nil
 	default:
 		log.Printf("adapter: exit pid=%d reason=mcp-error err=%v", os.Getpid(), err)
@@ -140,7 +153,7 @@ func installSignalHandlers(cancel context.CancelFunc) {
 // within idleStartupTimeout. This handles the observed `--resume` failure
 // mode where CC spawns an adapter, the adapter completes broker handshake,
 // but CC never sends `initialize` (presumed: CC orphans the spawn during
-// session resume teardown). Without this, the adapter sits in os.Stdin.Read
+// session resume teardown). Without this, the adapter sits reading stdin
 // forever, holding a broker conn, and the user sees the plugin as
 // "disconnected" until they manually `/mcp` reconnect.
 func (a *adapter) idleStartupWatchdog(ctx context.Context, cancel context.CancelFunc) {
@@ -182,7 +195,9 @@ func setupAdapterLog() (string, error) {
 }
 
 type adapter struct {
-	mcp *mcp.Server
+	// notifyTx wraps the stdio transport to permit emitting custom
+	// `notifications/claude/channel` frames. Set in run() before Server.Run.
+	notifyTx *notifyTransport
 
 	// Broker connection state.
 	bmu    sync.Mutex
@@ -207,10 +222,11 @@ type adapter struct {
 	// notifications/claude/channel frame for live debugging.
 	firstInbound atomic.Bool
 
-	// dispatched is set the first time Dispatch is called — i.e. Claude
-	// Code has sent at least one MCP frame. The idle-startup watchdog
+	// dispatched is set the first time the SDK runs a method handler — i.e.
+	// Claude Code has sent at least one MCP frame. The idle-startup watchdog
 	// uses this to distinguish "live session" from "orphaned spawn that
-	// Claude Code never drove".
+	// Claude Code never drove". The receiving-middleware in buildMCPServer
+	// flips this on first call.
 	dispatched atomic.Bool
 }
 
@@ -286,10 +302,6 @@ func (a *adapter) hello() error {
 // either ctx is canceled or we re-establish a usable connection. After
 // recovery, replays the last successful attach so the route claim is
 // re-established without user intervention.
-//
-// Reconnect-once semantics from spec §4.4 are upgraded to reconnect-forever
-// (with backoff) — the original behavior turned a 30-second broker rebuild
-// into a permanently dead adapter that required restarting the CLI session.
 func (a *adapter) brokerReader(ctx context.Context) {
 	for {
 		conn := a.currentConn()
@@ -314,7 +326,7 @@ func (a *adapter) brokerReader(ctx context.Context) {
 		}
 		switch op {
 		case ipc.OpInbound:
-			a.handleInbound(raw)
+			a.handleInbound(ctx, raw)
 		case ipc.OpToolResult:
 			a.dispatchToolResult(raw)
 		case ipc.OpAttached:
@@ -353,10 +365,6 @@ func (a *adapter) reconnectBroker() error {
 // succeeds, or ctx cancellation aborts the loop (returns false).
 // After a successful reconnect, replays the last successful attach
 // (best-effort) so the route claim is restored.
-//
-// ctx-aware sleep ensures SIGTERM mid-reconnect actually aborts the
-// loop — Go's default time.Sleep would have us stuck in 30s waits
-// long after the user wanted us to exit.
 func (a *adapter) recoverBroker(ctx context.Context) bool {
 	const (
 		base       = 500 * time.Millisecond
@@ -411,9 +419,6 @@ func (a *adapter) replayLastAttach() {
 		return
 	}
 	if conn := a.currentConn(); conn != nil {
-		// Copy and mark as replay so the broker can suppress the
-		// on-attach welcome message — this isn't a user-initiated
-		// attach, it's transparent recovery.
 		replay := *req
 		replay.Replay = true
 		if err := conn.WriteJSON(replay); err != nil {
@@ -448,7 +453,7 @@ func (a *adapter) currentConn() *ipc.Conn {
 //
 // Logging policy: log delivery metadata only (chan / chat / topic / msg /
 // kind / outcome). NEVER content, NEVER sender username. See DEBUGGING.md.
-func (a *adapter) handleInbound(raw []byte) {
+func (a *adapter) handleInbound(ctx context.Context, raw []byte) {
 	var in ipc.InboundMsg
 	if err := json.Unmarshal(raw, &in); err != nil {
 		log.Printf("handleInbound unmarshal: %v", err)
@@ -477,7 +482,7 @@ func (a *adapter) handleInbound(raw []byte) {
 		}
 	}
 
-	if err := a.mcp.Notify("notifications/claude/channel", frame); err != nil {
+	if err := a.notifyTx.Notify(ctx, "notifications/claude/channel", frame); err != nil {
 		log.Printf("notify FAIL chan=%s chat=%d topic=%s msg=%d kind=%s: %v",
 			in.Inbound.Channel, in.Inbound.ChatID, topic, in.Inbound.MessageID, kind, err)
 		return
@@ -496,7 +501,7 @@ func (a *adapter) handleInbound(raw []byte) {
 //   - `content` is a STRING, not an array of MCP-style content blocks. We
 //     had it as the array shape originally and Claude Code dropped every
 //     inbound on the floor (broker logged "delivered", user saw nothing).
-//   - `chat_id` is a raw int64; everything else (ids, sizes) is stringified.
+//   - `chat_id` is stringified (matching channels-reference.md docs).
 //   - `message_thread_id` only present when non-nil; same for the optional
 //     attachment / reply_to fields.
 func buildClaudeChannelFrame(in *c3types.Inbound) map[string]any {
@@ -597,8 +602,6 @@ func (a *adapter) dispatchAttached(raw []byte) {
 	}
 	a.pmu.Unlock()
 	if ok {
-		// Route attached as a fake ToolResultMsg.Result with the raw payload
-		// preserved under "_attached".
 		var attached ipc.AttachedMsg
 		_ = json.Unmarshal(raw, &attached)
 		ch <- ipc.ToolResultMsg{Result: map[string]any{"_attached": attached}}
@@ -619,85 +622,62 @@ func (a *adapter) dispatchTopicsList(raw []byte) {
 	}
 }
 
-// ─── MCP dispatch ───────────────────────────────────────────────────────────
+// ─── MCP server wiring (modelcontextprotocol/go-sdk) ────────────────────────
 
-// Dispatch implements mcp.Handler.
-func (a *adapter) Dispatch(ctx context.Context, req *mcp.Request) *mcp.Response {
-	// Mark the adapter as "driven" — disarms the idle-startup watchdog.
-	a.dispatched.Store(true)
-
-	// Log every method Claude Code sends — diagnosing "channel notification
-	// silently dropped" requires knowing whether Claude Code is invoking some
-	// method we reject. tools/call and tools/list are noisy but useful for
-	// confirming basic flow.
-	if req.Method != "ping" {
-		log.Printf("mcp recv: method=%s id=%s notif=%v", req.Method, string(req.ID), req.IsNotification())
-	}
-	switch req.Method {
-	case "initialize":
-		return a.initializeResponse(req)
-	case "notifications/initialized":
-		return nil
-	case "tools/list":
-		return a.toolsListResponse(req)
-	case "tools/call":
-		return a.toolsCallResponse(ctx, req)
-	case "ping":
-		return &mcp.Response{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{}}
-	default:
-		if req.IsNotification() {
-			log.Printf("mcp recv: UNKNOWN notification method=%s (ignored)", req.Method)
-			return nil
-		}
-		log.Printf("mcp recv: UNKNOWN request method=%s (returning -32601)", req.Method)
-		return &mcp.Response{
-			JSONRPC: "2.0", ID: req.ID,
-			Error: &mcp.Error{Code: -32601, Message: "method not found: " + req.Method},
-		}
-	}
-}
-
-func (a *adapter) initializeResponse(req *mcp.Request) *mcp.Response {
-	instructions := a.buildInstructions()
-	return &mcp.Response{
-		JSONRPC: "2.0", ID: req.ID,
-		Result: map[string]any{
-			"protocolVersion": mcpProtocolVersion,
-			"capabilities": map[string]any{
-				"tools": map[string]any{},
-				"experimental": map[string]any{
-					// Match fakechat (the reference channel impl)
-					// EXACTLY — only claude/channel. We previously also
-					// declared claude/channel/permission to match the
-					// official telegram plugin, but we don't implement
-					// the permission protocol. Declaring an unfulfilled
-					// capability may be why Claude Code silently drops
-					// our channel notifications. fakechat declares ONLY
-					// claude/channel and that's what we're testing.
-					"claude/channel": map[string]any{},
-				},
+// buildMCPServer constructs the SDK-backed MCP server, wires the
+// `instructions` / `experimental.claude/channel` initialize-response
+// fields, registers all 8 tool handlers, and installs a receiving
+// middleware that flips the idle-startup watchdog disarm flag on the
+// first incoming MCP frame.
+//
+// helloAck must be populated before calling — the `instructions` text
+// depends on whether the broker reports no-config / no-mapping / auto-
+// attached state.
+func (a *adapter) buildMCPServer() *mcp.Server {
+	opts := &mcp.ServerOptions{
+		Instructions: a.buildInstructions(),
+		Capabilities: &mcp.ServerCapabilities{
+			Tools: &mcp.ToolCapabilities{ListChanged: false},
+			// Experimental.claude/channel matches the fakechat reference
+			// (~/.claude/plugins/.../fakechat/server.ts) — and matches
+			// what the hand-rolled MCP server declared pre-migration.
+			// Without it, Claude Code's channel-dispatch validator may
+			// silently drop our `notifications/claude/channel` frames.
+			Experimental: map[string]any{
+				"claude/channel": map[string]any{},
 			},
-			"serverInfo": map[string]any{
-				"name":    adapterName,
-				"version": adapterVersion,
-			},
-			"instructions": instructions,
 		},
 	}
+	srv := mcp.NewServer(&mcp.Implementation{
+		Name:    adapterName,
+		Version: adapterVersion,
+	}, opts)
+
+	// Receiving middleware flips `dispatched` on first frame. This is the
+	// integration point for the idle-startup watchdog: once any MCP frame
+	// arrives, the watchdog is disarmed for the lifetime of the session.
+	// ping/initialize/tools/list/tools/call all flow through here.
+	srv.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			a.dispatched.Store(true)
+			if method != "ping" {
+				log.Printf("mcp recv: method=%s", method)
+			}
+			return next(ctx, method, req)
+		}
+	})
+
+	// Register the 8 tools. Schemas are passed as map[string]any (SDK
+	// accepts any value that JSON-marshals to a valid object schema).
+	a.registerTools(srv)
+	return srv
 }
 
-// modeProtocol is the per-session output-mode contract every agent using
-// c3 must honor. Appended to every adapter MCP-initialize instructions
-// variant so the rule travels with the plugin, not with the user's
-// AGENTS.md. Karthi's standing instruction (2026-05-15): make this part
-// of the plugin contract so any agent using c3 understands the protocol
-// without per-user setup.
-const modeProtocol = "\n\n" +
-	"OUTPUT MODE PROTOCOL (per-session, agent-only state — default CLI mode on every fresh session):\n" +
-	"• CLI mode (DEFAULT): your replies go to the CLI terminal. Telegram is INPUT-ONLY — voice and replies from Telegram arrive as `<channel>` blocks. DO NOT call the `reply` tool to respond unless the user explicitly asks.\n" +
-	"• Telegram mode: your substantive replies go to Telegram via the `reply` tool. Switch when the user says \"switch to Telegram\", \"Telegram mode\", or steps away from the laptop. Switch back to CLI when they say \"switch to CLI\" or return to the terminal.\n" +
-	"• The mode is your responsibility to track — the broker doesn't store it. Always start in CLI mode; honor the user's switch instructions immediately."
-
+// buildInstructions assembles the `instructions` text returned in the MCP
+// initialize response. Composed of (a) a head line that reflects current
+// helloAck state and (b) the shared mode.Combined() suffix (CLI/Telegram
+// mode protocol + multi-part reply protocol). mode.Combined() is the
+// single source of truth shared with the Codex adapter.
 func (a *adapter) buildInstructions() string {
 	var head string
 	switch {
@@ -712,140 +692,150 @@ func (a *adapter) buildInstructions() string {
 	default:
 		head = "C3 connected. Use the `attach` tool to claim a Telegram topic for this session."
 	}
-	return head + modeProtocol
+	return head + mode.Combined()
 }
 
-func (a *adapter) toolsListResponse(req *mcp.Request) *mcp.Response {
-	tools := []map[string]any{
+// registerTools adds all 8 adapter tools to srv. Each tool uses the SDK's
+// raw ToolHandler (json.RawMessage args) so the schemas remain pure
+// map[string]any — no struct-tag reflection. This matches the
+// pre-migration hand-rolled wire shape.
+func (a *adapter) registerTools(srv *mcp.Server) {
+	tools := []struct {
+		tool    *mcp.Tool
+		handler mcp.ToolHandler
+	}{
 		{
-			"name":        "attach",
-			"description": "Attach this session to a Telegram topic. Either pass `expr` (raw user-supplied string the broker parses: empty=cwd-default, 'dm'=DM, '<int>'=topic-id, 'create <name>' or '-y <name>'=create that name, '<other>'=name) OR structured args. `target='dm'` for the user's DM. `name='X'` for a specific name. `topic_id=N` to claim a known thread id. `create=true` to confirm a creation proposal. `steal=true` to displace an existing alive holder (only after user-confirmed force_steal proposal).",
-			"inputSchema": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"expr":     map[string]any{"type": "string"},
-					"target":   map[string]any{"type": "string"},
-					"name":     map[string]any{"type": "string"},
-					"topic_id": map[string]any{"type": "integer"},
-					"group":    map[string]any{"type": "string"},
-					"create":   map[string]any{"type": "boolean"},
-					"steal":    map[string]any{"type": "boolean"},
+			tool: &mcp.Tool{
+				Name:        "attach",
+				Description: "Attach this session to a Telegram topic. Either pass `expr` (raw user-supplied string the broker parses: empty=cwd-default, 'dm'=DM, '<int>'=topic-id, 'create <name>' or '-y <name>'=create that name, '<other>'=name) OR structured args. `target='dm'` for the user's DM. `name='X'` for a specific name. `topic_id=N` to claim a known thread id. `create=true` to confirm a creation proposal. `steal=true` to displace an existing alive holder (only after user-confirmed force_steal proposal).",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"expr":     map[string]any{"type": "string"},
+						"target":   map[string]any{"type": "string"},
+						"name":     map[string]any{"type": "string"},
+						"topic_id": map[string]any{"type": "integer"},
+						"group":    map[string]any{"type": "string"},
+						"create":   map[string]any{"type": "boolean"},
+						"steal":    map[string]any{"type": "boolean"},
+					},
 				},
 			},
+			handler: a.toolAttach,
 		},
 		{
-			"name":        "detach",
-			"description": "Release this session's current Telegram topic claim. After detach, inbound messages on that route fall through to the broker's fallback. No-op if not attached.",
-			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
-		},
-		{
-			"name":        "topics",
-			"description": "List known Telegram topics across all groups, with claim state.",
-			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
-		},
-		{
-			"name":        "reply",
-			"description": "Send a Telegram reply to the currently-attached topic.",
-			"inputSchema": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"text":       map[string]any{"type": "string"},
-					"reply_to":   map[string]any{"type": "integer"},
-					"parse_mode": map[string]any{"type": "string"},
-				},
-				"required": []string{"text"},
+			tool: &mcp.Tool{
+				Name:        "detach",
+				Description: "Release this session's current Telegram topic claim. After detach, inbound messages on that route fall through to the broker's fallback. No-op if not attached.",
+				InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
 			},
+			handler: a.toolDetach,
 		},
 		{
-			"name":        "react",
-			"description": "Set a single-emoji reaction on a Telegram message.",
-			"inputSchema": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"message_id": map[string]any{"type": "integer"},
-					"emoji":      map[string]any{"type": "string"},
-				},
-				"required": []string{"message_id", "emoji"},
+			tool: &mcp.Tool{
+				Name:        "topics",
+				Description: "List known Telegram topics across all groups, with claim state.",
+				InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
 			},
+			handler: a.toolTopics,
 		},
 		{
-			"name":        "edit_message",
-			"description": "Edit a previously-sent Telegram message.",
-			"inputSchema": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"message_id": map[string]any{"type": "integer"},
-					"text":       map[string]any{"type": "string"},
+			tool: &mcp.Tool{
+				Name:        "reply",
+				Description: "Send a Telegram reply to the currently-attached topic.",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"text":       map[string]any{"type": "string"},
+						"reply_to":   map[string]any{"type": "integer"},
+						"parse_mode": map[string]any{"type": "string"},
+					},
+					"required": []string{"text"},
 				},
-				"required": []string{"message_id", "text"},
 			},
+			handler: a.toolForward("reply"),
 		},
 		{
-			"name":        "send_typing",
-			"description": "Send a typing indicator to the attached topic.",
-			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
-		},
-		{
-			"name":        "download_attachment",
-			"description": "Download a Telegram file by file_id; returns the local path.",
-			"inputSchema": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"file_id": map[string]any{"type": "string"},
+			tool: &mcp.Tool{
+				Name:        "react",
+				Description: "Set a single-emoji reaction on a Telegram message.",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"message_id": map[string]any{"type": "integer"},
+						"emoji":      map[string]any{"type": "string"},
+					},
+					"required": []string{"message_id", "emoji"},
 				},
-				"required": []string{"file_id"},
 			},
+			handler: a.toolForward("react"),
+		},
+		{
+			tool: &mcp.Tool{
+				Name:        "edit_message",
+				Description: "Edit a previously-sent Telegram message.",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"message_id": map[string]any{"type": "integer"},
+						"text":       map[string]any{"type": "string"},
+					},
+					"required": []string{"message_id", "text"},
+				},
+			},
+			handler: a.toolForward("edit_message"),
+		},
+		{
+			tool: &mcp.Tool{
+				Name:        "send_typing",
+				Description: "Send a typing indicator to the attached topic.",
+				InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+			},
+			handler: a.toolForward("send_typing"),
+		},
+		{
+			tool: &mcp.Tool{
+				Name:        "download_attachment",
+				Description: "Download a Telegram file by file_id; returns the local path.",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"file_id": map[string]any{"type": "string"},
+					},
+					"required": []string{"file_id"},
+				},
+			},
+			handler: a.toolForward("download_attachment"),
 		},
 	}
-	return &mcp.Response{
-		JSONRPC: "2.0", ID: req.ID,
-		Result: map[string]any{"tools": tools},
+	for _, t := range tools {
+		srv.AddTool(t.tool, t.handler)
 	}
 }
 
-// toolsCallResponse handles MCP tools/call. attach and topics are
-// adapter-local; other tools forward to the broker as ipc.OpToolCall.
-func (a *adapter) toolsCallResponse(ctx context.Context, req *mcp.Request) *mcp.Response {
-	var params struct {
-		Name      string         `json:"name"`
-		Arguments map[string]any `json:"arguments"`
+// decodeArgs unmarshals the raw tool arguments into a generic map.
+// Empty/null arguments are tolerated and yield an empty map.
+func decodeArgs(raw json.RawMessage) (map[string]any, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return map[string]any{}, nil
 	}
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		return errResp(req.ID, -32602, "invalid params: "+err.Error())
+	var args map[string]any
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return nil, err
 	}
-
-	switch params.Name {
-	case "attach":
-		return a.handleAttachLocal(ctx, req, params.Arguments)
-	case "detach":
-		return a.handleDetachLocal(req)
-	case "topics":
-		return a.handleTopicsLocal(ctx, req)
-	default:
-		return a.forwardToBroker(req, params.Name, params.Arguments)
+	if args == nil {
+		args = map[string]any{}
 	}
+	return args, nil
 }
 
-// handleDetachLocal sends OpRelease so the broker frees this stub's
-// claims. Stub.SetRoute(nil) is also performed broker-side. Idempotent
-// (no-op if not attached).
-func (a *adapter) handleDetachLocal(req *mcp.Request) *mcp.Response {
-	conn := a.currentConn()
-	if conn == nil {
-		return errResp(req.ID, -32000, "broker not connected")
+// toolAttach implements the `attach` tool: send AttachReq to the broker
+// and wait for an AttachedMsg. Mirrors the pre-migration handleAttachLocal.
+func (a *adapter) toolAttach(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, err := decodeArgs(req.Params.Arguments)
+	if err != nil {
+		return nil, fmt.Errorf("invalid params: %w", err)
 	}
-	if err := conn.WriteJSON(struct {
-		Op ipc.Op `json:"op"`
-	}{Op: ipc.OpRelease}); err != nil {
-		return errResp(req.ID, -32000, "broker write: "+err.Error())
-	}
-	a.amu.Lock()
-	a.lastAttach = nil
-	a.amu.Unlock()
-	return mcpTextResp(req.ID, "detached")
-}
-
-func (a *adapter) handleAttachLocal(ctx context.Context, req *mcp.Request, args map[string]any) *mcp.Response {
 	cwd, _ := os.Getwd()
 	attachReq := ipc.AttachReq{Op: ipc.OpAttach, CWD: cwd}
 	if v, ok := args["expr"].(string); ok {
@@ -886,161 +876,180 @@ func (a *adapter) handleAttachLocal(ctx context.Context, req *mcp.Request, args 
 		a.pmu.Lock()
 		delete(a.pending, "attached")
 		a.pmu.Unlock()
-		return errResp(req.ID, -32000, "broker reconnecting — retry attach in a moment")
+		return toolErrorResult("broker reconnecting — retry attach in a moment"), nil
 	}
 	if err := conn.WriteJSON(attachReq); err != nil {
 		a.pmu.Lock()
 		delete(a.pending, "attached")
 		a.pmu.Unlock()
-		return errResp(req.ID, -32000, "broker write: "+err.Error())
+		return toolErrorResult("broker write: " + err.Error()), nil
 	}
 
 	select {
 	case <-ctx.Done():
-		return errResp(req.ID, -32000, "canceled")
+		return toolErrorResult("canceled"), nil
 	case res := <-ch:
 		attached, _ := res.Result["_attached"].(ipc.AttachedMsg)
 		if attached.OK {
 			a.rememberAttach(attachReq)
+			// Side-effect surface: write OSC-0 title-bar escape to
+			// stderr so the user's terminal-emulator title reflects
+			// the currently-attached topic. Closes TODO #19(a).
+			// Gated on tty + C3_NO_TERMINAL_TITLE — see
+			// internal/termtitle for the contract. Failure paths
+			// (NeedsConfirmation, Status=no_topics_configured,
+			// Status=policy_rejected, Err-set) never reach this
+			// branch because they leave OK=false.
+			termtitle.EmitAttach(&attached)
 		}
-		return mcpTextResp(req.ID, formatAttached(&attached))
+		return toolTextResult(ipc.FormatAttached(&attached)), nil
 	}
 }
 
-func formatAttached(a *ipc.AttachedMsg) string {
-	if a.OK {
-		s := fmt.Sprintf("attached to %q", a.Name)
-		if a.TopicID != nil {
-			s += fmt.Sprintf(" (chat %d, thread %d)", a.ChatID, *a.TopicID)
-		} else {
-			s += fmt.Sprintf(" (chat %d, DM)", a.ChatID)
-		}
-		return s
+// toolDetach implements the `detach` tool: send OpRelease and forget the
+// last-attach replay.
+func (a *adapter) toolDetach(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	conn := a.currentConn()
+	if conn == nil {
+		return toolErrorResult("broker not connected"), nil
 	}
-	if a.NeedsConfirmation && a.Proposal != nil {
-		switch a.Proposal.Action {
-		case "create":
-			return fmt.Sprintf("No mapping for this directory. I'd create a new topic %q in the %q group. To proceed, call attach(create=true). To use an existing topic instead, call attach(topic_id=<n>).",
-				a.Proposal.Name, a.Proposal.Group)
-		case "use_existing_other_group":
-			alt := ""
-			if a.Proposal.Alternative != nil {
-				alt = fmt.Sprintf(" or attach(create=true, group=%q) to create a new topic in %q",
-					a.Proposal.Alternative.Group, a.Proposal.Alternative.Group)
-			}
-			return fmt.Sprintf("Found topic %q in group %q (thread %d). Reply yes to claim it%s.",
-				a.Proposal.Existing.Name, a.Proposal.Existing.Group, a.Proposal.Existing.TopicID, alt)
-		case "disambiguate_dm":
-			ex := a.Proposal.Existing
-			return fmt.Sprintf("Ambiguous: a topic named %q exists in group %q (thread %d). Did you mean attach to that topic, or to your actual Telegram DM? Confirm by calling attach(topic_id=%d) for the topic, or attach(target=\"dm\", steal=true) for the actual DM.",
-				ex.Name, ex.Group, ex.TopicID, ex.TopicID)
-		case "force_steal":
-			h := a.Proposal.Holder
-			return fmt.Sprintf("Topic %q is currently held by %s pid %d (cwd %q). Re-invoke attach with steal=true to evict that session and take the claim. Only do this if the user explicitly confirms.",
-				a.Proposal.Name, h.CLI, h.PID, h.CWD)
-		}
+	if err := conn.WriteJSON(struct {
+		Op ipc.Op `json:"op"`
+	}{Op: ipc.OpRelease}); err != nil {
+		return toolErrorResult("broker write: " + err.Error()), nil
 	}
-	if a.Err != "" {
-		return "attach failed: " + a.Err
-	}
-	return "attach: unspecified failure"
+	a.amu.Lock()
+	a.lastAttach = nil
+	a.amu.Unlock()
+	// Restore the terminal-emulator's default title — see
+	// EmitAttach call-site comment in toolAttach for context.
+	termtitle.Clear()
+	return toolTextResult("detached"), nil
 }
 
-func (a *adapter) handleTopicsLocal(ctx context.Context, req *mcp.Request) *mcp.Response {
+// toolTopics implements the `topics` tool.
+func (a *adapter) toolTopics(ctx context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ch := make(chan ipc.ToolResultMsg, 1)
 	a.pmu.Lock()
 	a.pending["topics_list"] = ch
 	a.pmu.Unlock()
+
 	conn := a.currentConn()
 	if conn == nil {
 		a.pmu.Lock()
 		delete(a.pending, "topics_list")
 		a.pmu.Unlock()
-		return errResp(req.ID, -32000, "broker reconnecting — retry topics in a moment")
+		return toolErrorResult("broker reconnecting — retry topics in a moment"), nil
 	}
 	if err := conn.WriteJSON(ipc.ListTopicsReq{Op: ipc.OpListTopics}); err != nil {
 		a.pmu.Lock()
 		delete(a.pending, "topics_list")
 		a.pmu.Unlock()
-		return errResp(req.ID, -32000, "broker write: "+err.Error())
+		return toolErrorResult("broker write: " + err.Error()), nil
 	}
 	select {
 	case <-ctx.Done():
-		return errResp(req.ID, -32000, "canceled")
+		return toolErrorResult("canceled"), nil
 	case res := <-ch:
 		list, _ := res.Result["_topics_list"].(ipc.TopicsListMsg)
-		return mcpTextResp(req.ID, formatTopics(&list))
+		return toolTextResult(ipc.FormatTopics(&list)), nil
 	}
 }
 
-func formatTopics(list *ipc.TopicsListMsg) string {
-	if len(list.Topics) == 0 {
-		return "no topics configured."
-	}
-	var lines []string
-	lines = append(lines, "known topics:")
-	for _, t := range list.Topics {
-		state := "free"
-		if t.ClaimedBy != nil {
-			state = fmt.Sprintf("held by %s pid %d", t.ClaimedBy.CLI, t.ClaimedBy.PID)
+// toolForward returns a ToolHandler that forwards the named tool call to
+// the broker via ipc.OpToolCall and surfaces the broker's
+// ipc.OpToolResult to the caller. Used for the broker-side tools
+// (reply / react / edit_message / send_typing / download_attachment).
+func (a *adapter) toolForward(name string) mcp.ToolHandler {
+	return func(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args, err := decodeArgs(req.Params.Arguments)
+		if err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
 		}
-		lines = append(lines, fmt.Sprintf("  • %s/%s (chat %d, thread %d) — %s",
-			t.Group, t.Name, t.ChatID, t.TopicID, state))
-	}
-	return strings.Join(lines, "\n")
-}
-
-// forwardToBroker forwards a tool call as ipc.OpToolCall and waits for the
-// matching ipc.OpToolResult.
-func (a *adapter) forwardToBroker(req *mcp.Request, name string, args map[string]any) *mcp.Response {
-	id := strconv.FormatUint(a.nextID.Add(1), 10)
-	ch := make(chan ipc.ToolResultMsg, 1)
-	a.pmu.Lock()
-	a.pending[id] = ch
-	a.pmu.Unlock()
-
-	tcReq := ipc.ToolCallReq{Op: ipc.OpToolCall, ID: id, Name: name, Args: args}
-	conn := a.currentConn()
-	if conn == nil {
+		id := strconv.FormatUint(a.nextID.Add(1), 10)
+		ch := make(chan ipc.ToolResultMsg, 1)
 		a.pmu.Lock()
-		delete(a.pending, id)
+		a.pending[id] = ch
 		a.pmu.Unlock()
-		return errResp(req.ID, -32000, "broker reconnecting — retry tool call in a moment")
-	}
-	if err := conn.WriteJSON(tcReq); err != nil {
-		a.pmu.Lock()
-		delete(a.pending, id)
-		a.pmu.Unlock()
-		return errResp(req.ID, -32000, "broker write: "+err.Error())
-	}
 
-	select {
-	case <-time.After(120 * time.Second):
-		a.pmu.Lock()
-		delete(a.pending, id)
-		a.pmu.Unlock()
-		return errResp(req.ID, -32000, "tool timeout")
-	case res := <-ch:
-		if res.Error != nil {
-			return errResp(req.ID, res.Error.Code, res.Error.Message)
+		tcReq := ipc.ToolCallReq{Op: ipc.OpToolCall, ID: id, Name: name, Args: args}
+		conn := a.currentConn()
+		if conn == nil {
+			a.pmu.Lock()
+			delete(a.pending, id)
+			a.pmu.Unlock()
+			return toolErrorResult("broker reconnecting — retry tool call in a moment"), nil
 		}
-		return &mcp.Response{JSONRPC: "2.0", ID: req.ID, Result: res.Result}
+		if err := conn.WriteJSON(tcReq); err != nil {
+			a.pmu.Lock()
+			delete(a.pending, id)
+			a.pmu.Unlock()
+			return toolErrorResult("broker write: " + err.Error()), nil
+		}
+
+		select {
+		case <-time.After(120 * time.Second):
+			a.pmu.Lock()
+			delete(a.pending, id)
+			a.pmu.Unlock()
+			return toolErrorResult("tool timeout"), nil
+		case res := <-ch:
+			if res.Error != nil {
+				return toolErrorResult(res.Error.Message), nil
+			}
+			return toolResultFromMap(res.Result), nil
+		}
 	}
 }
 
-func errResp(id json.RawMessage, code int, msg string) *mcp.Response {
-	return &mcp.Response{
-		JSONRPC: "2.0", ID: id,
-		Error: &mcp.Error{Code: code, Message: msg},
+// toolTextResult wraps a string into the standard CallToolResult shape
+// (one TextContent block). IsError stays false.
+func toolTextResult(text string) *mcp.CallToolResult {
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: text}},
 	}
 }
 
-func mcpTextResp(id json.RawMessage, text string) *mcp.Response {
-	return &mcp.Response{
-		JSONRPC: "2.0", ID: id,
-		Result: map[string]any{
-			"content": []map[string]any{{"type": "text", "text": text}},
-		},
+// toolErrorResult wraps an error message as an in-band tool error (IsError
+// true). Per the SDK's guidance, errors that originate inside the tool
+// should be reported as IsError=true in the result, not as protocol-level
+// errors, so the LLM can see and self-correct.
+func toolErrorResult(msg string) *mcp.CallToolResult {
+	return &mcp.CallToolResult{
+		IsError: true,
+		Content: []mcp.Content{&mcp.TextContent{Text: msg}},
 	}
 }
 
+// toolResultFromMap converts a broker-returned result map into a
+// CallToolResult. The broker may return either the standard MCP-style
+// `{"content":[{"type":"text","text":…}]}` shape, in which case we
+// translate it back into SDK content blocks; or a plain object, in which
+// case we emit a single JSON-encoded text block.
+func toolResultFromMap(result map[string]any) *mcp.CallToolResult {
+	if result == nil {
+		return toolTextResult("")
+	}
+	if contentRaw, ok := result["content"]; ok {
+		if items, ok := contentRaw.([]any); ok {
+			var blocks []mcp.Content
+			for _, item := range items {
+				m, ok := item.(map[string]any)
+				if !ok {
+					continue
+				}
+				text, _ := m["text"].(string)
+				blocks = append(blocks, &mcp.TextContent{Text: text})
+			}
+			if len(blocks) > 0 {
+				return &mcp.CallToolResult{Content: blocks}
+			}
+		}
+	}
+	// Fallback: JSON-encode the whole result map.
+	enc, err := json.Marshal(result)
+	if err != nil {
+		return toolErrorResult("marshal result: " + err.Error())
+	}
+	return toolTextResult(string(enc))
+}

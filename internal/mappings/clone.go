@@ -45,6 +45,16 @@ func (mf *MappingsFile) Clone() *MappingsFile {
 			out.Plugins[k] = inner
 		}
 	}
+	if mf.Allowlist != nil {
+		al := Allowlist{}
+		if mf.Allowlist.Users != nil {
+			al.Users = append([]int64(nil), mf.Allowlist.Users...)
+		}
+		if mf.Allowlist.Groups != nil {
+			al.Groups = append([]int64(nil), mf.Allowlist.Groups...)
+		}
+		out.Allowlist = &al
+	}
 	return out
 }
 

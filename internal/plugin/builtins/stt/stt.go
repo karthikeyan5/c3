@@ -86,6 +86,17 @@ func Register(host plugin.Host) error {
 		host.Logf("stt: registered with handler=%s timeout=%ds", cfg.HandlerPath, cfg.Timeout)
 	}
 
+	// TODO #12 (2026-05-16): belt-and-suspenders for the fresh-install STT
+	// crash. The Python handler also mkdir's these on its own at import
+	// time (see plugins/c3/stt/stt-handler.py), but doing it here too means
+	// even if the user is running an older bundled handler, the broker
+	// has already created the default dirs before the first voice arrives.
+	// We only know the *default* paths; if the operator overrides via
+	// STT_INBOX_DIR / STT_LOG_FILE in the handler's env, only the Python
+	// side's mkdir covers those — that's fine, the Python side is
+	// authoritative for handler-side paths.
+	ensureSTTDefaultDirs(host)
+
 	// Resolve telegram channel for the bot token. We need the token because
 	// the POC handler shells out to Telegram's getFile API itself; the channel
 	// owns the only authoritative copy of the token.
@@ -109,8 +120,33 @@ func Register(host plugin.Host) error {
 // fallback so the receiver knows transcription didn't run and can resend.
 // 2026-05-09: "if it's not delivered, you can log it"; equivalent
 // principle for STT failure — surface, don't swallow.
+//
+// 2026-05-18 (#13): include a pointer to the broker log so a fresh-install
+// user knows where the actual traceback lives. The marker keeps the
+// machine-parseable "[STT FAILED: <reason>]" shape and appends a
+// "(see <path>)" hint in human-readable form.
 func sttFailureMarker(reason string) string {
-	return "[STT FAILED: " + reason + "]"
+	return "[STT FAILED: " + reason + " — see " + sttLogHintPath() + "]"
+}
+
+// sttLogHintPath returns the broker log path to surface in the failure
+// marker. Mirrors broker.LogPath() but lives here to avoid the
+// plugin->broker import cycle. Falls back to the documented default if
+// $HOME isn't readable (unlikely; if it happens we'd rather show *a*
+// path than an empty string).
+func sttLogHintPath() string {
+	if env := os.Getenv("C3_LOG_FILE"); env != "" {
+		return env
+	}
+	state := os.Getenv("XDG_STATE_HOME")
+	if state == "" {
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			return "~/.local/state/c3/broker.log"
+		}
+		state = filepath.Join(home, ".local", "state")
+	}
+	return filepath.Join(state, "c3", "broker.log")
 }
 
 func runHandler(ctx context.Context, host plugin.Host, cfg Config, token string, p c3types.VoicePayload) (string, error) {
@@ -186,6 +222,30 @@ func readTelegramToken(host plugin.Host) (string, error) {
 		return "", fmt.Errorf("stt: bot_token is empty in mappings.json:channels.telegram")
 	}
 	return cc.BotToken, nil
+}
+
+// ensureSTTDefaultDirs creates the default handler-side log and inbox
+// directories at broker startup. The Python handler also mkdir's these
+// at import time; this is belt-and-suspenders so a fresh install can't
+// surface the cryptic FileNotFoundError->[STT FAILED: error] failure
+// mode if the user is somehow running an older handler bundle.
+//
+// Failures are logged and swallowed — broker startup must never be
+// blocked by an inability to pre-create a plugin scratch dir.
+func ensureSTTDefaultDirs(host plugin.Host) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		host.Logf("stt: skipping default-dir precreate (no home dir): %v", err)
+		return
+	}
+	for _, d := range []string{
+		filepath.Join(home, ".claude", "channels", "telegram", "inbox"),
+		filepath.Join(home, ".claude", "channels", "telegram"), // for stt-handler.log
+	} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			host.Logf("stt: failed to pre-create %s: %v (handler will retry at import)", d, err)
+		}
+	}
 }
 
 // defaultHandlerPath returns the path to the bundled handler shipped under

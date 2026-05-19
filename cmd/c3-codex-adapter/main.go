@@ -24,6 +24,8 @@
 //	C3_CODEX_CWD                absolute cwd; used for thread/list filtering
 //	C3_CODEX_APP_SERVER_WS      ws://host:port of the Codex app-server
 //	C3_CODEX_ALLOW_MANUAL_FORWARD  debug bypass for split-brain guard
+//
+// MCP wire layer: github.com/modelcontextprotocol/go-sdk (v1.6.0+).
 package main
 
 import (
@@ -31,6 +33,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -43,14 +46,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/karthikeyan5/c3/internal/broker"
 	"github.com/karthikeyan5/c3/internal/c3types"
 	"github.com/karthikeyan5/c3/internal/ipc"
-	"github.com/karthikeyan5/c3/internal/mcp"
+	"github.com/karthikeyan5/c3/internal/mode"
+	"github.com/karthikeyan5/c3/internal/termtitle"
 )
 
 const (
-	mcpProtocolVersion = "2024-11-05"
 	// adapterName MUST match the mcp_servers.<key>.* registration the
 	// launcher writes into Codex's config (cmd/codex/main.go uses
 	// `c3_codex`). Codex's channel/notification dispatch keys on this
@@ -59,6 +64,7 @@ const (
 	// (see cmd/c3-claude-adapter/main.go's same comment).
 	adapterName    = "c3_codex"
 	adapterVersion = "0.1.0"
+
 	inboxCap           = 100             // ring buffer max
 	idleStartupTimeout = 60 * time.Second // mirror cmd/c3-claude-adapter behavior
 )
@@ -90,19 +96,19 @@ func run() error {
 		go a.autoAttach(name)
 	}
 
-	mcpSrv := mcp.New(os.Stdin, os.Stdout, a)
-	a.mcp = mcpSrv
+	srv := a.buildMCPServer()
+	a.transport = newLogNotifyTransport(&mcp.StdioTransport{})
 
 	go a.brokerReader()
 	go a.idleStartupWatchdog(ctx, cancel)
 
-	err := mcpSrv.Run(ctx)
+	err := srv.Run(ctx, a.transport)
 	switch {
 	case err == nil:
 		log.Printf("adapter: exit pid=%d reason=stdin-eof (clean)", os.Getpid())
 		return nil
-	case errors.Is(err, context.Canceled):
-		log.Printf("adapter: exit pid=%d reason=context-canceled (signal or idle-startup) (clean)", os.Getpid())
+	case errors.Is(err, context.Canceled) || errors.Is(err, io.EOF):
+		log.Printf("adapter: exit pid=%d reason=context-canceled-or-eof (signal or idle-startup) (clean)", os.Getpid())
 		return nil
 	default:
 		log.Printf("adapter: exit pid=%d reason=mcp-error err=%v", os.Getpid(), err)
@@ -144,7 +150,10 @@ func (a *adapter) idleStartupWatchdog(ctx context.Context, cancel context.Cancel
 }
 
 type adapter struct {
-	mcp *mcp.Server
+	// transport wraps the stdio transport to expose Notify for the
+	// `notifications/message` log frame the SDK's Log API would normally
+	// emit but with our own shape (no level filtering).
+	transport *logNotifyTransport
 
 	bmu  sync.Mutex
 	conn *ipc.Conn
@@ -159,9 +168,8 @@ type adapter struct {
 
 	helloAck ipc.HelloAckMsg
 
-	// dispatched is set the first time Dispatch is called — i.e. Codex
-	// has sent at least one MCP frame. The idle-startup watchdog uses
-	// this to distinguish "live session" from "orphaned spawn".
+	// dispatched is set the first time the SDK routes a method through the
+	// receiving middleware — i.e. Codex has sent at least one MCP frame.
 	dispatched atomic.Bool
 }
 
@@ -189,11 +197,24 @@ func (a *adapter) connectBroker() error {
 	return fmt.Errorf("could not reach broker at %s after 10s", sockPath)
 }
 
+// spawnBroker forks a `c3-broker` process detached from our process group
+// so it survives our shutdown.
+//
+// Stderr is explicitly NOT inherited from the adapter. Matches the Claude
+// adapter (cmd/c3-claude-adapter/main.go::spawnBroker) verbatim per
+// Karthi's "every flow must work the same in Codex" principle: the
+// adapter's stderr is piped to the host's plugin host; piping broker log
+// lines through that channel can make the host appear distressed (lots
+// of unexplained stderr noise during normal broker bounces). The broker
+// has its own structured log at $XDG_STATE_HOME/c3/broker.log via
+// SetupLogging; the host has no reason to see broker stderr.
+//
+// Closes report MINOR m3 (2026-05-19).
 func spawnBroker() error {
 	cmd := exec.Command("c3-broker")
 	cmd.Stdin = nil
 	cmd.Stdout = nil
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = nil
 	cmd.SysProcAttr = sysSetsid()
 	return cmd.Start()
 }
@@ -248,7 +269,6 @@ func (a *adapter) autoAttach(name string) {
 		log.Printf("auto-attach write failed: %v", err)
 		return
 	}
-	// Drain (the brokerReader routes to this channel via dispatchAttached).
 	select {
 	case <-time.After(15 * time.Second):
 		a.pmu.Lock()
@@ -356,11 +376,13 @@ func (a *adapter) handleInbound(raw []byte) {
 	a.imu.Unlock()
 
 	// Log notification — cheap; future-proofs for Codex native rendering.
-	_ = a.mcp.Notify("notifications/message", map[string]any{
-		"level":  "info",
-		"logger": "c3",
-		"data":   formatLogLine(&msg.Inbound),
-	})
+	if a.transport != nil {
+		_ = a.transport.Notify(context.Background(), "notifications/message", map[string]any{
+			"level":  "info",
+			"logger": "c3",
+			"data":   formatLogLine(&msg.Inbound),
+		})
+	}
 
 	// WS forwarder (gated by env, see split-brain guard).
 	if codexForwardingAllowed() {
@@ -398,11 +420,6 @@ func codexForwardingAllowed() bool {
 // Each inbound opens a fresh short-lived WebSocket (Codex app-server expects
 // new turns this way; long-lived sessions would conflict with the visible
 // TUI's connection).
-//
-// v0.1.0 stub: the WebSocket dance is documented in the spec; concrete
-// implementation is left as a TODO with a warning log so the adapter still
-// compiles and the inbox-poll fallback works. Plan 7-followup will fill this
-// in — see the Python POC's CodexAppServerForwarder for the reference shape.
 func (a *adapter) forwardToCodexAppServer(in *c3types.Inbound) {
 	if err := forwardInboundToCodexAppServer(context.Background(), in, codexForwardConfigFromEnv()); err != nil {
 		fmt.Fprintf(os.Stderr, "c3-codex-adapter: WS forward failed for inbound id=%d: %v\n", in.MessageID, err)
@@ -453,57 +470,34 @@ func (a *adapter) dispatchTopicsList(raw []byte) {
 	}
 }
 
-// ─── MCP dispatch ───────────────────────────────────────────────────────────
+// ─── MCP server wiring (modelcontextprotocol/go-sdk) ────────────────────────
 
-func (a *adapter) Dispatch(ctx context.Context, req *mcp.Request) *mcp.Response {
-	a.dispatched.Store(true) // disarm idle-startup watchdog
-	switch req.Method {
-	case "initialize":
-		return a.initializeResponse(req)
-	case "notifications/initialized":
-		return nil
-	case "tools/list":
-		return a.toolsListResponse(req)
-	case "tools/call":
-		return a.toolsCallResponse(ctx, req)
-	case "ping":
-		return &mcp.Response{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{}}
-	default:
-		if req.IsNotification() {
-			return nil
-		}
-		return &mcp.Response{
-			JSONRPC: "2.0", ID: req.ID,
-			Error: &mcp.Error{Code: -32601, Message: "method not found: " + req.Method},
-		}
-	}
-}
-
-func (a *adapter) initializeResponse(req *mcp.Request) *mcp.Response {
-	return &mcp.Response{
-		JSONRPC: "2.0", ID: req.ID,
-		Result: map[string]any{
-			"protocolVersion": mcpProtocolVersion,
-			"capabilities": map[string]any{
-				"tools":   map[string]any{},
-				"logging": map[string]any{},
-			},
-			"serverInfo": map[string]any{
-				"name":    adapterName,
-				"version": adapterVersion,
-			},
-			"instructions": a.buildInstructions(),
+// buildMCPServer constructs the SDK-backed MCP server with Codex-specific
+// initialize fields, registers all tools, and installs the receiving
+// middleware that disarms the idle-startup watchdog on first frame.
+func (a *adapter) buildMCPServer() *mcp.Server {
+	opts := &mcp.ServerOptions{
+		Instructions: a.buildInstructions(),
+		Capabilities: &mcp.ServerCapabilities{
+			Tools:   &mcp.ToolCapabilities{ListChanged: false},
+			Logging: &mcp.LoggingCapabilities{},
 		},
 	}
-}
+	srv := mcp.NewServer(&mcp.Implementation{
+		Name:    adapterName,
+		Version: adapterVersion,
+	}, opts)
 
-// modeProtocol mirrors the Claude adapter (same rule for any agent
-// using c3 — see cmd/c3-claude-adapter/main.go for rationale).
-const modeProtocol = "\n\n" +
-	"OUTPUT MODE PROTOCOL (per-session, agent-only state — default CLI mode on every fresh session):\n" +
-	"• CLI mode (DEFAULT): your replies go to the CLI terminal. Telegram is INPUT-ONLY — voice and replies from Telegram arrive as buffered inbound. DO NOT call the `reply` tool to respond unless the user explicitly asks.\n" +
-	"• Telegram mode: your substantive replies go to Telegram via the `reply` tool. Switch when the user says \"switch to Telegram\", \"Telegram mode\", or steps away from the laptop. Switch back to CLI when they say \"switch to CLI\" or return to the terminal.\n" +
-	"• The mode is your responsibility to track — the broker doesn't store it. Always start in CLI mode; honor the user's switch instructions immediately."
+	srv.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			a.dispatched.Store(true)
+			return next(ctx, method, req)
+		}
+	})
+
+	a.registerTools(srv)
+	return srv
+}
 
 func (a *adapter) buildInstructions() string {
 	var head string
@@ -519,136 +513,166 @@ func (a *adapter) buildInstructions() string {
 	default:
 		head = "C3 connected. Use `attach` to claim a Telegram topic, `inbox` to drain buffered inbound, `reply` to send. Codex doesn't render unsolicited MCP notifications today; check `inbox` periodically."
 	}
-	return head + modeProtocol
+	return head + mode.Combined()
 }
 
-func (a *adapter) toolsListResponse(req *mcp.Request) *mcp.Response {
-	tools := []map[string]any{
+// registerTools adds all 9 adapter tools to srv (8 user-facing + the
+// `codex_forward` debug tool).
+func (a *adapter) registerTools(srv *mcp.Server) {
+	tools := []struct {
+		tool    *mcp.Tool
+		handler mcp.ToolHandler
+	}{
 		{
-			"name":        "attach",
-			"description": "Attach this Codex session to a Telegram topic. Same proposal-flow semantics as Claude Code's attach.",
-			"inputSchema": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"target":   map[string]any{"type": "string"},
-					"name":     map[string]any{"type": "string"},
-					"topic_id": map[string]any{"type": "integer"},
-					"group":    map[string]any{"type": "string"},
-					"create":   map[string]any{"type": "boolean"},
+			tool: &mcp.Tool{
+				Name:        "attach",
+				Description: "Attach this Codex session to a Telegram topic. Same proposal-flow semantics as Claude Code's attach. If your CLI host's policy layer rejects this call (e.g. Codex approvals_reviewer=auto_review surfacing 'unacceptable risk rejection'), re-invoke with `policy_rejected=true` so the user sees the actionable next-step (tenant admin approval) rather than a silent failure.",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"target":          map[string]any{"type": "string"},
+						"name":            map[string]any{"type": "string"},
+						"topic_id":        map[string]any{"type": "integer"},
+						"group":           map[string]any{"type": "string"},
+						"create":          map[string]any{"type": "boolean"},
+						"steal":           map[string]any{"type": "boolean"},
+						"policy_rejected": map[string]any{"type": "boolean"},
+					},
 				},
 			},
+			handler: a.toolAttach,
 		},
 		{
-			"name":        "topics",
-			"description": "List known Telegram topics + claim state.",
-			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+			tool: &mcp.Tool{
+				Name:        "topics",
+				Description: "List known Telegram topics + claim state.",
+				InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+			},
+			handler: a.toolTopics,
 		},
 		{
-			"name":        "inbox",
-			"description": "Drain buffered inbound Telegram messages. Codex-only fallback path until Codex renders unsolicited MCP notifications natively.",
-			"inputSchema": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
-					"ack":   map[string]any{"type": "boolean", "default": true},
+			tool: &mcp.Tool{
+				Name:        "inbox",
+				Description: "Drain buffered inbound Telegram messages. Codex-only fallback path until Codex renders unsolicited MCP notifications natively.",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+						"ack":   map[string]any{"type": "boolean", "default": true},
+					},
 				},
 			},
+			handler: a.toolInbox,
 		},
 		{
-			"name":        "reply",
-			"description": "Send a Telegram reply to the currently-attached topic.",
-			"inputSchema": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"text":       map[string]any{"type": "string"},
-					"reply_to":   map[string]any{"type": "integer"},
-					"parse_mode": map[string]any{"type": "string"},
+			tool: &mcp.Tool{
+				Name:        "reply",
+				Description: "Send a Telegram reply to the currently-attached topic.",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"text":       map[string]any{"type": "string"},
+						"reply_to":   map[string]any{"type": "integer"},
+						"parse_mode": map[string]any{"type": "string"},
+					},
+					"required": []string{"text"},
 				},
-				"required": []string{"text"},
 			},
+			handler: a.toolForward("reply"),
 		},
 		{
-			"name":        "react",
-			"description": "Set a single-emoji reaction on a Telegram message.",
-			"inputSchema": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"message_id": map[string]any{"type": "integer"},
-					"emoji":      map[string]any{"type": "string"},
+			tool: &mcp.Tool{
+				Name:        "react",
+				Description: "Set a single-emoji reaction on a Telegram message.",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"message_id": map[string]any{"type": "integer"},
+						"emoji":      map[string]any{"type": "string"},
+					},
+					"required": []string{"message_id", "emoji"},
 				},
-				"required": []string{"message_id", "emoji"},
 			},
+			handler: a.toolForward("react"),
 		},
 		{
-			"name":        "edit_message",
-			"description": "Edit a previously-sent Telegram message.",
-			"inputSchema": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"message_id": map[string]any{"type": "integer"},
-					"text":       map[string]any{"type": "string"},
+			tool: &mcp.Tool{
+				Name:        "edit_message",
+				Description: "Edit a previously-sent Telegram message.",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"message_id": map[string]any{"type": "integer"},
+						"text":       map[string]any{"type": "string"},
+					},
+					"required": []string{"message_id", "text"},
 				},
-				"required": []string{"message_id", "text"},
 			},
+			handler: a.toolForward("edit_message"),
 		},
 		{
-			"name":        "send_typing",
-			"description": "Send a typing indicator to the attached topic.",
-			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+			tool: &mcp.Tool{
+				Name:        "send_typing",
+				Description: "Send a typing indicator to the attached topic.",
+				InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+			},
+			handler: a.toolForward("send_typing"),
 		},
 		{
-			"name":        "download_attachment",
-			"description": "Download a Telegram file by file_id; returns the local path.",
-			"inputSchema": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"file_id": map[string]any{"type": "string"},
+			tool: &mcp.Tool{
+				Name:        "download_attachment",
+				Description: "Download a Telegram file by file_id; returns the local path.",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"file_id": map[string]any{"type": "string"},
+					},
+					"required": []string{"file_id"},
 				},
-				"required": []string{"file_id"},
 			},
+			handler: a.toolForward("download_attachment"),
 		},
 		{
-			"name":        "codex_forward",
-			"description": "Debugging/manual override for the Codex app-server WebSocket forwarder. Refused unless C3_CODEX_REMOTE_BRIDGE=1 (set by the codex launcher) or C3_CODEX_ALLOW_MANUAL_FORWARD=1.",
-			"inputSchema": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"app_server_ws": map[string]any{"type": "string"},
-					"thread_id":     map[string]any{"type": "string"},
+			tool: &mcp.Tool{
+				Name:        "codex_forward",
+				Description: "Debugging/manual override for the Codex app-server WebSocket forwarder. Refused unless C3_CODEX_REMOTE_BRIDGE=1 (set by the codex launcher) or C3_CODEX_ALLOW_MANUAL_FORWARD=1.",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"app_server_ws": map[string]any{"type": "string"},
+						"thread_id":     map[string]any{"type": "string"},
+					},
+					"required": []string{"app_server_ws"},
 				},
-				"required": []string{"app_server_ws"},
 			},
+			handler: a.toolCodexForward,
 		},
 	}
-	return &mcp.Response{
-		JSONRPC: "2.0", ID: req.ID,
-		Result: map[string]any{"tools": tools},
+	for _, t := range tools {
+		srv.AddTool(t.tool, t.handler)
 	}
 }
 
-func (a *adapter) toolsCallResponse(ctx context.Context, req *mcp.Request) *mcp.Response {
-	var params struct {
-		Name      string         `json:"name"`
-		Arguments map[string]any `json:"arguments"`
+// decodeArgs unmarshals raw tool arguments into a generic map.
+func decodeArgs(raw json.RawMessage) (map[string]any, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return map[string]any{}, nil
 	}
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		return errResp(req.ID, -32602, "invalid params: "+err.Error())
+	var args map[string]any
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return nil, err
 	}
-	switch params.Name {
-	case "attach":
-		return a.handleAttachLocal(ctx, req, params.Arguments)
-	case "topics":
-		return a.handleTopicsLocal(ctx, req)
-	case "inbox":
-		return a.handleInboxLocal(ctx, req, params.Arguments)
-	case "codex_forward":
-		return a.handleCodexForwardLocal(req, params.Arguments)
-	default:
-		return a.forwardToBroker(req, params.Name, params.Arguments)
+	if args == nil {
+		args = map[string]any{}
 	}
+	return args, nil
 }
 
-func (a *adapter) handleAttachLocal(ctx context.Context, req *mcp.Request, args map[string]any) *mcp.Response {
+func (a *adapter) toolAttach(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, err := decodeArgs(req.Params.Arguments)
+	if err != nil {
+		return nil, fmt.Errorf("invalid params: %w", err)
+	}
 	cwd := os.Getenv("C3_CODEX_CWD")
 	if cwd == "" {
 		cwd, _ = os.Getwd()
@@ -665,6 +689,12 @@ func (a *adapter) handleAttachLocal(ctx context.Context, req *mcp.Request, args 
 	}
 	if v, ok := args["create"].(bool); ok {
 		attachReq.Create = v
+	}
+	if v, ok := args["steal"].(bool); ok {
+		attachReq.Steal = v
+	}
+	if v, ok := args["policy_rejected"].(bool); ok {
+		attachReq.PolicyRejected = v
 	}
 	if v, ok := args["topic_id"]; ok {
 		switch x := v.(type) {
@@ -686,55 +716,31 @@ func (a *adapter) handleAttachLocal(ctx context.Context, req *mcp.Request, args 
 		a.pmu.Lock()
 		delete(a.pending, "attached")
 		a.pmu.Unlock()
-		return errResp(req.ID, -32000, "broker reconnecting — retry attach in a moment")
+		return toolErrorResult("broker reconnecting — retry attach in a moment"), nil
 	}
 	if err := conn.WriteJSON(attachReq); err != nil {
 		a.pmu.Lock()
 		delete(a.pending, "attached")
 		a.pmu.Unlock()
-		return errResp(req.ID, -32000, "broker write: "+err.Error())
+		return toolErrorResult("broker write: " + err.Error()), nil
 	}
 	select {
 	case <-ctx.Done():
-		return errResp(req.ID, -32000, "canceled")
+		return toolErrorResult("canceled"), nil
 	case res := <-ch:
 		attached, _ := res.Result["_attached"].(ipc.AttachedMsg)
-		return mcpTextResp(req.ID, formatAttached(&attached))
+		if attached.OK {
+			// Side-effect surface: OSC-0 title-bar escape to stderr
+			// for the currently-attached topic. Closes TODO #19(a).
+			// Cross-CLI parity with the Claude adapter; same gates
+			// (tty + C3_NO_TERMINAL_TITLE). See internal/termtitle.
+			termtitle.EmitAttach(&attached)
+		}
+		return toolTextResult(ipc.FormatAttached(&attached)), nil
 	}
 }
 
-func formatAttached(a *ipc.AttachedMsg) string {
-	if a.OK {
-		s := fmt.Sprintf("attached to %q", a.Name)
-		if a.TopicID != nil {
-			s += fmt.Sprintf(" (chat %d, thread %d)", a.ChatID, *a.TopicID)
-		} else {
-			s += fmt.Sprintf(" (chat %d, DM)", a.ChatID)
-		}
-		return s
-	}
-	if a.NeedsConfirmation && a.Proposal != nil {
-		switch a.Proposal.Action {
-		case "create":
-			return fmt.Sprintf("No mapping for this directory. I'd create a new topic %q in the %q group. Call attach(create=true) to proceed, or attach(topic_id=<n>) to use an existing topic.",
-				a.Proposal.Name, a.Proposal.Group)
-		case "use_existing_other_group":
-			alt := ""
-			if a.Proposal.Alternative != nil {
-				alt = fmt.Sprintf(" or attach(create=true) to create a new topic in %q",
-					a.Proposal.Alternative.Group)
-			}
-			return fmt.Sprintf("Found %q in group %q (thread %d). Reply yes to claim it%s.",
-				a.Proposal.Existing.Name, a.Proposal.Existing.Group, a.Proposal.Existing.TopicID, alt)
-		}
-	}
-	if a.Err != "" {
-		return "attach failed: " + a.Err
-	}
-	return "attach: unspecified failure"
-}
-
-func (a *adapter) handleTopicsLocal(ctx context.Context, req *mcp.Request) *mcp.Response {
+func (a *adapter) toolTopics(ctx context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	ch := make(chan ipc.ToolResultMsg, 1)
 	a.pmu.Lock()
 	a.pending["topics_list"] = ch
@@ -744,41 +750,28 @@ func (a *adapter) handleTopicsLocal(ctx context.Context, req *mcp.Request) *mcp.
 		a.pmu.Lock()
 		delete(a.pending, "topics_list")
 		a.pmu.Unlock()
-		return errResp(req.ID, -32000, "broker reconnecting — retry topics in a moment")
+		return toolErrorResult("broker reconnecting — retry topics in a moment"), nil
 	}
 	if err := conn.WriteJSON(ipc.ListTopicsReq{Op: ipc.OpListTopics}); err != nil {
 		a.pmu.Lock()
 		delete(a.pending, "topics_list")
 		a.pmu.Unlock()
-		return errResp(req.ID, -32000, "broker write: "+err.Error())
+		return toolErrorResult("broker write: " + err.Error()), nil
 	}
 	select {
 	case <-ctx.Done():
-		return errResp(req.ID, -32000, "canceled")
+		return toolErrorResult("canceled"), nil
 	case res := <-ch:
 		list, _ := res.Result["_topics_list"].(ipc.TopicsListMsg)
-		return mcpTextResp(req.ID, formatTopics(&list))
+		return toolTextResult(ipc.FormatTopics(&list)), nil
 	}
 }
 
-func formatTopics(list *ipc.TopicsListMsg) string {
-	if len(list.Topics) == 0 {
-		return "no topics configured."
+func (a *adapter) toolInbox(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, err := decodeArgs(req.Params.Arguments)
+	if err != nil {
+		return nil, fmt.Errorf("invalid params: %w", err)
 	}
-	var lines []string
-	lines = append(lines, "known topics:")
-	for _, t := range list.Topics {
-		state := "free"
-		if t.ClaimedBy != nil {
-			state = fmt.Sprintf("held by %s pid %d", t.ClaimedBy.CLI, t.ClaimedBy.PID)
-		}
-		lines = append(lines, fmt.Sprintf("  • %s/%s (chat %d, thread %d) — %s",
-			t.Group, t.Name, t.ChatID, t.TopicID, state))
-	}
-	return strings.Join(lines, "\n")
-}
-
-func (a *adapter) handleInboxLocal(_ context.Context, req *mcp.Request, args map[string]any) *mcp.Response {
 	limit := 10
 	if v, ok := args["limit"]; ok {
 		if f, ok := v.(float64); ok {
@@ -800,7 +793,7 @@ func (a *adapter) handleInboxLocal(_ context.Context, req *mcp.Request, args map
 	defer a.imu.Unlock()
 
 	if len(a.inbox) == 0 {
-		return mcpTextResp(req.ID, "c3 inbox is empty")
+		return toolTextResult("c3 inbox is empty"), nil
 	}
 	n := limit
 	if n > len(a.inbox) {
@@ -813,73 +806,106 @@ func (a *adapter) handleInboxLocal(_ context.Context, req *mcp.Request, args map
 	if ack {
 		a.inbox = a.inbox[n:]
 	}
-	return mcpTextResp(req.ID, strings.Join(chunks, "\n\n"))
+	return toolTextResult(strings.Join(chunks, "\n\n")), nil
 }
 
-func (a *adapter) handleCodexForwardLocal(req *mcp.Request, args map[string]any) *mcp.Response {
+func (a *adapter) toolCodexForward(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, err := decodeArgs(req.Params.Arguments)
+	if err != nil {
+		return nil, fmt.Errorf("invalid params: %w", err)
+	}
 	if !codexForwardingAllowed() {
-		return errResp(req.ID, -32000,
-			"codex_forward refused: requires C3_CODEX_REMOTE_BRIDGE=1 (set by the codex launcher) or C3_CODEX_ALLOW_MANUAL_FORWARD=1 (debug). Split-brain guard.")
+		return toolErrorResult(
+			"codex_forward refused: requires C3_CODEX_REMOTE_BRIDGE=1 (set by the codex launcher) or C3_CODEX_ALLOW_MANUAL_FORWARD=1 (debug). Split-brain guard."), nil
 	}
 	wsURL, _ := args["app_server_ws"].(string)
 	if wsURL == "" {
 		wsURL = os.Getenv("C3_CODEX_APP_SERVER_WS")
 	}
 	if wsURL == "" {
-		return errResp(req.ID, -32602, "app_server_ws is required (or set C3_CODEX_APP_SERVER_WS)")
+		return toolErrorResult("app_server_ws is required (or set C3_CODEX_APP_SERVER_WS)"), nil
 	}
-	return mcpTextResp(req.ID,
-		fmt.Sprintf("codex_forward registered ws=%s", wsURL))
+	return toolTextResult(fmt.Sprintf("codex_forward registered ws=%s", wsURL)), nil
 }
 
-func (a *adapter) forwardToBroker(req *mcp.Request, name string, args map[string]any) *mcp.Response {
-	id := strconv.FormatUint(a.nextID.Add(1), 10)
-	ch := make(chan ipc.ToolResultMsg, 1)
-	a.pmu.Lock()
-	a.pending[id] = ch
-	a.pmu.Unlock()
-
-	tcReq := ipc.ToolCallReq{Op: ipc.OpToolCall, ID: id, Name: name, Args: args}
-	conn := a.currentConn()
-	if conn == nil {
-		a.pmu.Lock()
-		delete(a.pending, id)
-		a.pmu.Unlock()
-		return errResp(req.ID, -32000, "broker reconnecting — retry tool call in a moment")
-	}
-	if err := conn.WriteJSON(tcReq); err != nil {
-		a.pmu.Lock()
-		delete(a.pending, id)
-		a.pmu.Unlock()
-		return errResp(req.ID, -32000, "broker write: "+err.Error())
-	}
-
-	select {
-	case <-time.After(120 * time.Second):
-		a.pmu.Lock()
-		delete(a.pending, id)
-		a.pmu.Unlock()
-		return errResp(req.ID, -32000, "tool timeout")
-	case res := <-ch:
-		if res.Error != nil {
-			return errResp(req.ID, res.Error.Code, res.Error.Message)
+func (a *adapter) toolForward(name string) mcp.ToolHandler {
+	return func(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args, err := decodeArgs(req.Params.Arguments)
+		if err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
 		}
-		return &mcp.Response{JSONRPC: "2.0", ID: req.ID, Result: res.Result}
+		id := strconv.FormatUint(a.nextID.Add(1), 10)
+		ch := make(chan ipc.ToolResultMsg, 1)
+		a.pmu.Lock()
+		a.pending[id] = ch
+		a.pmu.Unlock()
+
+		tcReq := ipc.ToolCallReq{Op: ipc.OpToolCall, ID: id, Name: name, Args: args}
+		conn := a.currentConn()
+		if conn == nil {
+			a.pmu.Lock()
+			delete(a.pending, id)
+			a.pmu.Unlock()
+			return toolErrorResult("broker reconnecting — retry tool call in a moment"), nil
+		}
+		if err := conn.WriteJSON(tcReq); err != nil {
+			a.pmu.Lock()
+			delete(a.pending, id)
+			a.pmu.Unlock()
+			return toolErrorResult("broker write: " + err.Error()), nil
+		}
+
+		select {
+		case <-time.After(120 * time.Second):
+			a.pmu.Lock()
+			delete(a.pending, id)
+			a.pmu.Unlock()
+			return toolErrorResult("tool timeout"), nil
+		case res := <-ch:
+			if res.Error != nil {
+				return toolErrorResult(res.Error.Message), nil
+			}
+			return toolResultFromMap(res.Result), nil
+		}
 	}
 }
 
-func errResp(id json.RawMessage, code int, msg string) *mcp.Response {
-	return &mcp.Response{
-		JSONRPC: "2.0", ID: id,
-		Error: &mcp.Error{Code: code, Message: msg},
+func toolTextResult(text string) *mcp.CallToolResult {
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: text}},
 	}
 }
 
-func mcpTextResp(id json.RawMessage, text string) *mcp.Response {
-	return &mcp.Response{
-		JSONRPC: "2.0", ID: id,
-		Result: map[string]any{
-			"content": []map[string]any{{"type": "text", "text": text}},
-		},
+func toolErrorResult(msg string) *mcp.CallToolResult {
+	return &mcp.CallToolResult{
+		IsError: true,
+		Content: []mcp.Content{&mcp.TextContent{Text: msg}},
 	}
+}
+
+func toolResultFromMap(result map[string]any) *mcp.CallToolResult {
+	if result == nil {
+		return toolTextResult("")
+	}
+	if contentRaw, ok := result["content"]; ok {
+		if items, ok := contentRaw.([]any); ok {
+			var blocks []mcp.Content
+			for _, item := range items {
+				m, ok := item.(map[string]any)
+				if !ok {
+					continue
+				}
+				text, _ := m["text"].(string)
+				blocks = append(blocks, &mcp.TextContent{Text: text})
+			}
+			if len(blocks) > 0 {
+				return &mcp.CallToolResult{Content: blocks}
+			}
+		}
+	}
+	enc, err := json.Marshal(result)
+	if err != nil {
+		return toolErrorResult("marshal result: " + err.Error())
+	}
+	return toolTextResult(string(enc))
 }
