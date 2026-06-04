@@ -60,6 +60,27 @@ func FormatAttached(a *AttachedMsg) string {
 		return fmt.Sprintf("C3 is not configured for this destination. Run `c3-broker setup` to wire up the Telegram bot token, group chat id, and a starter topic, then retry attach. (broker said: %s)", a.Err)
 	case AttachStatusPolicyRejected:
 		return fmt.Sprintf("Attach rejected by your CLI host's policy layer. The Telegram destination needs tenant-admin approval before this CLI can attach. Ask the tenant admin to approve the destination, then retry attach. (host said: %s)", a.Err)
+	case AttachStatusCwdDefaultCollision:
+		// SYMPTOM-3: a bare cwd-default attach resolved to a topic a
+		// different live session already holds. Multiple `claude`
+		// instances launched from the same parent dir report identical
+		// cwds, so the saved mapping is ambiguous. Guide the user toward
+		// the likely-correct fix (attach a different topic by name); the
+		// "force" path is to re-attach the SAME topic by its explicit
+		// name, which triggers the normal force_steal confirmation —
+		// there is no `--steal` CLI token (the override is steal=true,
+		// handled by the agent on that confirmation).
+		holder := "another session"
+		if a.Holder != nil {
+			holder = fmt.Sprintf("%s pid %d", a.Holder.CLI, a.Holder.PID)
+		}
+		return fmt.Sprintf(
+			"⚠ cwd %s maps to topic %q, already held by %s (a different session).\n"+
+				"  Did you mean a different topic? Attach by name:\n"+
+				"      /c3:attach <topic>\n"+
+				"  Or to take %q from that session, re-attach it by name and confirm the steal:\n"+
+				"      /c3:attach %s",
+			a.CWD, a.Name, holder, a.Name, a.Name)
 	}
 	if a.Err != "" {
 		return "attach failed: " + a.Err

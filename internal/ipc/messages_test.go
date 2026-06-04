@@ -79,9 +79,10 @@ func TestAttachStatusConstants(t *testing.T) {
 	// Wire-shape lock: these strings show up in adapter formatters and
 	// agent prompts. Renaming them is a breaking change.
 	cases := map[AttachStatus]string{
-		AttachStatusOK:                 "ok",
-		AttachStatusNoTopicsConfigured: "no_topics_configured",
-		AttachStatusPolicyRejected:     "policy_rejected",
+		AttachStatusOK:                  "ok",
+		AttachStatusNoTopicsConfigured:  "no_topics_configured",
+		AttachStatusPolicyRejected:      "policy_rejected",
+		AttachStatusCwdDefaultCollision: "cwd_default_collision",
 	}
 	for got, want := range cases {
 		if string(got) != want {
@@ -101,6 +102,56 @@ func TestAttachedMsg_StatusFieldOmitEmpty(t *testing.T) {
 	}
 	if got := string(raw); got == "" || containsJSONField(got, "status") {
 		t.Errorf("AttachedMsg with empty Status must omit status field; got %q", got)
+	}
+}
+
+func TestAttachedMsg_CwdDefaultCollision_Roundtrip(t *testing.T) {
+	// The cwd_default_collision status carries enough fields for the
+	// formatter to render the guided message: the resolved topic Name,
+	// the colliding cwd (CWD), and the live Holder (cli+pid). All must
+	// round-trip across the IPC wire.
+	tid := int64(281)
+	in := AttachedMsg{
+		Op:      OpAttached,
+		OK:      false,
+		Status:  AttachStatusCwdDefaultCollision,
+		Name:    "c3",
+		CWD:     "/home/karthi/arogara",
+		ChatID:  -100,
+		TopicID: &tid,
+		Holder:  &Holder{CLI: "claude", PID: 9823, CWD: "/home/karthi/arogara"},
+		Err:     "cwd maps to a topic held by another session",
+	}
+	data, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out AttachedMsg
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Status != AttachStatusCwdDefaultCollision {
+		t.Errorf("Status=%q want %q", out.Status, AttachStatusCwdDefaultCollision)
+	}
+	if out.Name != "c3" || out.CWD != "/home/karthi/arogara" {
+		t.Errorf("Name=%q CWD=%q want c3 / /home/karthi/arogara", out.Name, out.CWD)
+	}
+	if out.Holder == nil || out.Holder.CLI != "claude" || out.Holder.PID != 9823 {
+		t.Errorf("Holder roundtrip mismatch: %+v", out.Holder)
+	}
+}
+
+func TestAttachedMsg_HolderFieldOmitEmpty(t *testing.T) {
+	// Holder is wire-additive on AttachedMsg: a message without it (every
+	// pre-collision flow) must serialize without the key for byte-equal
+	// round-trips.
+	msg := AttachedMsg{Op: OpAttached, OK: true}
+	raw, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(raw); containsJSONField(got, "holder") {
+		t.Errorf("AttachedMsg with nil Holder must omit holder field; got %q", got)
 	}
 }
 

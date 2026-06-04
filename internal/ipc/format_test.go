@@ -151,6 +151,42 @@ func TestFormatAttached_PolicyRejected(t *testing.T) {
 	}
 }
 
+// TestFormatAttached_CwdDefaultCollision asserts the guided message the
+// broker emits when a BARE (cwd-default) attach resolves to a topic that
+// is already held by a different live session. The rendered text must
+// name the cwd, the resolved topic, the holder (cli+pid), and offer both
+// the attach-by-name path and the steal (re-attach-by-name + confirm)
+// escape hatch. SYMPTOM-3 fix.
+func TestFormatAttached_CwdDefaultCollision(t *testing.T) {
+	tid := int64(281)
+	msg := &AttachedMsg{
+		Op:      OpAttached,
+		OK:      false,
+		Status:  AttachStatusCwdDefaultCollision,
+		Name:    "c3",
+		CWD:     "/home/karthi/arogara",
+		ChatID:  -100,
+		TopicID: &tid,
+		Holder:  &Holder{CLI: "claude", PID: 9823, CWD: "/home/karthi/arogara"},
+	}
+	got := FormatAttached(msg)
+	for _, w := range []string{
+		"/home/karthi/arogara", // the colliding cwd
+		"c3",                   // the resolved topic name
+		"claude",               // holder cli
+		"9823",                 // holder pid
+		"attach",               // generic guidance verb
+		"steal",                // force escape hatch (re-attach by name + confirm)
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("FormatAttached(cwd_default_collision) missing %q in %q", w, got)
+		}
+	}
+	if strings.Contains(got, "unspecified failure") {
+		t.Errorf("FormatAttached(cwd_default_collision) leaked unspecified-failure: %q", got)
+	}
+}
+
 // TestFormatAttached_ErrFallback confirms a bare Err (no Status, no
 // Proposal) renders as "attach failed: <err>".
 func TestFormatAttached_ErrFallback(t *testing.T) {

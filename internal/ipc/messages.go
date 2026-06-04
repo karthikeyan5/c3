@@ -115,17 +115,17 @@ type ClaimsListMsg struct {
 // when the route corresponds to a known topic in mappings.json (lookup is
 // best-effort; empty when the route is a DM or a yet-unregistered topic).
 type ClaimEntry struct {
-	Channel    string `json:"channel"`
-	ChatID     int64  `json:"chat_id"`
-	HasTopic   bool   `json:"has_topic"`
-	TopicID    int64  `json:"topic_id,omitempty"`
-	TopicName  string `json:"topic_name,omitempty"`
-	GroupName  string `json:"group_name,omitempty"`
-	HolderCLI  string `json:"holder_cli"`
-	HolderPID  int    `json:"holder_pid"`
-	HolderCWD  string `json:"holder_cwd,omitempty"`
-	ConnID     uint64 `json:"conn_id"`
-	Connected  bool   `json:"connected"`
+	Channel   string `json:"channel"`
+	ChatID    int64  `json:"chat_id"`
+	HasTopic  bool   `json:"has_topic"`
+	TopicID   int64  `json:"topic_id,omitempty"`
+	TopicName string `json:"topic_name,omitempty"`
+	GroupName string `json:"group_name,omitempty"`
+	HolderCLI string `json:"holder_cli"`
+	HolderPID int    `json:"holder_pid"`
+	HolderCWD string `json:"holder_cwd,omitempty"`
+	ConnID    uint64 `json:"conn_id"`
+	Connected bool   `json:"connected"`
 }
 
 // TopicEntry is one row in TopicsListMsg.Topics. Also reused by Proposal.Existing
@@ -168,6 +168,21 @@ const (
 	// adapter formatter can render an actionable next-step (ask tenant
 	// admin to approve the Telegram destination, then retry).
 	AttachStatusPolicyRejected AttachStatus = "policy_rejected"
+
+	// AttachStatusCwdDefaultCollision indicates a BARE (cwd-default, no
+	// explicit name) attach resolved its saved cwd→topic mapping to a
+	// topic that is ALREADY HELD by a DIFFERENT live session (SYMPTOM-3,
+	// 2026-06-04). Multiple `claude` instances launched from the same
+	// parent dir report identical os.Getwd(); a bare attach from a
+	// session that meant a different sub-project would otherwise silently
+	// race/steal a sibling's topic. Rather than silently claim — or show
+	// only the raw force_steal y/n prompt — the broker returns this status
+	// with the resolved topic Name, the colliding CWD, and the live
+	// Holder so the formatter can render a guided message: "did you mean a
+	// different topic? attach by name … or force this topic with --steal".
+	// ONLY fires for the cwd-default case; an explicit `/c3:attach <name>`
+	// to a held topic still gets the normal force_steal proposal.
+	AttachStatusCwdDefaultCollision AttachStatus = "cwd_default_collision"
 )
 
 // AttachReq is the adapter → broker attach request. Spec §4.4.1.
@@ -179,12 +194,12 @@ const (
 //     Lets every CLI's slash-command wrapper be a one-liner —
 //     `attach(expr=$ARGUMENTS)` — instead of duplicating arg-parsing logic.
 //     Parsing rules in the broker:
-//       ""                  → fall back to cwd-saved mapping
-//       "dm" (any case)     → target=dm (with disambiguation if a topic
-//                              named "dm" also exists)
-//       "<int>"             → topic_id=<int>
-//       "<name>" / "create <name>" / "-y <name>"
-//                           → name=<name> (create=true if prefix used)
+//     ""                  → fall back to cwd-saved mapping
+//     "dm" (any case)     → target=dm (with disambiguation if a topic
+//     named "dm" also exists)
+//     "<int>"             → topic_id=<int>
+//     "<name>" / "create <name>" / "-y <name>"
+//     → name=<name> (create=true if prefix used)
 type AttachReq struct {
 	Op      Op     `json:"op"` // = OpAttach
 	CWD     string `json:"cwd,omitempty"`
@@ -247,6 +262,19 @@ type AttachedMsg struct {
 	// for backward compat with pre-2026-05-19 consumers that switch on
 	// OK / NeedsConfirmation / Err.
 	Status AttachStatus `json:"status,omitempty"`
+
+	// CWD is the colliding launch/working directory whose saved cwd→topic
+	// mapping resolved to a held topic. Set only on
+	// AttachStatusCwdDefaultCollision so the formatter can name the
+	// directory in the guided message. Omitted otherwise (wire-additive).
+	CWD string `json:"cwd,omitempty"`
+
+	// Holder identifies the live session currently holding the resolved
+	// topic. Set only on AttachStatusCwdDefaultCollision (cli + pid drive
+	// the "already held by claude pid N" line). Omitted otherwise
+	// (wire-additive; the force_steal holder still travels inside
+	// Proposal.Holder).
+	Holder *Holder `json:"holder,omitempty"`
 }
 
 // Proposal describes what the broker would do if the agent confirms.
@@ -278,7 +306,7 @@ type Proposal struct {
 // generated 4-digit code and TTL. The CLI displays the code so the
 // human can type it into the bot.
 type PairModeStartReq struct {
-	Op     Op     `json:"op"` // = OpPairModeStart
+	Op     Op     `json:"op"`     // = OpPairModeStart
 	Target string `json:"target"` // "dm" or "group"
 	ChatID int64  `json:"chat_id,omitempty"`
 }
@@ -298,15 +326,27 @@ type PairModeReplyMsg struct {
 // (slash command `/c3:ping`) to ask the broker to send a one-shot
 // identification message to whichever Telegram route the calling
 // session currently holds. The transient client itself doesn't hold a
-// route — the broker matches by CWD against the adapter stubs to
-// locate the user's actual session.
+// route — the broker matches the user's actual session against the live
+// adapter stubs.
+//
+// Matching is PID-primary, CWD-fallback (mirrors ListSessionsReq):
+//
+// PID: the calling CLI session's best-effort PID, walked up the PPID
+// chain from the slash command's shell-out (see bestEffortSessionPID in
+// cmd/c3-broker/sessions.go). When set (!=0) the broker matches the stub
+// whose PID equals this — the stable identity that survives the CWD
+// collapse that happens when `claude` is launched from a parent dir and
+// the slash command runs from a project subdir.
 //
 // CWD: the calling client's working directory (typically inherited
-// from the user's shell / slash-command invocation). The broker
-// scans live stubs for one whose CWD matches AND whose CurrentRoute
-// is non-nil; that stub's claim is the target of the ping reply.
+// from the user's shell / slash-command invocation). Used only as a
+// fallback when PID==0 (PPID walk failed — non-Linux / missing /proc /
+// ancestors exited). The broker scans live stubs for one whose CWD
+// matches AND whose CurrentRoute is non-nil; that stub's claim is the
+// target of the ping reply.
 type PingThisSessionReq struct {
 	Op  Op     `json:"op"` // = OpPingThisSession
+	PID int    `json:"pid,omitempty"`
 	CWD string `json:"cwd"`
 }
 

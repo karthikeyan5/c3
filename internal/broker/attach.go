@@ -23,13 +23,13 @@ import (
 //  2. Resolve channel (args.Channel or default).
 //  3. Branch by target type:
 //     a. args.Target == "dm" → claim (channel, dm_chat_id, nil), no per-cwd
-//        persistence (DM is universal).
+//     persistence (DM is universal).
 //     b. args.TopicID != nil → validate via channel.ValidateTopic + claim by
-//        id; register topic in mappings.json:channels.<name>.topics with a
-//        placeholder name if not already present; persist cwd mapping.
+//     id; register topic in mappings.json:channels.<name>.topics with a
+//     placeholder name if not already present; persist cwd mapping.
 //     c. args.Name != "" or inferred from basename(cwd) → search topic
-//        registry. If found in default group → claim. If found in another
-//        group → propose disambiguation. If found nowhere → propose creation.
+//     registry. If found in default group → claim. If found in another
+//     group → propose disambiguation. If found nowhere → propose creation.
 //  4. On args.Create == true → call channel.CreateTopic, register topic,
 //     claim, persist mapping.
 func (b *Broker) handleAttach(conn *ipc.Conn, stub *Stub, raw []byte) {
@@ -324,6 +324,41 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 					tidPtr = nil
 				}
 				key := MakeRouteKey(chanName, m.ChatID, tidPtr)
+
+				// SYMPTOM-3 (2026-06-04): cwd-default collision warning.
+				// This branch is reached for a BARE `/c3:attach` (name=="")
+				// resolving the saved cwd→topic mapping. Multiple `claude`
+				// instances launched from the same parent dir report
+				// identical cwds, so this mapping is ambiguous. If the
+				// resolved topic is already held by a DIFFERENT live session,
+				// silently claiming (or showing only the raw force_steal
+				// prompt) hides that the user probably meant another topic.
+				// Surface a guided collision message instead.
+				//
+				// Gated on name=="" (truly bare): an EXPLICIT name — even one
+				// equal to the saved mapping's name — is the user asking for
+				// THAT topic, and must keep the normal force_steal flow
+				// (steal=true bypasses, so a confirmed re-invoke is honored).
+				if name == "" && !steal {
+					if holder, collides := b.heldByDifferentLiveSession(key, stub); collides {
+						_ = conn.WriteJSON(ipc.AttachedMsg{
+							Op: ipc.OpAttached, OK: false,
+							Status:  ipc.AttachStatusCwdDefaultCollision,
+							Channel: chanName, ChatID: m.ChatID, TopicID: tidPtr,
+							Name:  m.Name,
+							Group: m.Group,
+							CWD:   cwd,
+							Holder: &ipc.Holder{
+								CLI: holder.CLI, PID: holder.PID, CWD: holder.CWD,
+							},
+							Err: fmt.Sprintf(
+								"cwd %s maps to topic %q, already held by %s pid %d (a different session); attach by name to pick another topic, or re-invoke with steal=true",
+								cwd, m.Name, holder.CLI, holder.PID),
+						})
+						return
+					}
+				}
+
 				if !b.tryClaim(conn, stub, key, m.Name, steal, replay) {
 					return
 				}
@@ -457,6 +492,30 @@ func (b *Broker) createAndClaim(conn *ipc.Conn, stub *Stub, chanName, gName stri
 	})
 }
 
+// heldByDifferentLiveSession reports whether key is currently claimed by a
+// LIVE session that is NOT the caller (stub). Returns the holder when so.
+//
+// This mirrors the exact collision predicate Routes.Claim uses to decide
+// whether a claim would be rejected (held + different-logical-session +
+// IsAlive) — see routes.go. It's a read-only peek used by the SYMPTOM-3
+// cwd-default collision check to surface a guided warning BEFORE attempting
+// the claim, without duplicating the liveness rules. A same-logical-session
+// holder (reconnect/self) or a dead holder is NOT a collision: the caller is
+// (or supersedes) the holder and the claim would succeed anyway.
+func (b *Broker) heldByDifferentLiveSession(key RouteKey, stub *Stub) (*Stub, bool) {
+	holder, held := b.Routes.Holder(key)
+	if !held {
+		return nil, false
+	}
+	if sameLogicalSession(holder, stub) {
+		return nil, false
+	}
+	if !holder.IsAlive() {
+		return nil, false
+	}
+	return holder, true
+}
+
 // tryClaim attempts to add (key → stub) to ROUTES; on collision with a
 // different alive holder, sends AttachedMsg with a force_steal proposal
 // (the LLM-side asks the user; on confirmation, attach is re-invoked with
@@ -553,7 +612,17 @@ func (b *Broker) sendWelcome(stub *Stub, key RouteKey, label string) {
 		t := key.TopicID
 		topicID = &t
 	}
-	text := welcomeText(stub, label)
+	// Resolve the displayed directory the same way persistMapping resolves
+	// the SAVED mapping (FIX 2, 2026-06-03). resolveAttachCWD refines the
+	// raw launch dir (stub.CWD) down to <launchCWD>/<topicName> when that
+	// subdir exists — so a session launched in a parent dir and attached to
+	// a topic named after a project subdir shows the project, not the
+	// parent. label IS the topic name on the by-name / saved-mapping attach
+	// paths (the cases where refinement can fire); on the DM / topic-by-id
+	// paths label is a display string that won't match any subdir, so
+	// resolveAttachCWD returns stub.CWD unchanged — no behavior change.
+	resolved := resolveAttachCWD(stub.CWD, label)
+	text := welcomeText(stub, label, resolved)
 	if _, err := ch.SendReply(c3types.ReplyArgs{
 		Channel: key.Channel,
 		ChatID:  key.ChatID,
@@ -569,8 +638,19 @@ func (b *Broker) sendWelcome(stub *Stub, key RouteKey, label string) {
 // welcomeText renders the on-attach confirmation. Friendly tone (PID
 // intentionally omitted per pre-release UX feedback 2026-05-14: the PID
 // is mechanical clutter for a human reader; cwd + cli are what matter).
-func welcomeText(stub *Stub, label string) string {
-	cwd := stub.CWD
+//
+// resolvedCWD (FIX 2, 2026-06-03) is the project dir resolved by
+// resolveAttachCWD — i.e. stub.CWD refined down to the topic's project
+// subdir when the user launched in a parent. When non-empty it is the
+// rendered directory line, so the welcome matches the SAVED mapping
+// instead of showing the bare parent launch dir. Falls back to stub.CWD
+// when resolvedCWD is "" (the DM / no-refine case, where caller passes
+// "" or where resolveAttachCWD declined to refine).
+func welcomeText(stub *Stub, label, resolvedCWD string) string {
+	cwd := resolvedCWD
+	if cwd == "" {
+		cwd = stub.CWD
+	}
 	if home, err := os.UserHomeDir(); err == nil && home != "" && strings.HasPrefix(cwd, home) {
 		cwd = "~" + cwd[len(home):]
 	}
@@ -698,4 +778,3 @@ func (b *Broker) defaultChannel() string {
 	}
 	return ""
 }
-

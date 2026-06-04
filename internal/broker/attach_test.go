@@ -446,7 +446,7 @@ func TestWelcomeText_HomeShortened(t *testing.T) {
 		t.Skip("no home dir")
 	}
 	stub := &Stub{CLI: "claude", CWD: filepath.Join(home, "arogara", "c3")}
-	got := welcomeText(stub, "c3")
+	got := welcomeText(stub, "c3", "")
 	if !strings.Contains(got, "~/arogara/c3") {
 		t.Errorf("welcomeText should home-shorten cwd, got %q", got)
 	}
@@ -457,7 +457,7 @@ func TestWelcomeText_HomeShortened(t *testing.T) {
 
 func TestWelcomeText_IncludesCLIAndLabel(t *testing.T) {
 	stub := &Stub{CLI: "claude", CWD: "/tmp/x"}
-	got := welcomeText(stub, "my-project")
+	got := welcomeText(stub, "my-project", "")
 	for _, want := range []string{"claude", "my-project"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("welcomeText missing %q in %q", want, got)
@@ -469,7 +469,7 @@ func TestWelcomeText_NoPID(t *testing.T) {
 	// Karthi explicit feedback 2026-05-14: PID is mechanical clutter,
 	// don't include it.
 	stub := &Stub{CLI: "claude", PID: 12345, CWD: "/tmp/x"}
-	got := welcomeText(stub, "label")
+	got := welcomeText(stub, "label", "")
 	if strings.Contains(got, "12345") {
 		t.Errorf("welcomeText should not include PID, got %q", got)
 	}
@@ -477,7 +477,7 @@ func TestWelcomeText_NoPID(t *testing.T) {
 
 func TestWelcomeText_NoCWD_StillFriendly(t *testing.T) {
 	stub := &Stub{CLI: "claude"}
-	got := welcomeText(stub, "label")
+	got := welcomeText(stub, "label", "")
 	if got == "" {
 		t.Fatal("welcomeText with no cwd should still return something")
 	}

@@ -290,25 +290,48 @@ func (b *Broker) handlePingThisSession(conn *ipc.Conn, raw []byte) {
 		return
 	}
 
-	// Find the attached user session by CWD. Skip the transient client
-	// itself by requiring CurrentRoute != nil; the c3-broker-cli stub
-	// never attaches.
+	// Find the attached user session. Skip the transient client itself by
+	// requiring CurrentRoute != nil; the c3-broker-cli stub never attaches.
 	//
-	// Determinism: when >1 stub matches (rare — two adapters in the same
-	// project directory both attached), pick the one with the highest
-	// ConnID. The registry mints monotonic ConnIDs via atomic.Uint64, so
-	// "highest" == "most recently registered" == "the session the user
-	// most likely meant" when they fired the ping from that cwd. Map-
-	// iteration order over Stubs.Snapshot() would otherwise make the
-	// target nondeterministic. Closes report MINOR m1 (2026-05-19).
+	// Two-phase match (FIX 1, 2026-06-03), mirroring /c3:sessions:
+	//
+	//  Phase 1 (primary): if the caller supplied a PID hint (its
+	//  best-effort walk up the PPID chain — see bestEffortSessionPID in
+	//  cmd/c3-broker/sessions.go), match the stub whose PID equals it. PID
+	//  is the stable identity that survives the CWD collapse: when `claude`
+	//  is launched from a parent dir and the slash command runs from a
+	//  project subdir, the stub's stored CWD (the launch dir) can never
+	//  equal the slash command's CWD, so CWD-equality matching silently
+	//  fails. PID bridges that gap.
+	//
+	//  Phase 2 (fallback): only when no PID hint was supplied (PID==0 — the
+	//  PPID walk failed on non-Linux / missing /proc / exited ancestors) do
+	//  we fall back to CWD-equality matching.
+	//
+	// Determinism: in BOTH phases, when >1 stub matches (rare — a reconnect
+	// re-registered the same logical session under a new ConnID before the
+	// old stub was reaped, or two adapters share a project dir), pick the
+	// one with the highest ConnID. The registry mints monotonic ConnIDs via
+	// atomic.Uint64, so "highest" == "most recently registered" == "the
+	// session the user most likely meant". Map-iteration order over
+	// Stubs.Snapshot() would otherwise make the target nondeterministic.
+	// Closes report MINOR m1 (2026-05-19) for the CWD phase; the same
+	// tiebreak is preserved here for the PID phase.
 	var target *Stub
 	candidateCount := 0
+	matchedByPID := req.PID != 0
 	for _, s := range b.Stubs.Snapshot() {
-		if s.CWD != req.CWD {
-			continue
-		}
 		if s.CurrentRoute() == nil {
 			continue
+		}
+		if matchedByPID {
+			if s.PID != req.PID {
+				continue
+			}
+		} else {
+			if s.CWD != req.CWD {
+				continue
+			}
 		}
 		candidateCount++
 		if target == nil || s.ConnID > target.ConnID {
@@ -316,8 +339,16 @@ func (b *Broker) handlePingThisSession(conn *ipc.Conn, raw []byte) {
 		}
 	}
 	if candidateCount > 1 && target != nil {
-		log.Printf("ping: multiple stubs at cwd=%q; targeting most recent (PID %d, conn=%d)",
-			req.CWD, target.PID, target.ConnID)
+		if matchedByPID {
+			log.Printf("ping: multiple stubs at pid=%d; targeting most recent (conn=%d cwd=%q)",
+				req.PID, target.ConnID, target.CWD)
+		} else {
+			log.Printf("ping: multiple stubs at cwd=%q; targeting most recent (PID %d, conn=%d)",
+				req.CWD, target.PID, target.ConnID)
+		}
+	}
+	if target != nil && matchedByPID {
+		log.Printf("ping: matched by PID %d → conn=%d (cwd=%q)", req.PID, target.ConnID, target.CWD)
 	}
 	if target == nil {
 		_ = conn.WriteJSON(ipc.PingThisSessionReplyMsg{
