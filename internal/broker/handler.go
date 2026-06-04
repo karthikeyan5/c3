@@ -454,7 +454,11 @@ func pingTopicLabel(b *Broker, key RouteKey) string {
 // home-shorten + cli-fallback conventions as welcomeText so the two
 // messages look like siblings in the Telegram view.
 func pingText(stub *Stub, label string) string {
-	cwd := stub.CWD
+	// Show the resolved project dir (launchCWD/topicName when it exists),
+	// matching the on-attach welcome — not the bare launch dir. label IS
+	// the topic name; resolveAttachCWD refines downward or returns the
+	// launch cwd unchanged (and "" for the DM/no-cwd case).
+	cwd := resolveAttachCWD(stub.CWD, label)
 	if home, err := os.UserHomeDir(); err == nil && home != "" && strings.HasPrefix(cwd, home) {
 		cwd = "~" + cwd[len(home):]
 	}
