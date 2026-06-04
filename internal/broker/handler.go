@@ -293,62 +293,75 @@ func (b *Broker) handlePingThisSession(conn *ipc.Conn, raw []byte) {
 	// Find the attached user session. Skip the transient client itself by
 	// requiring CurrentRoute != nil; the c3-broker-cli stub never attaches.
 	//
-	// Two-phase match (FIX 1, 2026-06-03), mirroring /c3:sessions:
+	// Three-tier match (FIX 2, 2026-06-04), shared with /c3:sessions via
+	// stubMatchesPID:
 	//
-	//  Phase 1 (primary): if the caller supplied a PID hint (its
-	//  best-effort walk up the PPID chain — see bestEffortSessionPID in
-	//  cmd/c3-broker/sessions.go), match the stub whose PID equals it. PID
-	//  is the stable identity that survives the CWD collapse: when `claude`
-	//  is launched from a parent dir and the slash command runs from a
-	//  project subdir, the stub's stored CWD (the launch dir) can never
-	//  equal the slash command's CWD, so CWD-equality matching silently
-	//  fails. PID bridges that gap.
+	//  Tier 1 (primary, PID): if the caller supplied a PID hint (its
+	//  best-effort walk up the PPID chain — see proctree.BestEffortCallerPID),
+	//  match the stub whose PID equals it OR whose CLI-session ancestor pid
+	//  equals it. The CLI-ancestor arm is essential: a Claude stub registers
+	//  under its ADAPTER's pid (comm "c3-claude-adapt"), while the caller
+	//  resolves the real claude pid — the adapter's PARENT. Without the
+	//  ancestor arm, req.PID(claude) never equals stub.PID(adapter) and the
+	//  ping reports "not attached" even when attached. PID is also the stable
+	//  identity that survives the CWD collapse (claude launched from a parent
+	//  dir, slash command run from a project subdir).
 	//
-	//  Phase 2 (fallback): only when no PID hint was supplied (PID==0 — the
-	//  PPID walk failed on non-Linux / missing /proc / exited ancestors) do
-	//  we fall back to CWD-equality matching.
+	//  Tier 3 (tertiary fallback, CWD): when a PID hint WAS supplied but NO
+	//  stub matched by pid-or-CLI-ancestor (the walk failed, or the stub
+	//  registered under a pid we can't bridge), fall back to CWD-equality
+	//  matching before giving up — a robustness add so a failed walk still
+	//  has a chance. Also used when no PID hint was supplied at all (PID==0).
 	//
-	// Determinism: in BOTH phases, when >1 stub matches (rare — a reconnect
+	// Determinism: in every tier, when >1 stub matches (rare — a reconnect
 	// re-registered the same logical session under a new ConnID before the
 	// old stub was reaped, or two adapters share a project dir), pick the
 	// one with the highest ConnID. The registry mints monotonic ConnIDs via
 	// atomic.Uint64, so "highest" == "most recently registered" == "the
-	// session the user most likely meant". Map-iteration order over
-	// Stubs.Snapshot() would otherwise make the target nondeterministic.
-	// Closes report MINOR m1 (2026-05-19) for the CWD phase; the same
-	// tiebreak is preserved here for the PID phase.
+	// session the user most likely meant". Closes report MINOR m1
+	// (2026-05-19) for the CWD tier; the same tiebreak holds in the PID tier.
 	var target *Stub
 	candidateCount := 0
-	matchedByPID := req.PID != 0
-	for _, s := range b.Stubs.Snapshot() {
-		if s.CurrentRoute() == nil {
-			continue
-		}
-		if matchedByPID {
-			if s.PID != req.PID {
+	matchRule := "none"
+	if req.PID != 0 {
+		for _, s := range b.Stubs.Snapshot() {
+			if s.CurrentRoute() == nil {
 				continue
 			}
-		} else {
+			rule, ok := b.stubMatchesPID(s, req.PID)
+			if !ok {
+				continue
+			}
+			candidateCount++
+			if target == nil || s.ConnID > target.ConnID {
+				target = s
+				matchRule = rule
+			}
+		}
+	}
+	// Tertiary CWD fallback: no PID hint, or PID hint matched nothing.
+	if target == nil {
+		for _, s := range b.Stubs.Snapshot() {
+			if s.CurrentRoute() == nil {
+				continue
+			}
 			if s.CWD != req.CWD {
 				continue
 			}
-		}
-		candidateCount++
-		if target == nil || s.ConnID > target.ConnID {
-			target = s
+			candidateCount++
+			if target == nil || s.ConnID > target.ConnID {
+				target = s
+				matchRule = "cwd"
+			}
 		}
 	}
 	if candidateCount > 1 && target != nil {
-		if matchedByPID {
-			log.Printf("ping: multiple stubs at pid=%d; targeting most recent (conn=%d cwd=%q)",
-				req.PID, target.ConnID, target.CWD)
-		} else {
-			log.Printf("ping: multiple stubs at cwd=%q; targeting most recent (PID %d, conn=%d)",
-				req.CWD, target.PID, target.ConnID)
-		}
+		log.Printf("ping: multiple stubs matched (rule=%s); targeting most recent (conn=%d pid=%d cwd=%q)",
+			matchRule, target.ConnID, target.PID, target.CWD)
 	}
-	if target != nil && matchedByPID {
-		log.Printf("ping: matched by PID %d → conn=%d (cwd=%q)", req.PID, target.ConnID, target.CWD)
+	if target != nil {
+		log.Printf("ping: matched by %s (req.pid=%d → conn=%d pid=%d cwd=%q)",
+			matchRule, req.PID, target.ConnID, target.PID, target.CWD)
 	}
 	if target == nil {
 		_ = conn.WriteJSON(ipc.PingThisSessionReplyMsg{
@@ -393,6 +406,35 @@ func (b *Broker) handlePingThisSession(conn *ipc.Conn, raw []byte) {
 		Op: ipc.OpPingThisSessionReply, OK: true,
 		Channel: key.Channel, Topic: label, SentText: text,
 	})
+}
+
+// stubMatchesPID reports whether the stub corresponds to the caller's
+// resolved CLI session pid (reqPID), and names the rule that matched. A stub
+// matches when EITHER:
+//
+//   - reqPID == stub.PID — the direct case (stub registered under the CLI
+//     pid itself, or a non-adapter stub), OR
+//   - reqPID == sessionPIDResolver(stub.PID) — the CLI-ancestor case: the
+//     Claude adapter registers under its OWN pid (comm "c3-claude-adapt"),
+//     so we walk up from stub.PID (strict predicate skips the adapter) to the
+//     real claude/codex ancestor and compare that. This is THE bridge that
+//     makes /c3:ping and /c3:sessions work for Claude stubs.
+//
+// reqPID==0 never matches (caller had no usable hint). The shared resolver is
+// proctree.CLISessionPID by default; injectable for tests.
+func (b *Broker) stubMatchesPID(s *Stub, reqPID int) (rule string, ok bool) {
+	if reqPID == 0 {
+		return "", false
+	}
+	if s.PID == reqPID {
+		return "pid", true
+	}
+	if resolve := b.sessionPIDResolver; resolve != nil {
+		if resolve(s.PID) == reqPID {
+			return "cli-ancestor", true
+		}
+	}
+	return "", false
 }
 
 // pingTopicLabel returns the human label for a route key — "dm" for
@@ -470,7 +512,11 @@ func (b *Broker) handleListSessions(conn *ipc.Conn, raw []byte) {
 		if rk := s.CurrentRoute(); rk != nil {
 			e.AttachedTo = sessionTopicLabel(b, *rk)
 		}
-		if req.PID != 0 && req.PID == s.PID {
+		// "you are here" marker. Same PID-match as /c3:ping (FIX 2,
+		// 2026-06-04): direct stub.PID equality OR the stub's CLI-session
+		// ancestor pid (so a Claude stub registered under its adapter pid is
+		// marked when the caller resolved the real claude pid).
+		if _, ok := b.stubMatchesPID(s, req.PID); ok {
 			e.IsThisSession = true
 		}
 		entries = append(entries, e)

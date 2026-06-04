@@ -4,11 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"runtime"
 	"strconv"
 	"strings"
 
 	"github.com/karthikeyan5/c3/internal/ipc"
+	"github.com/karthikeyan5/c3/internal/proctree"
 )
 
 // runSessions is the `c3-broker sessions` subcommand. Lists every live
@@ -23,7 +23,7 @@ import (
 // Mirrors `c3-broker ping` (cmd/c3-broker/ping.go).
 func runSessions(_ []string) error {
 	cwd, _ := os.Getwd()
-	pid := bestEffortSessionPID()
+	pid := proctree.BestEffortCallerPID()
 
 	conn, err := dialBroker()
 	if err != nil {
@@ -46,103 +46,6 @@ func runSessions(_ []string) error {
 	}
 	fmt.Print(renderSessionsTable(resp.Sessions))
 	return nil
-}
-
-// bestEffortSessionPID walks up the parent-PID chain looking for a
-// process whose comm name indicates the user's CLI session (claude,
-// codex, or their c3 adapters). Returns the matched PID, or 0 on
-// failure (non-Linux, /proc missing, all ancestors exited, depth
-// exceeded). On non-Linux platforms, returns os.Getppid() as a
-// best-effort single-level fallback — the broker matches this PID
-// against its stub registry, so even a single-level guess is useful
-// when the slash command is invoked outside a shell-out wrapper.
-func bestEffortSessionPID() int {
-	if runtime.GOOS != "linux" {
-		// Single-level fallback. Slash-command shells-out typically
-		// land at the shell PID (sh / bash), not the CLI — so this is
-		// best-effort only. Tolerable degradation.
-		return os.Getppid()
-	}
-	// On Linux: walk up. The slash command shell-out chain looks like:
-	//   claude (CLI session)
-	//     └─ sh -c "c3-broker sessions"
-	//          └─ c3-broker sessions   <- us
-	// so getppid()==sh, not claude. Walk until we hit a known CLI
-	// name. Depth cap so a deep tree doesn't loop unboundedly.
-	const maxDepth = 10
-	pid := os.Getppid()
-	for i := 0; i < maxDepth; i++ {
-		if pid <= 1 {
-			return 0
-		}
-		comm := procComm(pid)
-		if isUserCLIComm(comm) {
-			return pid
-		}
-		next, ok := procPPID(pid)
-		if !ok {
-			return 0
-		}
-		if next == pid {
-			return 0 // loop guard (shouldn't happen)
-		}
-		pid = next
-	}
-	return 0
-}
-
-// isUserCLIComm matches the /proc/<pid>/status "Name:" field (15-char
-// truncated comm) against known CLI binaries the user might be
-// running. Matches both the direct CLI (claude, codex) AND the c3
-// adapters, in case the slash command runs inside an adapter process
-// for some reason. Conservative — only matches names that are clearly
-// the user's CLI, not e.g. "bash" or generic shell.
-func isUserCLIComm(comm string) bool {
-	switch comm {
-	case "claude", "codex":
-		return true
-	case "c3-claude-adapt", "c3-claude-adapter": // 15-char truncation
-		return true
-	case "c3-codex-adapte", "c3-codex-adapter":
-		return true
-	}
-	return false
-}
-
-// procComm returns the "Name:" field from /proc/<pid>/status (the
-// 15-char-truncated process comm). Empty string if /proc is missing
-// or the file can't be read.
-func procComm(pid int) string {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
-	if err != nil {
-		return ""
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "Name:") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "Name:"))
-		}
-	}
-	return ""
-}
-
-// procPPID returns the "PPid:" field from /proc/<pid>/status. ok=false
-// if the process has exited or /proc is missing.
-func procPPID(pid int) (int, bool) {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
-	if err != nil {
-		return 0, false
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "PPid:") {
-			s := strings.TrimSpace(strings.TrimPrefix(line, "PPid:"))
-			n, err := strconv.Atoi(s)
-			if err != nil {
-				return 0, false
-			}
-			return n, true
-		}
-	}
-	return 0, false
 }
 
 // renderSessionsTable formats a slice of SessionEntry into the

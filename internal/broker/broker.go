@@ -10,6 +10,7 @@ import (
 	"github.com/karthikeyan5/c3/internal/channel"
 	"github.com/karthikeyan5/c3/internal/mappings"
 	"github.com/karthikeyan5/c3/internal/plugin"
+	"github.com/karthikeyan5/c3/internal/proctree"
 )
 
 // Broker holds the in-memory state shared by all connections: stubs registry,
@@ -45,6 +46,15 @@ type Broker struct {
 
 	chMu     sync.RWMutex
 	channels map[string]*channelRegistration
+
+	// sessionPIDResolver maps a registered stub's PID to the real CLI
+	// session pid by walking up the /proc tree (defaults to
+	// proctree.CLISessionPID). A Claude stub registers under its ADAPTER's
+	// pid (comm "c3-claude-adapt"); the slash-command caller resolves the
+	// real claude ancestor pid. This resolver bridges that gap in the ping /
+	// sessions PID-match. Injectable so handler tests can supply a synthetic
+	// process tree without a real /proc.
+	sessionPIDResolver func(int) int
 }
 
 const defaultWorkerIdle = 60 * time.Second
@@ -53,13 +63,14 @@ const defaultWorkerIdle = 60 * time.Second
 func New(mf *mappings.MappingsFile) *Broker {
 	ctx, cancel := context.WithCancel(context.Background())
 	b := &Broker{
-		Stubs:     NewStubRegistry(),
-		Routes:    NewRoutes(),
-		Fallbacks: newFallbackTracker(defaultFallbackCooldown),
-		Pairing:   newPairingState(),
-		ctx:       ctx,
-		cancel:    cancel,
-		channels:  map[string]*channelRegistration{},
+		Stubs:              NewStubRegistry(),
+		Routes:             NewRoutes(),
+		Fallbacks:          newFallbackTracker(defaultFallbackCooldown),
+		Pairing:            newPairingState(),
+		ctx:                ctx,
+		cancel:             cancel,
+		channels:           map[string]*channelRegistration{},
+		sessionPIDResolver: proctree.CLISessionPID,
 	}
 	b.mappings.Store(mf)
 	b.Workers = NewWorkerPool(ctx, defaultWorkerIdle, b)
