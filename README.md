@@ -24,7 +24,7 @@ Built around three ideas:
 - Multiple channels-ready (Telegram today, Slack/web chat/voice-mode as roadmap items)
 - Plugin host for cross-cutting concerns (STT, future translation, scheduling, etc.)
 
-The name's overdue for a refresh — "Claude Code" is no longer the whole story. A rename is on the roadmap before v1.0. Until then, C3 is the sticky placeholder. Pronounced "C-cubed".
+"Claude Code" is no longer the whole story, but the name has stuck — **C3 is the final name** (no rename planned). Pronounced "C-cubed".
 
 ## Install
 
@@ -100,7 +100,7 @@ See [`INSTALL.md`](INSTALL.md) for the agent script (what the agent reads) and [
 
 **v0.1.0** — first public release. Plans 1–7 + 9 functionally complete; pre-release UX bugs resolved (welcome on attach, stale-claim sweep, MCP-disconnect-on-resume hardening, install path math, SIGHUP-driven config reload). Live broker verified end-to-end against a Telegram bot; MCP exchange round-trip confirmed; voice STT bundled.
 
-Roadmap (not yet started): per-user access control, inter-CLI messaging, monitoring dashboard, web/voice channel impls, project rename. See [`TODO.md`](TODO.md) for the full list.
+Roadmap (not yet started): rich-text + channel-capability architecture (next up), remote terminal-control, per-user access control, inter-CLI messaging, monitoring dashboard, web/voice channel impls. See [`ROADMAP.md`](ROADMAP.md) for the full prioritized list.
 
 ## License
 

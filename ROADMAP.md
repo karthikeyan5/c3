@@ -10,7 +10,35 @@ Legend — **status**: `planned` · `in-progress` · `idea` (not yet committed t
 
 ---
 
-## P0 — Remote terminal-control (the main feature)
+## P0 — Channel rich-content + capability architecture (NEW top priority — Karthi 2026-06-14)
+
+Sequenced **before** terminal-control. Goal: C3 supports the full Telegram feature
+surface, delivered through a channel-capability system that won't break when other
+channels are added. The architecture is being designed + pressure-tested by subagents
+(2026-06-14) before any build — nothing ships until the design + plan are ratified.
+
+- **Rich-text formatting for Telegram** — `planned` · P0 — MarkdownV2 / HTML / message
+  entities (see the Bot API formatting-options reference). The single highest-priority
+  feature.
+- **Full media / file / poll support** — `planned` · P0 — photos (compressed) vs
+  documents (uncompressed/original file), video/audio/voice/animation, albums (media
+  groups), polls; honor all Bot API limits (4096 text, 1024 caption, ~50MB send / ~20MB
+  download, media-group size, edit/rate limits). There is no default file-send path today.
+- **Channel-capability declaration system** — `planned` · P0 — each channel declares
+  exactly what it supports (rich text, streaming, special chars, media kinds, polls,
+  limits). C3 exposes the active channel's capability set **plus prompt guidance** to the
+  agent (how to format, what to embed, what streams, what's unsupported) so it formulates
+  a correct message. Telegram specifics must NOT leak into core; only feature-level
+  supports/does-not-support crosses the boundary. Must work identically for Claude Code
+  AND Codex. Adding a channel must never feed it features it can't render (graceful
+  degradation).
+- **Deterministic typing indicator** — `planned` · P0 — relayed PROGRAMMATICALLY by C3
+  while the agent works mid-turn; NOT a tool the LLM decides to call. (Supersedes/absorbs
+  FIX #2's auto-ticker.)
+- **Deterministic streaming of reasoning/thinking** — `planned` · P0 — streamed
+  programmatically (e.g. via message editing), NOT LLM-driven.
+
+## P1 — Remote terminal-control (the main build feature — sequenced *after* the channel architecture above)
 
 - **Remote terminal-control of coding agents from Telegram** — `in-progress`
   Bring up a terminal connected to a DM and spawn/control other coding agents (TUI or not). Needs a dedicated PTY subsystem (can't ride the MCP channel surface). Karthi's reference: `github.com/helvesec/rmux`. Mid-design.
@@ -24,7 +52,7 @@ Legend — **status**: `planned` · `in-progress` · `idea` (not yet committed t
 
 ---
 
-## P1 — Near-term
+## P1 — Near-term (push-blockers & parked fixes)
 
 - **Permission relay** — `planned`
   Forward Claude Code permission prompts to Telegram for remote approve/deny. The one supported remote-approval path (the channel's 3rd surface). Build prompt exists; relay returns GO/DENY as a **string, not bool**; does NOT catch auto-mode classifier hard-denies (that's the trusted-operator item below).
@@ -36,11 +64,11 @@ Legend — **status**: `planned` · `in-progress` · `idea` (not yet committed t
   Back-to-back messages 186/187 logged ~33µs apart but only one reached the agent; two files sent as an album → only one arrived. C3 has **no media-group assembly** (relies on the 1.5s debounce). NEXT: read `internal/channel/telegram/poll.go` dispatch path for where a same-poll-batch update is dropped before enqueue. Needs from Karthi: rough send-time of the two-files album.
   _Source: RESUME.md §FIX #1 (parked)._
 - **FIX #2 (parked): typing indicator never shows while the agent works** — `in-progress`
-  Typing is **manual-only** (fires only on the `send_typing` MCP call); the 2026-05-08 rearch specced an auto-ticker that was never built. FIX: per-route typing ticker in the route worker.
+  Typing is **manual-only** (fires only on the `send_typing` MCP call); the 2026-05-08 rearch specced an auto-ticker that was never built. FIX: per-route typing ticker in the route worker. **Now absorbed into the P0 "deterministic typing indicator" item above** (programmatic relay, not LLM-driven) — keep this entry for the repro/history.
   _Source: RESUME.md §FIX #2 (parked)._
-- **Project rename + clean migration** — `planned` (public-push blocker)
-  "C3" / "Claude Code Claw" no longer reflects the architecture (Codex + future channels + plugin extensibility). Plan: pick name → new repo dir → copy with clean namespace → fresh-install verify → push. Not started.
-  _Source: README.md:103; RESUME.md §What's NOT done (voice 1073, 2026-05-13)._
+- **C3 name is FINAL — no rename** (Karthi 2026-06-14). The earlier rename plan is
+  dropped. C3 = "Claude Code Claw"; an origin note lives in the README. Previously listed
+  as a public-push blocker — no longer.
 - **First-run install validation on a fresh machine** — `in-progress` (public-push blocker)
   Paste the install one-liner into a fresh Claude Code session, walk `INSTALL.md`, cd into a project, attach, confirm a real Telegram round-trip. Surfaces rough edges before the public GitHub push.
   _Source: TODO.md §In flight (user-driven)._
