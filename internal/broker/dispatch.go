@@ -29,14 +29,17 @@ func dispatchTool(ch channel.Channel, key RouteKey, tool string, args map[string
 }
 
 func dispatchReply(ch channel.Channel, key RouteKey, args map[string]any) (map[string]any, error) {
+	markup, err := markupFromParseMode(argString(args, "parse_mode", ""))
+	if err != nil {
+		return nil, err
+	}
 	r := c3types.ReplyArgs{
 		Channel: key.Channel,
 		ChatID:  argInt64(args, "chat_id", key.ChatID),
 		TopicID: argTopicID(args, "topic_id", key),
 		Text:    argString(args, "text", ""),
-	}
-	if pm := argString(args, "parse_mode", ""); pm != "" {
-		r.ParseMode = pm
+		Markup:  markup,
+		Media:   mediaFromFilesArg(args),
 	}
 	if rt := argInt64Ptr(args, "reply_to"); rt != nil {
 		r.ReplyTo = rt
@@ -46,6 +49,59 @@ func dispatchReply(ch channel.Channel, key RouteKey, args map[string]any) (map[s
 		return nil, err
 	}
 	return mcpText(fmt.Sprintf("sent (id: %d)", id)), nil
+}
+
+// mediaFromFilesArg is a one-release back-compat shim translating the legacy
+// `files` tool arg (a list of local paths) into channel-neutral Media items of
+// Kind=file (byte-for-byte original delivery). No tool schema advertises or
+// populates `files` today, so this returns nil in practice (behavior-preserving);
+// it exists only to map a stray in-flight `files` arg until media sending lands
+// in P3. Removed alongside the other shims in P7.
+func mediaFromFilesArg(args map[string]any) []c3types.MediaItem {
+	raw, ok := args["files"]
+	if !ok {
+		return nil
+	}
+	list, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	var out []c3types.MediaItem
+	for _, v := range list {
+		p, ok := v.(string)
+		if !ok || p == "" {
+			continue
+		}
+		out = append(out, c3types.MediaItem{Kind: c3types.MediaFile, Path: p})
+	}
+	return out
+}
+
+// markupFromParseMode is a one-release back-compat shim translating the legacy
+// `parse_mode` tool arg into the channel-neutral Markup intent, for in-flight
+// sessions whose tool schemas still advertise `parse_mode`. The shim is removed
+// in P7.
+//
+// Mapping:
+//   - ""           → MarkupMarkdown (the converter renders agent markdown natively)
+//   - "HTML"       → MarkupNative   (pre-formed channel markup; passthrough)
+//   - "MarkdownV2" → reject with a clear note (the converter handles markdown
+//     natively now; raw MarkdownV2 from the agent is rare and unsupported)
+//
+// Any other value is raw channel markup and is REJECTED unless it is the
+// recognized native form ("HTML") — raw channel markup is only accepted via
+// MarkupNative.
+func markupFromParseMode(pm string) (c3types.Markup, error) {
+	switch pm {
+	case "":
+		return c3types.MarkupMarkdown, nil
+	case "HTML":
+		return c3types.MarkupNative, nil
+	case "MarkdownV2":
+		return "", fmt.Errorf("parse_mode=MarkdownV2 is no longer supported: write standard markdown and omit parse_mode (it is converted for you), or pass parse_mode=HTML for pre-formed channel markup")
+	default:
+		return "", fmt.Errorf("parse_mode=%q is not a recognized channel markup: omit parse_mode for markdown, or pass parse_mode=HTML for pre-formed channel markup", pm)
+	}
 }
 
 func dispatchReact(ch channel.Channel, key RouteKey, args map[string]any) (map[string]any, error) {
@@ -62,12 +118,16 @@ func dispatchReact(ch channel.Channel, key RouteKey, args map[string]any) (map[s
 }
 
 func dispatchEditMessage(ch channel.Channel, key RouteKey, args map[string]any) (map[string]any, error) {
+	markup, err := markupFromParseMode(argString(args, "parse_mode", ""))
+	if err != nil {
+		return nil, err
+	}
 	a := c3types.EditArgs{
 		Channel:   key.Channel,
 		ChatID:    argInt64(args, "chat_id", key.ChatID),
 		MessageID: argInt64(args, "message_id", 0),
 		Text:      argString(args, "text", ""),
-		ParseMode: argString(args, "parse_mode", ""),
+		Markup:    markup,
 	}
 	r, err := ch.EditMessage(a)
 	if err != nil {

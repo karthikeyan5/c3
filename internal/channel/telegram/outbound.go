@@ -20,23 +20,30 @@ import (
 // when args.TopicID is non-nil. Honors reply_parameters when args.ReplyTo is
 // non-nil.
 //
-// Files are not yet implemented in this method — when args.Files is non-empty,
-// the method returns an error. Photo/document sending lands in a follow-up.
+// Markup mapping (channel-neutral intent → Telegram wire):
+//   - MarkupMarkdown ("" default): run mdToTelegramHTML, send parse_mode=HTML.
+//   - MarkupNative: send the text as-is (pre-formed HTML), parse_mode=HTML.
+//   - MarkupNone: plain text, no parse_mode.
+//
+// Media sending is not yet implemented in this method (P3) — when args.Media is
+// non-empty, the method returns an error.
 func (c *Channel) SendReply(args c3types.ReplyArgs) (int64, error) {
 	if c.bot == nil {
 		return 0, errors.New("telegram: channel not started")
 	}
-	if len(args.Files) > 0 {
-		return 0, errors.New("telegram: file attachments not yet implemented (Phase 4B-followup)")
+	if len(args.Media) > 0 {
+		return 0, errors.New("telegram: media send not yet implemented (P3)")
 	}
 
-	// Markdown rendering: when the caller didn't pin a ParseMode, treat the
-	// text as standard markdown and convert to Telegram HTML. Without this,
-	// `**bold**` and `` `code` `` show as literal characters in Telegram
-	// (2026-05-09 photo report). We chunk the RAW text first, then
-	// convert each chunk independently so a 4096-char split never bisects an
-	// opened tag.
-	autoHTML := args.ParseMode == ""
+	// Markdown rendering: for MarkupMarkdown (the default), treat the text as
+	// standard markdown and convert to Telegram HTML. Without this, `**bold**`
+	// and `` `code` `` show as literal characters in Telegram (2026-05-09 photo
+	// report). For MarkupNative the text is already pre-formed HTML and is sent
+	// as-is with parse_mode=HTML. For MarkupNone the text is sent plain with no
+	// parse_mode. We chunk the RAW text first, then (for markdown) convert each
+	// chunk independently so a 4096-char split never bisects an opened tag.
+	convertMd := args.Markup == c3types.MarkupMarkdown
+	useHTML := args.Markup == c3types.MarkupMarkdown || args.Markup == c3types.MarkupNative
 	chunks := chunkText(args.Text, 4096)
 	var firstID int64
 	for i, chunk := range chunks {
@@ -44,11 +51,11 @@ func (c *Channel) SendReply(args c3types.ReplyArgs) (int64, error) {
 		if args.TopicID != nil {
 			opts.MessageThreadId = *args.TopicID
 		}
-		if autoHTML {
+		if convertMd {
 			chunk = mdToTelegramHTML(chunk)
+		}
+		if useHTML {
 			opts.ParseMode = "HTML"
-		} else if args.ParseMode != "" {
-			opts.ParseMode = args.ParseMode
 		}
 		// Reply-to applies only to the first chunk; subsequent chunks chain
 		// to the previous chunk implicitly via Telegram's UI.
@@ -63,7 +70,7 @@ func (c *Channel) SendReply(args c3types.ReplyArgs) (int64, error) {
 			return firstID, fmt.Errorf("telegram: rate-wait: %w", err)
 		}
 		msg, err := c.bot.SendMessage(args.ChatID, chunk, opts)
-		if err != nil && autoHTML && isParseEntityError(err) {
+		if err != nil && convertMd && isParseEntityError(err) {
 			// Plaintext fallback (per OpenClaw bot/delivery.send.ts pattern).
 			// Our markdown converter occasionally produces malformed HTML for
 			// pathological input; re-send the ORIGINAL chunk as plain text
@@ -132,6 +139,12 @@ func (c *Channel) SendTyping(chatID int64, threadID *int64) error {
 
 // EditMessage edits a previously-sent message's text. Used by the
 // edit_progress tool (spec §7.2) and by the broker's placeholder lifecycle.
+//
+// Markup mapping (P1 — behavior-preserving; the converter is wired into edits
+// in P2b, not here):
+//   - MarkupNative: send the text as-is (pre-formed HTML), parse_mode=HTML.
+//   - MarkupMarkdown ("" default) / MarkupNone: send the text unchanged with no
+//     parse_mode — matching today's non-converting edit behavior.
 func (c *Channel) EditMessage(args c3types.EditArgs) (*c3types.EditResult, error) {
 	if c.bot == nil {
 		return nil, errors.New("telegram: channel not started")
@@ -141,8 +154,8 @@ func (c *Channel) EditMessage(args c3types.EditArgs) (*c3types.EditResult, error
 		MessageId:   args.MessageID,
 		RequestOpts: requestOptsFor("editMessageText", longPollTimeoutSeconds),
 	}
-	if args.ParseMode != "" {
-		opts.ParseMode = args.ParseMode
+	if args.Markup == c3types.MarkupNative {
+		opts.ParseMode = "HTML"
 	}
 	if err := c.rate.Wait(c.ctx, args.ChatID); err != nil {
 		return nil, fmt.Errorf("telegram: rate-wait: %w", err)

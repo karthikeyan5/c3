@@ -57,17 +57,22 @@ type ReplyContext struct {
 
 // Outbound is one tool-call from a CLI adapter to a Channel for delivery.
 // Used for both the `reply` tool and as the base shape for derived
-// args (see ReplyArgs alias). Files is a list of local paths the
-// channel uploads; ParseMode is channel-specific markup (e.g.
-// "HTML" / "MarkdownV2" for Telegram).
+// args (see ReplyArgs alias).
+//
+// Outbound is channel-neutral: Markup is the markup intent (none/markdown/
+// native) the channel renders for; Media is the channel-neutral media list;
+// Poll is an optional outbound poll. No Telegram-specific identifier (e.g.
+// "HTML"/"MarkdownV2" parse modes, file paths) leaks into this shape — the
+// channel translates Markup/Media/Poll into its own dialect.
 type Outbound struct {
-	Channel   string
-	ChatID    int64
-	TopicID   *int64
-	Text      string
-	Files     []string
-	ParseMode string
-	ReplyTo   *int64
+	Channel string
+	ChatID  int64
+	TopicID *int64
+	Text    string
+	Markup  Markup
+	Media   []MediaItem
+	Poll    *PollSpec
+	ReplyTo *int64
 }
 
 // ReplyArgs is the argument shape for the `reply` MCP tool. Aliased to
@@ -78,13 +83,14 @@ type ReplyArgs = Outbound
 
 // EditArgs is the argument shape for the `edit_message` MCP tool.
 // MessageID identifies the message to edit; Text is the new content;
-// ParseMode follows the same convention as Outbound.
+// Markup is the channel-neutral markup intent (none/markdown/native),
+// the same convention as Outbound — so edits join the markup system.
 type EditArgs struct {
 	Channel   string
 	ChatID    int64
 	MessageID int64
 	Text      string
-	ParseMode string
+	Markup    Markup
 }
 
 // EditResult is returned from Channel.EditMessage. MessageID echoes
