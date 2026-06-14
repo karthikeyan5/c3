@@ -316,6 +316,40 @@ the manifest (anti-drift).
 2. Gated Telegram-named interface methods — inert until a 2nd channel forces a rename.
 3. `c3types.Inbound.Attachment.Kind` — open enum on Telegram terms (`types.go:39/41`); deferred.
 
+## Live smoke checklist
+
+The build self-verifies everything except a real round-trip from a phone. After
+`/c3:build` (fresh binaries) and attaching a session in Telegram mode, run these
+from the actual Telegram app — this is the one check the build can't perform.
+
+1. **Rich text marks.** Ask the agent to reply with one message exercising every
+   mark: **bold**, *italic*, a [link](https://example.com), a bulleted list, a
+   numbered list, a `> block quote`, `inline code`, a fenced code block,
+   ~~strikethrough~~, and a ||spoiler||. Confirm each renders natively in
+   Telegram (not as literal markdown/HTML characters) and the spoiler is
+   tap-to-reveal.
+2. **Long reply → multi-message split.** Have the agent send a reply well over
+   ~4096 characters. Confirm it arrives as several ordered messages (no drop, no
+   truncation), the split lands on a paragraph/line boundary (not mid-word, not
+   inside a code fence or link), and the agent's reported message id is the
+   FIRST part.
+3. **Photo (compressed) vs file (original).** Have the agent send the SAME image
+   twice: once `kind="photo"` and once `kind="file"`. Confirm the photo appears
+   as a compressed in-chat preview and the file downloads byte-for-byte original
+   (check size/EXIF differ). Optionally repeat for a PDF/log as `kind="file"`.
+4. **Poll.** Have the agent send a poll (a question + 3 options). Confirm it
+   renders as a native Telegram poll and a vote registers.
+5. **Reaction.** Have the agent set a single-emoji reaction on one of your
+   messages; confirm the reaction appears on that message.
+6. **Typing indicator on turn 2.** Send a first message (turn 1 — no typing
+   expected; the holder hasn't replied yet, documented limitation). After the
+   agent replies, send a second message that triggers a slow reply; confirm the
+   "typing…" indicator pulses while the agent works, and stops when the reply
+   lands.
+7. **Rich edit (optional).** Have the agent send a reply then `edit_message` it
+   with new markdown; confirm the edited message re-renders rich (bold/links),
+   not as plain text.
+
 ## Items for Karthi (review after the build)
 
 - **Streaming (R4):** which path, if any — reverse the Codex opt-out (Codex-only) or pivot C3 to an

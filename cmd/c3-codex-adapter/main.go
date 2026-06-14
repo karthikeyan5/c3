@@ -594,10 +594,9 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 				InputSchema: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"text":       map[string]any{"type": "string"},
-						"reply_to":   map[string]any{"type": "integer"},
-						"parse_mode": map[string]any{"type": "string"},
-						"media":      mcptools.ReplyMediaSchema(caps),
+						"text":     map[string]any{"type": "string"},
+						"reply_to": map[string]any{"type": "integer"},
+						"media":    mcptools.ReplyMediaSchema(caps),
 					},
 					"required": []string{"text"},
 				},

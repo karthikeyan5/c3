@@ -35,17 +35,17 @@ func dispatchTool(ch channel.Channel, key RouteKey, tool string, args map[string
 }
 
 func dispatchReply(ch channel.Channel, key RouteKey, args map[string]any) (map[string]any, error) {
-	markup, err := markupFromParseMode(argString(args, "parse_mode", ""))
-	if err != nil {
-		return nil, err
-	}
 	out := c3types.Outbound{
 		Channel: key.Channel,
 		ChatID:  argInt64(args, "chat_id", key.ChatID),
 		TopicID: argTopicID(args, "topic_id", key),
 		Text:    argString(args, "text", ""),
-		Markup:  markup,
-		Media:   mediaFromArgs(args),
+		// The agent writes standard markdown; C3 converts + escapes it for the
+		// channel. Markup is always the markdown intent (MarkupNative remains a
+		// dormant internal escape hatch in the type system but is not agent-
+		// selectable in v1).
+		Markup: c3types.MarkupMarkdown,
+		Media:  mediaFromArgs(args),
 	}
 	if rt := argInt64Ptr(args, "reply_to"); rt != nil {
 		out.ReplyTo = rt
@@ -142,60 +142,16 @@ func dispatchPoll(ch channel.Channel, key RouteKey, args map[string]any) (map[st
 	return sendParts(ch, key, parts, notes)
 }
 
-// mediaFromArgs parses the reply tool's `media` array arg (P3, the real surface)
-// into channel-neutral MediaItems, then appends any items from the legacy `files`
-// shim. The `media` arg is the authored surface; `files` is the one-release
-// back-compat shim (removed in P7).
-//
-// `media` is a JSON array of objects: {kind, path, url, caption, spoiler}. An
-// item with neither path nor url, or with an empty/unknown kind, is skipped here;
-// the channel surfaces a clear send error for any genuinely bad item that slips
-// through. Kind defaults to "file" (byte-for-byte original) when omitted.
+// mediaFromArgs parses the reply tool's `media` array arg into channel-neutral
+// MediaItems. `media` is a JSON array of objects: {kind, path, url, caption,
+// spoiler}. An item with neither path nor url, or with an empty/unknown kind, is
+// skipped here; the channel surfaces a clear send error for any genuinely bad
+// item that slips through. Kind defaults to "file" (byte-for-byte original) when
+// omitted.
 func mediaFromArgs(args map[string]any) []c3types.MediaItem {
 	var out []c3types.MediaItem
 
-	if raw, ok := args["media"]; ok {
-		if list, ok := raw.([]any); ok {
-			for _, v := range list {
-				m, ok := v.(map[string]any)
-				if !ok {
-					continue
-				}
-				path := argString(m, "path", "")
-				urlStr := argString(m, "url", "")
-				if path == "" && urlStr == "" {
-					continue
-				}
-				kind := c3types.MediaKind(argString(m, "kind", string(c3types.MediaFile)))
-				if kind == "" {
-					kind = c3types.MediaFile
-				}
-				item := c3types.MediaItem{
-					Kind:    kind,
-					Path:    path,
-					URL:     urlStr,
-					Caption: argString(m, "caption", ""),
-				}
-				if sp, ok := m["spoiler"].(bool); ok {
-					item.Spoiler = sp
-				}
-				out = append(out, item)
-			}
-		}
-	}
-
-	out = append(out, mediaFromFilesArg(args)...)
-	return out
-}
-
-// mediaFromFilesArg is a one-release back-compat shim translating the legacy
-// `files` tool arg (a list of local paths) into channel-neutral Media items of
-// Kind=file (byte-for-byte original delivery). No tool schema advertises or
-// populates `files` today, so this returns nil in practice (behavior-preserving);
-// it exists only to map a stray in-flight `files` arg. Removed alongside the
-// other shims in P7.
-func mediaFromFilesArg(args map[string]any) []c3types.MediaItem {
-	raw, ok := args["files"]
+	raw, ok := args["media"]
 	if !ok {
 		return nil
 	}
@@ -203,42 +159,32 @@ func mediaFromFilesArg(args map[string]any) []c3types.MediaItem {
 	if !ok {
 		return nil
 	}
-	var out []c3types.MediaItem
 	for _, v := range list {
-		p, ok := v.(string)
-		if !ok || p == "" {
+		m, ok := v.(map[string]any)
+		if !ok {
 			continue
 		}
-		out = append(out, c3types.MediaItem{Kind: c3types.MediaFile, Path: p})
+		path := argString(m, "path", "")
+		urlStr := argString(m, "url", "")
+		if path == "" && urlStr == "" {
+			continue
+		}
+		kind := c3types.MediaKind(argString(m, "kind", string(c3types.MediaFile)))
+		if kind == "" {
+			kind = c3types.MediaFile
+		}
+		item := c3types.MediaItem{
+			Kind:    kind,
+			Path:    path,
+			URL:     urlStr,
+			Caption: argString(m, "caption", ""),
+		}
+		if sp, ok := m["spoiler"].(bool); ok {
+			item.Spoiler = sp
+		}
+		out = append(out, item)
 	}
 	return out
-}
-
-// markupFromParseMode is a one-release back-compat shim translating the legacy
-// `parse_mode` tool arg into the channel-neutral Markup intent, for in-flight
-// sessions whose tool schemas still advertise `parse_mode`. The shim is removed
-// in P7.
-//
-// Mapping:
-//   - ""           → MarkupMarkdown (the converter renders agent markdown natively)
-//   - "HTML"       → MarkupNative   (pre-formed channel markup; passthrough)
-//   - "MarkdownV2" → reject with a clear note (the converter handles markdown
-//     natively now; raw MarkdownV2 from the agent is rare and unsupported)
-//
-// Any other value is raw channel markup and is REJECTED unless it is the
-// recognized native form ("HTML") — raw channel markup is only accepted via
-// MarkupNative.
-func markupFromParseMode(pm string) (c3types.Markup, error) {
-	switch pm {
-	case "":
-		return c3types.MarkupMarkdown, nil
-	case "HTML":
-		return c3types.MarkupNative, nil
-	case "MarkdownV2":
-		return "", fmt.Errorf("parse_mode=MarkdownV2 is no longer supported: write standard markdown and omit parse_mode (it is converted for you), or pass parse_mode=HTML for pre-formed channel markup")
-	default:
-		return "", fmt.Errorf("parse_mode=%q is not a recognized channel markup: omit parse_mode for markdown, or pass parse_mode=HTML for pre-formed channel markup", pm)
-	}
 }
 
 func dispatchReact(ch channel.Channel, key RouteKey, args map[string]any) (map[string]any, error) {
@@ -255,10 +201,10 @@ func dispatchReact(ch channel.Channel, key RouteKey, args map[string]any) (map[s
 }
 
 func dispatchEditMessage(ch channel.Channel, key RouteKey, args map[string]any) (map[string]any, error) {
-	markup, err := markupFromParseMode(argString(args, "parse_mode", ""))
-	if err != nil {
-		return nil, err
-	}
+	// Edits join the markup system: the agent writes standard markdown and C3
+	// converts it (MarkupNative stays a dormant internal escape hatch, not agent-
+	// selectable in v1).
+	markup := c3types.MarkupMarkdown
 	caps := ch.Capabilities()
 	text := argString(args, "text", "")
 
