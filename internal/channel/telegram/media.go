@@ -70,15 +70,19 @@ func (c *Channel) sendMedia(args c3types.ReplyArgs, item c3types.MediaItem) (int
 		src = gotgbot.InputFileByURL(item.URL)
 	}
 
-	// Caption: convert markdown→HTML the same way text replies do. The gate is
-	// responsible for caption-length policy; we guard here as a last resort and
-	// reject a grossly-oversize caption rather than let Telegram 400.
+	// Caption: convert markdown→HTML the same way text replies do, then measure
+	// the CONVERTED caption — that is what Telegram actually receives and counts.
+	// Measuring the RAW caption would let a near-limit formatted caption balloon
+	// past 1024 once converted (e.g. `<a href="…">…</a>` is far longer than its
+	// markdown source) and Telegram would 400 with no fallback. We reject the
+	// converted over-limit caption here as a clean pre-send error instead. (v1:
+	// no gate trim+follow-up; a clear actionable rejection is the behavior.)
 	caption := item.Caption
-	if captionUTF16Len(caption) > maxCaptionRunes {
-		return 0, fmt.Errorf("telegram: caption is %d chars, over the %d-char caption limit — shorten it or send the text as a separate message",
-			captionUTF16Len(caption), maxCaptionRunes)
-	}
 	captionHTML := mdToTelegramHTML(caption)
+	if captionUTF16Len(captionHTML) > maxCaptionRunes {
+		return 0, fmt.Errorf("telegram: formatted caption is %d chars, over the %d-char caption limit — shorten it or send the text as a separate message (markdown formatting expands the length Telegram counts)",
+			captionUTF16Len(captionHTML), maxCaptionRunes)
+	}
 
 	if err := c.rate.Wait(c.ctx, args.ChatID); err != nil {
 		return 0, fmt.Errorf("telegram: rate-wait: %w", err)

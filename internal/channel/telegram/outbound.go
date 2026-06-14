@@ -236,6 +236,18 @@ func (c *Channel) DownloadAttachment(fileID string) (string, error) {
 		return "", errors.New("telegram: GetFile returned empty file_path (file may be too large or expired)")
 	}
 
+	// Size pre-check (cap-aware): the Bot API download ceiling is 20 MiB. The
+	// inbound Attachment.Size is not reachable through the channel.Channel
+	// DownloadAttachment(fileID) signature, so we pre-check the GetFile result's
+	// FileSize (set for most file types) and reject BEFORE streaming the body,
+	// with a clear MB-vs-limit message rather than a late copy failure. FileSize
+	// can be 0/absent for some kinds; in that case we fall through and rely on the
+	// HTTP layer (a 20 MiB+ file won't have produced a FilePath above anyway).
+	if f.FileSize > maxDownloadBytes {
+		return "", fmt.Errorf("telegram: attachment too large to download (%d MB > %d MB limit)",
+			f.FileSize/(1024*1024), int64(maxDownloadBytes)/(1024*1024))
+	}
+
 	cacheDir, err := attachmentsCacheDir()
 	if err != nil {
 		return "", err

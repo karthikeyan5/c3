@@ -340,6 +340,98 @@ func (c *noTypingChannel) Capabilities() c3types.Capabilities {
 	return c3types.Capabilities{Channel: "telegram", Typing: false}
 }
 
+// TestTypingRelay_IdlesOutWhenNoReply is the regression test for the
+// 2026-06-15 triple-review finding: a typing tick must NOT extend the worker's
+// idle lifetime. Before the fix, the run loop reset the idle timer on EVERY
+// select iteration (including the typing-tick case); since typingInterval <
+// idle, an armed ticker re-armed idle forever, so a worker that took an inbound
+// (or a non-reply tool call) but never replied — e.g. the user switched to CLI
+// mode mid-turn — pulsed "typing…" to Telegram indefinitely and never idled out.
+//
+// Here we arm the relay via a successful non-reply tool call (react), which arms
+// typing in the worker goroutine (race-free), then never reply. With a short
+// idle and short pulse cadence the worker MUST idle out and disarm the relay.
+func TestTypingRelay_IdlesOutWhenNoReply(t *testing.T) {
+	tid := int64(281)
+	key := RouteKey{Channel: "telegram", ChatID: -100, HasTopic: true, TopicID: tid}
+	ch := &typingRecorderChannel{} // Typing: true; react returns nil
+	b := brokerWithGenericChannel(t, mfWithTelegram(), ch)
+	defer b.Shutdown()
+	holder := claimedHolder(t, b, key)
+	holder.MarkReplied() // arm gate: holder must have replied at least once
+
+	w := newRouteWorker(context.Background(), key, 150*time.Millisecond, b)
+	w.typingIvl = 20 * time.Millisecond // many pulses fit inside the idle window
+	defer w.Stop()
+
+	// A successful non-reply tool call arms the relay from the worker goroutine.
+	resultCh := make(chan OutboundResult, 1)
+	if !w.Submit(Job{Kind: JobOutbound, Outbound: &OutboundJob{
+		Tool: "react", Args: map[string]any{"message_id": int64(1), "emoji": "👍"}, ResultCh: resultCh,
+	}}) {
+		t.Fatal("Submit react job failed")
+	}
+	if r := <-resultCh; r.Err != nil {
+		t.Fatalf("react tool call should succeed (arms typing); got err %v", r.Err)
+	}
+
+	// The worker must idle out despite the typing ticker pulsing the whole time.
+	select {
+	case <-w.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did NOT idle out — a typing tick is still extending the idle timer (unbounded pulsing)")
+	}
+
+	// After the run goroutine has exited (Done closed), no concurrent writes
+	// remain, so reading typing state here is race-free. The defer disarmTyping()
+	// in run() must have stopped the relay.
+	if w.typingTicker != nil || w.typingC != nil {
+		t.Fatal("typing relay must be disarmed once the worker idles out")
+	}
+
+	// Pulsing happened (proof the relay was live) but is bounded — it did not run
+	// away. Far fewer than a runaway count.
+	if n := len(ch.typingSnapshot()); n == 0 {
+		t.Fatal("expected at least one typing pulse while the relay was armed")
+	}
+}
+
+// TestTypingRelay_DisarmsAfterMaxPulses covers the belt-and-suspenders bound:
+// even if (hypothetically) the idle timeout never trips, the relay self-disarms
+// after maxTypingPulses consecutive unanswered pulses. We drive pulseTyping
+// directly (worker goroutine semantics: armTyping then pulseTyping are the same
+// calls the run loop makes) on a long-idle worker so only the cap can stop it.
+func TestTypingRelay_DisarmsAfterMaxPulses(t *testing.T) {
+	tid := int64(281)
+	key := RouteKey{Channel: "telegram", ChatID: -100, HasTopic: true, TopicID: tid}
+	ch := &typingRecorderChannel{}
+	b := brokerWithGenericChannel(t, mfWithTelegram(), ch)
+	defer b.Shutdown()
+	holder := claimedHolder(t, b, key)
+	holder.MarkReplied()
+
+	// Long idle + manual stepping so the run loop's own typing-tick never races
+	// our direct calls (Stop cancels the loop before we touch state).
+	w := newRouteWorker(context.Background(), key, time.Hour, b)
+	w.Stop() // stop the run goroutine; we drive the relay calls directly below
+
+	w.armTyping(holder)
+	if w.typingTicker == nil {
+		t.Fatal("setup: relay should arm")
+	}
+	// Pulse up to the cap: pulses 1..maxTypingPulses succeed; the next disarms.
+	for i := 0; i < maxTypingPulses; i++ {
+		w.pulseTyping(context.Background())
+		if w.typingTicker == nil {
+			t.Fatalf("relay disarmed too early at pulse %d (cap is %d)", i+1, maxTypingPulses)
+		}
+	}
+	w.pulseTyping(context.Background()) // exceeds the cap
+	if w.typingTicker != nil || w.typingC != nil {
+		t.Fatalf("relay must self-disarm after exceeding %d consecutive unanswered pulses", maxTypingPulses)
+	}
+}
+
 func TestWorker_OutboundStubReturnsErr(t *testing.T) {
 	w := newRouteWorker(context.Background(), RouteKey{Channel: "x"}, time.Hour, nil)
 	defer w.Stop()

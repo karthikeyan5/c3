@@ -1,7 +1,11 @@
 package broker
 
 import (
+	"bytes"
 	"context"
+	"log"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -150,6 +154,54 @@ func TestDispatchReply_MediaArgSplitsIntoParts(t *testing.T) {
 	if len(sent[2].Media) != 1 || sent[2].Media[0].Kind != c3types.MediaPhoto ||
 		sent[2].Media[0].URL != "https://example.com/x.jpg" || !sent[2].Media[0].Spoiler {
 		t.Errorf("part 2 should carry the photo URL item with spoiler; got %+v", sent[2].Media)
+	}
+}
+
+// TestSendParts_MediaPathAuditLogged covers the 2026-06-15 security finding: the
+// broker must emit an audit line for every outbound media item with a non-empty
+// local Path (a prompt-injected agent could exfil the bot token / ssh keys to the
+// chat; that is accepted under the trusted-local-agent model but MUST be
+// detectable). The path is resolved with filepath.Abs. URL-only media must NOT
+// produce a media-send line.
+func TestSendParts_MediaPathAuditLogged(t *testing.T) {
+	var buf bytes.Buffer
+	oldOut := log.Writer()
+	oldFlags := log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(oldOut)
+		log.SetFlags(oldFlags)
+	}()
+
+	ch := &mediaReplyChannel{}
+	key := RouteKey{Channel: "telegram", ChatID: -100}
+	args := map[string]any{
+		"text": "see attached",
+		"media": []any{
+			map[string]any{"kind": "file", "path": "relative/secret.pdf"},
+			map[string]any{"kind": "photo", "url": "https://example.com/x.jpg"},
+		},
+	}
+	if _, err := dispatchReply(ch, key, args); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	out := buf.String()
+	wantAbs, _ := filepath.Abs("relative/secret.pdf")
+	if !strings.Contains(out, "media-send") {
+		t.Fatalf("expected a media-send audit line; log was:\n%s", out)
+	}
+	if !strings.Contains(out, "path="+strconv.Quote(wantAbs)) {
+		t.Errorf("audit line must record the ABSOLUTE path %q; log was:\n%s", wantAbs, out)
+	}
+	// URL-only media must not be audited (nothing local is being read).
+	if strings.Contains(out, "x.jpg") {
+		t.Errorf("URL-only media must NOT produce a media-send audit line; log was:\n%s", out)
+	}
+	// Exactly one media-send line (the file item only).
+	if n := strings.Count(out, "media-send"); n != 1 {
+		t.Errorf("expected exactly 1 media-send line (the Path item); got %d; log was:\n%s", n, out)
 	}
 }
 

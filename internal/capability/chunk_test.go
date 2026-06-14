@@ -51,6 +51,22 @@ func TestChunkMarkdown_LinkNotBisected(t *testing.T) {
 	}
 }
 
+// TestChunkMarkdown_LinkWithBalancedParensNotBisected guards the depth-tracking
+// fix in linkSpan: a [label](url) whose URL contains balanced parens (e.g.
+// .../Foo_(bar)) is one indivisible link. Before the fix linkSpan ended the URL
+// at the FIRST ')', so the trailing ")" leaked out as a separate token and a
+// chunk boundary could fall inside the link.
+func TestChunkMarkdown_LinkWithBalancedParensNotBisected(t *testing.T) {
+	limit := 60
+	link := "[Foo](https://en.wikipedia.org/wiki/Foo_(bar))" // 46 units — fits 60
+	src := "see this " + link + " for more context details here please"
+	parts, _ := chunkMarkdown(src, limit)
+	partsWithinLimit(t, parts, limit)
+	if !constructInOnePart(parts, link) {
+		t.Errorf("link with balanced parens was bisected across parts; parts=%q", parts)
+	}
+}
+
 func TestChunkMarkdown_BlockquoteNotBisected(t *testing.T) {
 	limit := 50
 	// A blockquote run that as a whole exceeds the limit, packed with a

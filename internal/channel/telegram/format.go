@@ -313,6 +313,20 @@ func matchDelim(runes []rune, i int, delim string, wordBoundary bool) (inner str
 	// Search for the closing delimiter.
 	for j := start; j+dl <= len(runes); j++ {
 		if string(runes[j:j+dl]) == delim {
+			// SINGLE-delimiter (italic *…* / _…_) only: a delimiter that sits in a
+			// DOUBLED run (a `**`/`__` bold marker) is NOT a single-emphasis close.
+			// Without this, `*a **b** c*` (italic wrapping bold) closes the italic
+			// at the first `*` of the inner `**`, producing balanced-but-wrong HTML.
+			// Skip the whole doubled run so the search finds the true single close;
+			// the inner `**b**` is then handled by the recursive renderInline.
+			if dl == 1 && ((j > 0 && runes[j-1] == delimRune) || (j+1 < len(runes) && runes[j+1] == delimRune)) {
+				// Advance j past the rest of this delimiter run (the loop's j++ then
+				// steps past the final delim rune of the run).
+				for j+1 < len(runes) && runes[j+1] == delimRune {
+					j++
+				}
+				continue
+			}
 			candidate := runes[start:j]
 			if len(candidate) == 0 {
 				return "", 0, false // empty span, not emphasis
@@ -355,7 +369,10 @@ func parseLink(runes []rune, i int) (label, url string, next int, ok bool) {
 	if close+1 >= len(runes) || runes[close+1] != '(' {
 		return "", "", 0, false
 	}
-	paren := indexRune(runes, ')', close+2)
+	// Scan to the MATCHING close paren with depth tracking so a URL containing
+	// balanced parens (e.g. https://en.wikipedia.org/wiki/Foo_(bar)) is not
+	// truncated at the first ')'. Depth starts at 1 for the opening '('.
+	paren := matchCloseParen(runes, close+1)
 	if paren < 0 {
 		return "", "", 0, false
 	}
@@ -365,6 +382,28 @@ func parseLink(runes []rune, i int) (label, url string, next int, ok bool) {
 		return "", "", 0, false
 	}
 	return label, url, paren + 1, true
+}
+
+// matchCloseParen returns the index of the ')' that matches the '(' at index
+// open, tracking nesting depth so balanced inner parens don't end the scan
+// early. Returns -1 if runes[open] is not '(' or no matching close exists.
+func matchCloseParen(runes []rune, open int) int {
+	if open >= len(runes) || runes[open] != '(' {
+		return -1
+	}
+	depth := 0
+	for j := open; j < len(runes); j++ {
+		switch runes[j] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return j
+			}
+		}
+	}
+	return -1
 }
 
 // indexRune returns the index of the first occurrence of r in runes at or after
@@ -404,6 +443,13 @@ func escapeRune(r rune) string {
 // escapeURL escapes a URL for use inside an href="..." attribute. In addition
 // to the text-content set it escapes `"` so the attribute can't be terminated
 // early.
+//
+// SCHEME SAFETY: this escapes attribute syntax only — it does NOT validate the
+// URL scheme. No-XSS (no javascript:/data: hrefs) relies entirely on the
+// Telegram client honoring only http/https/tg/tel in an <a href>. A future
+// channel reusing this converter for a context that DOES render arbitrary
+// schemes (a browser/webview) MUST re-validate the scheme before trusting the
+// href.
 func escapeURL(s string) string {
 	var b strings.Builder
 	for _, r := range s {

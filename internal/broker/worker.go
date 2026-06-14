@@ -66,6 +66,17 @@ type RouteWorker struct {
 	// (holder HasReplied + Capabilities.Typing) lives in armTyping.
 	typingTicker *time.Ticker
 	typingC      <-chan time.Time
+
+	// typingIvl is the relay re-pulse cadence. Defaults to typingInterval; tests
+	// shorten it to exercise pulse behavior within a short idle window.
+	typingIvl time.Duration
+
+	// typingPulses counts CONSECUTIVE typing ticks that fired without a reply
+	// ending the turn. It is reset to 0 on arm/re-arm and on a reply (disarm),
+	// and incremented on each pulse. Belt-and-suspenders: if it exceeds
+	// maxTypingPulses the relay self-disarms even if (for any reason) the idle
+	// timeout never trips. See pulseTyping.
+	typingPulses int
 }
 
 // debounceWindow / debounceMax defaults from spec §7.3 + §6.
@@ -78,6 +89,14 @@ const (
 	// ~4s re-pulse keeps the indicator continuously visible while the agent
 	// works a turn.
 	typingInterval = 4 * time.Second
+
+	// maxTypingPulses caps how many CONSECUTIVE typing pulses may fire without a
+	// reply ending the turn before the relay self-disarms. The worker's idle
+	// timeout is the primary stop (a typing tick no longer extends idle), so
+	// this is a belt-and-suspenders bound: at typingInterval=4s, 15 pulses is a
+	// full minute of an agent that took an inbound but never replied (e.g. the
+	// user switched to CLI mode mid-turn). It must never pulse forever.
+	maxTypingPulses = 15
 )
 
 // newRouteWorker starts a worker that runs until ctx is canceled OR no jobs
@@ -85,12 +104,13 @@ const (
 func newRouteWorker(parent context.Context, key RouteKey, idle time.Duration, broker *Broker) *RouteWorker {
 	ctx, cancel := context.WithCancel(parent)
 	w := &RouteWorker{
-		key:    key,
-		queue:  make(chan Job, 64),
-		idle:   idle,
-		broker: broker,
-		cancel: cancel,
-		done:   make(chan struct{}),
+		key:       key,
+		queue:     make(chan Job, 64),
+		idle:      idle,
+		broker:    broker,
+		cancel:    cancel,
+		done:      make(chan struct{}),
+		typingIvl: typingInterval,
 	}
 	go w.run(ctx)
 	return w
@@ -120,19 +140,25 @@ func (w *RouteWorker) run(ctx context.Context) {
 		debC = nil
 	}
 
-	stopIdle := func() {
+	// resetIdle restarts the worker's idle countdown. It is called ONLY from
+	// real-work arms (debounce flush, inbound, outbound) — NOT from the typing
+	// tick. A typing pulse must not extend the worker's lifetime: typingInterval
+	// (4s) is shorter than any sane idle window, so if the tick reset idle, an
+	// armed ticker would re-arm idle forever and a worker that took an inbound
+	// but never replied (e.g. user switched to CLI mode) would pulse "typing…"
+	// indefinitely and never idle out. Resetting idle only on real work lets the
+	// worker idle out normally; its defer disarmTyping() then stops the relay.
+	resetIdle := func() {
 		if !idleTimer.Stop() {
 			select {
 			case <-idleTimer.C:
 			default:
 			}
 		}
+		idleTimer.Reset(w.idle)
 	}
 
 	for {
-		stopIdle()
-		idleTimer.Reset(w.idle)
-
 		select {
 		case <-ctx.Done():
 			flushDeb()
@@ -141,17 +167,21 @@ func (w *RouteWorker) run(ctx context.Context) {
 			flushDeb()
 			return
 		case <-debC:
+			resetIdle()
 			flushDeb()
 		case <-w.typingC:
 			// Typing relay tick (P5). Runs in the worker's single goroutine —
 			// no new concurrency. Pulse the channel's typing action for this
 			// route; the ticker keeps firing on its own cadence until disarmed.
+			// Deliberately does NOT resetIdle — a typing pulse is not real work
+			// and must not keep the worker (and thus the relay) alive forever.
 			w.pulseTyping(ctx)
 		case job, ok := <-w.queue:
 			if !ok {
 				flushDeb()
 				return
 			}
+			resetIdle()
 			switch job.Kind {
 			case JobInbound:
 				if job.Inbound == nil {
@@ -458,10 +488,19 @@ func (w *RouteWorker) armTyping(holder *Stub) {
 		return
 	}
 	if w.typingTicker != nil {
-		return // already armed — keep the existing cadence
+		// Already armed. A re-arm marks fresh agent activity (a non-reply tool
+		// call this turn), so reset the unanswered-pulse counter but KEEP the
+		// existing ticker so the cadence stays steady across a turn's calls.
+		w.typingPulses = 0
+		return
 	}
-	w.typingTicker = time.NewTicker(typingInterval)
+	ivl := w.typingIvl
+	if ivl <= 0 {
+		ivl = typingInterval
+	}
+	w.typingTicker = time.NewTicker(ivl)
 	w.typingC = w.typingTicker.C
+	w.typingPulses = 0
 }
 
 // disarmTyping stops the per-route typing ticker if armed. Idempotent. Called
@@ -474,6 +513,7 @@ func (w *RouteWorker) disarmTyping() {
 	w.typingTicker.Stop()
 	w.typingTicker = nil
 	w.typingC = nil
+	w.typingPulses = 0
 }
 
 // pulseTyping fires one SendTyping for the route. Resolves the channel + the
@@ -482,6 +522,17 @@ func (w *RouteWorker) disarmTyping() {
 // the ticker spinning. Runs in the worker goroutine (the run loop's <-typingC).
 func (w *RouteWorker) pulseTyping(_ context.Context) {
 	if w.broker == nil {
+		w.disarmTyping()
+		return
+	}
+	// Belt-and-suspenders bound: if the relay has pulsed maxTypingPulses times
+	// without a reply ending the turn, disarm even though the idle timeout is the
+	// primary stop. Guards against any future change that re-extends idle on a
+	// pulse and would otherwise let "typing…" spin forever.
+	w.typingPulses++
+	if w.typingPulses > maxTypingPulses {
+		log.Printf("typing RELAY CAP chan=%s chat=%d topic=%s: %d consecutive pulses with no reply — disarming relay",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), w.typingPulses-1)
 		w.disarmTyping()
 		return
 	}

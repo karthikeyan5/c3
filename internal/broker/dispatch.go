@@ -3,6 +3,7 @@ package broker
 import (
 	"fmt"
 	"log"
+	"path/filepath"
 	"strings"
 	"unicode/utf16"
 
@@ -83,6 +84,23 @@ func logAlterations(key RouteKey, chatID int64, alts []c3types.Alteration) {
 func sendParts(ch channel.Channel, key RouteKey, parts []c3types.Outbound, notes []string) (map[string]any, error) {
 	var firstID int64
 	for i, part := range parts {
+		// SECURITY AUDIT (2026-06-15): record the absolute path of every local
+		// file being sent out to a chat. Under the trusted-local-agent model the
+		// media `path` arg may reference ANY broker-readable file (the bot token,
+		// ssh keys, …), so a prompt-injected agent could exfiltrate secrets to the
+		// chat. That is accepted by the threat model but MUST be detectable — this
+		// log line is the audit trail. URL-only media (no Path) is not logged here.
+		for _, m := range part.Media {
+			if m.Path == "" {
+				continue
+			}
+			abs, err := filepath.Abs(m.Path)
+			if err != nil {
+				abs = m.Path // best-effort: log the raw path if Abs fails
+			}
+			log.Printf("media-send chan=%s chat=%d topic=%s kind=%s path=%q",
+				key.Channel, part.ChatID, TopicKeyStr(key), m.Kind, abs)
+		}
 		id, err := ch.SendReply(part)
 		if i == 0 {
 			firstID = id

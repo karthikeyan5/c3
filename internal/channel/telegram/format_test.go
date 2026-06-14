@@ -21,6 +21,9 @@ func TestMdToTelegramHTML(t *testing.T) {
 		{"italic-star", "an *emphatic* word", "an <i>emphatic</i> word"},
 		{"italic-under", "an _emphatic_ word", "an <i>emphatic</i> word"},
 		{"bold-and-italic", "**b** and *i*", "<b>b</b> and <i>i</i>"},
+		// Italic wrapping bold: the single `*` must not close at the inner `**`.
+		{"italic-wrapping-bold-stars", "*a **b** c*", "<i>a <b>b</b> c</i>"},
+		{"italic-wrapping-bold-unders", "_a __b__ c_", "<i>a <b>b</b> c</i>"},
 
 		// --- Strikethrough / spoiler ---
 		{"strike", "this is ~~gone~~ now", "this is <s>gone</s> now"},
@@ -43,6 +46,11 @@ func TestMdToTelegramHTML(t *testing.T) {
 		{"link", "[label](http://x)", `<a href="http://x">label</a>`},
 		{"link-in-sentence", "see [docs](https://e.com) now", `see <a href="https://e.com">docs</a> now`},
 		{"link-url-amp-escaped", "[q](https://x/a?b=1&c=2)", `<a href="https://x/a?b=1&amp;c=2">q</a>`},
+		// URL with balanced parens must not truncate at the first ')'.
+		{"link-url-balanced-parens", "[Foo](https://en.wikipedia.org/wiki/Foo_(bar))",
+			`<a href="https://en.wikipedia.org/wiki/Foo_(bar)">Foo</a>`},
+		{"link-url-balanced-parens-in-sentence", "see [Foo](https://en.wikipedia.org/wiki/Foo_(bar)) here",
+			`see <a href="https://en.wikipedia.org/wiki/Foo_(bar)">Foo</a> here`},
 
 		// --- Blockquote ---
 		{"blockquote-single", "> a quoted line", "<blockquote>a quoted line</blockquote>"},

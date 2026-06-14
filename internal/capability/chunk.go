@@ -298,11 +298,36 @@ func linkSpan(runes []rune, i int) (end int, ok bool) {
 	if close < 0 || close+1 >= len(runes) || runes[close+1] != '(' {
 		return 0, false
 	}
-	paren := indexRune(runes, ')', close+2)
+	// Scan to the MATCHING close paren with depth tracking so a URL containing
+	// balanced parens (e.g. https://en.wikipedia.org/wiki/Foo_(bar)) is treated
+	// as one indivisible link and not truncated at the first ')'.
+	paren := matchCloseParen(runes, close+1)
 	if paren < 0 {
 		return 0, false
 	}
 	return paren + 1, true
+}
+
+// matchCloseParen returns the index of the ')' that matches the '(' at index
+// open, tracking nesting depth so balanced inner parens don't end the scan
+// early. Returns -1 if runes[open] is not '(' or no matching close exists.
+func matchCloseParen(runes []rune, open int) int {
+	if open >= len(runes) || runes[open] != '(' {
+		return -1
+	}
+	depth := 0
+	for j := open; j < len(runes); j++ {
+		switch runes[j] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return j
+			}
+		}
+	}
+	return -1
 }
 
 // repack greedily coalesces pieces (each already <= limit) into fewer pieces
