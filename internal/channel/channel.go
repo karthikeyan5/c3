@@ -16,6 +16,11 @@ type Channel interface {
 	Start(ctx context.Context, host Host) error
 	Stop() error
 
+	// Capabilities returns this channel's static capability manifest. No
+	// argument in v1 — RouteKey lives only in internal/broker; a RouteKey
+	// arg would introduce a channel→broker import cycle.
+	Capabilities() c3types.Capabilities
+
 	SendReply(args c3types.ReplyArgs) (sentMessageID int64, err error)
 	SendTyping(chatID int64, threadID *int64) error
 	EditMessage(args c3types.EditArgs) (*c3types.EditResult, error)

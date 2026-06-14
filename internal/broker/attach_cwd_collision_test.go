@@ -48,10 +48,14 @@ func TestAttach_CwdDefault_HeldByDifferentLiveSession_WarnsCollision(t *testing.
 	b, _ := collisionSetup(t, launch)
 	defer b.Shutdown()
 
-	// FIRST live session claims topic c3 directly (PID kept alive — the
-	// test process PID is alive, so IsAlive() on a disconnected stub is
-	// true; here the stub stays connected via the registry).
-	holder := b.Stubs.Register("claude", 9823, launch, nil)
+	// FIRST live session claims topic c3 directly. Register it WITH a
+	// non-nil conn so Stub.IsAlive() reports true via IsConnected() — the
+	// synthetic PID 9823 is not a real process on this machine, so a nil
+	// conn would fall through to isPIDAlive(9823)==false and the collision
+	// would never fire. The non-nil conn keeps the holder unambiguously
+	// live while still pinning PID 9823 for the holder-identity assertions
+	// below.
+	holder := b.Stubs.Register("claude", 9823, launch, struct{}{})
 	tid := int64(281)
 	key := MakeRouteKey("telegram", -100, &tid)
 	if !b.tryClaim(nil, holder, key, "c3", false, false) {
@@ -207,8 +211,9 @@ func TestAttach_ExplicitName_HeldTopic_StillForceSteal(t *testing.T) {
 	b, _ := collisionSetup(t, launch)
 	defer b.Shutdown()
 
-	// Holder owns c3.
-	holder := b.Stubs.Register("claude", 9823, launch, nil)
+	// Holder owns c3. Register WITH a non-nil conn so IsAlive() is true via
+	// IsConnected() (PID 9823 is synthetic and not a live process here).
+	holder := b.Stubs.Register("claude", 9823, launch, struct{}{})
 	tid := int64(281)
 	key := MakeRouteKey("telegram", -100, &tid)
 	if !b.tryClaim(nil, holder, key, "c3", false, false) {

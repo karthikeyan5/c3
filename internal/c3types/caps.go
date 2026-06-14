@@ -1,0 +1,142 @@
+package c3types
+
+import "time"
+
+// Capabilities is the flat, JSON-serializable per-channel capability
+// manifest returned by channel.Channel.Capabilities(). Spec
+// (2026-06-14-channel-capability-architecture) §"Key interfaces (sketch)".
+//
+// It describes feature-level capabilities only (booleans + numeric limits +
+// supported media kinds) plus an Inbound sub-section and a Stream sub-section.
+// It carries NO Telegram-specific identifiers — core code and the agent
+// surface read this manifest; the channel implementation owns the concrete
+// rendering/limits behind it.
+//
+// These types are additive in P0 and may be unused until later phases wire
+// them into the Outbound path, the gate, and the IPC payloads.
+type Capabilities struct {
+	// Channel is the canonical channel name this manifest describes
+	// (e.g. "telegram").
+	Channel string
+
+	// RichText reports whether the channel renders markdown markup.
+	RichText bool
+
+	// MaxMessageRunes is the maximum length of a single text message,
+	// measured in the units the channel counts (Telegram counts UTF-16
+	// code units). AutoChunks reports whether longer text is split
+	// automatically into multiple messages.
+	MaxMessageRunes int
+	// MaxCaptionRunes is the maximum length of a media caption.
+	MaxCaptionRunes int
+	AutoChunks      bool
+
+	// MediaKinds lists the media kinds the channel can send. CompressedPhoto
+	// reports whether a compressed in-chat photo preview is supported;
+	// OriginalFile reports whether byte-for-byte original-file delivery is
+	// supported; Albums reports whether multiple media can be grouped into a
+	// single album (FALSE in v1 — sequential single sends).
+	MediaKinds      []MediaKind
+	CompressedPhoto bool
+	OriginalFile    bool
+	Albums          bool
+
+	// MaxSendBytes is the per-item upload size ceiling.
+	MaxSendBytes int64
+
+	// Feature flags.
+	Polls           bool
+	Reactions       bool
+	ReactionsSingle bool
+	EditMessages    bool
+	Threads         bool
+	Typing          bool
+
+	// Inbound describes inbound-direction capabilities.
+	Inbound InboundCaps
+	// Stream describes reasoning-streaming capabilities (DEFERRED in v1).
+	Stream StreamCaps
+}
+
+// InboundCaps describes the inbound-direction capabilities of a channel.
+type InboundCaps struct {
+	// MaxDownloadBytes is the size ceiling for downloading an inbound
+	// attachment.
+	MaxDownloadBytes int64
+	// InboundKinds lists the attachment kinds the channel delivers inbound.
+	InboundKinds []MediaKind
+	// SupportsReplyContext reports whether inbound messages can carry a
+	// quote-reply context.
+	SupportsReplyContext bool
+}
+
+// StreamCaps describes a channel's ability to stream in-flight reasoning.
+// In v1 streaming is DEFERRED (StreamViaEdit is always false); see the spec
+// §"Streaming reality (R4)".
+type StreamCaps struct {
+	// StreamViaEdit reports whether reasoning can be streamed by editing an
+	// in-flight message. FALSE in v1.
+	StreamViaEdit bool
+	// MinEditInterval is the minimum interval between successive edits the
+	// channel will tolerate without rate-limiting.
+	MinEditInterval time.Duration
+}
+
+// Markup is the channel-neutral markup intent for an Outbound message:
+//   - "none"     — plain text, no markup.
+//   - "markdown" — agent-authored standard markdown; the channel converts.
+//   - "native"   — restricted opaque pass-through in the channel's own dialect
+//     (the gate flags its use).
+type Markup string
+
+const (
+	MarkupNone     Markup = "none"
+	MarkupMarkdown Markup = "markdown"
+	MarkupNative   Markup = "native"
+)
+
+// MediaKind is the channel-neutral kind of a media item.
+//   - "photo"     — compressed in-chat preview (loses original bytes/EXIF).
+//   - "file"      — byte-for-byte original document.
+//   - "video" / "audio" / "voice" / "animation" — their respective media.
+type MediaKind string
+
+const (
+	MediaPhoto     MediaKind = "photo"
+	MediaFile      MediaKind = "file"
+	MediaVideo     MediaKind = "video"
+	MediaAudio     MediaKind = "audio"
+	MediaVoice     MediaKind = "voice"
+	MediaAnimation MediaKind = "animation"
+)
+
+// MediaItem is one piece of outbound media. Exactly one of Path (a local
+// file on the shared single host) or URL (fetched server-side by the channel)
+// is set. Caption is an optional caption; Spoiler hides the item behind a
+// spoiler overlay where supported.
+type MediaItem struct {
+	Kind    MediaKind
+	Path    string
+	URL     string
+	Caption string
+	Spoiler bool
+}
+
+// PollSpec describes an outbound poll. Options is the ordered list of answer
+// strings; Anonymous and MultipleAnswers tune the poll behavior.
+type PollSpec struct {
+	Question        string
+	Options         []string
+	Anonymous       bool
+	MultipleAnswers bool
+}
+
+// Alteration is one structured record of a change the capability gate made to
+// an Outbound while degrading it to fit a channel's manifest (e.g. demoting a
+// photo to a document, splitting over-limit text). Kind is a stable machine
+// tag; Detail is a human-readable explanation. The pure gate returns these;
+// the impure broker dispatch writes the durable log line from them.
+type Alteration struct {
+	Kind   string
+	Detail string
+}

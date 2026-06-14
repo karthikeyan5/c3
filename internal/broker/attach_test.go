@@ -41,6 +41,9 @@ type validateCall struct {
 func (f *fakeChannel) Name() string                                 { return "telegram" }
 func (f *fakeChannel) Start(_ context.Context, _ channel.Host) error { return nil }
 func (f *fakeChannel) Stop() error                                  { return nil }
+func (f *fakeChannel) Capabilities() c3types.Capabilities {
+	return c3types.Capabilities{Channel: "telegram"}
+}
 func (f *fakeChannel) SendReply(args c3types.ReplyArgs) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
