@@ -1,5 +1,24 @@
 # RESUME
 
+## Update — 2026-06-15: channel-capability build SHIPPED
+
+The P0 **channel rich-content + capability architecture** is built and committed on
+`master` — 8 phases (P0–P7), designed via a 10-agent workflow, hardened by 3 critique
+passes, triple-reviewed, review-fixes applied. **Shipped:** Telegram rich text (agent
+writes markdown, C3 converts/escapes), media/file/poll sends (compressed photo vs original
+file; albums sequential in v1), a per-channel capability manifest + agent guidance (Claude
++ Codex), deterministic broker-relayed typing, and a CI no-leak guard. **Deferred —
+needs your call:** streaming of reasoning (R4) — Claude Code exposes no reasoning frame to
+an MCP adapter; either reverse the Codex forwarder opt-out (Codex-only) or pivot C3 to an
+SDK/Messages-API host (both CLIs). **Remaining:** a live Telegram round-trip smoke test
+(needs your phone — checklist at the bottom of the spec). Spec:
+[`docs/specs/2026-06-14-channel-capability-architecture.md`](docs/specs/2026-06-14-channel-capability-architecture.md).
+
+**Next up:** terminal-control (settle design Q1/Q2/Q3 — the three questions are waiting on
+the CLI) and the deferred items above. Note: the 2 flaky broker tests are now fixed (P0).
+
+---
+
 ## Current handoff — 2026-06-14 (state reconciliation)
 
 A full state/docs/code reconciliation ran today — a multi-agent sweep of every state

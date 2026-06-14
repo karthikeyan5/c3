@@ -1,6 +1,6 @@
 # C3 — Product Roadmap
 
-**Status as of 2026-06-14.** Last commit `1a8a2bd` (2026-06-04); last feature work ~2026-06-01. Version line: v0.1.0 (pre-public-push).
+**Status as of 2026-06-15.** The channel rich-content + capability architecture (the P0 below) is **BUILT and committed** on `master` — 8 phases (P0–P7), designed via a 10-agent workflow, hardened by 3 critique passes, and triple-reviewed. Pending a live Telegram smoke test (the one check that needs a phone — checklist in `docs/specs/2026-06-14-channel-capability-architecture.md`). Version line: v0.1.0 (pre-public-push).
 
 This is the **single consolidated roadmap** for C3. It was reconciled on 2026-06-14 from every source — `TODO.md`, `RESUME.md`, `MORNING-REVIEW-2026-05-19.md`, `DECISIONS.md`, `DEBUGGING.md`, `docs/plans/` + `docs/specs/`, the live Go codebase, and a mining sweep of every past C3 session transcript (incl. cross-project SSHGate/proctor sessions). **Nothing was dropped:** ideas that previously lived only in voice notes are now captured here and flagged `risk-of-loss: was-untracked`.
 
@@ -10,33 +10,33 @@ Legend — **status**: `planned` · `in-progress` · `idea` (not yet committed t
 
 ---
 
-## P0 — Channel rich-content + capability architecture (NEW top priority — Karthi 2026-06-14)
+## P0 — Channel rich-content + capability architecture — ✅ BUILT (2026-06-15)
 
-Sequenced **before** terminal-control. Goal: C3 supports the full Telegram feature
-surface, delivered through a channel-capability system that won't break when other
-channels are added. The architecture is being designed + pressure-tested by subagents
-(2026-06-14) before any build — nothing ships until the design + plan are ratified.
+Architecture: **Capability Manifest + Gate (CMG)** — each channel returns a flat
+capability manifest; one pure broker-side `Gate` validates + degrades every outbound; the
+agent receives capability + formatting guidance (Claude **and** Codex); no Telegram code
+leaks into core (enforced by a CI grep-guard, `internal/archguard`). Spec:
+[`docs/specs/2026-06-14-channel-capability-architecture.md`](docs/specs/2026-06-14-channel-capability-architecture.md).
+**Remaining:** a live Telegram round-trip smoke test (needs Karthi's phone — checklist in the spec).
 
-- **Rich-text formatting for Telegram** — `planned` · P0 — MarkdownV2 / HTML / message
-  entities (see the Bot API formatting-options reference). The single highest-priority
-  feature.
-- **Full media / file / poll support** — `planned` · P0 — photos (compressed) vs
-  documents (uncompressed/original file), video/audio/voice/animation, albums (media
-  groups), polls; honor all Bot API limits (4096 text, 1024 caption, ~50MB send / ~20MB
-  download, media-group size, edit/rate limits). There is no default file-send path today.
-- **Channel-capability declaration system** — `planned` · P0 — each channel declares
-  exactly what it supports (rich text, streaming, special chars, media kinds, polls,
-  limits). C3 exposes the active channel's capability set **plus prompt guidance** to the
-  agent (how to format, what to embed, what streams, what's unsupported) so it formulates
-  a correct message. Telegram specifics must NOT leak into core; only feature-level
-  supports/does-not-support crosses the boundary. Must work identically for Claude Code
-  AND Codex. Adding a channel must never feed it features it can't render (graceful
-  degradation).
-- **Deterministic typing indicator** — `planned` · P0 — relayed PROGRAMMATICALLY by C3
-  while the agent works mid-turn; NOT a tool the LLM decides to call. (Supersedes/absorbs
-  FIX #2's auto-ticker.)
-- **Deterministic streaming of reasoning/thinking** — `planned` · P0 — streamed
-  programmatically (e.g. via message editing), NOT LLM-driven.
+- **Rich-text formatting for Telegram** — `done` — the agent writes standard markdown;
+  C3 converts to Telegram HTML and escapes (bold/italic/strike/spoiler/links/lists/quotes/
+  inline+fenced code). The agent never hand-writes channel tags.
+- **Full media / file / poll support** — `done` — `kind=photo` (compressed preview) vs
+  `kind=file` (byte-for-byte original), video/audio/voice/animation, polls; in-channel
+  size/existence validation; Bot API limits (4096 text, 1024 caption, 50MB send, 20MB
+  download). **Albums descoped to sequential single sends in v1** (full grouping later).
+- **Channel-capability declaration system** — `done` — flat `Capabilities` manifest per
+  channel, delivered over `hello_ack`/`attached`; a single `GuidanceFor` feeds both the
+  degrade gate and the agent surface (can't drift); Telegram specifics confined to the
+  telegram package. Works identically for Claude + Codex.
+- **Deterministic typing indicator** — `done` — broker-relayed programmatically (not an
+  LLM tool); shown turns 2..N of a Telegram-mode session. (Absorbed FIX #2's auto-ticker.)
+- **Deterministic streaming of reasoning/thinking** — `deferred` — **needs Karthi's call.**
+  Verified: Claude Code exposes no in-flight reasoning to an MCP adapter (hooks/MCP see no
+  reasoning frames; only the raw Messages API / Agent SDK do). Options: (a) reverse the
+  Codex forwarder opt-out → Codex-only streaming (asymmetric); (b) pivot C3 to host the
+  agent via the SDK/Messages-API → both CLIs (large). Manifest reports `StreamViaEdit=false`.
 
 ## P1 — Remote terminal-control (the main build feature — sequenced *after* the channel architecture above)
 
