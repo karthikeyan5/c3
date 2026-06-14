@@ -2,8 +2,12 @@ package broker
 
 import (
 	"fmt"
+	"log"
+	"strings"
+	"unicode/utf16"
 
 	"github.com/karthikeyan5/c3/internal/c3types"
+	"github.com/karthikeyan5/c3/internal/capability"
 	"github.com/karthikeyan5/c3/internal/channel"
 )
 
@@ -33,7 +37,7 @@ func dispatchReply(ch channel.Channel, key RouteKey, args map[string]any) (map[s
 	if err != nil {
 		return nil, err
 	}
-	r := c3types.ReplyArgs{
+	out := c3types.Outbound{
 		Channel: key.Channel,
 		ChatID:  argInt64(args, "chat_id", key.ChatID),
 		TopicID: argTopicID(args, "topic_id", key),
@@ -42,13 +46,52 @@ func dispatchReply(ch channel.Channel, key RouteKey, args map[string]any) (map[s
 		Media:   mediaFromFilesArg(args),
 	}
 	if rt := argInt64Ptr(args, "reply_to"); rt != nil {
-		r.ReplyTo = rt
+		out.ReplyTo = rt
 	}
-	id, err := ch.SendReply(r)
+
+	// Route through the pure capability gate: it validates (hard-reject), down-
+	// converts (e.g. markup→none), and splits the text into ordered parts that
+	// each fit the channel's limits. A non-nil err is a HARD REJECTION — surface
+	// it to the agent without sending anything (matching tool-error surfacing).
+	parts, notes, alts, err := capability.Gate(ch.Capabilities(), out)
 	if err != nil {
 		return nil, err
 	}
-	return mcpText(fmt.Sprintf("sent (id: %d)", id)), nil
+
+	// The gate is pure; dispatch (impure) writes the durable alteration log.
+	for _, a := range alts {
+		log.Printf("outbound-alteration chan=%s chat=%d topic=%s kind=%s detail=%q",
+			key.Channel, out.ChatID, TopicKeyStr(key), a.Kind, a.Detail)
+	}
+
+	// Multi-part send contract: send parts sequentially, in order; on part-k
+	// failure STOP (fail-fast) and report exactly how many landed. NEVER report
+	// silent success. The agent-visible id is the FIRST part's id; reply-
+	// threading/edits target the first part.
+	var firstID int64
+	for i, part := range parts {
+		id, err := ch.SendReply(part)
+		if i == 0 {
+			firstID = id
+		}
+		if err != nil {
+			if i == 0 {
+				return nil, fmt.Errorf("send failed: %w", err)
+			}
+			// Some parts already landed: tell the agent precisely how far we got.
+			return nil, fmt.Errorf("partial send: sent %d of %d; part %d failed: %w",
+				i, len(parts), i+1, err)
+		}
+	}
+
+	result := fmt.Sprintf("sent (id: %d)", firstID)
+	if len(parts) > 1 {
+		result = fmt.Sprintf("sent %d messages (first id: %d)", len(parts), firstID)
+	}
+	if len(notes) > 0 {
+		result += "\n" + strings.Join(notes, "\n")
+	}
+	return mcpText(result), nil
 }
 
 // mediaFromFilesArg is a one-release back-compat shim translating the legacy
@@ -122,18 +165,49 @@ func dispatchEditMessage(ch channel.Channel, key RouteKey, args map[string]any) 
 	if err != nil {
 		return nil, err
 	}
+	caps := ch.Capabilities()
+	text := argString(args, "text", "")
+
+	// Edits join the markup system but are SINGLE messages — they cannot be
+	// split. Apply the same markup degradation the gate would (!RichText→none)
+	// so an edit renders consistently with a reply, but reject (don't split) an
+	// over-limit edit because there is no second message to overflow into.
+	notes := []string{}
+	if !caps.RichText && markup != c3types.MarkupNone {
+		markup = c3types.MarkupNone
+		notes = append(notes, "rich text is not supported on this channel — markdown was sent as plain text")
+		log.Printf("outbound-alteration chan=%s chat=%d topic=%s kind=markup_degraded detail=%q",
+			key.Channel, argInt64(args, "chat_id", key.ChatID), TopicKeyStr(key),
+			"edit markup downgraded to none (channel RichText=false)")
+	}
+	if caps.MaxMessageRunes > 0 && utf16Len(text) > caps.MaxMessageRunes {
+		return nil, fmt.Errorf("edit text is %d chars, over the channel's %d-char limit; an edit is a single message and cannot be split — shorten it or send a new reply instead",
+			utf16Len(text), caps.MaxMessageRunes)
+	}
+
 	a := c3types.EditArgs{
 		Channel:   key.Channel,
 		ChatID:    argInt64(args, "chat_id", key.ChatID),
 		MessageID: argInt64(args, "message_id", 0),
-		Text:      argString(args, "text", ""),
+		Text:      text,
 		Markup:    markup,
 	}
 	r, err := ch.EditMessage(a)
 	if err != nil {
 		return nil, err
 	}
-	return mcpText(fmt.Sprintf("edited (id: %d)", r.MessageID)), nil
+	result := fmt.Sprintf("edited (id: %d)", r.MessageID)
+	if len(notes) > 0 {
+		result += "\n" + strings.Join(notes, "\n")
+	}
+	return mcpText(result), nil
+}
+
+// utf16Len counts a string's length in UTF-16 code units — the unit channels
+// like Telegram measure message length in. Used for the edit-over-limit check;
+// the multi-part reply path measures inside the pure gate.
+func utf16Len(s string) int {
+	return len(utf16.Encode([]rune(s)))
 }
 
 func dispatchSendTyping(ch channel.Channel, key RouteKey, args map[string]any) (map[string]any, error) {
