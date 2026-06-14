@@ -56,12 +56,28 @@ type RouteWorker struct {
 	done    chan struct{}
 	mu      sync.Mutex
 	stopped bool
+
+	// Typing relay state (P5 / spec R3). The ticker re-pulses SendTyping for
+	// the route while the agent works a turn. It is ONLY ever touched from the
+	// worker's single run goroutine (armed/re-armed/disarmed in forwardOrFallback
+	// + dispatchOutbound, drained by the run loop's <-typingC case), so it needs
+	// NO lock — no new goroutine is introduced. typingC mirrors the ticker's
+	// channel and is nil while disarmed so the select arm parks. The arm gate
+	// (holder HasReplied + Capabilities.Typing) lives in armTyping.
+	typingTicker *time.Ticker
+	typingC      <-chan time.Time
 }
 
 // debounceWindow / debounceMax defaults from spec §7.3 + §6.
 const (
 	defaultDebounceWindow  = 1500 * time.Millisecond
 	defaultDebounceMaxMsgs = 50
+
+	// typingInterval is the re-pulse cadence for the deterministic typing relay
+	// (P5). Telegram's "typing" chat action expires ~5s after it is sent, so a
+	// ~4s re-pulse keeps the indicator continuously visible while the agent
+	// works a turn.
+	typingInterval = 4 * time.Second
 )
 
 // newRouteWorker starts a worker that runs until ctx is canceled OR no jobs
@@ -84,6 +100,9 @@ func (w *RouteWorker) run(ctx context.Context) {
 	defer close(w.done)
 	idleTimer := time.NewTimer(w.idle)
 	defer idleTimer.Stop()
+	// Ensure the typing ticker is stopped on any exit (ctx cancel, idle,
+	// release, queue close) so it never leaks past the worker's life.
+	defer w.disarmTyping()
 
 	var debBuf []*c3types.Inbound
 	var debTimer *time.Timer
@@ -123,6 +142,11 @@ func (w *RouteWorker) run(ctx context.Context) {
 			return
 		case <-debC:
 			flushDeb()
+		case <-w.typingC:
+			// Typing relay tick (P5). Runs in the worker's single goroutine —
+			// no new concurrency. Pulse the channel's typing action for this
+			// route; the ticker keeps firing on its own cadence until disarmed.
+			w.pulseTyping(ctx)
 		case job, ok := <-w.queue:
 			if !ok {
 				flushDeb()
@@ -303,6 +327,12 @@ func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound) 
 		log.Printf("delivered chan=%s chat=%d topic=%s msg=%d to cli=%s pid=%d conn=%d",
 			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID,
 			holder.CLI, holder.PID, holder.ConnID)
+		// Typing relay (P5): an inbound was just delivered to the claimed
+		// holder, so the agent is about to work this turn. Arm the typing
+		// ticker — but ONLY if this holder has already replied at least once
+		// (the deterministic "in Telegram mode" gate; see Stub.hasReplied) and
+		// the channel supports typing. armTyping enforces both gates.
+		w.armTyping(holder)
 		return
 	}
 	if !w.broker.Fallbacks.ShouldSend(w.key) {
@@ -385,7 +415,91 @@ func (w *RouteWorker) dispatchOutbound(_ context.Context, job *OutboundJob) {
 		return
 	}
 	result, err := dispatchTool(ch, w.key, job.Tool, job.Args)
+
+	// Typing relay (P5). All of this runs in the worker's single goroutine.
+	//   - A successful `reply` ENDS the turn: mark the holder as having replied
+	//     (so future turns on this route arm typing) and disarm the ticker.
+	//   - A successful non-reply tool-call (edit_message / react /
+	//     download_attachment / send_typing) means the agent is still working;
+	//     re-arm so typing stays visible across the turn's tool calls. Re-arm is
+	//     gated the same way as the initial arm (holder HasReplied + Typing cap)
+	//     via armTyping.
+	if err == nil {
+		if job.Tool == "reply" {
+			if holder, ok := w.broker.Routes.Holder(w.key); ok {
+				holder.MarkReplied()
+			}
+			w.disarmTyping()
+		} else if holder, ok := w.broker.Routes.Holder(w.key); ok {
+			w.armTyping(holder)
+		}
+	}
+
 	job.ResultCh <- OutboundResult{Result: result, Err: err}
+}
+
+// armTyping starts (or keeps running) the per-route typing ticker, IF the
+// deterministic gates pass: the holder has replied at least once (Telegram-mode
+// proxy) AND the channel advertises Typing. Both gates avoid pulsing "typing…"
+// for default CLI-mode sessions. Called only from the worker goroutine
+// (forwardOrFallback delivered path + dispatchOutbound non-reply path), so it
+// mutates worker-local ticker state without a lock and never holds a lock across
+// a network call. An already-armed ticker is left running (re-arm = no-op while
+// armed) so the cadence stays steady across a turn's tool calls.
+func (w *RouteWorker) armTyping(holder *Stub) {
+	if holder == nil || !holder.HasReplied() {
+		return
+	}
+	if w.broker == nil {
+		return
+	}
+	ch, err := w.broker.Channel(w.key.Channel)
+	if err != nil || !ch.Capabilities().Typing {
+		return
+	}
+	if w.typingTicker != nil {
+		return // already armed — keep the existing cadence
+	}
+	w.typingTicker = time.NewTicker(typingInterval)
+	w.typingC = w.typingTicker.C
+}
+
+// disarmTyping stops the per-route typing ticker if armed. Idempotent. Called
+// from the worker goroutine (dispatchOutbound reply path) and from run's defer
+// on worker shutdown — so the ticker never leaks past the worker's life.
+func (w *RouteWorker) disarmTyping() {
+	if w.typingTicker == nil {
+		return
+	}
+	w.typingTicker.Stop()
+	w.typingTicker = nil
+	w.typingC = nil
+}
+
+// pulseTyping fires one SendTyping for the route. Resolves the channel + the
+// route's chat/topic, releases (it holds no lock across the call), then sends.
+// On error it logs and disarms — a persistently failing channel should not keep
+// the ticker spinning. Runs in the worker goroutine (the run loop's <-typingC).
+func (w *RouteWorker) pulseTyping(_ context.Context) {
+	if w.broker == nil {
+		w.disarmTyping()
+		return
+	}
+	ch, err := w.broker.Channel(w.key.Channel)
+	if err != nil {
+		w.disarmTyping()
+		return
+	}
+	var topicID *int64
+	if w.key.HasTopic {
+		t := w.key.TopicID
+		topicID = &t
+	}
+	if err := ch.SendTyping(w.key.ChatID, topicID); err != nil {
+		log.Printf("typing PULSE FAIL chan=%s chat=%d topic=%s: %v (disarming relay)",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), err)
+		w.disarmTyping()
+	}
 }
 
 // Submit enqueues a job. Returns false if the worker is stopped or the

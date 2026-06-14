@@ -103,16 +103,18 @@ func TestServerInfoName(t *testing.T) {
 	}
 
 	// Verify tools/list returns the adapter tools (attach, detach, topics,
-	// reply, react, edit_message, send_typing, poll, download_attachment) —
-	// Claude Code displays tool presence per-server and a regression here turns
-	// a working session into "tool not found" for every adapter operation.
+	// reply, react, edit_message, poll, download_attachment) — Claude Code
+	// displays tool presence per-server and a regression here turns a working
+	// session into "tool not found" for every adapter operation. `send_typing`
+	// is deliberately ABSENT (P5): the typing indicator is relayed
+	// programmatically by the broker, not via an LLM tool.
 	listResult, err := sess.ListTools(ctx, nil)
 	if err != nil {
 		t.Fatalf("ListTools: %v", err)
 	}
 	wantTools := []string{
 		"attach", "detach", "topics", "reply", "react",
-		"edit_message", "send_typing", "poll", "download_attachment",
+		"edit_message", "poll", "download_attachment",
 	}
 	got := map[string]bool{}
 	for _, tool := range listResult.Tools {
@@ -122,6 +124,12 @@ func TestServerInfoName(t *testing.T) {
 		if !got[name] {
 			t.Errorf("tools/list missing %q (got %v)", name, got)
 		}
+	}
+	// send_typing must NOT be agent-facing (P5): the broker relays typing
+	// programmatically. A regression that re-registers it would let an LLM
+	// pulse typing, defeating the deterministic relay.
+	if got["send_typing"] {
+		t.Errorf("send_typing must NOT be registered as an agent tool (P5: broker-relayed); got %v", got)
 	}
 }
 

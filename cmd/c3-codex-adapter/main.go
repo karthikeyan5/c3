@@ -634,14 +634,13 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 			},
 			handler: a.toolForward("edit_message"),
 		},
-		{
-			tool: &mcp.Tool{
-				Name:        "send_typing",
-				Description: "Send a typing indicator to the attached topic.",
-				InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
-			},
-			handler: a.toolForward("send_typing"),
-		},
+		// NOTE: `send_typing` is intentionally NOT registered as an agent tool
+		// (P5 / spec R3). The typing indicator is relayed PROGRAMMATICALLY by
+		// the broker's per-route RouteWorker (a ticker armed on inbound delivery
+		// once the session is in Telegram mode), never by an LLM tool call. The
+		// broker dispatch still HANDLES a `send_typing` op (legacy-in-flight
+		// callers + the validate_topic piggyback) and the channel keeps its
+		// SendTyping method — only the agent-facing tool is gone.
 		{
 			tool: &mcp.Tool{
 				Name:        "poll",

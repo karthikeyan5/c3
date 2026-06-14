@@ -153,6 +153,97 @@ func TestDispatchReply_MediaArgSplitsIntoParts(t *testing.T) {
 	}
 }
 
+// typingRecorderChannel records SendTyping (chatID, threadID) calls so tests can
+// assert the legacy send_typing dispatch op and the validate_topic piggyback
+// (which routes ValidateTopic → SendTyping) still drive the channel after P5
+// removed the agent-facing send_typing tool.
+type typingRecorderChannel struct {
+	mu     sync.Mutex
+	typing []typingCall
+}
+
+type typingCall struct {
+	chatID   int64
+	threadID *int64
+}
+
+func (c *typingRecorderChannel) Name() string                              { return "telegram" }
+func (c *typingRecorderChannel) Start(context.Context, channel.Host) error { return nil }
+func (c *typingRecorderChannel) Stop() error                               { return nil }
+func (c *typingRecorderChannel) Capabilities() c3types.Capabilities {
+	return c3types.Capabilities{Channel: "telegram", Typing: true}
+}
+func (c *typingRecorderChannel) SendReply(c3types.ReplyArgs) (int64, error) { return 0, nil }
+func (c *typingRecorderChannel) SendTyping(chatID int64, threadID *int64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.typing = append(c.typing, typingCall{chatID: chatID, threadID: threadID})
+	return nil
+}
+func (c *typingRecorderChannel) EditMessage(c3types.EditArgs) (*c3types.EditResult, error) {
+	return &c3types.EditResult{}, nil
+}
+func (c *typingRecorderChannel) React(c3types.ReactArgs) error             { return nil }
+func (c *typingRecorderChannel) DownloadAttachment(string) (string, error) { return "", nil }
+func (c *typingRecorderChannel) CreateTopic(int64, string) (int64, error)  { return 0, nil }
+
+// ValidateTopic piggybacks SendTyping — the same path Telegram uses to confirm
+// a thread exists (channel/telegram/outbound.go:ValidateTopic).
+func (c *typingRecorderChannel) ValidateTopic(chatID, threadID int64) error {
+	return c.SendTyping(chatID, &threadID)
+}
+
+func (c *typingRecorderChannel) typingSnapshot() []typingCall {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]typingCall, len(c.typing))
+	copy(out, c.typing)
+	return out
+}
+
+// TestDispatchTool_LegacySendTypingStillHandled asserts the broker dispatch keeps
+// HANDLING a send_typing op (legacy in-flight callers + the internal relay) even
+// though P5 removed send_typing from the agent-facing tool set. The op must route
+// to the channel's SendTyping with the route's chat/topic.
+func TestDispatchTool_LegacySendTypingStillHandled(t *testing.T) {
+	ch := &typingRecorderChannel{}
+	tid := int64(281)
+	key := RouteKey{Channel: "telegram", ChatID: -100, HasTopic: true, TopicID: tid}
+
+	res, err := dispatchTool(ch, key, "send_typing", map[string]any{})
+	if err != nil {
+		t.Fatalf("send_typing op should still be handled by dispatch; got err %v", err)
+	}
+	if res == nil {
+		t.Fatal("send_typing op should return a result")
+	}
+	got := ch.typingSnapshot()
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 SendTyping call from the legacy op; got %d", len(got))
+	}
+	if got[0].chatID != -100 || got[0].threadID == nil || *got[0].threadID != tid {
+		t.Errorf("send_typing should target the route's chat/topic; got %+v", got[0])
+	}
+}
+
+// TestValidateTopic_PiggybacksSendTyping asserts the validate_topic primitive
+// still works after P5: ValidateTopic routes through SendTyping (the typing
+// action with a thread_id implicitly validates the thread). P5 must not have
+// disturbed the channel's SendTyping method that this relies on.
+func TestValidateTopic_PiggybacksSendTyping(t *testing.T) {
+	ch := &typingRecorderChannel{}
+	if err := ch.ValidateTopic(-100, 412); err != nil {
+		t.Fatalf("ValidateTopic should succeed; got %v", err)
+	}
+	got := ch.typingSnapshot()
+	if len(got) != 1 {
+		t.Fatalf("ValidateTopic should fire exactly 1 SendTyping; got %d", len(got))
+	}
+	if got[0].chatID != -100 || got[0].threadID == nil || *got[0].threadID != 412 {
+		t.Errorf("ValidateTopic should SendTyping for the validated thread; got %+v", got[0])
+	}
+}
+
 // mediaReplyChannel is a test channel with the full media-kind manifest that
 // records the parts it is asked to send.
 type mediaReplyChannel struct {

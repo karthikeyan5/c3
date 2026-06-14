@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/karthikeyan5/c3/internal/c3types"
+	"github.com/karthikeyan5/c3/internal/channel"
 	"github.com/karthikeyan5/c3/internal/mappings"
 )
 
@@ -205,6 +206,138 @@ func TestForwardOrFallback_AliveButDisconnectedHolder_SkipsDelivery(t *testing.T
 	if got := len(fc.sendRepliesSnapshot()); got != 0 {
 		t.Errorf("expected no fallback for alive disconnected holder, got %d sends", got)
 	}
+}
+
+// brokerWithGenericChannel wires a broker pre-registered with an arbitrary
+// channel.Channel (not just *fakeChannel), mirroring brokerWithChannel's manual
+// registration so the typing-relay tests can use a SendTyping-recording channel.
+func brokerWithGenericChannel(t *testing.T, mf *mappings.MappingsFile, ch channel.Channel) *Broker {
+	t.Helper()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	b := New(mf)
+	b.chMu.Lock()
+	b.channels[ch.Name()] = &channelRegistration{Channel: ch}
+	b.chMu.Unlock()
+	return b
+}
+
+// claimedHolder registers a connected, alive stub holding key and returns it.
+func claimedHolder(t *testing.T, b *Broker, key RouteKey) *Stub {
+	t.Helper()
+	s := &Stub{CLI: "claude", PID: os.Getpid(), CWD: "/proj", ConnID: 7, Conn: "live"}
+	b.Routes.Claim(key, s)
+	return s
+}
+
+// TestTypingRelay_ArmsOnlyWhenHolderRepliedAndTypingCap covers the deterministic
+// arm gate (P5): the typing ticker arms on a delivered inbound ONLY IF the holder
+// has replied (Telegram-mode proxy) AND the channel advertises Typing.
+func TestTypingRelay_ArmsOnlyWhenHolderRepliedAndTypingCap(t *testing.T) {
+	tid := int64(281)
+	key := RouteKey{Channel: "telegram", ChatID: -100, HasTopic: true, TopicID: tid}
+
+	t.Run("not armed before holder has replied", func(t *testing.T) {
+		ch := &typingRecorderChannel{}
+		b := brokerWithGenericChannel(t, mfWithTelegram(), ch)
+		defer b.Shutdown()
+		holder := claimedHolder(t, b, key)
+		w := newRouteWorker(context.Background(), key, time.Hour, b)
+		defer w.Stop()
+
+		w.armTyping(holder) // holder.HasReplied() == false
+		if w.typingTicker != nil || w.typingC != nil {
+			t.Fatal("typing must NOT arm before the holder has replied (CLI-mode gate)")
+		}
+	})
+
+	t.Run("armed once holder has replied", func(t *testing.T) {
+		ch := &typingRecorderChannel{} // Typing: true
+		b := brokerWithGenericChannel(t, mfWithTelegram(), ch)
+		defer b.Shutdown()
+		holder := claimedHolder(t, b, key)
+		holder.MarkReplied()
+		w := newRouteWorker(context.Background(), key, time.Hour, b)
+		defer w.Stop()
+
+		w.armTyping(holder)
+		if w.typingTicker == nil || w.typingC == nil {
+			t.Fatal("typing should arm once the holder has replied and Typing cap is set")
+		}
+		// A pulse must fire SendTyping for the route's chat/topic.
+		w.pulseTyping(context.Background())
+		got := ch.typingSnapshot()
+		if len(got) != 1 || got[0].chatID != -100 || got[0].threadID == nil || *got[0].threadID != tid {
+			t.Fatalf("pulse should SendTyping for the route; got %+v", got)
+		}
+	})
+
+	t.Run("not armed when channel lacks Typing cap", func(t *testing.T) {
+		ch := &noTypingChannel{} // Typing: false
+		b := brokerWithGenericChannel(t, mfWithTelegram(), ch)
+		defer b.Shutdown()
+		holder := claimedHolder(t, b, key)
+		holder.MarkReplied()
+		w := newRouteWorker(context.Background(), key, time.Hour, b)
+		defer w.Stop()
+
+		w.armTyping(holder)
+		if w.typingTicker != nil {
+			t.Fatal("typing must NOT arm when the channel does not advertise Typing")
+		}
+	})
+}
+
+// TestTypingRelay_DisarmIsIdempotentAndStopsTicker covers disarm (P5): the first
+// reply of a turn disarms the ticker; disarm is idempotent and clears state.
+func TestTypingRelay_DisarmIsIdempotentAndStopsTicker(t *testing.T) {
+	tid := int64(281)
+	key := RouteKey{Channel: "telegram", ChatID: -100, HasTopic: true, TopicID: tid}
+	ch := &typingRecorderChannel{}
+	b := brokerWithGenericChannel(t, mfWithTelegram(), ch)
+	defer b.Shutdown()
+	holder := claimedHolder(t, b, key)
+	holder.MarkReplied()
+	w := newRouteWorker(context.Background(), key, time.Hour, b)
+	defer w.Stop()
+
+	w.armTyping(holder)
+	if w.typingTicker == nil {
+		t.Fatal("setup: ticker should be armed")
+	}
+	w.disarmTyping()
+	if w.typingTicker != nil || w.typingC != nil {
+		t.Fatal("disarm should stop the ticker and clear state")
+	}
+	w.disarmTyping() // idempotent — must not panic on a nil ticker
+}
+
+// TestTypingRelay_ReArmKeepsCadence covers re-arm (P5): re-arming an already-armed
+// ticker is a no-op (keeps the same ticker), so a turn's tool calls don't reset
+// the cadence.
+func TestTypingRelay_ReArmKeepsCadence(t *testing.T) {
+	tid := int64(281)
+	key := RouteKey{Channel: "telegram", ChatID: -100, HasTopic: true, TopicID: tid}
+	ch := &typingRecorderChannel{}
+	b := brokerWithGenericChannel(t, mfWithTelegram(), ch)
+	defer b.Shutdown()
+	holder := claimedHolder(t, b, key)
+	holder.MarkReplied()
+	w := newRouteWorker(context.Background(), key, time.Hour, b)
+	defer w.Stop()
+
+	w.armTyping(holder)
+	first := w.typingTicker
+	w.armTyping(holder) // re-arm
+	if w.typingTicker != first {
+		t.Fatal("re-arm should keep the existing ticker (steady cadence), not replace it")
+	}
+}
+
+// noTypingChannel advertises Typing:false so the arm gate can be tested.
+type noTypingChannel struct{ typingRecorderChannel }
+
+func (c *noTypingChannel) Capabilities() c3types.Capabilities {
+	return c3types.Capabilities{Channel: "telegram", Typing: false}
 }
 
 func TestWorker_OutboundStubReturnsErr(t *testing.T) {

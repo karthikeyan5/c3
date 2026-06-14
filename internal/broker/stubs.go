@@ -43,8 +43,18 @@ type Stub struct {
 	// Route is the currently-claimed route for this stub (one per connection
 	// in v1; re-attach replaces). nil when unclaimed. Set/cleared by the
 	// broker handler under stubMu.
-	stubMu sync.Mutex
-	Route  *RouteKey
+	//
+	// hasReplied records whether this connection has successfully dispatched at
+	// least one `reply` to its claimed route. It is the deterministic "this
+	// session is in Telegram mode" proxy that gates the typing relay (P5 /
+	// spec R3): typing is only pulsed for a route whose holder has replied,
+	// avoiding "typing…" noise for default CLI-mode sessions that never reply
+	// to Telegram. It lives on the per-connection Stub (NOT the per-RouteKey
+	// RouteWorker, which outlives sessions) so it resets naturally when a new
+	// adapter connects. Guarded by stubMu.
+	stubMu     sync.Mutex
+	Route      *RouteKey
+	hasReplied bool
 }
 
 // MarkDisconnected records that the stub's conn has dropped. The claim
@@ -110,6 +120,25 @@ func (s *Stub) SetRoute(key *RouteKey) {
 	}
 	k := *key
 	s.Route = &k
+}
+
+// MarkReplied records that this connection has dispatched ≥1 `reply` to its
+// claimed route. Idempotent. Once set it stays set for the life of the
+// connection — a session that has replied once is "in Telegram mode" and stays
+// eligible for the typing relay across subsequent turns.
+func (s *Stub) MarkReplied() {
+	s.stubMu.Lock()
+	defer s.stubMu.Unlock()
+	s.hasReplied = true
+}
+
+// HasReplied reports whether this connection has dispatched ≥1 `reply`. The
+// typing relay (P5) arms only when the current holder HasReplied — see the
+// hasReplied field doc.
+func (s *Stub) HasReplied() bool {
+	s.stubMu.Lock()
+	defer s.stubMu.Unlock()
+	return s.hasReplied
 }
 
 // CurrentRoute returns a copy of the stub's current claim, or nil.
