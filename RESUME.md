@@ -1,6 +1,41 @@
 # RESUME
 
-## Current session handoff — 2026-06-01 (Ram, picking up on laptop)
+## Current handoff — 2026-06-14 (state reconciliation)
+
+A full state/docs/code reconciliation ran today — a multi-agent sweep of every state
+file, the `docs/plans` + `docs/specs`, the live Go code, and every past C3 session
+transcript (incl. cross-project sessions). The consolidated, prioritized roadmap now
+lives in **[ROADMAP.md](ROADMAP.md)** — that is the canonical "what's next." Nothing
+from old notes or voice memos was dropped; previously-untracked ideas are flagged
+`risk-of-loss: was-untracked` there.
+
+**Machine note:** this checkout is Karthi's laptop at `/home/karthi/arogara/c3`. The
+2026-06-01 handoff below was written on a **server at `/home/claw`** that was being shut
+down — treat its absolute paths and env-key locations (`gateway.systemd.env`,
+`openclaw.json`, `/home/claw/...`) as server-specific, **not valid on this machine**.
+
+**Where things stand:** the code is mature and healthy — `go build ./...` and
+`go vet ./...` are clean, and all packages test green **except 2 environment-flaky
+broker tests** (a hardcoded-PID test-fixture defect, not a production bug — see
+ROADMAP P2). Last commit 2026-06-04. The big open items are **unbuilt features, not
+regressions**.
+
+**Pick up next (priority order):**
+1. **Terminal-control** (P0, the main feature) — blocked on design Q1/Q2/Q3 below;
+   recommendation is to prototype the Go PTY stack. Settle the Qs first.
+2. **Trusted-operator DM authorization** (P1) — spec written at
+   `docs/specs/2026-06-14-trusted-operator-dm-authorization.md` (committed in this
+   cleanup). Needs the §9 Phase-0 verification + §10 ratification before building.
+3. **FIX #1 / FIX #2** (parked, P1) — inbound/album drop + typing auto-ticker; detailed
+   repro in the 2026-06-01 handoff below.
+4. **Pre-public-push blockers** (P1) — project rename + first-run install validation.
+
+The detailed in-flight design notes (terminal-control architecture + Go libs,
+permission-relay corrections, FIX #1/#2 repro) are preserved verbatim below.
+
+---
+
+## (Earlier) Session handoff — 2026-06-01 (Ram, picking up on laptop)
 
 Context was on a server session that's being shut down; this section is the
 full handoff so a fresh Ram on the laptop can continue without the chat
@@ -153,7 +188,11 @@ the agent. Earlier, two files sent as a group → only one arrived.
 
 ---
 
-## Current state — 2026-05-14
+## (Historical) Pre-public-push state — 2026-05-14
+
+_Superseded by [ROADMAP.md](ROADMAP.md) (which carries the verified done-list) and the
+2026-06-14 handoff above; kept for provenance. Note: "7 tools" below is now **8** on the
+Claude adapter._
 
 **Phase: pre-public-push hardening.** v0.1.0 is functionally complete
 (Plans 1–7 + 9 + plugin host shipped 2026-05-08 → 2026-05-09). Subsequent
@@ -239,22 +278,25 @@ claude --dangerously-load-development-channels plugin:c3@c3
 
 A plain `claude` leaves notifications silently dropped on the receiving
 side (broker log shows `delivered`, conversation sees nothing). See
-[`CLAUDE.md`](CLAUDE.md) for why.
+[`CLAUDE.md`](CLAUDE.md) for why. (Eliminating this flag via a private
+trusted plugin store is itself a roadmap item — ROADMAP P2.)
 
-**Next concrete step:** finish first-run install validation, decide
-whether to do the project-rename migration before or after the public
-push.
+**Canonical roadmap:** [`ROADMAP.md`](ROADMAP.md). **Detailed checklist:**
+[`TODO.md`](TODO.md).
 
 ## Key references
 
-- **Spec (locked):** [`docs/specs/2026-05-08-c3-rearch-design.md`](docs/specs/2026-05-08-c3-rearch-design.md) — v5
-- **Plans:** [`docs/plans/`](docs/plans) — 2026-05-08 foundation,
-  2026-05-09 broker+ipc, 2026-05-09 channel+worker
+- **Roadmap (canonical):** [`ROADMAP.md`](ROADMAP.md)
+- **Specs:** [`docs/specs/2026-05-08-c3-rearch-design.md`](docs/specs/2026-05-08-c3-rearch-design.md)
+  (v5, locked); [`docs/specs/2026-06-14-trusted-operator-dm-authorization.md`](docs/specs/2026-06-14-trusted-operator-dm-authorization.md)
+  (DRAFT — awaiting ratification)
+- **Plans:** [`docs/plans/`](docs/plans) — foundation, broker+ipc, channel+worker, plus
+  the 2026-05-19 batch. (`2026-05-19-mcp-test-race-patch.md` is **SUPERSEDED** —
+  `internal/mcp/` was removed in the go-sdk migration; do not resurrect.)
 - **Decisions:** [`DECISIONS.md`](DECISIONS.md) — D009 (Go implementation
-  landed) and D011 (Codex bridge in Go) are the most recent
-- **User guide:** [`docs/USAGE.md`](docs/USAGE.md)
-- **Authoring:** [`docs/PLUGINS.md`](docs/PLUGINS.md),
-  [`docs/CHANNELS.md`](docs/CHANNELS.md),
-  [`docs/ADAPTERS.md`](docs/ADAPTERS.md)
+  landed) and D011 (Codex bridge in Go) are the most recent.
+- **User guide:** [`docs/USAGE.md`](docs/USAGE.md). **Authoring:**
+  [`docs/PLUGINS.md`](docs/PLUGINS.md), [`docs/CHANNELS.md`](docs/CHANNELS.md),
+  [`docs/ADAPTERS.md`](docs/ADAPTERS.md). **Commands:** [`docs/COMMANDS.md`](docs/COMMANDS.md).
 - **Research notes:** [`docs/research/`](docs/research/) — Go MCP SDK
   evaluation, stdio protocol notes (2026-04-15, context for D004/D006).

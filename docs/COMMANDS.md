@@ -22,6 +22,7 @@ support.
 | `reload-config` | `pkill -HUP c3-broker`            | pure shell    | Signal the broker to re-read mappings.json. Non-disruptive — no process restart, in-memory pointer swap, live claims preserved. Replaces the old `restart-broker` (which killed the CLI's MCP server as a side effect — see 2026-05-14 RESUME). For binary updates, restart Claude Code instead. |
 | `attach`        | `mcp_attach(expr=…)` (MCP tool)   | LLM dispatch  | Attach this session's adapter to a Telegram topic. Broker parses `expr` and either silent-claims or proposes.          |
 | `detach`        | `mcp_detach()` (MCP tool)         | LLM dispatch  | Release the session's current claim (sends `OpRelease`).                                                              |
+| `release`       | `c3-broker release <cwd>` (CLI)   | pure shell    | **Stubbed in v0.1.0** — intended to drop a route claim by cwd without restarting the broker; returns 'not yet implemented' today; workaround is `/exit` the holding session. |
 
 ## attach — the parser (lives in the broker)
 

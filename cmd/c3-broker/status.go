@@ -17,7 +17,7 @@ import (
 //   - Socket: path + reachable?
 //   - Mappings: parses + validates? (or error)
 //   - Channels: each name + (if alive) basic info from config
-//   - Claims: (TODO — needs running broker introspection IPC; v1 just notes)
+//   - Live claims: live route table via OpListClaims (or a note if the broker is down)
 func runStatus() error {
 	var b strings.Builder
 	fmt.Fprintln(&b, "C3 broker status")

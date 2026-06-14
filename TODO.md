@@ -1,5 +1,9 @@
 # TODO
 
+**Canonical prioritized roadmap: [ROADMAP.md](ROADMAP.md)** (reconciled
+2026-06-14). This file is the detailed working checklist; ROADMAP.md is the
+prioritized product view — keep them in sync.
+
 Status as of 2026-05-09. Locked spec is
 [`docs/specs/2026-05-08-c3-rearch-design.md`](docs/specs/2026-05-08-c3-rearch-design.md).
 Re-prioritize against the spec when picking next work.
@@ -45,14 +49,14 @@ the section when empty.
    Done 2026-05-18 (`docs/INSTALL.md`). `/setprivacy → Disable` is
    documented as step 2 of the bot-setup checklist, before adding
    the bot to the group. Kept manual (BotFather-only — see item #2).
-4. [ ] **Onboarding preamble explaining what C3 is and why each
+4. [x] **Onboarding preamble explaining what C3 is and why each
    step exists.** Users hit setup completely blank on what the system
    does, why they're creating a group, why topics. Lead with a short
-   narrative before asking for any input.
-5. [ ] **Front-load bot-token ask; run install in background.** Bot
+   narrative before asking for any input. (verified done 2026-06-14)
+5. [x] **Front-load bot-token ask; run install in background.** Bot
    token is the only true prerequisite — ask for it first and kick
    off install in parallel while walking the user through the rest of
-   the flow.
+   the flow. (verified done 2026-06-14)
 6. [x] **Per-client Telegram-settings matrix.** Done 2026-05-18
    (`docs/INSTALL.md`). Per Karthi: no per-client matrix, just
    "don't use Telegram Web — use Desktop/iOS/Android/macOS." The
@@ -550,8 +554,17 @@ same session.
 Skipped (intentional):
 - Transport-level fallback chain (IPv4-sticky / pinned IP) — overkill for
   our deployment shape.
-- Media-group debounce (500ms hold-and-merge) — only matters for
-  multi-photo album sends, not in any current flow.
+
+Reopened (was mis-marked "Skipped (intentional)"):
+- **Album / media-group handling — KNOWN GAP, reopened as RESUME FIX #1.**
+  ~~Media-group debounce (500ms hold-and-merge) — only matters for
+  multi-photo album sends, not in any current flow.~~ (2026-06-14
+  reconciliation) This contradicts `RESUME.md` §FIX #1 (parked), which
+  documents a real bug: a same-poll-batch inbound was silently dropped
+  (msgs 186/187 logged ~33µs apart, only 187 delivered) AND C3 has **no
+  media-group assembly** — it relies on the 1.5s debounce, so a two-file
+  album loses a sibling. Not intentional; tracked as RESUME FIX #1
+  (P1, parked). See `RESUME.md` §FIX #1 and ROADMAP.md P1.
 
 ## Phase 3 — User & Access Management (not started)
 
@@ -604,3 +617,36 @@ Kept short for reference; full detail in the git history.
   `status` / `validate` subcommands, root `INSTALL.md` single-line install
 - Plan 10: doc pass — D009 added, README + RESUME + TODO rewritten to
   current state
+
+## Recovered from past sessions (2026-06-14 reconciliation)
+
+Ideas raised in voice notes / sessions that were never tracked here. Mined
+during the 2026-06-14 roadmap reconciliation; see ROADMAP.md for priority.
+
+- **Drop `--dangerously-load-development-channels` / register a private
+  trusted plugin store** — sign a certificate or whatever's needed to
+  eliminate the dangerous flag, and officially register Karthi's own
+  trusted plugin store for his many private plugins. (session 2026-05-18)
+  — see ROADMAP.md.
+- **ContestEval extension / programmatic non-Telegram channel** —
+  pluggable platform beyond Telegram where deterministic code injects
+  context into the LLM via C3 and gets a fixed-format response back (a
+  programmatic channel, not chat). (session 2026-06-04) — see ROADMAP.md.
+- **STT multi-provider modularity + retry/fallback + "how to add a
+  provider" README** — chain + fallback exist; the explicit how-to-add-a-
+  provider README Karthi asked for is unverified / likely missing.
+  (session 2026-05-15) — see ROADMAP.md.
+- **Codex ↔ Claude install/setup parity gaps** — Codex MCP install
+  hiccups; Codex didn't prompt for STT keys; Codex unaware of the
+  CLI/Telegram output-mode protocol. Confirm which asymmetries are
+  intentional vs gaps. (session 2026-05-18) — see ROADMAP.md.
+- **Auto-attach-to-c3-by-default bug — re-verify** — sessions default-
+  attach to the c3 topic even when not working on c3; reported fixed but
+  unverified in-repo (no commit since 2026-06-04). Re-verify.
+  (session 2026-06-13) — see ROADMAP.md.
+- **5 code-review guideline-file edits** — Karthi's rubric files awaiting
+  his voice on each (subjective rubric changes, not code).
+  (MORNING-REVIEW-2026-05-19) — see ROADMAP.md.
+- **n3 — Unicode bullets in user output** — keep Unicode bullets in
+  user-facing output? Subjective UX call; Karthi decides.
+  (MORNING-REVIEW-2026-05-19) — see ROADMAP.md.

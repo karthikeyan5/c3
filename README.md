@@ -58,9 +58,9 @@ See [`INSTALL.md`](INSTALL.md) for the agent script (what the agent reads) and [
   CLI-1  CLI-2              codex
 ```
 
-**Broker.** Single long-running Go process. One Telegram poller (Bot API constraint), N MCP adapters connected over a unix socket. Per-route serial executor (one goroutine per `RouteKey = {channel, chat_id, topic_id?}`) owns the inbound pipeline, outbound calls, placeholder + typing state, and debounce/merge. `flock` singleton with stale-pid recovery.
+**Broker.** Single long-running Go process. One Telegram poller (Bot API constraint), N MCP adapters connected over a unix socket. Per-route serial executor (one goroutine per `RouteKey = {channel, chat_id, topic_id?}`) owns the inbound pipeline, outbound calls, placeholder state (typing is signalled on demand via `send_typing`), and debounce/merge. `flock` singleton with stale-pid recovery.
 
-**Adapters.** Thin MCP stdio servers. Each looks like a normal MCP plugin to its CLI. Receives only messages routed to its attached topics/chats. Tools: `attach`, `detach`, `topics`, `reply`, `react`, `edit_message`, `send_typing`, `download_attachment`. Survives a broker bounce via exponential-backoff reconnect plus replay of the last successful attach (no manual re-attach needed).
+**Adapters.** Thin MCP stdio servers. Each looks like a normal MCP plugin to its CLI. Receives only messages routed to its attached topics/chats. Tools: `attach`, `detach`, `topics`, `reply`, `react`, `edit_message`, `send_typing`, `download_attachment`. Codex's adapter omits `detach` and adds `inbox` (drain buffered inbound) plus an env-gated `codex_forward` debug tool — see [`docs/ADAPTERS.md`](docs/ADAPTERS.md). Survives a broker bounce via exponential-backoff reconnect plus replay of the last successful attach (no manual re-attach needed).
 
 **Channels.** Pluggable transport layer. v0.1 ships Telegram only (`internal/channel/telegram`, cleanroom Go via `gotgbot/v2` rc.34) with resilience hardening: 401 circuit-breaker, 429 retry-after, 409 conflict detection, persisted update-id watermark, outbound rate-limiting, per-update semantic dedup. The `Channel` interface is the seam for adding Slack/web/voice/etc.
 

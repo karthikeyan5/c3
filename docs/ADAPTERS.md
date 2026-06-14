@@ -9,12 +9,12 @@ Adapters are not channels. Channels move bytes between users and the broker over
 Three jobs, every one of them small:
 
 1. **Speak the host CLI's MCP protocol over stdio.** Claude Code and Codex both use a JSON-RPC 2.0 dialect very close to the MCP standard, with extensions for unsolicited notifications. A new CLI may differ in small ways; understand its dialect before starting.
-2. **Maintain a connection to the broker over `/tmp/c3.sock`** and translate MCP tool calls into broker IPC ops.
+2. **Maintain a connection to the broker over `$XDG_RUNTIME_DIR/c3.sock`** (falls back to `/tmp/c3-$UID/c3.sock` when `XDG_RUNTIME_DIR` is unset — see internal/broker/paths.go) and translate MCP tool calls into broker IPC ops.
 3. **Translate inbound messages from the broker into whatever the host CLI can render.** Claude Code natively renders `notifications/claude/channel`. Codex doesn't render unsolicited notifications today, so the Codex adapter buffers them for a poll tool and (separately) forwards them via WebSocket into the running app-server. A new CLI may need yet another delivery path.
 
 ## The broker IPC contract
 
-Every adapter speaks the same broker IPC over `/tmp/c3.sock`. Newline-delimited JSON, one message per line. The protocol is the same for all CLIs — the broker doesn't care what's on the other end.
+Every adapter speaks the same broker IPC over `$XDG_RUNTIME_DIR/c3.sock`. Newline-delimited JSON, one message per line. The protocol is the same for all CLIs — the broker doesn't care what's on the other end.
 
 | Direction | Op | Purpose |
 |---|---|---|
@@ -37,7 +37,7 @@ Implement this in a small Go package — `internal/adapter/broker/` provides sha
 
 On startup:
 
-1. **Connect to the broker.** Open `/tmp/c3.sock`. If the connect fails because the broker isn't running, spawn it (`exec.Command("c3-broker")` in a detached process group, then retry the connect with backoff for up to 10s). Singleton enforcement is on the broker side via flock; a race during spawn is safe.
+1. **Connect to the broker.** Open `$XDG_RUNTIME_DIR/c3.sock`. If the connect fails because the broker isn't running, spawn it (`exec.Command("c3-broker")` in a detached process group, then retry the connect with backoff for up to 10s). Singleton enforcement is on the broker side via flock; a race during spawn is safe.
 2. **Send `hello`.** Include `cli` (your adapter's CLI name), `pid` (your adapter's pid; broker logs it for diagnostics), `cwd` (resolved-absolute path, used for cwd→mapping lookup).
 3. **Wait for `hello_ack`.** Three cases:
    - `no_config: true` → broker doesn't have `~/.config/c3/mappings.json`. Build an `instructions` string telling the agent to run setup.

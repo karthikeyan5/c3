@@ -1,3 +1,5 @@
+> **SUPERSEDED (2026-06-14):** This plan targeted `internal/mcp/`, which no longer exists — the project migrated to `github.com/modelcontextprotocol/go-sdk`. The `syncBuffer` race fix is moot. Kept for provenance; do not resurrect.
+
 # Plan — patch flaky data race in `internal/mcp/server_test.go`
 
 **Date:** 2026-05-19
