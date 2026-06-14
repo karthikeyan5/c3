@@ -4,8 +4,9 @@
 
 1. Read `README.md` — what C3 is and the architecture.
 2. Read `RESUME.md` — where we left off and what's in progress.
-3. Read `TODO.md` — current task list and priorities.
-4. Read `DECISIONS.md` — all decisions made so far.
+3. Read `ROADMAP.md` — the canonical prioritized roadmap (what's next; nothing-lost).
+4. Read `TODO.md` — the detailed working checklist.
+5. Read `DECISIONS.md` — all decisions made so far.
 
 ## The Short Version
 
