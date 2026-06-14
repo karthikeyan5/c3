@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/karthikeyan5/c3/internal/channel/telegram"
 	"github.com/karthikeyan5/c3/internal/mode"
 )
 
@@ -319,7 +320,13 @@ func codexAgentsMdPath() (string, error) {
 // double-newline-at-top would render as an empty paragraph in any
 // markdown viewer.
 func codexAgentsMdBlock() string {
-	body := strings.TrimLeft(mode.Combined(), "\n")
+	// Setup runs with NO live broker/connection, so caps come from the static
+	// channel literal. telegram.New() merely allocates (it does not dial the
+	// Bot API), making Capabilities() a pure literal here — same manifest the
+	// live broker would deliver over hello_ack, so the AGENTS.md guidance
+	// matches what Claude gets at MCP-initialize (Codex/Claude parity).
+	caps := telegram.New().Capabilities()
+	body := strings.TrimLeft(mode.Combined(caps), "\n")
 	return agentsMdBlockStart + "\n" +
 		"<!-- c3 manages this block. Do not edit between markers; rerun `c3-broker setup` to refresh. -->\n\n" +
 		body + "\n\n" +

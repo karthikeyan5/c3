@@ -209,12 +209,13 @@ func (b *Broker) attachDM(conn *ipc.Conn, stub *Stub, chanName string, steal, re
 		return
 	}
 	_ = conn.WriteJSON(ipc.AttachedMsg{
-		Op:      ipc.OpAttached,
-		OK:      true,
-		Status:  ipc.AttachStatusOK,
-		Channel: chanName,
-		ChatID:  cc.DMChatID,
-		Name:    "dm",
+		Op:           ipc.OpAttached,
+		OK:           true,
+		Status:       ipc.AttachStatusOK,
+		Channel:      chanName,
+		ChatID:       cc.DMChatID,
+		Name:         "dm",
+		Capabilities: b.capsForChannel(chanName),
 	})
 }
 
@@ -273,14 +274,15 @@ func (b *Broker) attachByTopicID(conn *ipc.Conn, stub *Stub, chanName string, to
 	b.persistMapping(stub, chanName, gCfg.ChatID, topicID, tp.Name, gName)
 
 	_ = conn.WriteJSON(ipc.AttachedMsg{
-		Op:      ipc.OpAttached,
-		OK:      true,
-		Status:  ipc.AttachStatusOK,
-		Channel: chanName,
-		ChatID:  gCfg.ChatID,
-		TopicID: &tid,
-		Name:    tp.Name,
-		Group:   gName,
+		Op:           ipc.OpAttached,
+		OK:           true,
+		Status:       ipc.AttachStatusOK,
+		Channel:      chanName,
+		ChatID:       gCfg.ChatID,
+		TopicID:      &tid,
+		Name:         tp.Name,
+		Group:        gName,
+		Capabilities: b.capsForChannel(chanName),
 	})
 }
 
@@ -368,6 +370,7 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 					Status:  ipc.AttachStatusOK,
 					Channel: chanName, ChatID: m.ChatID, TopicID: tidPtr,
 					Name: m.Name, Group: m.Group,
+					Capabilities: b.capsForChannel(chanName),
 				})
 				return
 			}
@@ -407,6 +410,7 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 			Status:  ipc.AttachStatusOK,
 			Channel: chanName, ChatID: tp.ChatID, TopicID: &tid,
 			Name: tp.Name, Group: tp.Group,
+			Capabilities: b.capsForChannel(chanName),
 		})
 		return
 	}
@@ -489,6 +493,7 @@ func (b *Broker) createAndClaim(conn *ipc.Conn, stub *Stub, chanName, gName stri
 		Status:  ipc.AttachStatusOK,
 		Channel: chanName, ChatID: chatID, TopicID: &tid,
 		Name: name, Group: gName,
+		Capabilities: b.capsForChannel(chanName),
 	})
 }
 

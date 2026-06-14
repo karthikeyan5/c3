@@ -1,0 +1,88 @@
+// Package mcptools is the single source of truth for the C3 MCP tool
+// InputSchemas that are shared verbatim between the Claude and Codex adapters.
+//
+// Karthi's standing principle (2026-05-18, TODO #20): anything duplicated
+// between the Claude and Codex adapters must have ONE source of truth. P3 added
+// per-adapter `replyMediaSchema()` / `pollToolSchema()` helpers that were
+// byte-identical copies; P4 collapses them here so the two adapters stay in
+// lockstep and the schemas can be derived from the capability manifest rather
+// than hand-maintained enums (CMG spec §L5 — "ONE shared helper generates tool
+// Descriptions/InputSchemas from the manifest").
+//
+// These builders return plain map[string]any so the MCP SDK can marshal them
+// directly (the adapters pass raw JSON-schema maps, not struct-tag reflection).
+package mcptools
+
+import "github.com/karthikeyan5/c3/internal/c3types"
+
+// allMediaKinds is the fallback ordered media-kind enum used when a manifest
+// reports no MediaKinds (e.g. a zero-value Capabilities). Matches the historical
+// hardcoded enum the per-adapter helpers used pre-P4.
+var allMediaKinds = []c3types.MediaKind{
+	c3types.MediaPhoto,
+	c3types.MediaFile,
+	c3types.MediaVideo,
+	c3types.MediaAudio,
+	c3types.MediaVoice,
+	c3types.MediaAnimation,
+}
+
+// mediaKindEnum returns the media-kind enum (as []string) for the reply tool's
+// `media[].kind` property, sourced from the manifest's MediaKinds so the schema
+// can never advertise a kind the channel cannot send. Falls back to the full
+// set when the manifest lists none (zero-value caps / older broker).
+func mediaKindEnum(caps c3types.Capabilities) []string {
+	kinds := caps.MediaKinds
+	if len(kinds) == 0 {
+		kinds = allMediaKinds
+	}
+	out := make([]string, 0, len(kinds))
+	for _, k := range kinds {
+		out = append(out, string(k))
+	}
+	return out
+}
+
+// ReplyMediaSchema is the JSON-schema for the reply tool's `media` array arg
+// (P3, manifest-driven in P4). Each item is one media object; the broker's gate
+// splits a multi-item array into one message per item. The `kind` enum is
+// derived from caps.MediaKinds.
+func ReplyMediaSchema(caps c3types.Capabilities) map[string]any {
+	return map[string]any{
+		"type":        "array",
+		"description": "Media to send, each item as its own message after the text.",
+		"items": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"kind": map[string]any{
+					"type": "string",
+					"enum": mediaKindEnum(caps),
+				},
+				"path":    map[string]any{"type": "string", "description": "Local file path on the shared host."},
+				"url":     map[string]any{"type": "string", "description": "Public URL Telegram fetches server-side."},
+				"caption": map[string]any{"type": "string"},
+				"spoiler": map[string]any{"type": "boolean"},
+			},
+			"required": []string{"kind"},
+		},
+	}
+}
+
+// PollToolSchema is the JSON-schema for the `poll` tool (P3). Channel-neutral —
+// the gate hard-rejects on a channel that does not support polls, so the schema
+// itself is the same shape regardless of manifest.
+func PollToolSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"question": map[string]any{"type": "string"},
+			"options": map[string]any{
+				"type":  "array",
+				"items": map[string]any{"type": "string"},
+			},
+			"anonymous": map[string]any{"type": "boolean", "description": "default true"},
+			"multiple":  map[string]any{"type": "boolean", "description": "allow multiple answers; default false"},
+		},
+		"required": []string{"question", "options"},
+	}
+}

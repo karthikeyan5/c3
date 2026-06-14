@@ -35,6 +35,20 @@ func TestServerInfoName(t *testing.T) {
 	// Construct the server and inspect what the SDK will emit on initialize
 	// by exercising in-memory transports end-to-end.
 	a := newAdapter()
+	// Seed the hello-ack caps so buildInstructions folds capability.GuidanceFor
+	// into the MCP `instructions` (P4). Mirrors the Telegram v1 manifest's
+	// load-bearing values so the positive guidance branches render.
+	a.helloAck.Capabilities = &c3types.Capabilities{
+		Channel:         "telegram",
+		RichText:        true,
+		MaxMessageRunes: 4096,
+		MediaKinds:      []c3types.MediaKind{c3types.MediaPhoto, c3types.MediaFile},
+		CompressedPhoto: true,
+		OriginalFile:    true,
+		MaxSendBytes:    50 * 1024 * 1024,
+		Polls:           true,
+		Typing:          true,
+	}
 	srv := a.buildMCPServer()
 	if srv == nil {
 		t.Fatal("buildMCPServer returned nil")
@@ -73,6 +87,19 @@ func TestServerInfoName(t *testing.T) {
 	}
 	if params.Instructions == "" {
 		t.Fatal("instructions empty in initialize response")
+	}
+	// P4: the capability guidance (capability.GuidanceFor, folded in via
+	// mode.Combined(caps)) must be present in the MCP instructions so the
+	// agent is capability-aware. Assert distinctive phrases — the header
+	// (always present) AND a positive cap line (proves the seeded caps
+	// actually flowed through, not just a zero-value default).
+	for _, want := range []string{
+		"CHANNEL CAPABILITIES",
+		"Typing: shown automatically",
+	} {
+		if !strings.Contains(params.Instructions, want) {
+			t.Errorf("instructions missing capability-guidance phrase %q:\n%s", want, params.Instructions)
+		}
 	}
 
 	// Verify tools/list returns the adapter tools (attach, detach, topics,

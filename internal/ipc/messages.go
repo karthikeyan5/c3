@@ -56,6 +56,16 @@ type HelloAckMsg struct {
 	ClaimHolder  *Holder  `json:"claim_holder,omitempty"`
 	NoConfig     bool     `json:"no_config,omitempty"`
 	NoMapping    bool     `json:"no_mapping,omitempty"`
+
+	// Capabilities carries the resolvable channel's static capability
+	// manifest so the adapter can fold GuidanceFor(caps) into the agent's
+	// MCP-initialize instructions (Claude) / AGENTS.md surface (Codex).
+	// Additive + omitempty: nil for older brokers that predate the CMG
+	// build, and nil when no channel is resolvable for the connection's
+	// route (the adapter falls back to a sensible default in that case).
+	// IPC has no version field; v1 relies on additive-omitempty +
+	// single-host lockstep `/c3:build` (spec §L4).
+	Capabilities *c3types.Capabilities `json:"capabilities,omitempty"`
 }
 
 // Holder identifies a claim holder for diagnostic responses.
@@ -275,6 +285,13 @@ type AttachedMsg struct {
 	// (wire-additive; the force_steal holder still travels inside
 	// Proposal.Holder).
 	Holder *Holder `json:"holder,omitempty"`
+
+	// Capabilities carries the just-attached channel's static capability
+	// manifest. Set only on a successful attach (OK=true) where the channel
+	// is resolvable; lets a multi-channel future refresh the agent surface
+	// at attach-time (the turn-time-refresh seam — spec §L5). Additive +
+	// omitempty: nil on failures and for older brokers.
+	Capabilities *c3types.Capabilities `json:"capabilities,omitempty"`
 }
 
 // Proposal describes what the broker would do if the agent confirms.

@@ -89,6 +89,18 @@ func (b *Broker) HandleConn(nc net.Conn) {
 	} else if _, ok := b.Mappings().LookupByCwd(hello.CWD); !ok {
 		ack.NoMapping = true
 	}
+	// Attach the resolvable channel's capability manifest so the adapter can
+	// fold GuidanceFor(caps) into the agent's MCP-initialize instructions
+	// (Claude) / AGENTS.md surface (Codex). Prefer the cwd-mapped channel;
+	// fall back to the default channel. nil (no channel resolvable) is a
+	// valid wire value — the adapter falls back to a default Capabilities.
+	chanName := ""
+	if m, ok := b.Mappings().LookupByCwd(hello.CWD); ok && m.Channel != "" {
+		chanName = m.Channel
+	} else {
+		chanName = b.defaultChannel()
+	}
+	ack.Capabilities = b.capsForChannel(chanName)
 	if err := conn.WriteJSON(ack); err != nil {
 		return
 	}

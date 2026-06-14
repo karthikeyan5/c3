@@ -51,6 +51,7 @@ import (
 	"github.com/karthikeyan5/c3/internal/broker"
 	"github.com/karthikeyan5/c3/internal/c3types"
 	"github.com/karthikeyan5/c3/internal/ipc"
+	"github.com/karthikeyan5/c3/internal/mcptools"
 	"github.com/karthikeyan5/c3/internal/mode"
 	"github.com/karthikeyan5/c3/internal/termtitle"
 )
@@ -452,6 +453,14 @@ func (a *adapter) dispatchAttached(raw []byte) {
 	if ok {
 		var attached ipc.AttachedMsg
 		_ = json.Unmarshal(raw, &attached)
+		// A successful attach may carry the just-claimed channel's manifest.
+		// Store it as the latest caps so any subsequent instructions rebuild
+		// reflects the attached channel (multi-channel turn-time-refresh seam,
+		// spec §L5). v1 single-channel: the hello_ack caps already cover the
+		// live session — kept for parity with the Claude adapter.
+		if attached.OK && attached.Capabilities != nil {
+			a.helloAck.Capabilities = attached.Capabilities
+		}
 		ch <- ipc.ToolResultMsg{Result: map[string]any{"_attached": attached}}
 	}
 }
@@ -513,12 +522,26 @@ func (a *adapter) buildInstructions() string {
 	default:
 		head = "C3 connected. Use `attach` to claim a Telegram topic, `inbox` to drain buffered inbound, `reply` to send. Codex doesn't render unsolicited MCP notifications today; check `inbox` periodically."
 	}
-	return head + mode.Combined()
+	return head + mode.Combined(a.capsOrDefault())
+}
+
+// capsOrDefault returns the channel capability manifest the broker delivered
+// on hello_ack (or a fresh attach), falling back to a zero Capabilities when
+// the broker predates the CMG build (Capabilities==nil) or no channel was
+// resolvable. GuidanceFor renders the zero value as honest all-NO guidance —
+// no panic, no fabricated capability. Parity with the Claude adapter: caps
+// ride the once-delivered init/setup instructions, NOT per-turn text.
+func (a *adapter) capsOrDefault() c3types.Capabilities {
+	if a.helloAck.Capabilities != nil {
+		return *a.helloAck.Capabilities
+	}
+	return c3types.Capabilities{}
 }
 
 // registerTools adds all adapter tools to srv (user-facing tools + the
 // `codex_forward` debug tool).
 func (a *adapter) registerTools(srv *mcp.Server) {
+	caps := a.capsOrDefault()
 	tools := []struct {
 		tool    *mcp.Tool
 		handler mcp.ToolHandler
@@ -574,7 +597,7 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 						"text":       map[string]any{"type": "string"},
 						"reply_to":   map[string]any{"type": "integer"},
 						"parse_mode": map[string]any{"type": "string"},
-						"media":      replyMediaSchema(),
+						"media":      mcptools.ReplyMediaSchema(caps),
 					},
 					"required": []string{"text"},
 				},
@@ -623,7 +646,7 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 			tool: &mcp.Tool{
 				Name:        "poll",
 				Description: "Send a Telegram poll to the attached topic. Provide a `question` and 2+ `options`. `anonymous` (default true) and `multiple` (default false) tune the poll.",
-				InputSchema: pollToolSchema(),
+				InputSchema: mcptools.PollToolSchema(),
 			},
 			handler: a.toolForward("poll"),
 		},
@@ -659,47 +682,6 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 	}
 	for _, t := range tools {
 		srv.AddTool(t.tool, t.handler)
-	}
-}
-
-// replyMediaSchema is the JSON-schema for the reply tool's `media` array arg
-// (P3). Each item is one media object; the broker's gate splits a multi-item
-// array into one message per item.
-func replyMediaSchema() map[string]any {
-	return map[string]any{
-		"type":        "array",
-		"description": "Media to send, each item as its own message after the text.",
-		"items": map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"kind": map[string]any{
-					"type": "string",
-					"enum": []string{"photo", "file", "video", "audio", "voice", "animation"},
-				},
-				"path":    map[string]any{"type": "string", "description": "Local file path on the shared host."},
-				"url":     map[string]any{"type": "string", "description": "Public URL Telegram fetches server-side."},
-				"caption": map[string]any{"type": "string"},
-				"spoiler": map[string]any{"type": "boolean"},
-			},
-			"required": []string{"kind"},
-		},
-	}
-}
-
-// pollToolSchema is the JSON-schema for the `poll` tool (P3).
-func pollToolSchema() map[string]any {
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"question": map[string]any{"type": "string"},
-			"options": map[string]any{
-				"type":  "array",
-				"items": map[string]any{"type": "string"},
-			},
-			"anonymous": map[string]any{"type": "boolean", "description": "default true"},
-			"multiple":  map[string]any{"type": "boolean", "description": "allow multiple answers; default false"},
-		},
-		"required": []string{"question", "options"},
 	}
 }
 

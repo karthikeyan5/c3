@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/karthikeyan5/c3/internal/c3types"
 	"github.com/karthikeyan5/c3/internal/channel"
 	"github.com/karthikeyan5/c3/internal/mappings"
 	"github.com/karthikeyan5/c3/internal/plugin"
@@ -144,6 +145,24 @@ func (b *Broker) Channel(name string) (channel.Channel, error) {
 		return nil, fmt.Errorf("broker: channel %q not registered", name)
 	}
 	return reg.Channel, nil
+}
+
+// capsForChannel returns the static capability manifest for the named channel,
+// or nil when the channel is not registered/resolvable. Used to populate the
+// additive Capabilities field on hello_ack and attached payloads so the
+// adapters can fold GuidanceFor(caps) into the agent surface. Nil is a valid
+// wire value (omitempty) — older adapters ignore it and newer ones fall back
+// to a sensible default.
+func (b *Broker) capsForChannel(name string) *c3types.Capabilities {
+	if name == "" {
+		return nil
+	}
+	ch, err := b.Channel(name)
+	if err != nil {
+		return nil
+	}
+	caps := ch.Capabilities()
+	return &caps
 }
 
 // Channels returns the names of all registered channels (diagnostic).

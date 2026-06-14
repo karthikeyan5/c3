@@ -30,6 +30,11 @@
 // just this package's.
 package mode
 
+import (
+	"github.com/karthikeyan5/c3/internal/c3types"
+	"github.com/karthikeyan5/c3/internal/capability"
+)
+
 // ModeProtocol is the per-session output-mode contract every agent using
 // c3 must honor. Appended to every adapter MCP-initialize instructions
 // variant so the rule travels with the plugin, not with the user's
@@ -61,7 +66,16 @@ const MultipartProtocol = "MULTI-PART REPLY PROTOCOL:\n" +
 // the historical wire shape — every adapter previously hard-coded its
 // modeProtocol const with that exact prefix, so existing tests / live
 // behaviour stay byte-identical for the ModeProtocol section. Between
-// the two protocols we use a single "\n\n" for separation.
-func Combined() string {
-	return "\n\n" + ModeProtocol + "\n\n" + MultipartProtocol
+// the protocols we use a single "\n\n" for separation.
+//
+// The trailing capability.GuidanceFor(c) section is the channel-capability
+// surface (CMG spec §L5) — folded in so the agent learns, in the SAME
+// init/setup delivery as the mode/multipart protocols, what the channel can
+// render (rich text, media, polls, typing, streaming). c is the resolvable
+// channel's manifest; callers source it from the hello_ack / attached payload
+// (live adapters) or from the static channel literal (broker setup, which has
+// no live connection). A zero Capabilities value renders honest all-NO
+// guidance, so a nil-caps fallback never panics.
+func Combined(c c3types.Capabilities) string {
+	return "\n\n" + ModeProtocol + "\n\n" + MultipartProtocol + "\n\n" + capability.GuidanceFor(c)
 }

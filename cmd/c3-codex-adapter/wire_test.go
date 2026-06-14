@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/karthikeyan5/c3/internal/c3types"
 )
 
 // TestServerInfoName guards the contract that the Codex adapter advertises
@@ -21,6 +23,20 @@ func TestServerInfoName(t *testing.T) {
 	}
 
 	a := newAdapter()
+	// Seed the hello-ack caps so buildInstructions folds capability.GuidanceFor
+	// into the MCP `instructions` (P4) — same path + parity as the Claude
+	// adapter. Mirrors the Telegram v1 manifest's load-bearing values.
+	a.helloAck.Capabilities = &c3types.Capabilities{
+		Channel:         "telegram",
+		RichText:        true,
+		MaxMessageRunes: 4096,
+		MediaKinds:      []c3types.MediaKind{c3types.MediaPhoto, c3types.MediaFile},
+		CompressedPhoto: true,
+		OriginalFile:    true,
+		MaxSendBytes:    50 * 1024 * 1024,
+		Polls:           true,
+		Typing:          true,
+	}
 	srv := a.buildMCPServer()
 	if srv == nil {
 		t.Fatal("buildMCPServer returned nil")
@@ -53,6 +69,19 @@ func TestServerInfoName(t *testing.T) {
 	}
 	if result.Instructions == "" {
 		t.Fatal("instructions empty in initialize response")
+	}
+	// P4: the capability guidance (capability.GuidanceFor, folded in via
+	// mode.Combined(caps)) must be present in the MCP instructions so the
+	// Codex agent is capability-aware — parity with the Claude adapter.
+	// Assert the header (always present) AND a positive cap line (proves the
+	// seeded caps flowed through, not just a zero-value default).
+	for _, want := range []string{
+		"CHANNEL CAPABILITIES",
+		"Typing: shown automatically",
+	} {
+		if !strings.Contains(result.Instructions, want) {
+			t.Errorf("instructions missing capability-guidance phrase %q:\n%s", want, result.Instructions)
+		}
 	}
 
 	// Verify tools/list returns the expected Codex tool set

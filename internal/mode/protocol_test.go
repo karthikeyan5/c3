@@ -3,7 +3,26 @@ package mode
 import (
 	"strings"
 	"testing"
+
+	"github.com/karthikeyan5/c3/internal/c3types"
 )
+
+// testCaps is a representative manifest passed to Combined() in these tests —
+// mirrors the Telegram v1 literal closely enough to exercise GuidanceFor's
+// positive branches. The exact values don't matter to the mode-protocol
+// assertions (those guard the protocol prose); the per-channel golden manifest
+// test pins the real Telegram values.
+var testCaps = c3types.Capabilities{
+	Channel:         "telegram",
+	RichText:        true,
+	MaxMessageRunes: 4096,
+	MediaKinds:      []c3types.MediaKind{c3types.MediaPhoto, c3types.MediaFile},
+	CompressedPhoto: true,
+	OriginalFile:    true,
+	MaxSendBytes:    50 * 1024 * 1024,
+	Polls:           true,
+	Typing:          true,
+}
 
 // TestModeProtocol_HasCanonicalKeyPhrases guards against accidental drift
 // of the user-facing protocol strings. We can't pin the whole text (it'll
@@ -58,7 +77,7 @@ func TestMultipartProtocol_HasCanonicalKeyPhrases(t *testing.T) {
 // existing adapter relies on (their previous modeProtocol consts opened
 // with "\n\n" — head text concatenated directly).
 func TestCombined_PreservesLeadingNewlines(t *testing.T) {
-	got := Combined()
+	got := Combined(testCaps)
 	if !strings.HasPrefix(got, "\n\n") {
 		t.Errorf("Combined() must start with \\n\\n so it splices onto head text; got %q", got[:min(10, len(got))])
 	}
@@ -68,7 +87,7 @@ func TestCombined_PreservesLeadingNewlines(t *testing.T) {
 // that callers don't have to remember to concatenate both protocols
 // themselves.
 func TestCombined_ContainsBothProtocols(t *testing.T) {
-	got := Combined()
+	got := Combined(testCaps)
 	if !strings.Contains(got, ModeProtocol) {
 		t.Error("Combined() missing ModeProtocol body")
 	}
@@ -77,12 +96,28 @@ func TestCombined_ContainsBothProtocols(t *testing.T) {
 	}
 }
 
+// TestCombined_FoldsInCapabilityGuidance is the P4 contract: the channel
+// capability guidance (capability.GuidanceFor) must be spliced into the
+// combined agent surface so the agent learns what the channel can render in
+// the SAME init/setup delivery as the mode/multipart protocols.
+func TestCombined_FoldsInCapabilityGuidance(t *testing.T) {
+	got := Combined(testCaps)
+	for _, want := range []string{
+		"CHANNEL CAPABILITIES",
+		"Typing: shown automatically",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Combined() missing capability-guidance phrase %q:\n%s", want, got)
+		}
+	}
+}
+
 // TestCombined_ProtocolsSeparated guards against the two protocols being
 // fused with no blank line between them (which would make the rendered
 // text harder to read for the agent and for humans inspecting the MCP
 // initialize response during debugging).
 func TestCombined_ProtocolsSeparated(t *testing.T) {
-	got := Combined()
+	got := Combined(testCaps)
 	// Find where ModeProtocol ends and MultipartProtocol begins, assert
 	// there's at least one blank line of separation.
 	idx := strings.Index(got, MultipartProtocol)
