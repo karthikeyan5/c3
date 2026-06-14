@@ -5,6 +5,7 @@
 **Revision history**
 - v1 — base synthesis.
 - v2 — critique pass 1 folded (code-grounding F1–F12): streaming deferred (no Claude-Code reasoning source); `Capabilities()` no-arg (avoids `channel→broker` cycle); typing relay re-specified; construct-aware chunking; pinned shim; album mixing in-channel; honest Claude init-only instructions.
+- v4 — critique pass 3 folded (GO verdict): fix the 2 pre-existing red attach-collision tests so phase gates mean something (gate = build clean + no NEW failures vs baseline); corrected the typing-flag anchor; noted the `ReplyArgs = Outbound` alias ripple; named the broker-setup caps source; split P2 into P2a/P2b; `sendPoll` in its own file.
 - v3 — **critique pass 2 folded.** Blockers: typing has-replied flag anchored on the per-connection holder (not the per-route worker); multi-part send contract defined + existing silent-success bug fixed. Majors: media is first-class new surface (reply tool gains a `media` arg); `edit_message` joins the markup system; `MarkdownV2` shim → reject+note; one concrete chunking algorithm; concrete `GuidanceFor` template + no per-turn Codex injection in v1. Scope trims: **albums descoped to sequential sends** (`Albums=false` in v1); **client-side reaction validation dropped** (Telegram is the authority).
 
 Supersedes the scattered channel/formatting assumptions in the v5 rearch spec for the parts it touches.
@@ -103,9 +104,10 @@ Broker-owned, driven by signals that already exist; never an LLM tool (the agent
 is removed from the default set — claude `main.go:790-794`, codex `:615-619`). **Mechanics:** the
 `RouteWorker.run` select loop (`worker.go:83-154`) gains a `<-ticker.C` arm + a per-route timer field
 (new per-route state, **no new goroutine**). **Session anchoring (blocker fix):** `RouteWorker` is
-per-RouteKey and outlives individual sessions, so the "this session talks to Telegram" signal is stored
-on the **per-connection holder/stub** (set with the route at `handler.go:119`), NOT on the worker —
-resets naturally per connection. **Arming rule:** arm the ~4s `SendTyping` pulse on inbound-delivered-to-
+per-RouteKey and outlives individual sessions, so the "this session talks to Telegram" signal is a
+`hasReplied` field on the **per-connection holder `Stub`** (the route is set via `Stub.SetRoute` at
+`attach.go:572`; the `RouteWorker` reads the holder via `Routes.Holder(key)`, `worker.go:267`), NOT on
+the worker — resets naturally per connection. **Arming rule:** arm the ~4s `SendTyping` pulse on inbound-delivered-to-
 a-claimed-route (`forwardOrFallback` delivered path, `worker.go:303`) **only once the current holder has
 dispatched ≥1 `reply`** (the deterministic "this session is in Telegram mode" proxy — avoids pulsing
 "typing…" for default CLI-mode sessions that never reply to Telegram). Re-arm on non-reply tool-calls
@@ -263,27 +265,39 @@ the manifest (anti-drift).
   (`Capabilities` + `Inbound`/`Stream`, `Markup`, `MediaKind`, `MediaItem`, `PollSpec`, `Alteration`). Add
   no-arg `Capabilities()` to the interface; implement the static Telegram literal (`Typing=true`,
   `Albums=false`, `Stream.StreamViaEdit=false`). **Grep ALL `channel.Channel` implementers + test doubles
-  and add the method in the SAME commit.** Compiles + passes.
+  (incl. `fakeChannel`, `attach_test.go:44`) and add the method in the SAME commit.** **Pre-step:** the
+  suite has 2 pre-existing red attach-collision tests (hardcoded synthetic PID 9823,
+  `attach_cwd_collision_test.go:79,230`) unrelated to this work — fix the fixture (use a live PID / a
+  connected holder stub) first so phase gates are meaningful. **Every phase gate = `go build ./...` clean +
+  `go vet` clean + NO NEW test failures vs the P0 baseline.**
 - **P1 — Kill ParseMode leaks + neutral Outbound/EditArgs.** `Outbound.ParseMode`→`Markup`; add
   `EditArgs.Markup`; remove `EditArgs.ParseMode` read + the unadvertised arg; `Files`→`Media` (+`Poll`).
   One-release back-compat shims in `dispatchReply`: `parse_mode=""`→`markdown`; `"HTML"`→`native`;
   **`"MarkdownV2"`→reject with a clear note** (converter now handles markdown natively; MarkdownV2-from-
-  agent is rare); `Files`→`Media{Kind:file}`. Assert raw-Telegram rejected unless `native`.
-- **P2 — `capability.Gate` + converter + chunking + multi-part contract.** Build `internal/capability`
-  (pure; `Gate` returns parts+notes+alts; `GuidanceFor` per the template; table-tested, imports only
-  `c3types`). Expand `mdToTelegramHTML` (golden tests) + route BOTH `dispatchReply` and `dispatchEditMessage`
-  through converter+gate. Implement the construct-aware chunking algorithm (golden tests incl. straddling
-  constructs + a single >4096 construct, UTF-16 counting). Implement the multi-part send contract in
-  dispatch (sequential, fail-fast, "sent k of N") and **fix the existing silent-success-on-partial-failure
-  bug** (`outbound.go:82-84`). Add the guidance-derives-from-caps golden test.
+  agent is rare); `Files`→`Media{Kind:file}`. Assert raw-Telegram rejected unless `native`. **Note:
+  `ReplyArgs = Outbound` (type alias, `types.go:77`), so this rename also changes the reply-tool arg shape,
+  the `SendReply(args ReplyArgs)` signatures (real channel + `fakeChannel`), and must replace the
+  `len(Files)>0` hard-error (`outbound.go:29-31`) atomically in the same commit.**
+- **P2a — Converter expansion (R1).** Expand `mdToTelegramHTML` to the full common-markdown set
+  (italic/underline/strike/spoiler/links/lists/quotes) with golden tests; lands green independently of the
+  gate. Make the manifest `RichText` advertisement match exactly what it renders.
+- **P2b — `capability.Gate` + chunking + multi-part contract.** Build `internal/capability` (pure; `Gate`
+  returns parts+notes+alts; `GuidanceFor` per the template; table-tested, imports only `c3types`). Route
+  BOTH `dispatchReply` and `dispatchEditMessage` through converter+gate. Implement the construct-aware
+  chunking algorithm (golden tests incl. straddling constructs + a single >4096 construct, UTF-16
+  counting). Implement the multi-part send contract in dispatch (sequential, fail-fast, "sent k of N") and
+  **fix the existing silent-success-on-partial-failure bug** (`outbound.go:82-84`). Add the
+  guidance-derives-from-caps golden test.
 - **P3 — Media + poll send paths.** Add the `media` array arg to the reply tool InputSchema (both adapters)
   + parse in `dispatchReply`. Replace the `Files` hard-error with per-Kind single-item sends + sequential
   multi-item (no album grouping). File existence + `MaxSendBytes` validation in-channel. Add `sendPoll` +
-  the gated `poll` tool. Surface 50MB/20MB caps.
+  the gated `poll` tool (`sendPoll` in a new `sendpoll.go` — the existing `poll.go` is the unrelated
+  getUpdates loop). Surface 50MB/20MB caps.
 - **P4 — Caps delivery + shared agent surface.** Add `Capabilities` to `hello_ack` AND `attached`.
   `mode.Combined(caps)` folds in `GuidanceFor` (ripples to all 3 consumers + `protocol_test.go`'s tests).
-  ONE shared helper generates tool Descriptions/InputSchemas (both adapters). **No per-turn Codex injection
-  in v1.** Add CONTENT assertions to the two adapter wire tests (today only `Instructions != ""`) + a
+  ONE shared helper generates tool Descriptions/InputSchemas (both adapters). The broker setup path
+  (`codexAgentsMdBlock`, `cli_host.go:322`) has no live connection — it sources caps from the static
+  channel `Capabilities()` literal. **No per-turn Codex injection in v1.** Add CONTENT assertions to the two adapter wire tests (today only `Instructions != ""`) + a
   per-channel golden manifest test.
 - **P5 — Deterministic typing relay.** Per-connection has-replied flag on the holder/stub; ticker select-arm
   + per-route timer on `RouteWorker`; arm on delivered-to-claimed-route once has-replied, re-arm on
