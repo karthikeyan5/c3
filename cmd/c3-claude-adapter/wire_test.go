@@ -75,18 +75,17 @@ func TestServerInfoName(t *testing.T) {
 		t.Fatal("instructions empty in initialize response")
 	}
 
-	// Verify tools/list returns the 8 tools the pre-migration adapter
-	// exposed (attach, detach, topics, reply, react, edit_message,
-	// send_typing, download_attachment) — Claude Code displays tool
-	// presence per-server and a regression here turns a working session
-	// into "tool not found" for every adapter operation.
+	// Verify tools/list returns the adapter tools (attach, detach, topics,
+	// reply, react, edit_message, send_typing, poll, download_attachment) —
+	// Claude Code displays tool presence per-server and a regression here turns
+	// a working session into "tool not found" for every adapter operation.
 	listResult, err := sess.ListTools(ctx, nil)
 	if err != nil {
 		t.Fatalf("ListTools: %v", err)
 	}
 	wantTools := []string{
 		"attach", "detach", "topics", "reply", "react",
-		"edit_message", "send_typing", "download_attachment",
+		"edit_message", "send_typing", "poll", "download_attachment",
 	}
 	got := map[string]bool{}
 	for _, tool := range listResult.Tools {

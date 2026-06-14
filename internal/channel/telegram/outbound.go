@@ -15,15 +15,21 @@ import (
 	"github.com/karthikeyan5/c3/internal/c3types"
 )
 
-// SendReply sends a SINGLE Telegram message and returns its message_id.
+// SendReply sends ONE Telegram part and returns its message_id. A part carries
+// AT MOST ONE of {text, a single media item, a poll} — the pure capability.Gate
+// splits a logical reply into such parts and dispatch sends one part per call.
 // Honors message_thread_id when args.TopicID is non-nil and reply_parameters
 // when args.ReplyTo is non-nil.
 //
-// Chunking is NOT done here. The pure capability.Gate (broker side) splits a
-// long logical reply into parts that each fit Telegram's limit and dispatch
-// sends one part per SendReply call. SendReply therefore sends args.Text as one
-// message — removing, by construction, the prior silent-success-on-chunk-k>0
-// bug where a failed Nth chunk logged, broke the loop, and returned success.
+// Part-by-content dispatch (P3):
+//   - args.Poll != nil → send a poll (sendPoll).
+//   - len(args.Media) == 1 → send that one media item by Kind (sendMedia).
+//   - else → send args.Text as a single text message (the path below).
+//
+// Chunking is NOT done here. The gate splits a long logical reply into parts
+// that each fit Telegram's limit — SendReply sends one. This removes, by
+// construction, the prior silent-success-on-chunk-k>0 bug where a failed Nth
+// chunk logged, broke the loop, and returned success.
 //
 // Markup mapping (channel-neutral intent → Telegram wire):
 //   - MarkupMarkdown OR "" (empty/zero value = the MARKDOWN DEFAULT): run
@@ -33,15 +39,21 @@ import (
 //     as literal characters.
 //   - MarkupNative: send the text as-is (pre-formed HTML), parse_mode=HTML.
 //   - MarkupNone: plain text, no parse_mode.
-//
-// Media sending is not yet implemented in this method (P3) — when args.Media is
-// non-empty, the method returns an error.
 func (c *Channel) SendReply(args c3types.ReplyArgs) (int64, error) {
 	if c.bot == nil {
 		return 0, errors.New("telegram: channel not started")
 	}
-	if len(args.Media) > 0 {
-		return 0, errors.New("telegram: media send not yet implemented (P3)")
+	// A part carries at most one of {poll, single media item, text}.
+	if args.Poll != nil {
+		return c.sendPoll(args)
+	}
+	if len(args.Media) == 1 {
+		return c.sendMedia(args, args.Media[0])
+	}
+	if len(args.Media) > 1 {
+		// The gate emits one media item per part; >1 here means a caller bypassed
+		// the gate. Fail loudly rather than silently send only the first.
+		return 0, fmt.Errorf("telegram: SendReply got %d media items in one part — the gate emits one item per part", len(args.Media))
 	}
 
 	// Empty/zero-value Markup is the MARKDOWN DEFAULT (see doc comment).

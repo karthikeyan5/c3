@@ -1,0 +1,191 @@
+package telegram
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"unicode/utf16"
+
+	"github.com/PaulSonOfLars/gotgbot/v2"
+
+	"github.com/karthikeyan5/c3/internal/c3types"
+)
+
+// captionUTF16Len counts a caption's length in UTF-16 code units — the unit
+// Telegram measures caption length in (an astral rune is a surrogate pair = 2
+// units). The caption-length policy is the gate's job; this is the in-channel
+// last-resort guard.
+func captionUTF16Len(s string) int {
+	return len(utf16.Encode([]rune(s)))
+}
+
+// sendMedia sends ONE media item (one part = one item; album grouping is
+// descoped in v1 — the gate emits one part per item). It dispatches by Kind to
+// the matching Bot API send method, honoring the caption (markdown→HTML via the
+// same converter as text), message_thread_id (TopicID), reply_parameters
+// (ReplyTo), and spoiler where the kind supports it. Returns the sent
+// message_id.
+//
+// Source resolution (single-host invariant): a non-empty Path is a local file
+// on the shared host (opened + uploaded as multipart); otherwise a non-empty URL
+// is passed to Telegram for server-side fetch. Path takes precedence when both
+// are set.
+//
+// Validation (impure — correct in the channel, not the pure gate): for a Path
+// item we os.Stat the file (clear error if missing) and reject if it exceeds
+// MaxSendBytes (50 MiB). A URL's size is unknowable pre-send, so we rely on
+// Telegram's own rejection surfaced as the send error.
+func (c *Channel) sendMedia(args c3types.ReplyArgs, item c3types.MediaItem) (int64, error) {
+	if item.Path == "" && item.URL == "" {
+		return 0, errors.New("telegram: media item has neither path nor url")
+	}
+
+	// Resolve the file source + validate a local Path (existence + size).
+	var src gotgbot.InputFileOrString
+	var fh *os.File
+	if item.Path != "" {
+		info, err := os.Stat(item.Path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return 0, fmt.Errorf("telegram: media file not found: %s", item.Path)
+			}
+			return 0, fmt.Errorf("telegram: stat media file %s: %w", item.Path, err)
+		}
+		if info.IsDir() {
+			return 0, fmt.Errorf("telegram: media path is a directory, not a file: %s", item.Path)
+		}
+		if info.Size() > maxSendBytes {
+			return 0, fmt.Errorf("telegram: media file too large: %s is %d bytes, over the %d-byte (50 MiB) send limit",
+				item.Path, info.Size(), int64(maxSendBytes))
+		}
+		f, err := os.Open(item.Path)
+		if err != nil {
+			return 0, fmt.Errorf("telegram: open media file %s: %w", item.Path, err)
+		}
+		fh = f
+		defer fh.Close()
+		src = gotgbot.InputFileByReader(filepath.Base(item.Path), fh)
+	} else {
+		src = gotgbot.InputFileByURL(item.URL)
+	}
+
+	// Caption: convert markdown→HTML the same way text replies do. The gate is
+	// responsible for caption-length policy; we guard here as a last resort and
+	// reject a grossly-oversize caption rather than let Telegram 400.
+	caption := item.Caption
+	if captionUTF16Len(caption) > maxCaptionRunes {
+		return 0, fmt.Errorf("telegram: caption is %d chars, over the %d-char caption limit — shorten it or send the text as a separate message",
+			captionUTF16Len(caption), maxCaptionRunes)
+	}
+	captionHTML := mdToTelegramHTML(caption)
+
+	if err := c.rate.Wait(c.ctx, args.ChatID); err != nil {
+		return 0, fmt.Errorf("telegram: rate-wait: %w", err)
+	}
+
+	var (
+		msg *gotgbot.Message
+		err error
+	)
+	switch item.Kind {
+	case c3types.MediaPhoto:
+		opts := &gotgbot.SendPhotoOpts{
+			Caption:         captionHTML,
+			HasSpoiler:      item.Spoiler,
+			RequestOpts:     requestOptsFor("sendPhoto", longPollTimeoutSeconds),
+			MessageThreadId: threadID(args.TopicID),
+			ReplyParameters: replyParams(args.ReplyTo),
+		}
+		if caption != "" {
+			opts.ParseMode = "HTML"
+		}
+		msg, err = c.bot.SendPhoto(args.ChatID, src, opts)
+	case c3types.MediaFile:
+		opts := &gotgbot.SendDocumentOpts{
+			Caption:         captionHTML,
+			RequestOpts:     requestOptsFor("sendDocument", longPollTimeoutSeconds),
+			MessageThreadId: threadID(args.TopicID),
+			ReplyParameters: replyParams(args.ReplyTo),
+		}
+		if caption != "" {
+			opts.ParseMode = "HTML"
+		}
+		msg, err = c.bot.SendDocument(args.ChatID, src, opts)
+	case c3types.MediaVideo:
+		opts := &gotgbot.SendVideoOpts{
+			Caption:         captionHTML,
+			HasSpoiler:      item.Spoiler,
+			RequestOpts:     requestOptsFor("sendVideo", longPollTimeoutSeconds),
+			MessageThreadId: threadID(args.TopicID),
+			ReplyParameters: replyParams(args.ReplyTo),
+		}
+		if caption != "" {
+			opts.ParseMode = "HTML"
+		}
+		msg, err = c.bot.SendVideo(args.ChatID, src, opts)
+	case c3types.MediaAudio:
+		opts := &gotgbot.SendAudioOpts{
+			Caption:         captionHTML,
+			RequestOpts:     requestOptsFor("sendAudio", longPollTimeoutSeconds),
+			MessageThreadId: threadID(args.TopicID),
+			ReplyParameters: replyParams(args.ReplyTo),
+		}
+		if caption != "" {
+			opts.ParseMode = "HTML"
+		}
+		msg, err = c.bot.SendAudio(args.ChatID, src, opts)
+	case c3types.MediaVoice:
+		opts := &gotgbot.SendVoiceOpts{
+			Caption:         captionHTML,
+			RequestOpts:     requestOptsFor("sendVoice", longPollTimeoutSeconds),
+			MessageThreadId: threadID(args.TopicID),
+			ReplyParameters: replyParams(args.ReplyTo),
+		}
+		if caption != "" {
+			opts.ParseMode = "HTML"
+		}
+		msg, err = c.bot.SendVoice(args.ChatID, src, opts)
+	case c3types.MediaAnimation:
+		opts := &gotgbot.SendAnimationOpts{
+			Caption:         captionHTML,
+			HasSpoiler:      item.Spoiler,
+			RequestOpts:     requestOptsFor("sendAnimation", longPollTimeoutSeconds),
+			MessageThreadId: threadID(args.TopicID),
+			ReplyParameters: replyParams(args.ReplyTo),
+		}
+		if caption != "" {
+			opts.ParseMode = "HTML"
+		}
+		msg, err = c.bot.SendAnimation(args.ChatID, src, opts)
+	default:
+		return 0, fmt.Errorf("telegram: unsupported media kind %q", string(item.Kind))
+	}
+
+	if err != nil {
+		c.recordOutboundErr(err)
+		return 0, fmt.Errorf("telegram: send %s: %w", string(item.Kind), err)
+	}
+	c.recordOutboundSuccess()
+	return msg.MessageId, nil
+}
+
+// threadID maps a *int64 TopicID into the int64 the gotgbot opts expect (0 = no
+// thread, the same zero-value gotgbot treats as "omit").
+func threadID(topicID *int64) int64 {
+	if topicID == nil {
+		return 0
+	}
+	return *topicID
+}
+
+// replyParams builds gotgbot ReplyParameters from a *int64 ReplyTo, or nil.
+func replyParams(replyTo *int64) *gotgbot.ReplyParameters {
+	if replyTo == nil {
+		return nil
+	}
+	return &gotgbot.ReplyParameters{
+		MessageId:                *replyTo,
+		AllowSendingWithoutReply: true,
+	}
+}

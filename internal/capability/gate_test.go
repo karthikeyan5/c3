@@ -132,8 +132,21 @@ func TestGate_LongText_SplitsWithNote(t *testing.T) {
 	}
 }
 
-func TestGate_FirstPartCarriesReplyMediaPoll(t *testing.T) {
-	caps := richCaps()
+// mediaCaps is a Telegram-like manifest with the full media kind set and both
+// CompressedPhoto + OriginalFile enabled — used by the media-splitting tests.
+func mediaCaps() c3types.Capabilities {
+	c := richCaps()
+	c.MediaKinds = []c3types.MediaKind{
+		c3types.MediaPhoto, c3types.MediaFile, c3types.MediaVideo,
+		c3types.MediaAudio, c3types.MediaVoice, c3types.MediaAnimation,
+	}
+	c.CompressedPhoto = true
+	c.OriginalFile = true
+	return c
+}
+
+func TestGate_ReplyToOnFirstPartOnly(t *testing.T) {
+	caps := mediaCaps()
 	caps.MaxMessageRunes = 50
 	rt := int64(99)
 	long := strings.Repeat("alpha ", 12) + "\n\n" + strings.Repeat("beta ", 12)
@@ -148,23 +161,189 @@ func TestGate_FirstPartCarriesReplyMediaPoll(t *testing.T) {
 	if len(parts) < 2 {
 		t.Fatalf("need >1 part to test first-part-only carry; got %d", len(parts))
 	}
-	// First part carries ReplyTo + Media.
+	// First part carries ReplyTo and is a text part (text comes before media).
 	if parts[0].ReplyTo == nil || *parts[0].ReplyTo != rt {
 		t.Errorf("first part should carry ReplyTo; got %+v", parts[0].ReplyTo)
 	}
-	if len(parts[0].Media) != 1 {
-		t.Errorf("first part should carry Media; got %+v", parts[0].Media)
+	if parts[0].Text == "" {
+		t.Errorf("first part should be the text part; got media/empty: %+v", parts[0])
 	}
-	// Subsequent parts must NOT.
+	if len(parts[0].Media) != 0 {
+		t.Errorf("first (text) part should NOT carry Media in P3; got %+v", parts[0].Media)
+	}
+	// No subsequent part carries ReplyTo.
 	for i := 1; i < len(parts); i++ {
 		if parts[i].ReplyTo != nil {
 			t.Errorf("part %d should not carry ReplyTo", i)
 		}
-		if len(parts[i].Media) != 0 {
-			t.Errorf("part %d should not carry Media", i)
+	}
+}
+
+// TestGate_MediaItemPerPart asserts the P3 layout: each media item lands on its
+// OWN part (no text on it), appended after the text parts, and no album grouping.
+func TestGate_MediaItemPerPart(t *testing.T) {
+	caps := mediaCaps()
+	parts, notes, alts, err := Gate(caps, c3types.Outbound{
+		Channel: "telegram", ChatID: 1, Text: "see attached", Markup: c3types.MarkupMarkdown,
+		Media: []c3types.MediaItem{
+			{Kind: c3types.MediaFile, Path: "/tmp/a.pdf"},
+			{Kind: c3types.MediaPhoto, Path: "/tmp/b.jpg"},
+			{Kind: c3types.MediaVideo, Path: "/tmp/c.mp4"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(alts) != 0 {
+		t.Errorf("all kinds supported — expected no alterations; got %v", altKinds(alts))
+	}
+	if len(notes) != 0 {
+		t.Errorf("all kinds supported — expected no notes; got %v", notes)
+	}
+	// 1 text part + 3 media parts.
+	if len(parts) != 4 {
+		t.Fatalf("expected 4 parts (1 text + 3 media); got %d", len(parts))
+	}
+	if parts[0].Text != "see attached" || len(parts[0].Media) != 0 {
+		t.Errorf("part 0 should be the text part; got %+v", parts[0])
+	}
+	wantKinds := []c3types.MediaKind{c3types.MediaFile, c3types.MediaPhoto, c3types.MediaVideo}
+	for i, want := range wantKinds {
+		p := parts[i+1]
+		if p.Text != "" {
+			t.Errorf("media part %d should carry no text; got %q", i, p.Text)
 		}
+		if len(p.Media) != 1 {
+			t.Fatalf("media part %d should carry exactly 1 item; got %d", i, len(p.Media))
+		}
+		if p.Media[0].Kind != want {
+			t.Errorf("media part %d kind = %q; want %q", i, p.Media[0].Kind, want)
+		}
+	}
+}
+
+// TestGate_MediaOnly_NoEmptyTextPart asserts that media with empty text does not
+// emit a leading empty text part.
+func TestGate_MediaOnly_NoEmptyTextPart(t *testing.T) {
+	caps := mediaCaps()
+	parts, _, _, err := Gate(caps, c3types.Outbound{
+		Channel: "telegram", ChatID: 1, Text: "",
+		Media: []c3types.MediaItem{{Kind: c3types.MediaPhoto, Path: "/tmp/x.jpg"}},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(parts) != 1 {
+		t.Fatalf("expected exactly 1 part (the media item); got %d", len(parts))
+	}
+	if parts[0].Text != "" || len(parts[0].Media) != 1 {
+		t.Errorf("the single part should carry only the media item; got %+v", parts[0])
+	}
+}
+
+// TestGate_UnsupportedKind_Dropped asserts an unsupported, non-demotable media
+// kind is dropped with a note + Alteration, while supported kinds survive.
+func TestGate_UnsupportedKind_Dropped(t *testing.T) {
+	// A channel that only sends files (no video).
+	caps := richCaps()
+	caps.MediaKinds = []c3types.MediaKind{c3types.MediaFile}
+	caps.OriginalFile = true
+	parts, notes, alts, err := Gate(caps, c3types.Outbound{
+		Channel: "telegram", ChatID: 1, Text: "",
+		Media: []c3types.MediaItem{
+			{Kind: c3types.MediaFile, Path: "/tmp/a.pdf"},
+			{Kind: c3types.MediaVideo, Path: "/tmp/b.mp4"}, // unsupported, not demotable
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Only the file survives → 1 media part.
+	if len(parts) != 1 {
+		t.Fatalf("expected 1 surviving media part; got %d", len(parts))
+	}
+	if parts[0].Media[0].Kind != c3types.MediaFile {
+		t.Errorf("surviving item should be the file; got %q", parts[0].Media[0].Kind)
+	}
+	if !notesContain(notes, "dropped") {
+		t.Errorf("expected a drop note; got %v", notes)
+	}
+	found := false
+	for _, a := range alts {
+		if a.Kind == "media_dropped" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a media_dropped Alteration; got %v", altKinds(alts))
+	}
+}
+
+// TestGate_PhotoDemotedToFile asserts photo→file demotion when the channel
+// cannot send a compressed photo but can send an original file.
+func TestGate_PhotoDemotedToFile(t *testing.T) {
+	// Synthetic caps: photo NOT in MediaKinds, CompressedPhoto=false, file ok.
+	caps := richCaps()
+	caps.MediaKinds = []c3types.MediaKind{c3types.MediaFile}
+	caps.CompressedPhoto = false
+	caps.OriginalFile = true
+	parts, notes, alts, err := Gate(caps, c3types.Outbound{
+		Channel: "telegram", ChatID: 1, Text: "",
+		Media: []c3types.MediaItem{{Kind: c3types.MediaPhoto, Path: "/tmp/x.jpg", Caption: "cap"}},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(parts) != 1 || len(parts[0].Media) != 1 {
+		t.Fatalf("expected 1 demoted media part; got %+v", parts)
+	}
+	if parts[0].Media[0].Kind != c3types.MediaFile {
+		t.Errorf("photo should be demoted to file; got %q", parts[0].Media[0].Kind)
+	}
+	if parts[0].Media[0].Caption != "cap" || parts[0].Media[0].Path != "/tmp/x.jpg" {
+		t.Errorf("demotion should preserve path/caption; got %+v", parts[0].Media[0])
+	}
+	if !notesContain(notes, "sent as a file") {
+		t.Errorf("expected a photo-demotion note; got %v", notes)
+	}
+	found := false
+	for _, a := range alts {
+		if a.Kind == "media_demoted" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a media_demoted Alteration; got %v", altKinds(alts))
+	}
+}
+
+// TestGate_PollOnOwnPart asserts a poll travels on its own part appended after
+// text + media (and carries no text/media).
+func TestGate_PollOnOwnPart(t *testing.T) {
+	caps := mediaCaps()
+	parts, _, _, err := Gate(caps, c3types.Outbound{
+		Channel: "telegram", ChatID: 1, Text: "vote now", Markup: c3types.MarkupMarkdown,
+		Media: []c3types.MediaItem{{Kind: c3types.MediaPhoto, Path: "/tmp/x.jpg"}},
+		Poll:  &c3types.PollSpec{Question: "q?", Options: []string{"a", "b"}},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// 1 text + 1 media + 1 poll.
+	if len(parts) != 3 {
+		t.Fatalf("expected 3 parts (text+media+poll); got %d", len(parts))
+	}
+	pollPart := parts[2]
+	if pollPart.Poll == nil {
+		t.Fatalf("last part should carry the poll; got %+v", pollPart)
+	}
+	if pollPart.Text != "" || len(pollPart.Media) != 0 {
+		t.Errorf("poll part should carry only the poll; got %+v", pollPart)
+	}
+	// No other part carries the poll.
+	for i := 0; i < 2; i++ {
 		if parts[i].Poll != nil {
-			t.Errorf("part %d should not carry Poll", i)
+			t.Errorf("part %d should not carry the poll", i)
 		}
 	}
 }

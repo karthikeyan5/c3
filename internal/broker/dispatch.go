@@ -25,6 +25,8 @@ func dispatchTool(ch channel.Channel, key RouteKey, tool string, args map[string
 		return dispatchEditMessage(ch, key, args)
 	case "send_typing":
 		return dispatchSendTyping(ch, key, args)
+	case "poll":
+		return dispatchPoll(ch, key, args)
 	case "download_attachment":
 		return dispatchDownloadAttachment(ch, args)
 	default:
@@ -43,7 +45,7 @@ func dispatchReply(ch channel.Channel, key RouteKey, args map[string]any) (map[s
 		TopicID: argTopicID(args, "topic_id", key),
 		Text:    argString(args, "text", ""),
 		Markup:  markup,
-		Media:   mediaFromFilesArg(args),
+		Media:   mediaFromArgs(args),
 	}
 	if rt := argInt64Ptr(args, "reply_to"); rt != nil {
 		out.ReplyTo = rt
@@ -59,15 +61,26 @@ func dispatchReply(ch channel.Channel, key RouteKey, args map[string]any) (map[s
 	}
 
 	// The gate is pure; dispatch (impure) writes the durable alteration log.
+	logAlterations(key, out.ChatID, alts)
+
+	return sendParts(ch, key, parts, notes)
+}
+
+// logAlterations writes the durable outbound-alteration log line for each
+// structured Alteration the pure gate returned.
+func logAlterations(key RouteKey, chatID int64, alts []c3types.Alteration) {
 	for _, a := range alts {
 		log.Printf("outbound-alteration chan=%s chat=%d topic=%s kind=%s detail=%q",
-			key.Channel, out.ChatID, TopicKeyStr(key), a.Kind, a.Detail)
+			key.Channel, chatID, TopicKeyStr(key), a.Kind, a.Detail)
 	}
+}
 
-	// Multi-part send contract: send parts sequentially, in order; on part-k
-	// failure STOP (fail-fast) and report exactly how many landed. NEVER report
-	// silent success. The agent-visible id is the FIRST part's id; reply-
-	// threading/edits target the first part.
+// sendParts implements the multi-part send contract: send parts sequentially,
+// in order; on part-k failure STOP (fail-fast) and report exactly how many
+// landed. NEVER report silent success. The agent-visible id is the FIRST part's
+// id; reply-threading/edits target the first part. Shared by dispatchReply and
+// dispatchPoll (a poll rides a single part).
+func sendParts(ch channel.Channel, key RouteKey, parts []c3types.Outbound, notes []string) (map[string]any, error) {
 	var firstID int64
 	for i, part := range parts {
 		id, err := ch.SendReply(part)
@@ -94,12 +107,93 @@ func dispatchReply(ch channel.Channel, key RouteKey, args map[string]any) (map[s
 	return mcpText(result), nil
 }
 
+// dispatchPoll builds an Outbound carrying a PollSpec from the `poll` tool args,
+// runs it through the pure capability gate (so a channel without poll support is
+// hard-rejected with the agent note), and sends it via the unified parts loop —
+// the poll rides a single part → SendReply → sendPoll.
+func dispatchPoll(ch channel.Channel, key RouteKey, args map[string]any) (map[string]any, error) {
+	question := argString(args, "question", "")
+	if question == "" {
+		return nil, fmt.Errorf("poll: question required")
+	}
+	options := argStringSlice(args, "options")
+	if len(options) < 2 {
+		return nil, fmt.Errorf("poll: at least 2 options required; got %d", len(options))
+	}
+
+	out := c3types.Outbound{
+		Channel: key.Channel,
+		ChatID:  argInt64(args, "chat_id", key.ChatID),
+		TopicID: argTopicID(args, "topic_id", key),
+		Poll: &c3types.PollSpec{
+			Question:        question,
+			Options:         options,
+			Anonymous:       argBool(args, "anonymous", true),
+			MultipleAnswers: argBool(args, "multiple", false),
+		},
+	}
+
+	// Gate validates (hard-reject when !Polls) + emits a single poll part.
+	parts, notes, alts, err := capability.Gate(ch.Capabilities(), out)
+	if err != nil {
+		return nil, err
+	}
+	logAlterations(key, out.ChatID, alts)
+	return sendParts(ch, key, parts, notes)
+}
+
+// mediaFromArgs parses the reply tool's `media` array arg (P3, the real surface)
+// into channel-neutral MediaItems, then appends any items from the legacy `files`
+// shim. The `media` arg is the authored surface; `files` is the one-release
+// back-compat shim (removed in P7).
+//
+// `media` is a JSON array of objects: {kind, path, url, caption, spoiler}. An
+// item with neither path nor url, or with an empty/unknown kind, is skipped here;
+// the channel surfaces a clear send error for any genuinely bad item that slips
+// through. Kind defaults to "file" (byte-for-byte original) when omitted.
+func mediaFromArgs(args map[string]any) []c3types.MediaItem {
+	var out []c3types.MediaItem
+
+	if raw, ok := args["media"]; ok {
+		if list, ok := raw.([]any); ok {
+			for _, v := range list {
+				m, ok := v.(map[string]any)
+				if !ok {
+					continue
+				}
+				path := argString(m, "path", "")
+				urlStr := argString(m, "url", "")
+				if path == "" && urlStr == "" {
+					continue
+				}
+				kind := c3types.MediaKind(argString(m, "kind", string(c3types.MediaFile)))
+				if kind == "" {
+					kind = c3types.MediaFile
+				}
+				item := c3types.MediaItem{
+					Kind:    kind,
+					Path:    path,
+					URL:     urlStr,
+					Caption: argString(m, "caption", ""),
+				}
+				if sp, ok := m["spoiler"].(bool); ok {
+					item.Spoiler = sp
+				}
+				out = append(out, item)
+			}
+		}
+	}
+
+	out = append(out, mediaFromFilesArg(args)...)
+	return out
+}
+
 // mediaFromFilesArg is a one-release back-compat shim translating the legacy
 // `files` tool arg (a list of local paths) into channel-neutral Media items of
 // Kind=file (byte-for-byte original delivery). No tool schema advertises or
 // populates `files` today, so this returns nil in practice (behavior-preserving);
-// it exists only to map a stray in-flight `files` arg until media sending lands
-// in P3. Removed alongside the other shims in P7.
+// it exists only to map a stray in-flight `files` arg. Removed alongside the
+// other shims in P7.
 func mediaFromFilesArg(args map[string]any) []c3types.MediaItem {
 	raw, ok := args["files"]
 	if !ok {
@@ -254,6 +348,48 @@ func argString(args map[string]any, key, fallback string) string {
 		}
 	}
 	return fallback
+}
+
+// argBool returns the bool value at key, or fallback. Accepts a real bool and
+// the string forms "true"/"false".
+func argBool(args map[string]any, key string, fallback bool) bool {
+	v, ok := args[key]
+	if !ok {
+		return fallback
+	}
+	switch x := v.(type) {
+	case bool:
+		return x
+	case string:
+		switch x {
+		case "true":
+			return true
+		case "false":
+			return false
+		}
+	}
+	return fallback
+}
+
+// argStringSlice returns the []string at key. Accepts a JSON array of strings
+// (the []any form json.Unmarshal produces); non-string elements are skipped.
+// Returns nil when the key is absent or not an array.
+func argStringSlice(args map[string]any, key string) []string {
+	raw, ok := args[key]
+	if !ok {
+		return nil
+	}
+	list, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(list))
+	for _, v := range list {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // argInt64 returns the int64 value at key, or fallback. Accepts float64

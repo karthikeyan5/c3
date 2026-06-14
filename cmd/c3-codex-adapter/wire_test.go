@@ -57,7 +57,7 @@ func TestServerInfoName(t *testing.T) {
 
 	// Verify tools/list returns the expected Codex tool set
 	// (attach, topics, inbox, reply, react, edit_message,
-	// send_typing, download_attachment, codex_forward) — a regression
+	// send_typing, poll, download_attachment, codex_forward) — a regression
 	// here breaks every adapter operation for Codex.
 	listResult, err := sess.ListTools(ctx, nil)
 	if err != nil {
@@ -65,7 +65,7 @@ func TestServerInfoName(t *testing.T) {
 	}
 	wantTools := []string{
 		"attach", "topics", "inbox", "reply", "react",
-		"edit_message", "send_typing", "download_attachment", "codex_forward",
+		"edit_message", "send_typing", "poll", "download_attachment", "codex_forward",
 	}
 	got := map[string]bool{}
 	for _, tool := range listResult.Tools {

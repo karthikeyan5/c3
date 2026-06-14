@@ -38,8 +38,18 @@ import (
 //   - Degrade markup: force Markup=none when the channel has no rich text.
 //   - Chunk text: construct-aware split of the SOURCE markdown so a split never
 //     bisects a fenced code block, a [label](url) link, or a blockquote run.
+//   - Degrade media (P3): demote an unsupported Kind (photo→file when the
+//     channel can't send a compressed photo but can send an original file;
+//     otherwise drop the item with a note + Alteration).
 //
-// Media SENDING is P3; the gate leaves Media on the parts as-is in v1.
+// Single-part content contract (P3): each emitted part carries AT MOST ONE of
+// {text, a single media item, a poll}. The layout is:
+//
+//	parts = [text chunks...] ++ [one part per media item] ++ [poll part if any]
+//
+// ReplyTo applies only to the FIRST part overall (reply-threading targets the
+// first message of a multi-part reply). Album grouping is descoped in v1 — every
+// media item is its own single send.
 func Gate(c c3types.Capabilities, out c3types.Outbound) (parts []c3types.Outbound, notes []string, alts []c3types.Alteration, err error) {
 	// --- Validation (hard rejection) -------------------------------------
 	// A poll on a channel that can't render one cannot be silently dropped or
@@ -87,27 +97,97 @@ func Gate(c c3types.Capabilities, out c3types.Outbound) (parts []c3types.Outboun
 		}
 	}
 
+	// --- Media degradation (P3, data-driven) -----------------------------
+	// For each media item, if its Kind is not in the channel's MediaKinds set,
+	// demote it (photo→file when the channel can't compress but can send an
+	// original file) or drop it (with a note + Alteration). For Telegram all
+	// kinds are supported so this is a no-op; it is generic so a leaner channel
+	// degrades correctly.
+	mediaItems := make([]c3types.MediaItem, 0, len(out.Media))
+	for _, m := range out.Media {
+		if mediaKindSupported(c, m.Kind) {
+			mediaItems = append(mediaItems, m)
+			continue
+		}
+		// Unsupported kind. The only sanctioned demotion is photo→file: a
+		// compressed-photo preview can fall back to the original-file send.
+		if m.Kind == c3types.MediaPhoto && !c.CompressedPhoto && c.OriginalFile &&
+			mediaKindSupported(c, c3types.MediaFile) {
+			demoted := m
+			demoted.Kind = c3types.MediaFile
+			mediaItems = append(mediaItems, demoted)
+			notes = append(notes, "a photo was sent as a file (this channel cannot send a compressed photo preview)")
+			alts = append(alts, c3types.Alteration{
+				Kind:   "media_demoted",
+				Detail: "photo demoted to file (channel CompressedPhoto=false, OriginalFile=true)",
+			})
+			continue
+		}
+		// No safe demotion — drop it so the agent knows.
+		notes = append(notes, fmt.Sprintf("a %q media item was dropped: this channel cannot send it", string(m.Kind)))
+		alts = append(alts, c3types.Alteration{
+			Kind:   "media_dropped",
+			Detail: fmt.Sprintf("media kind %q unsupported and not demotable (channel MediaKinds=%v)", string(m.Kind), c.MediaKinds),
+		})
+	}
+
 	// --- Emit parts ------------------------------------------------------
-	parts = make([]c3types.Outbound, 0, len(textParts))
-	for i, t := range textParts {
-		p := c3types.Outbound{
+	// Layout: [text chunks...] ++ [one part per media item] ++ [poll part].
+	// Each part carries AT MOST ONE of {text, single media item, poll}. ReplyTo
+	// rides only the FIRST part overall.
+	parts = make([]c3types.Outbound, 0, len(textParts)+len(mediaItems)+1)
+	// Suppress empty text parts ONLY when there is other content (media/poll) to
+	// carry the reply — otherwise an empty text part would send a bogus empty
+	// message ahead of the media. When text is the only content, an empty part is
+	// preserved so dispatch surfaces the natural "empty message" error as before.
+	hasOtherContent := len(mediaItems) > 0 || out.Poll != nil
+	for _, t := range textParts {
+		if t == "" && hasOtherContent {
+			continue
+		}
+		parts = append(parts, c3types.Outbound{
 			Channel: out.Channel,
 			ChatID:  out.ChatID,
 			TopicID: out.TopicID,
 			Text:    t,
 			Markup:  markup,
-			// Media stays on the FIRST part only (media sending is P3; this is a
-			// no-op in practice because Media is normally empty in P2b). Keeping
-			// it on part 0 avoids duplicating media across split text parts.
-		}
-		if i == 0 {
-			p.Media = out.Media
-			p.Poll = out.Poll
-			p.ReplyTo = out.ReplyTo
-		}
-		parts = append(parts, p)
+		})
+	}
+	for i := range mediaItems {
+		parts = append(parts, c3types.Outbound{
+			Channel: out.Channel,
+			ChatID:  out.ChatID,
+			TopicID: out.TopicID,
+			Markup:  markup,
+			Media:   []c3types.MediaItem{mediaItems[i]},
+		})
+	}
+	if out.Poll != nil {
+		parts = append(parts, c3types.Outbound{
+			Channel: out.Channel,
+			ChatID:  out.ChatID,
+			TopicID: out.TopicID,
+			Poll:    out.Poll,
+		})
+	}
+	// ReplyTo rides only the FIRST part overall (text if any, else first media,
+	// else the poll). textParts always has >=1 element ("" when Text empty), so
+	// parts is non-empty whenever there is any content.
+	if out.ReplyTo != nil && len(parts) > 0 {
+		parts[0].ReplyTo = out.ReplyTo
 	}
 	return parts, notes, alts, nil
+}
+
+// mediaKindSupported reports whether the channel's manifest lists kind in its
+// sendable MediaKinds.
+func mediaKindSupported(c c3types.Capabilities, kind c3types.MediaKind) bool {
+	for _, k := range c.MediaKinds {
+		if k == kind {
+			return true
+		}
+	}
+	return false
 }
 
 // utf16Len returns the length of s in UTF-16 code units — the unit Telegram

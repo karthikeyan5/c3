@@ -65,7 +65,7 @@ const (
 	adapterName    = "c3_codex"
 	adapterVersion = "0.1.0"
 
-	inboxCap           = 100             // ring buffer max
+	inboxCap           = 100              // ring buffer max
 	idleStartupTimeout = 60 * time.Second // mirror cmd/c3-claude-adapter behavior
 )
 
@@ -516,7 +516,7 @@ func (a *adapter) buildInstructions() string {
 	return head + mode.Combined()
 }
 
-// registerTools adds all 9 adapter tools to srv (8 user-facing + the
+// registerTools adds all adapter tools to srv (user-facing tools + the
 // `codex_forward` debug tool).
 func (a *adapter) registerTools(srv *mcp.Server) {
 	tools := []struct {
@@ -567,13 +567,14 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 		{
 			tool: &mcp.Tool{
 				Name:        "reply",
-				Description: "Send a Telegram reply to the currently-attached topic.",
+				Description: "Send a Telegram reply to the currently-attached topic. Attach media via the `media` array: kind=\"file\" delivers the ORIGINAL bytes (PDFs, logs); kind=\"photo\" is a COMPRESSED in-chat preview; also video/audio/voice/animation. Each item is sent as its own message after the text.",
 				InputSchema: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
 						"text":       map[string]any{"type": "string"},
 						"reply_to":   map[string]any{"type": "integer"},
 						"parse_mode": map[string]any{"type": "string"},
+						"media":      replyMediaSchema(),
 					},
 					"required": []string{"text"},
 				},
@@ -620,6 +621,14 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 		},
 		{
 			tool: &mcp.Tool{
+				Name:        "poll",
+				Description: "Send a Telegram poll to the attached topic. Provide a `question` and 2+ `options`. `anonymous` (default true) and `multiple` (default false) tune the poll.",
+				InputSchema: pollToolSchema(),
+			},
+			handler: a.toolForward("poll"),
+		},
+		{
+			tool: &mcp.Tool{
 				Name:        "download_attachment",
 				Description: "Download a Telegram file by file_id; returns the local path.",
 				InputSchema: map[string]any{
@@ -650,6 +659,47 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 	}
 	for _, t := range tools {
 		srv.AddTool(t.tool, t.handler)
+	}
+}
+
+// replyMediaSchema is the JSON-schema for the reply tool's `media` array arg
+// (P3). Each item is one media object; the broker's gate splits a multi-item
+// array into one message per item.
+func replyMediaSchema() map[string]any {
+	return map[string]any{
+		"type":        "array",
+		"description": "Media to send, each item as its own message after the text.",
+		"items": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"kind": map[string]any{
+					"type": "string",
+					"enum": []string{"photo", "file", "video", "audio", "voice", "animation"},
+				},
+				"path":    map[string]any{"type": "string", "description": "Local file path on the shared host."},
+				"url":     map[string]any{"type": "string", "description": "Public URL Telegram fetches server-side."},
+				"caption": map[string]any{"type": "string"},
+				"spoiler": map[string]any{"type": "boolean"},
+			},
+			"required": []string{"kind"},
+		},
+	}
+}
+
+// pollToolSchema is the JSON-schema for the `poll` tool (P3).
+func pollToolSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"question": map[string]any{"type": "string"},
+			"options": map[string]any{
+				"type":  "array",
+				"items": map[string]any{"type": "string"},
+			},
+			"anonymous": map[string]any{"type": "boolean", "description": "default true"},
+			"multiple":  map[string]any{"type": "boolean", "description": "allow multiple answers; default false"},
+		},
+		"required": []string{"question", "options"},
 	}
 }
 
