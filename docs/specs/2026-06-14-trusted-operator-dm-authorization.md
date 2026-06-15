@@ -3,7 +3,7 @@
 **Date:** 2026-06-14
 **Status:** DRAFT — for Karthi's ratification. Not yet approved for build. §10 lists the decisions that must be settled first; §9 Phase 0 is a hard gate.
 **Author:** Claude (Opus 4.8 — Fable 5 unavailable this session).
-**Origin:** Hit live during the SSHGate Tier-2 walk (2026-06-14). The Claude Code safety classifier repeatedly refused to run a privileged action (`sudo …`) whose authorization arrived over Telegram, because channel-sourced messages are treated as untrusted. Karthi: "if it's authenticated that it's coming from my Telegram, it should be allowed — write a spec to solve this."
+**Origin:** Hit live during a sibling out-of-band per-action approval system's Tier-2 walk (2026-06-14). The Claude Code safety classifier repeatedly refused to run a privileged action (`sudo …`) whose authorization arrived over Telegram, because channel-sourced messages are treated as untrusted. Karthi: "if it's authenticated that it's coming from my Telegram, it should be allowed — write a spec to solve this."
 
 ---
 
@@ -43,7 +43,7 @@ Both halves of this were verified against the code and the Claude Code docs (202
 
 ## 3. Design principle — separate auth / authz / enforcement
 
-The spec keeps three concerns distinct (the same shape as SSHGate, lifted one layer up to the Claude Code permission gate):
+The spec keeps three concerns distinct (the same shape as a sibling out-of-band per-action approval system, lifted one layer up to the Claude Code permission gate):
 
 | Concern | Owner | Mechanism |
 |---|---|---|
@@ -88,8 +88,8 @@ The owner issues an explicit DM command, e.g.:
 ```
 c3 records a **grant**: `{grant_id, route (cwd↔topic), scope (command glob/class), expiry, nonce, issued_by, issued_at}`. While a grant is live, the hook approves matching commands for the session bound to that route. Low friction; matches Karthi's stated intent. Bounded by scope + short TTL + audit + revocation; default-deny when no grant matches.
 
-### Style B — per-action approval (SSHGate-style)
-When the agent hits a guarded command, the `PreToolUse` hook calls the broker, which **DMs the owner the exact command** and waits (synchronously, with timeout) for an approve/deny tap (inline keyboard or a reply). The hook returns `allow`/`deny` accordingly. Highest assurance, per-command, shows the literal command before it runs — this is SSHGate's model applied to arbitrary Bash. Use for the highest-risk class (e.g. `sudo`, `rm -rf`, anything writing outside cwd).
+### Style B — per-action approval (out-of-band approval style)
+When the agent hits a guarded command, the `PreToolUse` hook calls the broker, which **DMs the owner the exact command** and waits (synchronously, with timeout) for an approve/deny tap (inline keyboard or a reply). The hook returns `allow`/`deny` accordingly. Highest assurance, per-command, shows the literal command before it runs — this is the per-action approval model applied to arbitrary Bash. Use for the highest-risk class (e.g. `sudo`, `rm -rf`, anything writing outside cwd).
 
 Both styles are enforced by the *same* hook; they differ only in whether the broker answers from a pre-issued grant (A) or by prompting the phone in real time (B).
 
@@ -177,6 +177,6 @@ DM-only is enforced structurally: group messages trust the `chat_id`, not the in
 
 ## 11. Notes
 
-- **This generalizes SSHGate.** SSHGate already does out-of-band, authenticated, per-action human approval for sensitive ops via Telegram. This spec is the same pattern at the Claude Code permission layer, with c3 as the authority. Worth keeping the two threat-model docs consistent.
+- **This generalizes a sibling key-signing project.** That project already does out-of-band, authenticated, per-action human approval for sensitive ops via Telegram. This spec is the same pattern at the Claude Code permission layer, with c3 as the authority. Worth keeping the two threat-model docs consistent.
 - **Ideal long-term:** a first-class Claude Code "channel trust" signal (the harness honoring a `meta` attribute that an allowlisted-owner DM is operator-trusted) would remove the need for the hook shim. Until/unless Anthropic ships that, the `PreToolUse` hook is the supported, robust path and requires **no** harness changes. Worth a feature request to Anthropic in parallel.
 - **What this does *not* do:** it does not make every owner DM a trusted instruction, and it does not relax protection for genuine third-party/group content. It adds one narrow, explicit, auditable path for the *operator* to authorize *scoped* actions.

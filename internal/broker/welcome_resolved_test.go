@@ -16,13 +16,13 @@ import (
 // way and threads the result into welcomeText as resolvedCWD.
 
 // TestWelcomeText_RendersResolvedCWD is the core FIX 2 test. A session
-// launched in the parent "/home/karthi/arogara" attaches to topic
-// "SSHGate" whose project lives at "/home/karthi/arogara/SSHGate". The
+// launched in the parent "/home/u/projects" attaches to topic
+// "widget" whose project lives at "/home/u/projects/widget". The
 // welcome must show the resolved sub-path, not the bare parent.
 func TestWelcomeText_RendersResolvedCWD(t *testing.T) {
-	stub := &Stub{CLI: "claude", CWD: "/home/karthi/arogara"}
-	got := welcomeText(stub, "SSHGate", "/home/karthi/arogara/SSHGate")
-	if !strings.Contains(got, "arogara/SSHGate") {
+	stub := &Stub{CLI: "claude", CWD: "/home/u/projects"}
+	got := welcomeText(stub, "widget", "/home/u/projects/widget")
+	if !strings.Contains(got, "projects/widget") {
 		t.Errorf("welcome should render resolved dir, got %q", got)
 	}
 }

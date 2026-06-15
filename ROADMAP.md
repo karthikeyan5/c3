@@ -2,7 +2,7 @@
 
 **Status as of 2026-06-15.** The channel rich-content + capability architecture (the P0 below) is **BUILT and committed** on `master` — 8 phases (P0–P7), designed via a 10-agent workflow, hardened by 3 critique passes, and triple-reviewed. Pending a live Telegram smoke test (the one check that needs a phone — checklist in `docs/specs/2026-06-14-channel-capability-architecture.md`). Version line: v0.1.0 (pre-public-push).
 
-This is the **single consolidated roadmap** for C3. It was reconciled on 2026-06-14 from every source — `TODO.md`, `RESUME.md`, `MORNING-REVIEW-2026-05-19.md`, `DECISIONS.md`, `DEBUGGING.md`, `docs/plans/` + `docs/specs/`, the live Go codebase, and a mining sweep of every past C3 session transcript (incl. cross-project SSHGate/proctor sessions). **Nothing was dropped:** ideas that previously lived only in voice notes are now captured here and flagged `risk-of-loss: was-untracked`.
+This is the **single consolidated roadmap** for C3. It was reconciled on 2026-06-14 from every source — `TODO.md`, `RESUME.md`, `MORNING-REVIEW-2026-05-19.md`, `DECISIONS.md`, `DEBUGGING.md`, `docs/plans/` + `docs/specs/`, the live Go codebase, and a mining sweep of every past C3 session transcript (incl. cross-project sessions). **Nothing was dropped:** ideas that previously lived only in voice notes are now captured here and flagged `risk-of-loss: was-untracked`.
 
 C3 is a Go end-to-end Telegram multiplexer for multiple Claude Code / Codex CLI sessions: one broker daemon, per-CLI MCP adapters, topic-based routing. **Code health:** `go build ./...` and `go vet ./...` pass clean; all packages test green **except** 2 environment-flaky broker tests (a test-fixture defect, not a production bug — see P2). The big open items below are **features that were never built**, not regressions.
 
@@ -58,7 +58,7 @@ leaks into core (enforced by a CI grep-guard, `internal/archguard`). Spec:
   Forward Claude Code permission prompts to Telegram for remote approve/deny. The one supported remote-approval path (the channel's 3rd surface). Build prompt exists; relay returns GO/DENY as a **string, not bool**; does NOT catch auto-mode classifier hard-denies (that's the trusted-operator item below).
   _Source: RESUME.md §Sub-feature permission relay (assessed GO)._
 - **Trusted-operator DM authorization (PreToolUse hook) — ratify + build** — `planned`
-  Let an authenticated owner-DM authorize classifier-blocked actions via a PreToolUse hook (SSHGate's model, one layer up). **Spec is written** at `docs/specs/2026-06-14-trusted-operator-dm-authorization.md`. Blocked on: §9 Phase-0 hard gate (empirically verify a hook "allow" actually bypasses the auto-mode classifier) + §10 decisions awaiting Karthi's ratification.
+  Let an authenticated owner-DM authorize classifier-blocked actions via a PreToolUse hook (an out-of-band per-action approval model, one layer up). **Spec is written** at `docs/specs/2026-06-14-trusted-operator-dm-authorization.md`. Blocked on: §9 Phase-0 hard gate (empirically verify a hook "allow" actually bypasses the auto-mode classifier) + §10 decisions awaiting Karthi's ratification.
   _Source: docs/specs/2026-06-14-…; MEMORY c3_trusted_operator_authz_spec.md._
 - **FIX #1 (parked): inbound delivery-drop + album/media-group drop** — `in-progress`
   Back-to-back messages 186/187 logged ~33µs apart but only one reached the agent; two files sent as an album → only one arrived. C3 has **no media-group assembly** (relies on the 1.5s debounce). NEXT: read `internal/channel/telegram/poll.go` dispatch path for where a same-poll-batch update is dropped before enqueue. Needs from Karthi: rough send-time of the two-files album.
@@ -83,8 +83,8 @@ leaks into core (enforced by a CI grep-guard, `internal/archguard`). Spec:
 - **Eliminate `--dangerously-load-development-channels` / register a private trusted plugin store** — `idea` · _risk-of-loss: was-untracked_
   Karthi: ready to sign a certificate / do whatever to drop the dangerous flag; wants to officially register his own trusted plugin store since he'll maintain many private plugins. Status unverified against current Claude Code capabilities.
   _Source: session 274227fa (2026-05-18); not in TODO.md or docs._
-- **ContestEval extension / programmatic non-Telegram channel** — `idea` · _risk-of-loss: was-untracked_
-  Make C3 a pluggable platform beyond Telegram: a "ContestEval extension" so deterministic code can inject context into an LLM via C3 and get a **fixed-format response** back (a programmatic channel, not chat).
+- **Programmatic (non-chat) channel extension** — `idea` · _risk-of-loss: was-untracked_
+  Make C3 a pluggable platform beyond Telegram: a programmatic channel extension so deterministic code can inject context into an LLM via C3 and get a **fixed-format response** back (a programmatic channel, not chat).
   _Source: session d1d95247 (2026-06-04); not tracked anywhere prior._
 - **STT multi-provider modularity + retry/fallback + "how to add a provider" README** — `in-progress` · _risk-of-loss: was-untracked_
   The chain exists (elevenlabs-scribe-v2 [opt-in], gemini-3-flash-openrouter, sarvam-saaras-v3) with fallback, but the explicit how-to-add-a-provider README Karthi asked for is unverified / likely missing.
@@ -131,7 +131,7 @@ Smaller backlog:
 - **5 code-review guideline-file edits** — `planned` · _risk-of-loss: only-in-MORNING-REVIEW_: Karthi's rubric files awaiting his voice on each (subjective rubric changes, not code). _Source: MORNING-REVIEW-2026-05-19.md._
 - **n3 — Unicode bullets in user output** — `planned` (P4) · _risk-of-loss: only-in-MORNING-REVIEW_: keep Unicode bullets in user-facing output? Karthi decides; subjective.
 - **STT gemini-3-flash-openrouter provider dead** — `planned` (P3, low — STT works): no `OPENROUTER_API_KEY` where the handler reads, so the chain runs on the Sarvam fallback only. Karthi wanted to copy the key from another OpenClaw instance but the auto-mode classifier blocked the cross-user read — needs CLI-level approval. (Ops/env state.) _Source: RESUME.md §Environment/ops._
-- **Proctor `VerdictSeam` → C3 transport** — `idea` (P4) · _low-confidence; risk-of-loss: only-an-agent-comment_: proctor's `VerdictSeam` is intentionally swappable so a future C3 transport can deliver alert verdicts ("we deliberately do NOT build C3 here"). Agent-authored comment in another repo, NOT a Karthi quote — surfaced only so the seam isn't lost. _Source: proctor monitoring/verdict_seam.py._
+- **A sibling project's swappable alert-delivery seam → C3 transport** — `idea` (P4) · _low-confidence; risk-of-loss: only-an-agent-comment_: a sibling project's alert-delivery seam is intentionally swappable so a future C3 transport can deliver alert verdicts ("we deliberately do NOT build C3 here"). Agent-authored comment in another repo, NOT a Karthi quote — surfaced only so the seam isn't lost. _Source: that project's monitoring/verdict_seam.py._
 
 ---
 

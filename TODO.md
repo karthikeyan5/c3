@@ -628,7 +628,7 @@ during the 2026-06-14 roadmap reconciliation; see ROADMAP.md for priority.
   eliminate the dangerous flag, and officially register Karthi's own
   trusted plugin store for his many private plugins. (session 2026-05-18)
   — see ROADMAP.md.
-- **ContestEval extension / programmatic non-Telegram channel** —
+- **Programmatic (non-chat) channel extension** —
   pluggable platform beyond Telegram where deterministic code injects
   context into the LLM via C3 and gets a fixed-format response back (a
   programmatic channel, not chat). (session 2026-06-04) — see ROADMAP.md.
