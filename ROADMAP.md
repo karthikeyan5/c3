@@ -32,7 +32,7 @@ leaks into core (enforced by a CI grep-guard, `internal/archguard`). Spec:
   telegram package. Works identically for Claude + Codex.
 - **Deterministic typing indicator** — `done` — broker-relayed programmatically (not an
   LLM tool); shown turns 2..N of a Telegram-mode session. (Absorbed FIX #2's auto-ticker.)
-- **Deterministic streaming of reasoning/thinking** — `deferred` — **needs Karthi's call.**
+- **Deterministic streaming of reasoning/thinking** — `deferred` — **build right AFTER terminal-control** (Karthi 2026-06-15); the path (Codex-opt-out vs SDK-host) is still TBD.
   Verified: Claude Code exposes no in-flight reasoning to an MCP adapter (hooks/MCP see no
   reasoning frames; only the raw Messages API / Agent SDK do). Options: (a) reverse the
   Codex forwarder opt-out → Codex-only streaming (asymmetric); (b) pivot C3 to host the
@@ -43,12 +43,12 @@ leaks into core (enforced by a CI grep-guard, `internal/archguard`). Spec:
 - **Remote terminal-control of coding agents from Telegram** — `in-progress`
   Bring up a terminal connected to a DM and spawn/control other coding agents (TUI or not). Needs a dedicated PTY subsystem (can't ride the MCP channel surface). Karthi's reference: `github.com/helvesec/rmux`. Mid-design.
   _Source: RESUME.md §THE MAIN FEATURE (2026-06-01)._
-- **Settle terminal-control design questions Q1/Q2/Q3** — `planned` (blocks the above)
-  - Q1: C3 orchestrates rmux, vs rmux replaces part of C3.
-  - Q2: Rust rmux CLI, vs a single-language Go stack (`creack/pty` + `go-expect` + a VT emulator as a new broker worker type).
-  - Q3: support only MCP-aware agents, vs arbitrary TUIs.
-  - Recommendation on file: prototype the Go stack.
-  _Source: RESUME.md §Q1/Q2/Q3._
+- **Terminal-control design — DECIDED (Karthi 2026-06-15):**
+  - Q1 → **C3 stays the brain** — it drives the terminal engine and reuses the per-route-worker model.
+  - Q2 → **all-Go PTY stack** — `creack/pty` + `Netflix/go-expect` + a VT emulator as a new broker worker type; single-language, no Rust dependency.
+  - Q3 → **arbitrary TUIs** — the raw PTY path; control anything in a terminal, not just MCP-aware agents.
+  - Next concrete step: prototype the Go PTY worker (snapshot-on-idle rendering + send-keys), per the 2026-06-01 handoff in RESUME.md.
+  _Source: RESUME.md §Q1/Q2/Q3; decided 2026-06-15._
 
 ---
 
