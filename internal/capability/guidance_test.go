@@ -65,8 +65,13 @@ func TestGuidanceFor_PositiveLines(t *testing.T) {
 		// Typing is automatic, not a tool.
 		"shown automatically while you work",
 		"do NOT call any typing tool",
-		// Polls supported.
+		// Polls supported, including the full P2 surface (quiz/explanation/timed).
 		"Polls: supported",
+		`type="quiz"`,
+		"correct_option",
+		"explanation",
+		"open_period",
+		"close_date",
 	})
 	// On a fully-supported channel, the feature negatives do not appear.
 	// (Streaming is OFF even on the full Telegram manifest in v1, so its

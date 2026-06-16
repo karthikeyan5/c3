@@ -122,13 +122,47 @@ type MediaItem struct {
 	Spoiler bool
 }
 
+// PollKind is the channel-neutral kind of a poll. The zero value ("") behaves
+// exactly as a regular poll, so existing callers that never set Kind are
+// unaffected.
+type PollKind string
+
+const (
+	// PollRegular is an ordinary multiple-choice poll (the default).
+	PollRegular PollKind = "regular"
+	// PollQuiz is a quiz poll: one option is the correct answer and an optional
+	// explanation is shown on a wrong answer.
+	PollQuiz PollKind = "quiz"
+)
+
 // PollSpec describes an outbound poll. Options is the ordered list of answer
-// strings; Anonymous and MultipleAnswers tune the poll behavior.
+// strings; Anonymous and MultipleAnswers tune the poll behavior. The Kind /
+// CorrectOption / Explanation / OpenPeriodSec / CloseDateUnix fields extend the
+// regular poll to the full send surface (quiz mode, explanation, timed polls).
+// A zero-value Kind ("") is treated as a regular poll, so existing callers that
+// set only the first four fields produce byte-identical behavior.
 type PollSpec struct {
 	Question        string
 	Options         []string
 	Anonymous       bool
 	MultipleAnswers bool
+
+	// Kind selects regular vs quiz. "" => regular (back-compat with existing
+	// callers).
+	Kind PollKind
+	// CorrectOption is the 0-based index of the correct answer. Required when
+	// Kind==quiz; ignored otherwise. A pointer so 0 (a valid index) is
+	// distinguishable from unset.
+	CorrectOption *int
+	// Explanation is shown when a quiz answer is wrong (0-200 chars). Ignored
+	// for a regular poll.
+	Explanation string
+	// OpenPeriodSec is the number of seconds the poll stays open before it
+	// auto-closes; 0 means unset. Mutually exclusive with CloseDateUnix.
+	OpenPeriodSec int
+	// CloseDateUnix is the Unix timestamp at which the poll auto-closes; 0 means
+	// unset. Mutually exclusive with OpenPeriodSec.
+	CloseDateUnix int64
 }
 
 // Alteration is one structured record of a change the capability gate made to

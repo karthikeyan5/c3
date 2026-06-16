@@ -106,8 +106,68 @@ func TestDispatchPoll_SendsPollPart(t *testing.T) {
 	}
 }
 
-// TestDispatchPoll_RequiresTwoOptions asserts dispatchPoll rejects a poll with
-// fewer than 2 options before reaching the channel.
+// TestDispatchPoll_QuizArgs asserts the quiz/timed args flow through dispatch
+// into the PollSpec the channel receives (with MultipleAnswers cleared by the
+// gate for a quiz).
+func TestDispatchPoll_QuizArgs(t *testing.T) {
+	ch := &pollChannel{polls: true}
+	key := RouteKey{Channel: "telegram", ChatID: -100}
+	args := map[string]any{
+		"question":       "Capital of France?",
+		"options":        []any{"Paris", "Rome"},
+		"type":           "quiz",
+		"correct_option": float64(0), // json numbers arrive as float64
+		"explanation":    "Paris is the capital.",
+		"open_period":    float64(120),
+		"multiple":       true, // should be cleared for a quiz
+	}
+	if _, err := dispatchPoll(ch, key, args); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	sent := ch.sentSnapshot()
+	if len(sent) != 1 || sent[0].Poll == nil {
+		t.Fatalf("expected 1 poll part; got %d", len(sent))
+	}
+	p := sent[0].Poll
+	if p.Kind != c3types.PollQuiz {
+		t.Errorf("expected quiz kind; got %q", p.Kind)
+	}
+	if p.CorrectOption == nil || *p.CorrectOption != 0 {
+		t.Errorf("correct_option not threaded through; got %v", p.CorrectOption)
+	}
+	if p.Explanation != "Paris is the capital." {
+		t.Errorf("explanation not threaded through; got %q", p.Explanation)
+	}
+	if p.OpenPeriodSec != 120 {
+		t.Errorf("open_period not threaded through; got %d", p.OpenPeriodSec)
+	}
+	if p.MultipleAnswers {
+		t.Errorf("MultipleAnswers should be cleared for a quiz")
+	}
+}
+
+// TestDispatchPoll_QuizMissingCorrectOption asserts a quiz without
+// correct_option is hard-rejected by the gate and nothing is sent.
+func TestDispatchPoll_QuizMissingCorrectOption(t *testing.T) {
+	ch := &pollChannel{polls: true}
+	key := RouteKey{Channel: "telegram", ChatID: -100}
+	_, err := dispatchPoll(ch, key, map[string]any{
+		"question": "q?",
+		"options":  []any{"a", "b"},
+		"type":     "quiz",
+	})
+	if err == nil || !strings.Contains(err.Error(), "correct_option") {
+		t.Fatalf("expected a correct_option hard-reject; got %v", err)
+	}
+	if got := ch.sentSnapshot(); len(got) != 0 {
+		t.Errorf("nothing should be sent for an invalid quiz; got %d", len(got))
+	}
+}
+
+// TestDispatchPoll_RequiresTwoOptions asserts a poll with fewer than 2 options
+// is hard-rejected (by the pure gate, which now owns option-count validation —
+// the duplicate check was deleted from dispatch in P2/CB-4) and that NOTHING is
+// sent to the channel.
 func TestDispatchPoll_RequiresTwoOptions(t *testing.T) {
 	ch := &pollChannel{polls: true}
 	key := RouteKey{Channel: "telegram", ChatID: -100}

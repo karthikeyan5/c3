@@ -64,7 +64,10 @@ func GuidanceFor(c c3types.Capabilities) string {
 
 	// Polls.
 	if c.Polls {
-		b.WriteString("- Polls: supported via the `poll` tool.\n")
+		b.WriteString("- Polls: supported via the `poll` tool (question + 2-10 options). Set type=\"quiz\" with\n")
+		b.WriteString("  correct_option (0-based) and an optional explanation (shown on a wrong answer) for a quiz;\n")
+		b.WriteString("  anonymous (default true) and multiple (ignored for a quiz) tune behavior; add a timer with\n")
+		b.WriteString("  open_period (seconds) OR close_date (Unix ts).\n")
 	} else {
 		b.WriteString("- Polls: NOT supported — render the choices as numbered text in a normal reply.\n")
 	}

@@ -68,9 +68,10 @@ func ReplyMediaSchema(caps c3types.Capabilities) map[string]any {
 	}
 }
 
-// PollToolSchema is the JSON-schema for the `poll` tool (P3). Channel-neutral —
-// the gate hard-rejects on a channel that does not support polls, so the schema
-// itself is the same shape regardless of manifest.
+// PollToolSchema is the JSON-schema for the `poll` tool (P3; full surface in
+// P2). Channel-neutral — the gate hard-rejects on a channel that does not
+// support polls and owns all shape validation, so the schema itself is the same
+// regardless of manifest. Covers regular AND quiz polls plus an optional timer.
 func PollToolSchema() map[string]any {
 	return map[string]any{
 		"type": "object",
@@ -81,7 +82,28 @@ func PollToolSchema() map[string]any {
 				"items": map[string]any{"type": "string"},
 			},
 			"anonymous": map[string]any{"type": "boolean", "description": "default true"},
-			"multiple":  map[string]any{"type": "boolean", "description": "allow multiple answers; default false"},
+			"multiple":  map[string]any{"type": "boolean", "description": "allow multiple answers; default false (ignored for a quiz)"},
+			"type": map[string]any{
+				"type":        "string",
+				"enum":        []string{"regular", "quiz"},
+				"description": `"regular" (default) or "quiz".`,
+			},
+			"correct_option": map[string]any{
+				"type":        "integer",
+				"description": "0-based index of the correct answer; REQUIRED when type=quiz.",
+			},
+			"explanation": map[string]any{
+				"type":        "string",
+				"description": "shown when a quiz answer is wrong (0-200 chars).",
+			},
+			"open_period": map[string]any{
+				"type":        "integer",
+				"description": "seconds the poll stays open before auto-closing; mutually exclusive with close_date.",
+			},
+			"close_date": map[string]any{
+				"type":        "integer",
+				"description": "Unix timestamp at which the poll auto-closes; mutually exclusive with open_period.",
+			},
 		},
 		"required": []string{"question", "options"},
 	}

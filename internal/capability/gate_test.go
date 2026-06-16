@@ -348,6 +348,141 @@ func TestGate_PollOnOwnPart(t *testing.T) {
 	}
 }
 
+// intPtr is a small helper for the nullable CorrectOption pointer.
+func intPtr(n int) *int { return &n }
+
+// TestGate_PollRegular_BackCompat asserts a regular poll (Kind unset) passes
+// through unchanged — the byte-identical back-compat contract for existing
+// callers that set only the original four fields.
+func TestGate_PollRegular_BackCompat(t *testing.T) {
+	in := &c3types.PollSpec{Question: "Lunch?", Options: []string{"Pizza", "Tacos"}, MultipleAnswers: true}
+	parts, notes, alts, err := Gate(richCaps(), c3types.Outbound{
+		Channel: "telegram", ChatID: 1, Poll: in,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(parts) != 1 || parts[0].Poll == nil {
+		t.Fatalf("expected 1 poll part; got %d", len(parts))
+	}
+	got := parts[0].Poll
+	if got.Question != "Lunch?" || len(got.Options) != 2 || !got.MultipleAnswers {
+		t.Errorf("regular poll altered: %+v", got)
+	}
+	if len(notes) != 0 || len(alts) != 0 {
+		t.Errorf("regular poll should not generate notes/alterations; got notes=%v alts=%v", notes, alts)
+	}
+	// The caller's spec must not be mutated.
+	if !in.MultipleAnswers {
+		t.Errorf("gate mutated the caller's PollSpec")
+	}
+}
+
+func TestGate_Poll_TooFewOptions(t *testing.T) {
+	_, _, _, err := Gate(richCaps(), c3types.Outbound{
+		Channel: "telegram", ChatID: 1,
+		Poll: &c3types.PollSpec{Question: "q?", Options: []string{"only"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "policy") {
+		t.Fatalf("expected a policy hard-reject for <2 options; got %v", err)
+	}
+}
+
+func TestGate_Poll_TooManyOptions(t *testing.T) {
+	opts := make([]string, 11)
+	for i := range opts {
+		opts[i] = "o"
+	}
+	_, _, _, err := Gate(richCaps(), c3types.Outbound{
+		Channel: "telegram", ChatID: 1,
+		Poll: &c3types.PollSpec{Question: "q?", Options: opts},
+	})
+	if err == nil || !strings.Contains(err.Error(), "policy") {
+		t.Fatalf("expected a policy hard-reject for >10 options; got %v", err)
+	}
+}
+
+func TestGate_Quiz_RequiresCorrectOption(t *testing.T) {
+	_, _, _, err := Gate(richCaps(), c3types.Outbound{
+		Channel: "telegram", ChatID: 1,
+		Poll: &c3types.PollSpec{Question: "q?", Options: []string{"a", "b"}, Kind: c3types.PollQuiz},
+	})
+	if err == nil || !strings.Contains(err.Error(), "correct_option") {
+		t.Fatalf("expected a hard-reject for a quiz without correct_option; got %v", err)
+	}
+}
+
+func TestGate_Quiz_CorrectOptionOutOfRange(t *testing.T) {
+	_, _, _, err := Gate(richCaps(), c3types.Outbound{
+		Channel: "telegram", ChatID: 1,
+		Poll: &c3types.PollSpec{Question: "q?", Options: []string{"a", "b"}, Kind: c3types.PollQuiz, CorrectOption: intPtr(2)},
+	})
+	if err == nil || !strings.Contains(err.Error(), "out of range") {
+		t.Fatalf("expected an out-of-range hard-reject; got %v", err)
+	}
+}
+
+func TestGate_Quiz_Valid_ClearsMultiple(t *testing.T) {
+	parts, notes, alts, err := Gate(richCaps(), c3types.Outbound{
+		Channel: "telegram", ChatID: 1,
+		Poll: &c3types.PollSpec{
+			Question: "Capital?", Options: []string{"Paris", "Rome"},
+			Kind: c3types.PollQuiz, CorrectOption: intPtr(0), Explanation: "Paris is the capital.",
+			MultipleAnswers: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error on a valid quiz: %v", err)
+	}
+	if parts[0].Poll.MultipleAnswers {
+		t.Errorf("quiz poll must have MultipleAnswers cleared")
+	}
+	if !notesContain(notes, "ignored for a quiz") {
+		t.Errorf("expected a note that multiple answers were cleared; got %v", notes)
+	}
+	if got := altKinds(alts); len(got) != 1 || got[0] != "poll_multiple_ignored_quiz" {
+		t.Errorf("expected poll_multiple_ignored_quiz alteration; got %v", got)
+	}
+}
+
+func TestGate_Quiz_ExplanationTooLong(t *testing.T) {
+	_, _, _, err := Gate(richCaps(), c3types.Outbound{
+		Channel: "telegram", ChatID: 1,
+		Poll: &c3types.PollSpec{
+			Question: "q?", Options: []string{"a", "b"},
+			Kind: c3types.PollQuiz, CorrectOption: intPtr(0), Explanation: strings.Repeat("x", 201),
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "explanation") {
+		t.Fatalf("expected an over-length explanation hard-reject; got %v", err)
+	}
+}
+
+func TestGate_Poll_TimerMutuallyExclusive(t *testing.T) {
+	_, _, _, err := Gate(richCaps(), c3types.Outbound{
+		Channel: "telegram", ChatID: 1,
+		Poll: &c3types.PollSpec{
+			Question: "q?", Options: []string{"a", "b"},
+			OpenPeriodSec: 60, CloseDateUnix: 1_900_000_000,
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("expected a mutual-exclusivity hard-reject; got %v", err)
+	}
+}
+
+func TestGate_Poll_LongOpenPeriodAllowed(t *testing.T) {
+	// A 1-hour poll (3600s) is live-valid even though rc.34's doc says 5-600;
+	// the gate must NOT hard-reject it.
+	_, _, _, err := Gate(richCaps(), c3types.Outbound{
+		Channel: "telegram", ChatID: 1,
+		Poll: &c3types.PollSpec{Question: "q?", Options: []string{"a", "b"}, OpenPeriodSec: 3600},
+	})
+	if err != nil {
+		t.Fatalf("a long open_period must be allowed; got %v", err)
+	}
+}
+
 func TestGate_NoLimit_SinglePart(t *testing.T) {
 	caps := richCaps()
 	caps.MaxMessageRunes = 0 // no advertised limit

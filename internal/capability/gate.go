@@ -65,6 +65,30 @@ func Gate(c c3types.Capabilities, out c3types.Outbound) (parts []c3types.Outboun
 			fmt.Errorf("polls are not supported on this channel — render the choices as numbered text in a normal reply instead")
 	}
 
+	// Structural poll validation (pure, channel-neutral). The single source of
+	// truth for poll shape lives here — the broker dispatch and the telegram
+	// channel must NOT duplicate these checks. Option-count bounds are C3
+	// POLICY, not Telegram API facts (the live API is more permissive). A
+	// non-nil error is a HARD REJECTION (no send). Quiz degradations (e.g.
+	// clearing MultipleAnswers) are recorded on a COPY of the spec so the
+	// caller's PollSpec is never mutated; the validated poll is emitted below.
+	pollSpec := out.Poll
+	if out.Poll != nil {
+		copySpec := *out.Poll
+		validated, pollNotes, pollAlts, perr := validatePoll(&copySpec)
+		if perr != nil {
+			return nil, nil,
+				[]c3types.Alteration{{
+					Kind:   "poll_rejected",
+					Detail: perr.Error(),
+				}},
+				perr
+		}
+		pollSpec = validated
+		notes = append(notes, pollNotes...)
+		alts = append(alts, pollAlts...)
+	}
+
 	// --- Markup degradation ----------------------------------------------
 	markup := out.Markup
 	if !c.RichText && markup != c3types.MarkupNone {
@@ -167,7 +191,7 @@ func Gate(c c3types.Capabilities, out c3types.Outbound) (parts []c3types.Outboun
 			Channel: out.Channel,
 			ChatID:  out.ChatID,
 			TopicID: out.TopicID,
-			Poll:    out.Poll,
+			Poll:    pollSpec,
 		})
 	}
 	// ReplyTo rides only the FIRST part overall (text if any, else first media,
@@ -177,6 +201,74 @@ func Gate(c c3types.Capabilities, out c3types.Outbound) (parts []c3types.Outboun
 		parts[0].ReplyTo = out.ReplyTo
 	}
 	return parts, notes, alts, nil
+}
+
+// C3 poll-policy bounds. These are C3 POLICY, not Telegram API facts — the live
+// API is more permissive (it now allows a 1-option poll and caps options higher
+// than 10). C3 deliberately requires 2-10 options because a 1-option poll is
+// meaningless for a relay. The 300/200 limits match both rc.34 and the live API.
+const (
+	minPollOptions       = 2
+	maxPollOptions       = 10
+	maxPollQuestionRunes = 300
+	maxPollExplainRunes  = 200
+)
+
+// validatePoll runs the pure, channel-neutral structural validation for a poll
+// and returns the (possibly degraded) spec, agent-facing notes, structured
+// alterations, and a hard-rejection error. It is the SINGLE source of truth for
+// poll shape: neither the broker dispatch nor the telegram channel re-checks
+// these. The caller passes a COPY (mutations like clearing MultipleAnswers for a
+// quiz must not touch the caller's PollSpec).
+//
+// Policy vs API: option-count bounds are C3 policy (rejection messages say so);
+// quiz requires a correct option (Telegram 400s otherwise); explanation length
+// is sane. open_period/close_date are only checked for mutual exclusivity — the
+// gate does NOT impose a 5-600 range (the live API allows far higher and the
+// pinned lib enforces nothing, so a hard range here would reject valid polls).
+func validatePoll(spec *c3types.PollSpec) (*c3types.PollSpec, []string, []c3types.Alteration, error) {
+	var notes []string
+	var alts []c3types.Alteration
+
+	if len(spec.Options) < minPollOptions {
+		return nil, nil, nil, fmt.Errorf("a poll needs at least %d options (C3 policy); got %d", minPollOptions, len(spec.Options))
+	}
+	if len(spec.Options) > maxPollOptions {
+		return nil, nil, nil, fmt.Errorf("a poll allows at most %d options (C3 policy); got %d", maxPollOptions, len(spec.Options))
+	}
+	if runeLen(spec.Question) > maxPollQuestionRunes {
+		return nil, nil, nil, fmt.Errorf("poll question is %d chars, over the %d-char limit", runeLen(spec.Question), maxPollQuestionRunes)
+	}
+
+	if spec.Kind == c3types.PollQuiz {
+		if spec.CorrectOption == nil {
+			return nil, nil, nil, fmt.Errorf("a quiz poll requires correct_option (the 0-based index of the right answer)")
+		}
+		if *spec.CorrectOption < 0 || *spec.CorrectOption >= len(spec.Options) {
+			return nil, nil, nil, fmt.Errorf("correct_option %d is out of range; must be 0..%d", *spec.CorrectOption, len(spec.Options)-1)
+		}
+		if runeLen(spec.Explanation) > maxPollExplainRunes {
+			return nil, nil, nil, fmt.Errorf("poll explanation is %d chars, over the %d-char limit", runeLen(spec.Explanation), maxPollExplainRunes)
+		}
+		// A quiz poll ignores multiple answers — match that by clearing it and
+		// telling the agent (degradation, not a rejection).
+		if spec.MultipleAnswers {
+			spec.MultipleAnswers = false
+			notes = append(notes, "multiple answers are ignored for a quiz poll — the setting was cleared")
+			alts = append(alts, c3types.Alteration{
+				Kind:   "poll_multiple_ignored_quiz",
+				Detail: "MultipleAnswers cleared (ignored for quiz polls)",
+			})
+		}
+	}
+
+	// open_period and close_date both auto-close the poll; Telegram accepts only
+	// one. Enforce mutual exclusivity ONLY — no range check (see doc comment).
+	if spec.OpenPeriodSec != 0 && spec.CloseDateUnix != 0 {
+		return nil, nil, nil, fmt.Errorf("open_period and close_date are mutually exclusive — set at most one")
+	}
+
+	return spec, notes, alts, nil
 }
 
 // mediaKindSupported reports whether the channel's manifest lists kind in its
@@ -196,4 +288,11 @@ func mediaKindSupported(c c3types.Capabilities, kind c3types.MediaKind) bool {
 // the count matches Telegram's, not Go's byte or rune count.
 func utf16Len(s string) int {
 	return len(utf16.Encode([]rune(s)))
+}
+
+// runeLen returns the number of Unicode code points in s. Poll question /
+// explanation limits are stated by Telegram in characters (code points), not
+// UTF-16 units, so this is the right measure for those checks.
+func runeLen(s string) int {
+	return len([]rune(s))
 }

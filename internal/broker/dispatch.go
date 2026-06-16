@@ -134,20 +134,24 @@ func dispatchPoll(ch channel.Channel, key RouteKey, args map[string]any) (map[st
 	if question == "" {
 		return nil, fmt.Errorf("poll: question required")
 	}
-	options := argStringSlice(args, "options")
-	if len(options) < 2 {
-		return nil, fmt.Errorf("poll: at least 2 options required; got %d", len(options))
-	}
-
+	// Option-count and full poll-shape validation (incl. quiz/timed rules) live
+	// in the pure capability gate — dispatch just builds the spec and surfaces
+	// the gate's hard-rejection error. Do NOT re-check options here (that check
+	// moved to the gate so it cannot diverge).
 	out := c3types.Outbound{
 		Channel: key.Channel,
 		ChatID:  argInt64(args, "chat_id", key.ChatID),
 		TopicID: argTopicID(args, "topic_id", key),
 		Poll: &c3types.PollSpec{
 			Question:        question,
-			Options:         options,
+			Options:         argStringSlice(args, "options"),
 			Anonymous:       argBool(args, "anonymous", true),
 			MultipleAnswers: argBool(args, "multiple", false),
+			Kind:            c3types.PollKind(argString(args, "type", string(c3types.PollRegular))),
+			CorrectOption:   argIntPtr(args, "correct_option"),
+			Explanation:     argString(args, "explanation", ""),
+			OpenPeriodSec:   int(argInt64(args, "open_period", 0)),
+			CloseDateUnix:   argInt64(args, "close_date", 0),
 		},
 	}
 
@@ -386,6 +390,17 @@ func argInt64Ptr(args map[string]any, key string) *int64 {
 		return nil
 	}
 	v := argInt64(args, key, 0)
+	return &v
+}
+
+// argIntPtr returns &v if args[key] is set and parseable; nil otherwise. Used
+// for nullable int args (e.g. a quiz poll's correct_option, where 0 is a valid
+// index and must be distinguishable from "not set").
+func argIntPtr(args map[string]any, key string) *int {
+	if _, ok := args[key]; !ok {
+		return nil
+	}
+	v := int(argInt64(args, key, 0))
 	return &v
 }
 
