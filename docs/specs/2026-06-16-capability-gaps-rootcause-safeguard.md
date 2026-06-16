@@ -9,6 +9,25 @@ This document is the single source of truth for closing the four capability gaps
 gaps the audit surfaced, the process safeguard that prevents a recurrence, and the phase-by-phase
 build plan. It supersedes the loose design + critique notes.
 
+> **Build outcome addendum (2026-06-16) — what actually shipped vs this design.**
+> This document was hardened *before* Karthi's sign-off, so its body still describes some
+> capabilities as `ship-now` that he then descoped. The batch shipped as P1–P7 on `master`
+> (`a59e1bb`…`a5c48f5`) plus review fixes. Resolved decisions, where the SHIPPED behavior is
+> authoritative over the design text below:
+> - **Q-RESULT-1 = AGGREGATE + final-on-close.** Per-voter `poll_answer` was **DESCOPED** — it
+>   is **not** subscribed (not in `allowed_updates`) and **not** built. The §3 matrix row
+>   "Read per-voter results (poll_answer update)" and the §4 F3.b `PollAnswer`/`PollAnswerEvent`/
+>   `dispatchPollAnswer` design are therefore **DEFERRED** (kept below only as design-if-revisited);
+>   per-voter reads live on the ROADMAP "build later" list, not in this batch.
+> - **Q-RESULT-2 = auto-ack callbacks.** Shipped.
+> - **Q-QUOTE-1 = explicit `||` terminator** (not length auto-collapse). Shipped.
+> - **Q-CHUNK-1 = manifest source-budget headroom (3686) + plaintext fallback.** Shipped.
+> - **Q-TABLE-1 = render-anyway + honest cross-client guidance** (we do NOT claim `<pre>` scrolls
+>   on desktop/web; Android scrolls). Shipped; live scroll behavior still phone-verified.
+> - **Typing-cap redesign = DEFERRED** by Karthi; `broker/worker.go` typing logic is unchanged.
+> - **P7 inline keyboards = shipped now;** the other deferred gaps (albums, echo-by-`file_id`,
+>   underline/mention, forwarding, location, partial-quote) were **not** pulled forward (ROADMAP).
+
 ---
 
 ## 1. Root cause — why the prior C3 channel build silently missed features
@@ -159,7 +178,7 @@ Every row from the audit (79 capabilities). Status = current code state; Rec = c
 | Poll new fields (revoting/shuffle/add-options/hide-results/members-only/country/desc/media) | polls | recent additions; ranges 'confirm vs live API' | missing | None modeled or set | defer | Nice-to-have embellishments beyond Karthi's set; **not present in rc.34 SendPollOpts** (needs dep bump). Defer. |
 | Stop poll (stopPoll) to read final tally | polls | returns final Poll w/ tallies; only own polls | missing | No StopPoll; no message_id retained for stopping (sendpoll.go:61 returns msg.MessageId, unstored) | ship-now | Supports 'reading poll results'. Deterministic force-close + read. Pairs with poll/poll_answer subscription. |
 | Read poll aggregate results (poll update) | polls | Update.poll = Poll w/ totals + per-option counts; 'poll' must be in allowed_updates | **missing** | allowedUpdates (poll.go:17) lacks 'poll'; dispatchUpdate (189-200) default-drops it | **ship-now** | Karthi's explicit must-fix. Add 'poll' to allowedUpdates AND a dispatch case. Prior build silently missed exactly this. |
-| Read per-voter results (poll_answer update) | polls | PollAnswer w/ user + option_ids; ONLY non-anon bot-sent polls; must be in allowed_updates | **missing** | allowedUpdates lacks 'poll_answer'; no PollAnswer case | **ship-now** | Karthi's explicit must-fix (who-voted-for-what). Subscribe + route + send is_anonymous=false; handle option_ids:[] as retraction not vote-for-0. |
+| Read per-voter results (poll_answer update) | polls | PollAnswer w/ user + option_ids; ONLY non-anon bot-sent polls; must be in allowed_updates | **missing** | allowedUpdates lacks 'poll_answer'; no PollAnswer case | defer | **Descoped by Q-RESULT-1 (2026-06-16) → aggregate-only shipped.** Per-voter "who-voted-what" is on the ROADMAP build-later list; design retained in §4 F3.b as design-if-revisited. |
 | Send reaction (setMessageReaction, single) | reactions | reaction[] of ReactionType; at most one; [] removes; is_big; fixed allowed set | shipped | telegram.go:197-216; manifest Reactions:true/ReactionsSingle:true (54-55); dispatch.go:208-219; main.go:785-796 | ship-now | Shipped. |
 | Reaction emoji validation | reactions | only fixed standard set valid; others 400 | missing | telegram.go:201-204 passes verbatim; no allowlist check | defer | Small robustness nicety (<50 LOC, in-package set embedded in gotgbot doc). Opportunistic — pulled into Phase 1. |
 | Big/animated reaction (is_big) | reactions | plays big animated effect | missing | React never sets IsBig | cut | Cosmetic; no relay value. Cut. |
