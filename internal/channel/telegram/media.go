@@ -118,11 +118,15 @@ func (c *Channel) sendMedia(args c3types.ReplyArgs, item c3types.MediaItem) (int
 		msg, err = c.bot.SendDocument(args.ChatID, src, opts)
 	case c3types.MediaVideo:
 		opts := &gotgbot.SendVideoOpts{
-			Caption:         captionHTML,
-			HasSpoiler:      item.Spoiler,
-			RequestOpts:     requestOptsFor("sendVideo", longPollTimeoutSeconds),
-			MessageThreadId: threadID(args.TopicID),
-			ReplyParameters: replyParams(args.ReplyTo),
+			Caption:    captionHTML,
+			HasSpoiler: item.Spoiler,
+			// Hint that the upload is progressive-playback friendly so clients
+			// can start playing before the full file downloads. Duration/size
+			// metadata is not plumbed through MediaItem yet (deferred).
+			SupportsStreaming: true,
+			RequestOpts:       requestOptsFor("sendVideo", longPollTimeoutSeconds),
+			MessageThreadId:   threadID(args.TopicID),
+			ReplyParameters:   replyParams(args.ReplyTo),
 		}
 		if caption != "" {
 			opts.ParseMode = "HTML"

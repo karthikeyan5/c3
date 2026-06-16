@@ -193,10 +193,32 @@ func (c *Channel) EditMessage(args c3types.EditArgs) (*c3types.EditResult, error
 	return &c3types.EditResult{MessageID: args.MessageID}, nil
 }
 
+// allowedReactionEmoji is Telegram's fixed set of standard reaction emoji
+// accepted by setMessageReaction (ReactionTypeEmoji). Anything outside this set
+// is rejected by the API with a raw 400; we pre-validate so the agent gets a
+// clear, actionable error instead. Sourced verbatim from the documented list on
+// ReactionTypeEmoji.Emoji (gotgbot gen_types.go; https://core.telegram.org/bots/api#reactiontypeemoji).
+// This is a Telegram-specific fact and intentionally lives in this package only.
+var allowedReactionEmoji = map[string]struct{}{
+	"👍": {}, "👎": {}, "❤": {}, "🔥": {}, "🥰": {}, "👏": {}, "😁": {}, "🤔": {},
+	"🤯": {}, "😱": {}, "🤬": {}, "😢": {}, "🎉": {}, "🤩": {}, "🤮": {}, "💩": {},
+	"🙏": {}, "👌": {}, "🕊": {}, "🤡": {}, "🥱": {}, "🥴": {}, "😍": {}, "🐳": {},
+	"❤‍🔥": {}, "🌚": {}, "🌭": {}, "💯": {}, "🤣": {}, "⚡": {}, "🍌": {}, "🏆": {},
+	"💔": {}, "🤨": {}, "😐": {}, "🍓": {}, "🍾": {}, "💋": {}, "🖕": {}, "😈": {},
+	"😴": {}, "😭": {}, "🤓": {}, "👻": {}, "👨‍💻": {}, "👀": {}, "🎃": {}, "🙈": {},
+	"😇": {}, "😨": {}, "🤝": {}, "✍": {}, "🤗": {}, "🫡": {}, "🎅": {}, "🎄": {},
+	"☃": {}, "💅": {}, "🤪": {}, "🗿": {}, "🆒": {}, "💘": {}, "🙉": {}, "🦄": {},
+	"😘": {}, "💊": {}, "🙊": {}, "😎": {}, "👾": {}, "🤷‍♂": {}, "🤷": {}, "🤷‍♀": {},
+	"😡": {},
+}
+
 // React sets a single-emoji reaction on a message.
 func (c *Channel) React(args c3types.ReactArgs) error {
 	if c.bot == nil {
 		return errors.New("telegram: channel not started")
+	}
+	if _, ok := allowedReactionEmoji[args.Emoji]; !ok {
+		return fmt.Errorf("telegram: unsupported reaction emoji %q; Telegram allows only its fixed standard set (👍 👎 ❤ 🔥 🥰 👏 😁 🤔 … 😡 — see https://core.telegram.org/bots/api#reactiontypeemoji)", args.Emoji)
 	}
 	opts := &gotgbot.SetMessageReactionOpts{
 		Reaction: []gotgbot.ReactionType{
