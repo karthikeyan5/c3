@@ -101,8 +101,21 @@ func Gate(c c3types.Capabilities, out c3types.Outbound) (parts []c3types.Outboun
 	}
 
 	// --- Text chunking (construct-aware, UTF-16 measured) ----------------
-	// MaxMessageRunes <= 0 means "no advertised limit" — emit a single part.
+	// The chunker measures the SOURCE text. The channel may render the source
+	// (e.g. markdown→HTML) before sending, which EXPANDS it, so a source chunk
+	// that fits the hard wire limit can exceed it once rendered. To leave room
+	// for that expansion the gate splits at MaxMessageRunesSource (a conservative
+	// budget BELOW the hard MaxMessageRunes wire limit) when the channel
+	// advertises one. When it is unset (0) — a channel with no headroom or whose
+	// rendering does not expand the source — the gate falls back to the hard
+	// MaxMessageRunes, byte-identical to the pre-headroom behavior. Either way
+	// MaxMessageRunes (or the budget) <= 0 means "no advertised limit" — emit a
+	// single part. No raw numeric limit appears here: both numbers come from the
+	// channel manifest (the no-leak rule — see internal/archguard).
 	limit := c.MaxMessageRunes
+	if c.MaxMessageRunesSource > 0 {
+		limit = c.MaxMessageRunesSource
+	}
 	var textParts []string
 	if limit <= 0 || utf16Len(out.Text) <= limit {
 		textParts = []string{out.Text}

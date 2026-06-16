@@ -10,8 +10,26 @@ import (
 // constants here (inside the telegram package) so no caller above this layer
 // names the raw numbers — the spec's no-leak rule (R7).
 const (
-	// maxMessageRunes is Telegram's per-message text limit (UTF-16 units).
+	// maxMessageRunes is Telegram's per-message text limit (UTF-16 units). This
+	// is the HARD wire ceiling: a sent message over this is rejected with a 400.
 	maxMessageRunes = 4096
+	// maxMessageRunesSource is the SOURCE-markdown budget the chunker splits at,
+	// kept below the hard maxMessageRunes so that the markdown→HTML conversion
+	// (mdToTelegramHTML — escaping `< > &` and wrapping `**x**`→`<b>x</b>`,
+	// `[t](u)`→`<a href="u">t</a>`, etc.) cannot push a near-limit chunk over the
+	// hard wire limit and earn a 400. The plaintext fallback (outbound.go) stays
+	// the net for pathological chunks; this headroom just keeps normal chunked
+	// prose from ever hitting it.
+	//
+	// Headroom rationale: ~10% (410 units) below 4096. Typical agent prose
+	// expands only a little under HTML conversion (a few escaped `< > &` and a
+	// handful of bold/italic/link tags per 4 KiB), so 10% comfortably absorbs the
+	// growth WITHOUT over-fragmenting ordinary text into extra messages. Markup-
+	// dense or escape-heavy chunks that still exceed 4096 after conversion remain
+	// caught by the plaintext fallback. Chosen as a conservative-but-not-wasteful
+	// middle ground rather than a worst-case (every char escaped) budget, which
+	// would needlessly split common replies.
+	maxMessageRunesSource = 3686
 	// maxCaptionRunes is Telegram's per-media caption limit (UTF-16 units).
 	maxCaptionRunes = 1024
 	// maxSendBytes is the Bot API upload ceiling for media we send (50 MiB).
@@ -33,11 +51,12 @@ const (
 // false (reasoning streaming deferred — no observable source frame).
 func (c *Channel) Capabilities() c3types.Capabilities {
 	return c3types.Capabilities{
-		Channel:         Name,
-		RichText:        true,
-		MaxMessageRunes: maxMessageRunes,
-		MaxCaptionRunes: maxCaptionRunes,
-		AutoChunks:      true,
+		Channel:               Name,
+		RichText:              true,
+		MaxMessageRunes:       maxMessageRunes,
+		MaxMessageRunesSource: maxMessageRunesSource,
+		MaxCaptionRunes:       maxCaptionRunes,
+		AutoChunks:            true,
 		MediaKinds: []c3types.MediaKind{
 			c3types.MediaPhoto,
 			c3types.MediaFile,

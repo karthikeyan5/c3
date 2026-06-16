@@ -132,6 +132,76 @@ func TestGate_LongText_SplitsWithNote(t *testing.T) {
 	}
 }
 
+// TestGate_SourceBudget_SplitsEarlierThanHardLimit exercises the chunk
+// HTML-overflow guard: when a channel advertises a MaxMessageRunesSource budget
+// below its hard MaxMessageRunes, the gate must split the SOURCE at the smaller
+// budget (leaving headroom for the rendering expansion the channel applies
+// before sending), so a chunk that WOULD fit the hard wire limit but exceed it
+// after rendering is split earlier. Concretely: text that fits the hard limit
+// but exceeds the source budget must be split into >1 part, each within the
+// budget.
+func TestGate_SourceBudget_SplitsEarlierThanHardLimit(t *testing.T) {
+	caps := richCaps()
+	caps.MaxMessageRunes = 50       // hard wire limit
+	caps.MaxMessageRunesSource = 30 // smaller source-markdown budget (headroom)
+	// Two paragraphs that together fit the 50 hard limit but exceed the 30 source
+	// budget -> must split under the budget (it would NOT split at the hard 50).
+	p1 := strings.Repeat("a", 20)
+	p2 := strings.Repeat("b", 20)
+	long := p1 + "\n\n" + p2 // 42 units total: <50 hard limit, >30 source budget
+	if utf16Len(long) > caps.MaxMessageRunes {
+		t.Fatalf("test setup: source %d must fit the hard limit %d", utf16Len(long), caps.MaxMessageRunes)
+	}
+	parts, notes, _, err := Gate(caps, c3types.Outbound{
+		Channel: "telegram", ChatID: 1, Text: long, Markup: c3types.MarkupMarkdown,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(parts) < 2 {
+		t.Fatalf("expected the source budget to force a split into >1 part (fits hard limit, exceeds budget); got %d", len(parts))
+	}
+	for i, p := range parts {
+		if utf16Len(p.Text) > caps.MaxMessageRunesSource {
+			t.Errorf("part %d over the source budget: %d > %d", i, utf16Len(p.Text), caps.MaxMessageRunesSource)
+		}
+	}
+	if !notesContain(notes, "split into") {
+		t.Errorf("expected a split note; got %v", notes)
+	}
+}
+
+// TestGate_SourceBudgetUnset_BackCompat asserts that when MaxMessageRunesSource
+// is 0 (a channel that sets no headroom — the pre-Phase-5 state) the gate falls
+// back to splitting at the hard MaxMessageRunes exactly as before: text that
+// fits the hard limit emits a single unsplit part. This guards the
+// backward-compat contract for channels that never set the source budget.
+func TestGate_SourceBudgetUnset_BackCompat(t *testing.T) {
+	caps := richCaps()
+	caps.MaxMessageRunes = 50
+	caps.MaxMessageRunesSource = 0 // unset — must behave exactly as today
+	// 42 units: fits the hard 50 limit; with no source budget it must NOT split.
+	text := strings.Repeat("a", 20) + "\n\n" + strings.Repeat("b", 20)
+	parts, notes, alts, err := Gate(caps, c3types.Outbound{
+		Channel: "telegram", ChatID: 1, Text: text, Markup: c3types.MarkupMarkdown,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(parts) != 1 {
+		t.Fatalf("expected a single part when MaxMessageRunesSource is unset and text fits the hard limit; got %d", len(parts))
+	}
+	if parts[0].Text != text {
+		t.Errorf("text mutated with unset source budget: got %q want %q", parts[0].Text, text)
+	}
+	if len(notes) != 0 {
+		t.Errorf("expected no split note for an unsplit single part; got %v", notes)
+	}
+	if len(alts) != 0 {
+		t.Errorf("expected no alterations for an unsplit single part; got %v", altKinds(alts))
+	}
+}
+
 // mediaCaps is a Telegram-like manifest with the full media kind set and both
 // CompressedPhoto + OriginalFile enabled — used by the media-splitting tests.
 func mediaCaps() c3types.Capabilities {

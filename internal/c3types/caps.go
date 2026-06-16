@@ -27,6 +27,18 @@ type Capabilities struct {
 	// code units). AutoChunks reports whether longer text is split
 	// automatically into multiple messages.
 	MaxMessageRunes int
+	// MaxMessageRunesSource is the SOURCE-markdown budget the chunker should
+	// split at, which is intentionally LESS than the hard MaxMessageRunes wire
+	// limit to leave headroom for the expansion that channel-side rendering
+	// applies to the source before sending (e.g. a channel that converts
+	// markdown to HTML escapes `< > &` and wraps `**x**` in tags, all of which
+	// lengthen the text). The gate measures the SOURCE length against this
+	// budget so a converted message stays under the hard limit. Channel-neutral:
+	// no rendering detail leaks here, only the int budget. When 0 (a channel
+	// that sets no headroom, or whose rendering does not expand the source) the
+	// gate falls back to splitting at MaxMessageRunes — byte-identical to the
+	// pre-headroom behavior.
+	MaxMessageRunesSource int
 	// MaxCaptionRunes is the maximum length of a media caption.
 	MaxCaptionRunes int
 	AutoChunks      bool
