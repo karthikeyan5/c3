@@ -59,6 +59,23 @@ func TestMdToTelegramHTML(t *testing.T) {
 		{"blockquote-with-text-after", "> quoted\nplain after",
 			"<blockquote>quoted</blockquote>\nplain after"},
 
+		// --- Expandable ("Show more") blockquote: last quoted line ends with a
+		// bare "||" terminator → <blockquote expandable>, terminator stripped. ---
+		{"blockquote-expandable-single", "> a long quote||",
+			"<blockquote expandable>a long quote</blockquote>"},
+		{"blockquote-expandable-multi", "> line one\n> line two||",
+			"<blockquote expandable>line one\nline two</blockquote>"},
+		{"blockquote-expandable-bare-marker-line", "> line one\n> line two\n> ||",
+			"<blockquote expandable>line one\nline two\n</blockquote>"},
+		// A genuine inline spoiler inside a quote ends with "||" but is a PAIRED
+		// ||x|| — it must render as a spoiler, NOT trigger expandable.
+		{"blockquote-with-spoiler-not-expandable", "> the answer is ||42||",
+			`<blockquote>the answer is <span class="tg-spoiler">42</span></blockquote>`},
+		// Expandable quote whose last line ALSO contains a real spoiler: the
+		// unpaired trailing "||" is the terminator; the inner spoiler still works.
+		{"blockquote-expandable-with-inner-spoiler", "> see ||secret|| now||",
+			`<blockquote expandable>see <span class="tg-spoiler">secret</span> now</blockquote>`},
+
 		// --- Lists (rendered as plain bullet text — Telegram has no list tag) ---
 		{"unordered-dash", "- first\n- second", "• first\n• second"},
 		{"unordered-star-plus", "* a\n+ b", "• a\n• b"},

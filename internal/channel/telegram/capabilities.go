@@ -46,16 +46,17 @@ func (c *Channel) Capabilities() c3types.Capabilities {
 			c3types.MediaVoice,
 			c3types.MediaAnimation,
 		},
-		CompressedPhoto: true,
-		OriginalFile:    true,
-		Albums:          false, // descoped in v1 — sequential single sends.
-		MaxSendBytes:    maxSendBytes,
-		Polls:           true,
-		Reactions:       true,
-		ReactionsSingle: true,
-		EditMessages:    true,
-		Threads:         true,
-		Typing:          true,
+		CompressedPhoto:  true,
+		OriginalFile:     true,
+		Albums:           false, // descoped in v1 — sequential single sends.
+		MaxSendBytes:     maxSendBytes,
+		Polls:            true,
+		Reactions:        true,
+		ReactionsSingle:  true,
+		EditMessages:     true,
+		Threads:          true,
+		Typing:           true,
+		ExpandableQuotes: true,
 		Inbound: c3types.InboundCaps{
 			MaxDownloadBytes: maxDownloadBytes,
 			// The attachment kinds Telegram delivers inbound. Mapped onto the

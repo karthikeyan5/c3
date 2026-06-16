@@ -30,6 +30,10 @@ func GuidanceFor(c c3types.Capabilities) string {
 		} else {
 			b.WriteString("  channel tags. Long replies are split automatically into several messages (edits/replies reference the first).\n")
 		}
+		if c.ExpandableQuotes {
+			b.WriteString("  For a long quoted block that should collapse behind a 'Show more' chevron, end the\n")
+			b.WriteString("  blockquote with a line containing only `||` (still capped at the message length limit).\n")
+		}
 	} else {
 		b.WriteString("- Rich text: NOT supported — write PLAIN text only; markdown/HTML will appear as literal characters.\n")
 		if c.MaxMessageRunes > 0 {

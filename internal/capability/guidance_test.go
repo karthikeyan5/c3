@@ -20,17 +20,18 @@ func telegramLikeCaps() c3types.Capabilities {
 			c3types.MediaPhoto, c3types.MediaFile, c3types.MediaVideo,
 			c3types.MediaAudio, c3types.MediaVoice, c3types.MediaAnimation,
 		},
-		CompressedPhoto: true,
-		OriginalFile:    true,
-		Albums:          false,
-		MaxSendBytes:    50 * 1024 * 1024,
-		Polls:           true,
-		Reactions:       true,
-		ReactionsSingle: true,
-		EditMessages:    true,
-		Threads:         true,
-		Typing:          true,
-		Stream:          c3types.StreamCaps{StreamViaEdit: false},
+		CompressedPhoto:  true,
+		OriginalFile:     true,
+		Albums:           false,
+		MaxSendBytes:     50 * 1024 * 1024,
+		Polls:            true,
+		Reactions:        true,
+		ReactionsSingle:  true,
+		EditMessages:     true,
+		Threads:          true,
+		Typing:           true,
+		ExpandableQuotes: true,
+		Stream:           c3types.StreamCaps{StreamViaEdit: false},
 	}
 }
 
@@ -59,6 +60,9 @@ func TestGuidanceFor_PositiveLines(t *testing.T) {
 		// Rich text.
 		"Rich text: YES",
 		"Write standard markdown",
+		// Expandable "Show more" blockquote guidance (gated on ExpandableQuotes).
+		"collapse behind a 'Show more' chevron",
+		"end the\n  blockquote with a line containing only `||`",
 		// Media: the load-bearing file-vs-photo distinction.
 		`kind="file" delivers the ORIGINAL bytes`,
 		`kind="photo" is a COMPRESSED in-chat preview`,
@@ -87,9 +91,15 @@ func TestGuidanceFor_NegativeLines(t *testing.T) {
 	caps := telegramLikeCaps()
 	caps.Polls = false
 	caps.Stream.StreamViaEdit = false // explicitly the v1 default
+	caps.ExpandableQuotes = false     // a channel without the Show-more affordance
 	g := GuidanceFor(caps)
 	assertContainsAll(t, g, []string{
 		"Polls: NOT supported",
 		"Streaming of reasoning: NOT available",
+	})
+	// The expandable-quote guidance is gated on the manifest bool — a channel
+	// without ExpandableQuotes must NOT advertise the "Show more" trick.
+	assertContainsNone(t, g, []string{
+		"collapse behind a 'Show more' chevron",
 	})
 }

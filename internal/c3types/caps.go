@@ -52,6 +52,12 @@ type Capabilities struct {
 	Threads         bool
 	Typing          bool
 
+	// ExpandableQuotes reports whether the channel can render a long quoted
+	// block as a collapsible "Show more" affordance (Telegram's
+	// expandable_blockquote). Channel-neutral: the trigger construct and wire
+	// rendering live in the channel implementation.
+	ExpandableQuotes bool
+
 	// Inbound describes inbound-direction capabilities.
 	Inbound InboundCaps
 	// Stream describes reasoning-streaming capabilities (DEFERRED in v1).

@@ -22,6 +22,9 @@ import (
 //                    ```\n...\n```              → <pre>...</pre>
 //   - Link:          [label](url)               → <a href="url">label</a>
 //   - Blockquote:    a run of "> " lines        → <blockquote>...</blockquote>
+//                    a "> " run ending in "||"  → <blockquote expandable>...</blockquote>
+//                    (the "Show more" affordance; the bare trailing "||" is the
+//                    terminator and is stripped — distinct from an inline spoiler)
 //   - Lists:         "- "/"* "/"+ "/"N. " items → bullet TEXT ("• item"), since
 //                    Telegram HTML has NO list tag. Ordered lists keep their
 //                    numbers; unordered lists get a "• " prefix.
@@ -80,13 +83,33 @@ func mdToTelegramHTML(s string) string {
 
 		// Blockquote run: consecutive lines beginning with "> " (or exactly ">").
 		if isBlockquote(line) {
-			var quoted []string
+			// Collect the run's stripped (marker-removed) lines first, so the
+			// expandable terminator can be detected/stripped at the BLOCK level —
+			// before inline conversion — and disambiguated from an inline spoiler.
+			var stripped []string
 			j := i
 			for j < len(lines) && isBlockquote(lines[j]) {
-				quoted = append(quoted, renderInline(stripBlockquote(lines[j])))
+				stripped = append(stripped, stripBlockquote(lines[j]))
 				j++
 			}
-			out = append(out, "<blockquote>"+strings.Join(quoted, "\n")+"</blockquote>")
+			// Expandable trigger: the run's LAST line ends with a bare "||"
+			// terminator. Strip it and emit <blockquote expandable>. A genuine
+			// inline spoiler (||x||) on the last line is NOT a terminator — its
+			// trailing "||" pairs with an opener (see isExpandableBlockquoteEnd).
+			expandable := false
+			if last := len(stripped) - 1; last >= 0 && isExpandableBlockquoteEnd(stripped[last]) {
+				expandable = true
+				stripped[last] = strings.TrimSuffix(stripped[last], "||")
+			}
+			quoted := make([]string, len(stripped))
+			for k, s := range stripped {
+				quoted[k] = renderInline(s)
+			}
+			tag := "<blockquote>"
+			if expandable {
+				tag = "<blockquote expandable>"
+			}
+			out = append(out, tag+strings.Join(quoted, "\n")+"</blockquote>")
 			i = j
 			continue
 		}
@@ -141,6 +164,29 @@ func stripBlockquote(line string) string {
 		return ""
 	}
 	return strings.TrimPrefix(line, "> ")
+}
+
+// isExpandableBlockquoteEnd reports whether the (marker-stripped) LAST line of a
+// blockquote run carries the bare "||" terminator that requests an EXPANDABLE
+// ("Show more") blockquote, as opposed to ending with a genuine inline spoiler
+// (||x||).
+//
+// Disambiguation from the inline spoiler syntax (||x||): a spoiler's trailing
+// "||" is the CLOSE of a "||"-delimited pair, so a line containing only paired
+// spoilers has an EVEN number of "||" tokens. A bare expandable terminator is an
+// extra, UNPAIRED trailing "||" — making the count ODD. We therefore treat a
+// trailing "||" as the terminator only when the total count of "||" tokens on
+// the line is odd. This keeps a real spoiler inside a quote working while still
+// recognizing a bare trailing "||" (with or without preceding spoilers) as the
+// expandable marker.
+func isExpandableBlockquoteEnd(line string) bool {
+	if !strings.HasSuffix(line, "||") {
+		return false
+	}
+	// Count non-overlapping "||" tokens. An odd count means the trailing "||" is
+	// unpaired (a terminator); an even count means every "||" is part of a
+	// spoiler pair and the line ends with a spoiler close, not a terminator.
+	return strings.Count(line, "||")%2 == 1
 }
 
 // listItem reports whether line is a markdown list item and returns the rendered
