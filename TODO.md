@@ -515,11 +515,11 @@ and Go adapter.
   in `cmd/c3-claude-adapter/main.go`. A long-running session now survives
   a broker bounce without restarting Claude Code.
 
-## Telegram resilience — OpenClaw parity
+## Telegram resilience — prior-art parity
 
-Surfaced 2026-05-09 after the polling-timeout bug fix. Source: OpenClaw's
-`extensions/telegram/` (grammy-based). Most items landed 2026-05-09 in the
-same session.
+Surfaced 2026-05-09 after the polling-timeout bug fix. Source: a prior
+TypeScript Telegram bot's `extensions/telegram/` (grammy-based). Most items
+landed 2026-05-09 in the same session.
 
 - [x] **Honor `parameters.retry_after` on Telegram 429.** Done in
   `internal/channel/telegram/poll.go` pollLoop (cap 60s).
@@ -585,8 +585,8 @@ Reopened (was mis-marked "Skipped (intentional)"):
 - [ ] **Persistent message history** — context recovery across CLI
   restarts.
 - [ ] **Slash commands handled in the broker** — `/status`, `/list`,
-  `/route`, etc. without round-tripping to the LLM. OpenClaw-style fast
-  ops.
+  `/route`, etc. without round-tripping to the LLM. Predecessor-bot-style
+  fast ops.
 - [ ] **Stream thinking / tool calls to Telegram** — research best UX
   first.
 - [ ] **Web chat channel** — second `Channel` impl alongside Telegram.

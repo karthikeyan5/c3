@@ -1,6 +1,6 @@
 """ElevenLabs Scribe v2 STT provider.
 
-Requires: ELEVENLABS_API_KEY env var (stored in ~/.openclaw/.env)
+Requires: ELEVENLABS_API_KEY env var (or in ~/.claude/stt.env)
 API: POST https://api.elevenlabs.io/v1/speech-to-text
 Model: scribe_v2
 """
@@ -14,7 +14,7 @@ def _get_key():
         return _EL_KEY
     _EL_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
     if not _EL_KEY:
-        env_path = os.path.expanduser("~/.openclaw/.env")
+        env_path = os.path.expanduser("~/.claude/stt.env")
         try:
             with open(env_path) as f:
                 for line in f:

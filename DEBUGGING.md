@@ -179,16 +179,16 @@ See `INSTALL.md` step 2.
 - Adapter (re)connect events with conn id and prior conn id — useful when
   a session loses its claim and you want to know why.
 
-## OpenClaw resilience parity
+## Telegram resilience parity (prior-art reference)
 
-OpenClaw's `extensions/telegram/` (grammy-based, TypeScript) has more
-production hardening than we currently do — explicit 429 `retry_after`
+A prior TypeScript Telegram bot (grammy-based, `extensions/telegram/`) had
+more production hardening than we currently do — explicit 429 `retry_after`
 honoring, 401 circuit-breaker, error classification (transient vs
 permanent), persisted update-id watermark for crash safety, per-method
 timeout policy, etc.
 
 The actionable punch list (researched 2026-05-09) lives in
-[`TODO.md`](TODO.md) under **"Telegram resilience — OpenClaw parity"**.
+[`TODO.md`](TODO.md) under **"Telegram resilience — prior-art parity"**.
 Not done yet; pick from there in priority order when adding more
 hardening to `internal/channel/telegram/`.
 

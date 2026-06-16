@@ -19,7 +19,7 @@ var allowedUpdates = []string{"message", "edited_message", "callback_query", "me
 // pollLoop runs Bot.GetUpdates in a loop, converting each Message into an
 // Inbound and emitting via host.Emit. Honors c.ctx cancellation.
 //
-// Error handling (per OpenClaw parity, see DEBUGGING.md):
+// Error handling (per prior-art parity, see DEBUGGING.md):
 //   - 409 Conflict: another poller holds this token. Log loud and EXIT —
 //     retrying would just thrash; the human needs to kill the other poller.
 //   - 401/403 Permanent: increment authBreaker. After auth401Threshold

@@ -1,6 +1,6 @@
 """Sarvam AI Saaras v3 STT provider.
 
-Requires: SARVAM_API_KEY env var, or in ~/.openclaw/openclaw.json env, or ~/.openclaw/.env
+Requires: SARVAM_API_KEY env var (or in ~/.claude/stt.env)
 For audio >30s: requires sarvamai Python package (pip install sarvamai)
 """
 import os, json, time, subprocess, tempfile, urllib.request, urllib.error
@@ -29,18 +29,16 @@ def _get_key():
         return _SARVAM_KEY
     _SARVAM_KEY = os.environ.get("SARVAM_API_KEY", "")
     if not _SARVAM_KEY:
+        env_path = os.path.expanduser("~/.claude/stt.env")
         try:
-            with open(os.path.expanduser("~/.openclaw/openclaw.json")) as f:
-                d = json.load(f)
-            _SARVAM_KEY = d.get("env", {}).get("SARVAM_API_KEY", "")
+            with open(env_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("SARVAM_API_KEY="):
+                        _SARVAM_KEY = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        break
         except:
             pass
-    if not _SARVAM_KEY:
-        env_path = os.path.expanduser("~/.openclaw/.env")
-        if os.path.exists(env_path):
-            for line in open(env_path):
-                if line.startswith("SARVAM_API_KEY="):
-                    _SARVAM_KEY = line.strip().split("=", 1)[1]
     return _SARVAM_KEY
 
 def _get_duration(audio_path):

@@ -29,9 +29,10 @@ from old notes or voice memos was dropped; previously-untracked ideas are flagge
 `risk-of-loss: was-untracked` there.
 
 **Machine note:** this checkout is Karthi's laptop at `/home/karthi/arogara/c3`. The
-2026-06-01 handoff below was written on a **server at `/home/claw`** that was being shut
-down — treat its absolute paths and env-key locations (`gateway.systemd.env`,
-`openclaw.json`, `/home/claw/...`) as server-specific, **not valid on this machine**.
+2026-06-01 handoff below was written on a **now-defunct server** that was being shut
+down — treat its absolute paths and env-key locations (`gateway.systemd.env`, the
+legacy bot config file, and that server's home directory) as server-specific, **not
+valid on this machine**.
 
 **Where things stand:** the code is mature and healthy — `go build ./...` and
 `go vet ./...` are clean, and all packages test green **except 2 environment-flaky
@@ -167,7 +168,7 @@ the agent. Earlier, two files sent as a group → only one arrived.
   a shared media_group_id). To pull the right log window I still need from
   Karthi: ROUGH TIME he sent the two-files-as-a-group (or whether it predates
   the 2026-06-01 session).
-- Note: the 1.5s debounce was copied from OpenClaw (Karthi confirmed).
+- Note: the 1.5s debounce was copied from the predecessor bot (Karthi confirmed).
 - #3 reply-quote retrieval turned out to ALREADY WORK for text: Karthi's reply
   quoting the dropped msg 186 delivered 186's FULL text via the quote (186
   genuinely ended at "...silent-drop val" — not truncated). Karthi will test
@@ -191,15 +192,16 @@ the agent. Earlier, two files sent as a group → only one arrived.
 
 ### Environment / ops notes (carry to laptop)
 
-- Home is `/home/claw` (NOT `/home/karthi`); some docs still say the legacy path.
+- Home was the now-defunct server's home dir (NOT `/home/karthi`); some docs still
+  say the legacy path.
 - STT: the `gemini-3-flash-openrouter → sarvam-saaras-v3` chain is running on
   the SARVAM fallback only. `gemini-3-flash-openrouter` is dead — no
-  `OPENROUTER_API_KEY` anywhere it reads (env, gateway.systemd.env, openclaw.json
-  at `models.providers.openrouter.apiKey`). Sarvam is actually MORE accurate on
-  Karthi's accent/proper-nouns. Karthi wanted to copy the key from another
-  OpenClaw instance on the box, but the auto-mode classifier blocked the cross-
-  user credential read; needs CLI-level approval (Telegram auth doesn't satisfy
-  the gate). Low priority — STT works.
+  `OPENROUTER_API_KEY` anywhere it reads (env, gateway.systemd.env, the legacy
+  bot config file at `models.providers.openrouter.apiKey`). Sarvam is actually
+  MORE accurate on Karthi's accent/proper-nouns. Karthi wanted to copy the key
+  from another instance of the predecessor bot on the box, but the auto-mode
+  classifier blocked the cross-user credential read; needs CLI-level approval
+  (Telegram auth doesn't satisfy the gate). Low priority — STT works.
 - Separate, non-c3: `~/arogara/voice-notes/` holds a catalog (TODO.md) of 5
   ideas Karthi dictated (utopia white-paper, long-running-Forge mode, Continuum-
   suit master plan, "predict what Karthikeyan would say" corpus, + an idea-

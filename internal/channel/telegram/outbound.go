@@ -83,7 +83,7 @@ func (c *Channel) SendReply(args c3types.ReplyArgs) (int64, error) {
 	}
 	msg, err := c.bot.SendMessage(args.ChatID, text, opts)
 	if err != nil && convertMd && isParseEntityError(err) {
-		// Plaintext fallback (per OpenClaw bot/delivery.send.ts pattern). Our
+		// Plaintext fallback (per the predecessor bot's bot/delivery.send.ts pattern). Our
 		// markdown converter occasionally produces malformed HTML for
 		// pathological input; re-send the ORIGINAL text as plain text rather
 		// than dropping the message.
@@ -102,8 +102,9 @@ func (c *Channel) SendReply(args c3types.ReplyArgs) (int64, error) {
 
 // isParseEntityError returns whether a SendMessage error indicates Telegram
 // rejected the entities we sent (malformed HTML or MarkdownV2). On these we
-// retry plain-text rather than drop the message — pattern from OpenClaw's
-// extensions/telegram/src/bot/delivery.send.ts (sub-agent research 2026-05-09).
+// retry plain-text rather than drop the message — pattern from a prior
+// TypeScript Telegram bot's extensions/telegram/src/bot/delivery.send.ts
+// (sub-agent research 2026-05-09).
 func isParseEntityError(err error) bool {
 	if err == nil {
 		return false

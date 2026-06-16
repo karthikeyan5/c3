@@ -16,8 +16,9 @@ import (
 // can pick the right recovery: backoff, sleep retry-after, exit cleanly, or
 // trip a circuit-breaker.
 //
-// Adapted from OpenClaw's `extensions/telegram/src/fetch.ts` error
-// classification — they're TS+grammy, we're Go+gotgbot, but the shape of
+// Adapted from a prior TypeScript Telegram bot's
+// `extensions/telegram/src/fetch.ts` error classification — they're TS+grammy,
+// we're Go+gotgbot, but the shape of
 // "what telegram errors mean and how to react" is the same.
 type errClass int
 
@@ -81,8 +82,8 @@ func classifyError(err error) (errClass, int) {
 }
 
 // isTransientNetworkError matches the kinds of errors gotgbot+net/http surface
-// when the wire is flaky. Inspired by OpenClaw's FALLBACK_RETRY_ERROR_CODES
-// (`extensions/telegram/src/fetch.ts`).
+// when the wire is flaky. Inspired by the predecessor bot's
+// FALLBACK_RETRY_ERROR_CODES (`extensions/telegram/src/fetch.ts`).
 func isTransientNetworkError(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, context.Canceled) {
@@ -124,7 +125,7 @@ func isTransientNetworkError(err error) bool {
 //
 // Generalizes the lesson from the 2026-05-09 polling-timeout bug: a single
 // global HTTP timeout either starves the long-poll or makes everything else
-// hang. Per-method matches OpenClaw's `bot-core.ts` resolveTelegramRequestTimeoutMs.
+// hang. Per-method matches the predecessor bot's `bot-core.ts` resolveTelegramRequestTimeoutMs.
 func timeoutFor(method string, longPollSeconds int) time.Duration {
 	switch method {
 	case "getUpdates":
@@ -154,7 +155,7 @@ func requestOptsFor(method string, longPollSeconds int) *gotgbot.RequestOpts {
 // authBreaker tracks consecutive 401s on the channel. Once `threshold` is
 // reached, the breaker trips and the channel suspends polling — preventing a
 // retry-storm against a revoked token (which Telegram can interpret as abuse
-// and respond to by banning the bot, per OpenClaw's
+// and respond to by banning the bot, per the predecessor bot's
 // `sendchataction-401-backoff.ts` warning).
 type authBreaker struct {
 	mu        sync.Mutex

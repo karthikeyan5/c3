@@ -102,7 +102,7 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 	// in net/http are MaxIdleConns=100, no per-component timeouts —
 	// fine for normal use but gives no upper bound on a stuck connection.
 	//
-	// Sub-agent research (2026-05-09, openclaw + grammyjs/runner): the
+	// Sub-agent research (2026-05-09, prior TypeScript bot + grammyjs/runner): the
 	// "polling silently stops" failure mode comes from a hung getUpdates
 	// where the kernel never sees a FIN. ResponseHeaderTimeout caps each
 	// HTTP response-header wait; combined with the long-poll's own server

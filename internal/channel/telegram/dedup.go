@@ -17,8 +17,8 @@ import (
 // Capacity-bounded so an attacker can't grow it unboundedly. Entries time
 // out independently of capacity so a quiet hour doesn't keep stale records.
 //
-// Inspired by OpenClaw's dedupe cache (`bot-updates.ts` "5-minute TTL and
-// 2000-item max").
+// Inspired by a prior TypeScript Telegram bot's dedupe cache (`bot-updates.ts`
+// "5-minute TTL and 2000-item max").
 type updateDedup struct {
 	mu       sync.Mutex
 	capacity int

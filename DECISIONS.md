@@ -15,10 +15,10 @@
 **Decision:** Voice transcription (speech-to-text, STT) runs in the daemon, not patched into each MCP stub.
 **Why:** Centralizes STT — one place to maintain, no patching needed. The daemon transcribes before routing, so stubs always receive text.
 
-## D004: Use OpenClaw Message Tool as Spec Reference
+## D004: Use the Predecessor Bot's Message Tool as Spec Reference
 **Date:** 2026-04-15
-**Decision:** Use OpenClaw's messaging system features as a reference spec, not its code. Adapt concepts (dedup, debouncing, session routing, access control) for our Telegram-centric model.
-**Why:** OpenClaw has solved many of the same problems. No need to reinvent — but we only need Telegram, not all-platform support.
+**Decision:** Use a predecessor TypeScript Telegram bot's messaging system features as a reference spec, not its code. Adapt concepts (dedup, debouncing, session routing, access control) for our Telegram-centric model.
+**Why:** The predecessor bot has solved many of the same problems. No need to reinvent — but we only need Telegram, not all-platform support.
 
 ## D005: Project Name — C3 (C-cubed)
 **Date:** 2026-04-15

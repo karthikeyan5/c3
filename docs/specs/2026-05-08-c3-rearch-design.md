@@ -28,8 +28,8 @@ This rearch is mostly a **return** to the original direction (D006 Go, D007 plug
 | D006 "Go for daemon and MCP stubs" | reaffirmed without exception; broker, both adapters, codex launcher all Go |
 | D007 "Pluggable transport — Telegram first, web/voice later" | §4.1 channels plane, multi-channel data model in v1 |
 | D008 "Official Go MCP SDK" | reaffirmed; adapters use `github.com/modelcontextprotocol/go-sdk` v1+ |
-| README §"Key Features" message dedup + debouncing | §7 OpenClaw UX features in v1 |
-| README §"OpenClaw inspiration" sender id with cross-channel prefix | §4.3 inbound payloads carry `channel` field |
+| README §"Key Features" message dedup + debouncing | §7 prior-art UX features in v1 |
+| README §"prior-art inspiration" sender id with cross-channel prefix | §4.3 inbound payloads carry `channel` field |
 | README §"Routing Modes" group-based (no topics) | §4.2 routing key is `(channel, chat_id, topic_id)` — `topic_id=None` covers no-topics |
 | TODO Phase 1 typing indicator | §7 — adopted in v1 |
 | TODO Phase 1 STT in daemon, attachment forwarding | §8 STT plugin; attachments via channel passthrough |
@@ -957,7 +957,7 @@ Why distribute the Python tree under the plugin instead of embedding via `//go:e
 
 Whisper is **not** shipped as a default provider. Users who want a local STT engine point `handler_path` at their own script — the argv contract (`<bot_token> <chat_id> <reply_msg_id> <file_id> [<message_thread_id>]`) is the only requirement.
 
-## 7. OpenClaw-inspired UX features (top 3, in v1)
+## 7. Prior-art-inspired UX features (top 3, in v1)
 
 ### 7.1 Typing indicator
 
@@ -981,7 +981,7 @@ Configurable per channel via `mappings.json:channels.<chan>.debounce_ms`. Per-gr
 
 ### Why these three, not others
 
-OpenClaw also has session-based routing, multi-turn ping-pong, fire-and-forget vs wait modes, sender-id prefixes. Those are inter-agent-messaging features (TODO Phase 4). Cross-channel sender-id prefix becomes relevant when we have >1 channel.
+The predecessor bot also has session-based routing, multi-turn ping-pong, fire-and-forget vs wait modes, sender-id prefixes. Those are inter-agent-messaging features (TODO Phase 4). Cross-channel sender-id prefix becomes relevant when we have >1 channel.
 
 ## 8. Plugin extension architecture
 
@@ -1114,7 +1114,7 @@ Phases 1-7 unblock single-user daily use. 8-10 are about shippability to others.
 - Codex inbound notification status: openai/codex#18056, #17543, #15299 — open.
 - Telegram Bot API: core.telegram.org/bots/api, /api-changelog.
 - Telegram forums constraint: tdlib/telegram-bot-api#356 (no `getForumTopics`).
-- OpenClaw messaging features: c3/README.md §"Inspiration: OpenClaw's Message Tool".
+- Predecessor-bot messaging features: c3/README.md §"Inspiration: the predecessor bot's Message Tool".
 - The Codex bridge architecture was informed by an end-to-end Python prototype (Telegram ↔ Codex turns + voice transcription, all working) that preceded this rewrite. v5 takes that architecture and re-implements it in Go.
 - Existing plugin scaffold: `plugin/.claude-plugin/marketplace.json`, `plugin/plugins/c3-telegram/`.
 - C3 stated direction: README.md §"Key Features (Full Vision)", TODO.md Phases 1-4, DECISIONS.md D001-D008.

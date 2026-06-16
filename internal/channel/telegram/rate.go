@@ -15,8 +15,8 @@ import (
 //   - per group chat: 20 messages/minute
 //   - per private chat: 1 message/second (burst 5)
 //
-// Waiting blocks the worker until a slot opens — same shape as OpenClaw's
-// `@grammyjs/transformer-throttler`. Each call waits on global AND per-chat
+// Waiting blocks the worker until a slot opens — same shape as the predecessor
+// bot's `@grammyjs/transformer-throttler`. Each call waits on global AND per-chat
 // in sequence; the per-chat limiter is created lazily by chat-id sign:
 // negative→group, positive→private.
 type rateLimiter struct {

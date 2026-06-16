@@ -1,6 +1,6 @@
 """Gemini 3 Flash STT provider via OpenRouter.
 
-Requires: OPENROUTER_API_KEY env var or key in ~/.openclaw/openclaw.json
+Requires: OPENROUTER_API_KEY env var (or in ~/.claude/stt.env)
 """
 import os, json, base64, urllib.request, urllib.error
 
@@ -13,10 +13,14 @@ def _get_key():
         return _OR_KEY
     _OR_KEY = os.environ.get("OPENROUTER_API_KEY", "")
     if not _OR_KEY:
+        env_path = os.path.expanduser("~/.claude/stt.env")
         try:
-            with open(os.path.expanduser("~/.openclaw/openclaw.json")) as f:
-                d = json.load(f)
-            _OR_KEY = d.get("models", {}).get("providers", {}).get("openrouter", {}).get("apiKey", "")
+            with open(env_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("OPENROUTER_API_KEY="):
+                        _OR_KEY = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        break
         except:
             pass
     return _OR_KEY

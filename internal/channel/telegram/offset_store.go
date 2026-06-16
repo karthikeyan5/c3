@@ -18,8 +18,8 @@ import (
 // won't redeliver them either. That's the same exposure as today;
 // persisting offset here only fixes the "broker restart re-runs the last
 // 24h of updates" footgun. A stronger guarantee (per-update completion
-// tracking) is OpenClaw's bot-update-tracker design — bigger change,
-// deferred.
+// tracking) is the predecessor bot's bot-update-tracker design — bigger
+// change, deferred.
 //
 // File: $XDG_STATE_HOME/c3/<channel>-offset.json (mode 0600).
 type offsetStore struct {
