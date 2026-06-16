@@ -114,6 +114,18 @@ func mdToTelegramHTML(s string) string {
 			continue
 		}
 
+		// GFM pipe table: a header line + a `|---|` delimiter row + body rows.
+		// Render as an aligned monospace <pre> block (a <pre> is atomic, with the
+		// same tag-balance/escaping guarantees as fenced code) instead of letting
+		// the literal pipe lines fall through as wrapping plain text. Checked
+		// before the listItem fall-through (a `|`-containing line is otherwise
+		// ordinary text). Per Q-TABLE-1, over-budget tables still render.
+		if rows, end, ok := detectTable(lines, i); ok {
+			out = append(out, renderTableMono(rows))
+			i = end
+			continue
+		}
+
 		// List item (unordered or ordered): render as a plain bullet line.
 		if marker, rest, ok := listItem(line); ok {
 			out = append(out, marker+renderInline(rest))

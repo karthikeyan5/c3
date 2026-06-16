@@ -102,6 +102,65 @@ func TestChunkMarkdown_FencedCodeNotBisected(t *testing.T) {
 	}
 }
 
+func TestChunkMarkdown_TableNotBisected(t *testing.T) {
+	limit := 60
+	// A GFM pipe table that as a whole fits the limit but straddles a boundary
+	// against neighboring paragraphs: it must move whole to its own part, never
+	// split between its rows.
+	table := "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |"
+	src := "intro paragraph here padding\n\n" + table + "\n\noutro paragraph"
+	parts, _ := chunkMarkdown(src, limit)
+	partsWithinLimit(t, parts, limit)
+	if !constructInOnePart(parts, table) {
+		t.Errorf("pipe table was bisected across parts; parts=%q", parts)
+	}
+}
+
+func TestChunkMarkdown_WideTableStillRendered(t *testing.T) {
+	// A wide/over-limit table is atomic + over-limit => it is hard-split (with an
+	// Alteration) rather than dropped. The point of Q-TABLE-1 is RENDER-ANYWAY:
+	// the content survives in the parts; it is never silently discarded.
+	limit := 30
+	table := "| col_one | col_two | col_three |\n" +
+		"|---------|---------|-----------|\n" +
+		"| aaaaaaa | bbbbbbb | ccccccccc |\n" +
+		"| ddddddd | eeeeeee | fffffffff |"
+	parts, alts := chunkMarkdown(table, limit)
+	partsWithinLimit(t, parts, limit)
+	if len(parts) < 2 {
+		t.Fatalf("expected the over-limit table to split into >1 part; got %d", len(parts))
+	}
+	if !hasHardSplit(alts) {
+		t.Errorf("expected a hard_split Alteration for an over-limit table; alts=%+v", alts)
+	}
+	// Content is not dropped: reassembly contains every header cell.
+	joined := strings.Join(parts, "")
+	for _, cell := range []string{"col_one", "col_two", "col_three"} {
+		if !strings.Contains(joined, cell) {
+			t.Errorf("table content %q was dropped (not rendered-anyway); parts=%q", cell, parts)
+		}
+	}
+}
+
+func TestChunkMarkdown_NonTablePipeNotAtomic(t *testing.T) {
+	// A `|`-containing line with NO delimiter row is prose, not a table: it must
+	// NOT be treated as an atomic block, so an ordinary paragraph boundary split
+	// still applies. Two prose lines (each with a pipe) under a small limit split
+	// on the line boundary rather than being glued into one atomic block.
+	limit := 20
+	src := "a | b is just text\nc | d is also text"
+	parts, _ := chunkMarkdown(src, limit)
+	partsWithinLimit(t, parts, limit)
+	// If this prose had been mis-detected as an atomic table, the over-limit
+	// combined block would hard-split mid-line; instead it splits on the line
+	// boundary and each line stays intact.
+	for _, line := range []string{"a | b is just text", "c | d is also text"} {
+		if !constructInOnePart(parts, line) {
+			t.Errorf("non-table pipe prose line %q was bisected (mis-detected as a table); parts=%q", line, parts)
+		}
+	}
+}
+
 func TestChunkMarkdown_SingleLongLinkHardSplit(t *testing.T) {
 	limit := 30
 	// One indivisible link longer than the limit: there is no safe boundary

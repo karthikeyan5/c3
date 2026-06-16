@@ -147,6 +147,18 @@ func splitBlocks(src string) []block {
 			continue
 		}
 
+		// GFM pipe-table run: a header line + a `|---|` delimiter row + body rows.
+		// Kept atomic so a table is never bisected across messages (the rendered
+		// monospace <pre> on the Telegram side relies on the whole table arriving
+		// in one part). The shape test here is a PURE markdown-level mirror of the
+		// telegram package's detectTable — this package must not import telegram.
+		if end, ok := tableRunEnd(lines, i); ok {
+			flushOrdinary()
+			blocks = append(blocks, block{text: strings.Join(lines[i:end], "\n"), atomic: true})
+			i = end
+			continue
+		}
+
 		// Blank line = paragraph boundary: close the current ordinary block.
 		if strings.TrimSpace(line) == "" {
 			flushOrdinary()
@@ -176,6 +188,8 @@ func splitBlock(blk block, limit int) ([]string, []c3types.Alteration) {
 		kind := "fenced code block"
 		if isBlockquoteLine(firstLine(blk.text)) {
 			kind = "blockquote"
+		} else if _, ok := tableRunEnd(strings.Split(blk.text, "\n"), 0); ok {
+			kind = "table"
 		}
 		return pieces, []c3types.Alteration{{
 			Kind:   "hard_split",
@@ -434,6 +448,80 @@ func isFenceClose(line, fence string) bool {
 // isBlockquoteLine reports whether line is part of a blockquote run.
 func isBlockquoteLine(line string) bool {
 	return strings.HasPrefix(line, "> ") || line == ">"
+}
+
+// tableRunEnd reports whether a GFM pipe-table run starts at lines[i] and, if so,
+// the exclusive end index of the run. It is a PURE markdown-level mirror of the
+// telegram package's detectTable shape test, kept here so chunk.go can treat a
+// table as an atomic block without importing the telegram package (capability
+// purity, archguard). Only the SHAPE is recognized — no rendering, no Telegram
+// literals.
+//
+// Shape: a header line containing '|', immediately followed by a delimiter row
+// (`|? :?-+:? (| :?-+:?)+ |?`), then zero or more body rows (lines containing
+// '|') until a line with no '|' (or end of input).
+func tableRunEnd(lines []string, i int) (end int, ok bool) {
+	if i+1 >= len(lines) {
+		return 0, false
+	}
+	if !strings.Contains(lines[i], "|") {
+		return 0, false
+	}
+	if !isTableDelimiterLine(lines[i+1]) {
+		return 0, false
+	}
+	j := i + 2
+	for j < len(lines) {
+		if !strings.Contains(lines[j], "|") {
+			break
+		}
+		if isTableDelimiterLine(lines[j]) {
+			break // a second delimiter row ends this run (start of another table)
+		}
+		j++
+	}
+	return j, true
+}
+
+// isTableDelimiterLine reports whether line is a GFM table delimiter row: a run
+// of dash cells separated by pipes, each cell optionally carrying `:` alignment
+// markers, with an optional leading/trailing pipe. This is the load-bearing
+// signal that a `|`-containing line is a table rather than prose. Pure mirror of
+// the telegram package's isTableDelimiter.
+func isTableDelimiterLine(line string) bool {
+	t := strings.TrimSpace(line)
+	if t == "" {
+		return false
+	}
+	t = strings.TrimPrefix(t, "|")
+	t = strings.TrimSuffix(t, "|")
+	cells := strings.Split(t, "|")
+	if len(cells) == 0 {
+		return false
+	}
+	for _, c := range cells {
+		if !isTableDelimiterCell(c) {
+			return false
+		}
+	}
+	return true
+}
+
+// isTableDelimiterCell reports whether c is a single GFM delimiter cell: optional
+// whitespace, an optional leading `:`, one or more `-`, an optional trailing `:`.
+func isTableDelimiterCell(c string) bool {
+	c = strings.TrimSpace(c)
+	c = strings.TrimPrefix(c, ":")
+	c = strings.TrimSuffix(c, ":")
+	if c == "" {
+		return false
+	}
+	for _, r := range c {
+		if r != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 func firstLine(s string) string {

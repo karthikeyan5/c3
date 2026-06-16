@@ -68,6 +68,13 @@ func TestGuidanceFor_PositiveLines(t *testing.T) {
 		// Expandable "Show more" blockquote guidance (gated on ExpandableQuotes).
 		"collapse behind a 'Show more' chevron",
 		"end the\n  blockquote with a line containing only `||`",
+		// Wide-table honesty line (P6) — gated on RichText. Asserts the HONEST
+		// cross-client claim (desktop/web WRAP, Android scrolls), not "scrolls
+		// everywhere".
+		"Wide tables: rendered as a monospace block for column alignment",
+		"Telegram does NOT\n  scroll wide content uniformly",
+		"desktop/web WRAP (breaking alignment), Android scrolls",
+		"Keep tables narrow (transpose, or fewer columns); for a truly wide table, send an image.",
 		// Media: the load-bearing file-vs-photo distinction.
 		`kind="file" delivers the ORIGINAL bytes`,
 		`kind="photo" is a COMPRESSED in-chat preview`,

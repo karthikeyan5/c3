@@ -34,6 +34,12 @@ func GuidanceFor(c c3types.Capabilities) string {
 			b.WriteString("  For a long quoted block that should collapse behind a 'Show more' chevron, end the\n")
 			b.WriteString("  blockquote with a line containing only `||` (still capped at the message length limit).\n")
 		}
+		// Wide-table honesty (P6): tables render as an aligned monospace block, but
+		// Telegram does NOT scroll wide content uniformly — we deliberately do not
+		// claim cross-client horizontal scroll.
+		b.WriteString("  Wide tables: rendered as a monospace block for column alignment. Telegram does NOT\n")
+		b.WriteString("  scroll wide content uniformly — desktop/web WRAP (breaking alignment), Android scrolls.\n")
+		b.WriteString("  Keep tables narrow (transpose, or fewer columns); for a truly wide table, send an image.\n")
 	} else {
 		b.WriteString("- Rich text: NOT supported — write PLAIN text only; markdown/HTML will appear as literal characters.\n")
 		if c.MaxMessageRunes > 0 {

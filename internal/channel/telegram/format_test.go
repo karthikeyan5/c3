@@ -97,6 +97,25 @@ func TestMdToTelegramHTML(t *testing.T) {
 		{"unclosed-bold-stays", "lone ** asterisks", "lone ** asterisks"},
 		{"unclosed-backtick-stays", "lone ` tick", "lone ` tick"},
 		{"arithmetic-stars-stay", "a * b * c", "a * b * c"},
+
+		// --- GFM pipe tables → aligned monospace <pre> ---
+		// Basic table: cells padded to per-column max width, " | " separator, an
+		// ASCII "-+-" rule under the header (never box-drawing chars).
+		{"table-basic", "| a | bb |\n|---|----|\n| 1 | 2 |",
+			"<pre>a | bb\n--+---\n1 | 2 </pre>"},
+		// No leading/trailing pipes is still a table (delimiter row is the signal).
+		{"table-no-edge-pipes", "a | bb\n--- | ----\n1 | 2",
+			"<pre>a | bb\n--+---\n1 | 2 </pre>"},
+		// Alignment colons in the delimiter are accepted; columns still align.
+		{"table-aligned-colons", "| h1 | h2 |\n|:--|--:|\n| x | yy |",
+			"<pre>h1 | h2\n---+---\nx  | yy</pre>"},
+		// Cell content is HTML-escaped inside <pre>.
+		{"table-escapes-cell", "| a | b |\n|---|---|\n| <x> | & |",
+			"<pre>a   | b\n----+--\n&lt;x&gt; | &amp;</pre>"},
+		// A lone pipe in prose (no delimiter row) is NOT a table — stays literal.
+		{"not-a-table-prose-pipe", "a | b is just text", "a | b is just text"},
+		// A pipe header with no delimiter row underneath is NOT a table.
+		{"not-a-table-no-delimiter", "| a | b |\n| 1 | 2 |", "| a | b |\n| 1 | 2 |"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
