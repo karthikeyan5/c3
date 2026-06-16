@@ -187,6 +187,17 @@ func (w *RouteWorker) run(ctx context.Context) {
 				if job.Inbound == nil {
 					continue
 				}
+				// CB-1: a synthesized channel EVENT (poll_result / reaction /
+				// callback) must NEVER share a debounce batch with text. Merging
+				// it would (a) drop its Kind/Event through mergeBatch's text-only
+				// copy and (b) run hasVoice/STT over a non-voice event. So: flush
+				// any buffered text first, then forward the event ALONE, bypassing
+				// the debounce buffer and the STT path entirely.
+				if job.Inbound.IsEvent() {
+					flushDeb()
+					w.flushEvent(ctx, job.Inbound)
+					continue
+				}
 				debBuf = append(debBuf, job.Inbound)
 				maxMsgs := w.debounceMaxMessages()
 				if len(debBuf) >= maxMsgs {
@@ -230,7 +241,11 @@ func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inboun
 	// Per-inbound STT substitution.
 	if w.broker.Plugins != nil {
 		for _, in := range batch {
-			if !hasVoice(in) {
+			// CB-1 defense-in-depth: never run voice/STT over a synthesized
+			// event. The run loop already diverts events to flushEvent, so a
+			// batch here is all ordinary messages — this guard makes that
+			// invariant explicit and survives any future caller change.
+			if in.IsEvent() || !hasVoice(in) {
 				continue
 			}
 			payload := c3types.VoicePayload{
@@ -273,8 +288,37 @@ func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inboun
 	w.forwardOrFallback(ctx, merged)
 }
 
+// flushEvent forwards a single synthesized channel EVENT (poll_result /
+// reaction / callback) straight through delivery. CB-1: events are NEVER
+// debounce-merged with text and NEVER run through the voice/STT substitution —
+// they are delivered intact and on their own. The OnInbound plugin chain still
+// runs (so a plugin can observe/drop an event), but the per-inbound STT loop in
+// flushInbounds is skipped entirely. An event whose chain returns nil is
+// dropped, matching the message path.
+func (w *RouteWorker) flushEvent(ctx context.Context, ev *c3types.Inbound) {
+	if w.broker == nil || ev == nil {
+		return
+	}
+	if w.broker.Plugins != nil {
+		next := w.broker.Plugins.FireOnInbound(ctx, ev)
+		if next == nil {
+			return // dropped by a plugin
+		}
+		ev = next
+	}
+	w.forwardOrFallback(ctx, ev)
+}
+
 // mergeBatch collapses a batch of inbounds into one. See flushInbounds for
 // the merge rules. Single-element batches return the element unchanged.
+//
+// CB-1 invariant: this is only ever called with ORDINARY message inbounds. The
+// run loop diverts every Kind != "" event to flushEvent before it can reach a
+// debounce batch, so an event never lands here. As defense-in-depth, if an
+// event ever does appear in a multi-element batch it is carried through verbatim
+// (its Kind/Event preserved) rather than silently text-spliced — see the
+// per-element copy below. The single-element fast path already returns the
+// element unchanged, preserving Kind/Event for the (event-alone) case.
 func mergeBatch(batch []*c3types.Inbound) *c3types.Inbound {
 	if len(batch) == 1 {
 		return batch[0]
@@ -287,6 +331,11 @@ func mergeBatch(batch []*c3types.Inbound) *c3types.Inbound {
 		MessageID: last.MessageID,
 		Sender:    last.Sender,
 		Timestamp: batch[0].Timestamp,
+		// Carry the latest event metadata through so a stray event in a batch is
+		// not silently dropped. In normal operation the run loop guarantees no
+		// event reaches mergeBatch (events flush alone via flushEvent).
+		Kind:  last.Kind,
+		Event: last.Event,
 	}
 	var texts []string
 	for _, in := range batch {

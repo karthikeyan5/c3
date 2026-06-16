@@ -45,6 +45,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -461,7 +462,9 @@ func (a *adapter) handleInbound(ctx context.Context, raw []byte) {
 		return
 	}
 	kind := "text"
-	if len(in.Inbound.Attachments) > 0 && in.Inbound.Attachments[0].Kind != "" {
+	if in.Inbound.IsEvent() {
+		kind = string(in.Inbound.Kind) // poll_result / reaction / callback
+	} else if len(in.Inbound.Attachments) > 0 && in.Inbound.Attachments[0].Kind != "" {
 		kind = in.Inbound.Attachments[0].Kind
 	}
 	topic := "-"
@@ -506,6 +509,25 @@ func (a *adapter) handleInbound(ctx context.Context, raw []byte) {
 //   - `message_thread_id` only present when non-nil; same for the optional
 //     attachment / reply_to fields.
 func buildClaudeChannelFrame(in *c3types.Inbound) map[string]any {
+	// P4: a synthesized channel event (poll_result / reaction / callback) renders
+	// from its neutral Event payload rather than the message text/attachment path.
+	// meta values stay strings (the frame contract requires Record<string,string>).
+	if in.IsEvent() {
+		content, evMeta := buildEventFrame(in)
+		evMeta["chat_id"] = strconv.FormatInt(in.ChatID, 10)
+		evMeta["ts"] = in.Timestamp.Format("2006-01-02T15:04:05.000Z")
+		if in.MessageID != 0 {
+			evMeta["message_id"] = strconv.FormatInt(in.MessageID, 10)
+		}
+		if in.TopicID != nil {
+			evMeta["message_thread_id"] = strconv.FormatInt(*in.TopicID, 10)
+		}
+		return map[string]any{
+			"content": content,
+			"meta":    evMeta,
+		}
+	}
+
 	meta := map[string]any{
 		// Per channels-reference.md, `meta` is typed Record<string, string>.
 		// All values must be strings; non-string values may cause Claude
@@ -572,6 +594,83 @@ func buildClaudeChannelFrame(in *c3types.Inbound) map[string]any {
 		"content": text, // STRING — matches official plugin shape
 		"meta":    meta,
 	}
+}
+
+// buildEventFrame renders a synthesized channel event (poll_result / reaction /
+// callback) into the channel-frame content string + a string-only meta map (the
+// caller adds the common chat_id/ts/message_id keys). Keeps payloads simple
+// strings — no structured Telegram types reach Claude Code (it would drop the
+// notification). Returns a safe fallback for an unknown/empty event shape.
+func buildEventFrame(in *c3types.Inbound) (string, map[string]any) {
+	meta := map[string]any{"kind": string(in.Kind)}
+	ev := in.Event
+	switch {
+	case ev != nil && ev.PollResult != nil:
+		pr := ev.PollResult
+		var b strings.Builder
+		fmt.Fprintf(&b, "Poll results: %q — %d vote", pr.Question, pr.TotalVoters)
+		if pr.TotalVoters != 1 {
+			b.WriteString("s")
+		}
+		parts := make([]string, 0, len(pr.Options))
+		for _, o := range pr.Options {
+			parts = append(parts, fmt.Sprintf("%s:%d", o.Text, o.VoterCount))
+		}
+		if len(parts) > 0 {
+			b.WriteString(" — ")
+			b.WriteString(strings.Join(parts, " "))
+		}
+		if pr.IsClosed {
+			b.WriteString(" (closed)")
+		}
+		meta["poll_id"] = pr.PollID
+		meta["total_voters"] = strconv.Itoa(pr.TotalVoters)
+		meta["is_closed"] = strconv.FormatBool(pr.IsClosed)
+		return b.String(), meta
+
+	case ev != nil && ev.Reaction != nil:
+		r := ev.Reaction
+		actor := senderLabel(r.Actor)
+		var b strings.Builder
+		fmt.Fprintf(&b, "%s reacted on message %d", actor, r.MessageID)
+		if len(r.Added) > 0 {
+			fmt.Fprintf(&b, " — added %s", strings.Join(r.Added, " "))
+		}
+		if len(r.Removed) > 0 {
+			fmt.Fprintf(&b, " — removed %s", strings.Join(r.Removed, " "))
+		}
+		meta["message_id"] = strconv.FormatInt(r.MessageID, 10)
+		if len(r.Added) > 0 {
+			meta["added"] = strings.Join(r.Added, " ")
+		}
+		if len(r.Removed) > 0 {
+			meta["removed"] = strings.Join(r.Removed, " ")
+		}
+		return b.String(), meta
+
+	case ev != nil && ev.Callback != nil:
+		cb := ev.Callback
+		actor := senderLabel(cb.Actor)
+		content := fmt.Sprintf("%s pressed a button (data=%q) on message %d", actor, cb.Data, cb.MessageID)
+		meta["callback_id"] = cb.CallbackID
+		meta["message_id"] = strconv.FormatInt(cb.MessageID, 10)
+		meta["data"] = cb.Data
+		return content, meta
+
+	default:
+		return fmt.Sprintf("(%s event)", in.Kind), meta
+	}
+}
+
+// senderLabel renders a Sender into a short display label for event content.
+func senderLabel(s c3types.Sender) string {
+	if s.Username != "" {
+		return "@" + s.Username
+	}
+	if s.UserID != 0 {
+		return "user " + strconv.FormatInt(s.UserID, 10)
+	}
+	return "someone"
 }
 
 // dispatchToolResult routes the result to the waiting caller.
@@ -824,6 +923,14 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 				InputSchema: mcptools.PollToolSchema(),
 			},
 			handler: a.toolForward("poll"),
+		},
+		{
+			tool: &mcp.Tool{
+				Name:        "stop_poll",
+				Description: "Force-close a poll you sent and read its final aggregate tally (counts per option + total voters). Pass the `message_id` returned when you sent the poll. Aggregate results also arrive automatically as a <channel> event when a poll closes; stop_poll is the deterministic early read.",
+				InputSchema: mcptools.StopPollToolSchema(),
+			},
+			handler: a.toolForward("stop_poll"),
 		},
 		{
 			tool: &mcp.Tool{

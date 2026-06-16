@@ -27,6 +27,12 @@ type Channel interface {
 	React(args c3types.ReactArgs) error
 	DownloadAttachment(fileID string) (path string, err error)
 
+	// StopPoll force-closes a bot-sent poll and returns its final aggregate
+	// tally. The deterministic read path for poll results (the passive `poll`
+	// update arrives only on close). Telegram-specific in v1 (like CreateTopic);
+	// future channels may stub it with an unsupported error.
+	StopPoll(chatID, messageID int64) (*c3types.PollResult, error)
+
 	// Topic management (Telegram-specific in v1; future channels may stub).
 	CreateTopic(chatID int64, name string) (topicID int64, err error)
 	ValidateTopic(chatID int64, threadID int64) error

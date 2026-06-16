@@ -72,11 +72,19 @@ func GuidanceFor(c c3types.Capabilities) string {
 		b.WriteString("  correct_option (0-based) and an optional explanation (shown on a wrong answer) for a quiz;\n")
 		b.WriteString("  anonymous (default true) and multiple (ignored for a quiz) tune behavior; add a timer with\n")
 		b.WriteString("  open_period (seconds) OR close_date (Unix ts).\n")
+		// Poll-result reading (P4) — gated on the manifest delivery bool so the
+		// guidance stays honest (anti-drift golden test).
+		if c.Inbound.DeliversPollResults {
+			b.WriteString("  Poll results: delivered automatically as a `<channel>` event when the poll CLOSES —\n")
+			b.WriteString("  AGGREGATE tallies only (counts per option + total voters), never per-voter identity.\n")
+			b.WriteString("  Use the `stop_poll` tool (with the poll's message_id) to force-close and read the\n")
+			b.WriteString("  final tally early.\n")
+		}
 	} else {
 		b.WriteString("- Polls: NOT supported — render the choices as numbered text in a normal reply.\n")
 	}
 
-	// Reactions.
+	// Reactions (outbound `react` tool).
 	if c.Reactions {
 		if c.ReactionsSingle {
 			b.WriteString("- Reactions: supported via the `react` tool (ONE emoji per message).\n")
@@ -85,6 +93,17 @@ func GuidanceFor(c c3types.Capabilities) string {
 		}
 	} else {
 		b.WriteString("- Reactions: NOT supported.\n")
+	}
+
+	// Inbound events (P4): reactions on / button presses on the bot's messages
+	// arrive as `<channel>` events. Gated on the manifest delivery bools.
+	if c.Inbound.DeliversReactions {
+		b.WriteString("- Inbound reactions: when someone reacts to a message, you receive a `<channel>` event\n")
+		b.WriteString("  with the added/removed emoji.\n")
+	}
+	if c.Inbound.DeliversCallbacks {
+		b.WriteString("- Button presses: inline-keyboard callbacks arrive as `<channel>` events (auto-acknowledged\n")
+		b.WriteString("  for you).\n")
 	}
 
 	// Edits.

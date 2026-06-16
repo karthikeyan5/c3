@@ -108,3 +108,22 @@ func PollToolSchema() map[string]any {
 		"required": []string{"question", "options"},
 	}
 }
+
+// StopPollToolSchema is the JSON-schema for the `stop_poll` tool (P4). It
+// force-closes a bot-sent poll and returns its final aggregate tally — the
+// deterministic read path, since the passive poll-result event only arrives when
+// a poll closes. message_id is the id returned by the `poll` tool when the poll
+// was sent. Channel-neutral: the broker gate hard-rejects on a channel without
+// poll support and the channel owns the stopPoll wire call.
+func StopPollToolSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"message_id": map[string]any{
+				"type":        "integer",
+				"description": "id of the poll message to close (the id returned when you sent the poll).",
+			},
+		},
+		"required": []string{"message_id"},
+	}
+}

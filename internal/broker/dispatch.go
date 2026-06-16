@@ -28,6 +28,8 @@ func dispatchTool(ch channel.Channel, key RouteKey, tool string, args map[string
 		return dispatchSendTyping(ch, key, args)
 	case "poll":
 		return dispatchPoll(ch, key, args)
+	case "stop_poll":
+		return dispatchStopPoll(ch, key, args)
 	case "download_attachment":
 		return dispatchDownloadAttachment(ch, args)
 	default:
@@ -162,6 +164,45 @@ func dispatchPoll(ch channel.Channel, key RouteKey, args map[string]any) (map[st
 	}
 	logAlterations(key, out.ChatID, alts)
 	return sendParts(ch, key, parts, notes)
+}
+
+// dispatchStopPoll force-closes a bot-sent poll and returns its final aggregate
+// tally as MCP text. This is the deterministic read path (the passive `poll`
+// update only arrives on close). message_id identifies the original poll message
+// — the agent gets it back from the `poll` tool's send result. The tool is gated
+// at registration on caps.Polls; here we surface the channel error verbatim if
+// the channel can't stop the poll (e.g. not the bot's poll, wrong message id).
+func dispatchStopPoll(ch channel.Channel, key RouteKey, args map[string]any) (map[string]any, error) {
+	messageID := argInt64(args, "message_id", 0)
+	if messageID == 0 {
+		return nil, fmt.Errorf("stop_poll: message_id required")
+	}
+	chatID := argInt64(args, "chat_id", key.ChatID)
+	res, err := ch.StopPoll(chatID, messageID)
+	if err != nil {
+		return nil, err
+	}
+	return mcpText(formatPollResult(res)), nil
+}
+
+// formatPollResult renders a PollResult tally into a compact human-readable line
+// for the stop_poll MCP return. Aggregate only (no per-voter identity).
+func formatPollResult(r *c3types.PollResult) string {
+	if r == nil {
+		return "poll stopped (no tally returned)"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Poll results: %q — %d vote", r.Question, r.TotalVoters)
+	if r.TotalVoters != 1 {
+		b.WriteString("s")
+	}
+	if r.IsClosed {
+		b.WriteString(" (closed)")
+	}
+	for _, o := range r.Options {
+		fmt.Fprintf(&b, "\n  %s: %d", o.Text, o.VoterCount)
+	}
+	return b.String()
 }
 
 // mediaFromArgs parses the reply tool's `media` array arg into channel-neutral

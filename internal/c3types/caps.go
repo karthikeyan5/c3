@@ -74,6 +74,18 @@ type InboundCaps struct {
 	// SupportsReplyContext reports whether inbound messages can carry a
 	// quote-reply context.
 	SupportsReplyContext bool
+
+	// DeliversPollResults reports whether the channel surfaces aggregate poll
+	// tallies (counts per option, total voters, is_closed) to the agent as
+	// inbound events. Q-RESULT-1: aggregate-only, final-on-close + stop_poll.
+	DeliversPollResults bool
+	// DeliversReactions reports whether the channel surfaces inbound reaction
+	// changes (added/removed emoji) to the agent as inbound events.
+	DeliversReactions bool
+	// DeliversCallbacks reports whether the channel surfaces inline-keyboard
+	// button presses (callbacks) to the agent as inbound events. The channel
+	// auto-acks the callback before surfacing it (Q-RESULT-2).
+	DeliversCallbacks bool
 }
 
 // StreamCaps describes a channel's ability to stream in-flight reasoning.

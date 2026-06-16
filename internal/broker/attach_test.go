@@ -38,9 +38,9 @@ type validateCall struct {
 	tid    int64
 }
 
-func (f *fakeChannel) Name() string                                 { return "telegram" }
+func (f *fakeChannel) Name() string                                  { return "telegram" }
 func (f *fakeChannel) Start(_ context.Context, _ channel.Host) error { return nil }
-func (f *fakeChannel) Stop() error                                  { return nil }
+func (f *fakeChannel) Stop() error                                   { return nil }
 func (f *fakeChannel) Capabilities() c3types.Capabilities {
 	return c3types.Capabilities{Channel: "telegram"}
 }
@@ -57,11 +57,11 @@ func (f *fakeChannel) sendRepliesSnapshot() []c3types.ReplyArgs {
 	copy(out, f.replyCalls)
 	return out
 }
-func (f *fakeChannel) SendTyping(int64, *int64) error               { return nil }
+func (f *fakeChannel) SendTyping(int64, *int64) error { return nil }
 func (f *fakeChannel) EditMessage(c3types.EditArgs) (*c3types.EditResult, error) {
 	return &c3types.EditResult{}, nil
 }
-func (f *fakeChannel) React(c3types.ReactArgs) error            { return nil }
+func (f *fakeChannel) React(c3types.ReactArgs) error             { return nil }
 func (f *fakeChannel) DownloadAttachment(string) (string, error) { return "", nil }
 
 func (f *fakeChannel) CreateTopic(chatID int64, name string) (int64, error) {
@@ -79,6 +79,10 @@ func (f *fakeChannel) ValidateTopic(chatID int64, tid int64) error {
 	defer f.mu.Unlock()
 	f.validateCalls = append(f.validateCalls, validateCall{chatID, tid})
 	return f.validateErr
+}
+
+func (f *fakeChannel) StopPoll(int64, int64) (*c3types.PollResult, error) {
+	return &c3types.PollResult{}, nil
 }
 
 // brokerWithChannel builds a Broker pre-wired with a fakeChannel and the

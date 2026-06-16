@@ -257,6 +257,21 @@ func (b *Broker) Gate(in *c3types.Inbound) GateDecision {
 		}
 	}
 
+	// CB-2: an aggregate poll_result event is bot-initiated on an already-trusted
+	// route — the bot only ever sends a poll onto a route it was attached to. Such
+	// an aggregate update carries NO voter (Telegram's `poll` update has no user),
+	// so the channel stamps the stored route-owner UserID before emit (see
+	// internal/channel/telegram/poll.go dispatchPollUpdate + the sentPolls map).
+	// The fast-path above normally clears it via IsUserAllowed(owner). This branch
+	// is the explicit safety net: if the owner could not be determined (stamp==0),
+	// a poll_result on a DM route the bot itself initiated must NOT be silently
+	// gate-dropped — that is the exact regression that made the headline feature
+	// dead in DMs. The allowlist stays authoritative for everything carrying a
+	// real user (per-voter would-be answers, reactions, callbacks gate normally).
+	if in.Kind == c3types.InboundPollResult {
+		return GateAllow
+	}
+
 	// Allowlist miss. Check pairing.
 	body := codeBody(in.Text)
 	if body == "" {

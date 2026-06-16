@@ -400,8 +400,45 @@ func formatLogLine(in *c3types.Inbound) string {
 	if sender == "" {
 		sender = strconv.FormatInt(in.Sender.UserID, 10)
 	}
+	// P4: a synthesized channel event (poll_result / reaction / callback) renders
+	// from its neutral Event payload rather than message text. String-only — no
+	// structured Telegram types reach the Codex turn.
+	if in.IsEvent() {
+		return fmt.Sprintf("Telegram %s event (chat=%d thread=%s)\n%s",
+			in.Kind, in.ChatID, thread, formatEventBody(in))
+	}
 	return fmt.Sprintf("Telegram message from %s (chat=%d thread=%s)\n%s",
 		sender, in.ChatID, thread, in.Text)
+}
+
+// formatEventBody renders a channel event's neutral payload into a one-line
+// string body for the Codex log/turn forwarder. Mirrors the Claude adapter's
+// buildEventFrame content (kept simple strings).
+func formatEventBody(in *c3types.Inbound) string {
+	ev := in.Event
+	switch {
+	case ev != nil && ev.PollResult != nil:
+		pr := ev.PollResult
+		parts := make([]string, 0, len(pr.Options))
+		for _, o := range pr.Options {
+			parts = append(parts, fmt.Sprintf("%s:%d", o.Text, o.VoterCount))
+		}
+		closed := ""
+		if pr.IsClosed {
+			closed = " (closed)"
+		}
+		return fmt.Sprintf("Poll results: %q — %d votes — %s%s",
+			pr.Question, pr.TotalVoters, strings.Join(parts, " "), closed)
+	case ev != nil && ev.Reaction != nil:
+		r := ev.Reaction
+		return fmt.Sprintf("reaction on message %d — added %s removed %s",
+			r.MessageID, strings.Join(r.Added, " "), strings.Join(r.Removed, " "))
+	case ev != nil && ev.Callback != nil:
+		cb := ev.Callback
+		return fmt.Sprintf("button pressed (data=%q) on message %d", cb.Data, cb.MessageID)
+	default:
+		return fmt.Sprintf("(%s event)", in.Kind)
+	}
 }
 
 func codexForwardingAllowed() bool {
@@ -647,6 +684,14 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 				InputSchema: mcptools.PollToolSchema(),
 			},
 			handler: a.toolForward("poll"),
+		},
+		{
+			tool: &mcp.Tool{
+				Name:        "stop_poll",
+				Description: "Force-close a poll you sent and read its final aggregate tally (counts per option + total voters). Pass the `message_id` returned when you sent the poll. Aggregate results also arrive automatically as a <channel> event when a poll closes; stop_poll is the deterministic early read.",
+				InputSchema: mcptools.StopPollToolSchema(),
+			},
+			handler: a.toolForward("stop_poll"),
 		},
 		{
 			tool: &mcp.Tool{

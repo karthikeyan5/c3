@@ -18,9 +18,16 @@ import (
 // which records the parts it is asked to send. Used to assert dispatchPoll
 // routes a poll through the gate and onto a SendReply part.
 type pollChannel struct {
-	mu    sync.Mutex
-	polls bool
-	sent  []c3types.ReplyArgs
+	mu             sync.Mutex
+	polls          bool
+	sent           []c3types.ReplyArgs
+	stopPollCalls  []stopPollCall
+	stopPollResult *c3types.PollResult
+}
+
+type stopPollCall struct {
+	chatID    int64
+	messageID int64
 }
 
 func (p *pollChannel) Name() string                              { return "telegram" }
@@ -43,6 +50,23 @@ func (p *pollChannel) React(c3types.ReactArgs) error             { return nil }
 func (p *pollChannel) DownloadAttachment(string) (string, error) { return "", nil }
 func (p *pollChannel) CreateTopic(int64, string) (int64, error)  { return 0, nil }
 func (p *pollChannel) ValidateTopic(int64, int64) error          { return nil }
+func (p *pollChannel) StopPoll(chatID, messageID int64) (*c3types.PollResult, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.stopPollCalls = append(p.stopPollCalls, stopPollCall{chatID, messageID})
+	if p.stopPollResult != nil {
+		return p.stopPollResult, nil
+	}
+	return &c3types.PollResult{}, nil
+}
+
+func (p *pollChannel) stopPollSnapshot() []stopPollCall {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]stopPollCall, len(p.stopPollCalls))
+	copy(out, p.stopPollCalls)
+	return out
+}
 
 func (p *pollChannel) sentSnapshot() []c3types.ReplyArgs {
 	p.mu.Lock()
@@ -183,6 +207,55 @@ func TestDispatchPoll_RequiresTwoOptions(t *testing.T) {
 	}
 }
 
+// TestDispatchStopPoll_CallsChannelAndFormatsTally asserts stop_poll routes to
+// the channel's StopPoll (with the route chat + the message_id arg) and formats
+// the returned aggregate tally as MCP text.
+func TestDispatchStopPoll_CallsChannelAndFormatsTally(t *testing.T) {
+	ch := &pollChannel{polls: true, stopPollResult: &c3types.PollResult{
+		Question: "Lunch?", TotalVoters: 3, IsClosed: true,
+		Options: []c3types.PollOptionTally{{Text: "Pizza", VoterCount: 2}, {Text: "Tacos", VoterCount: 1}},
+	}}
+	key := RouteKey{Channel: "telegram", ChatID: -100}
+	res, err := dispatchTool(ch, key, "stop_poll", map[string]any{"message_id": float64(42)})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	calls := ch.stopPollSnapshot()
+	if len(calls) != 1 || calls[0].chatID != -100 || calls[0].messageID != 42 {
+		t.Fatalf("StopPoll not called with the route chat + message_id; got %+v", calls)
+	}
+	text := mcpResultText(t, res)
+	for _, want := range []string{"Poll results:", "Lunch?", "3 votes", "(closed)", "Pizza: 2", "Tacos: 1"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("stop_poll result missing %q; got:\n%s", want, text)
+		}
+	}
+}
+
+// TestDispatchStopPoll_RequiresMessageID asserts a missing message_id is a hard
+// error and the channel is never called.
+func TestDispatchStopPoll_RequiresMessageID(t *testing.T) {
+	ch := &pollChannel{polls: true}
+	key := RouteKey{Channel: "telegram", ChatID: -100}
+	if _, err := dispatchTool(ch, key, "stop_poll", map[string]any{}); err == nil {
+		t.Fatal("expected an error when message_id is missing")
+	}
+	if got := ch.stopPollSnapshot(); len(got) != 0 {
+		t.Errorf("StopPoll must not be called without a message_id; got %d calls", len(got))
+	}
+}
+
+// mcpResultText extracts the first content[].text from an MCP-shape result map.
+func mcpResultText(t *testing.T, res map[string]any) string {
+	t.Helper()
+	content, ok := res["content"].([]map[string]any)
+	if !ok || len(content) == 0 {
+		t.Fatalf("result has no content[]: %+v", res)
+	}
+	s, _ := content[0]["text"].(string)
+	return s
+}
+
 // TestDispatchReply_MediaArgSplitsIntoParts asserts the `media` array arg is
 // parsed and the gate splits it into one SendReply part per item, after the
 // text part.
@@ -298,6 +371,9 @@ func (c *typingRecorderChannel) EditMessage(c3types.EditArgs) (*c3types.EditResu
 func (c *typingRecorderChannel) React(c3types.ReactArgs) error             { return nil }
 func (c *typingRecorderChannel) DownloadAttachment(string) (string, error) { return "", nil }
 func (c *typingRecorderChannel) CreateTopic(int64, string) (int64, error)  { return 0, nil }
+func (c *typingRecorderChannel) StopPoll(int64, int64) (*c3types.PollResult, error) {
+	return &c3types.PollResult{}, nil
+}
 
 // ValidateTopic piggybacks SendTyping — the same path Telegram uses to confirm
 // a thread exists (channel/telegram/outbound.go:ValidateTopic).
@@ -392,6 +468,9 @@ func (m *mediaReplyChannel) React(c3types.ReactArgs) error             { return 
 func (m *mediaReplyChannel) DownloadAttachment(string) (string, error) { return "", nil }
 func (m *mediaReplyChannel) CreateTopic(int64, string) (int64, error)  { return 0, nil }
 func (m *mediaReplyChannel) ValidateTopic(int64, int64) error          { return nil }
+func (m *mediaReplyChannel) StopPoll(int64, int64) (*c3types.PollResult, error) {
+	return &c3types.PollResult{}, nil
+}
 
 func (m *mediaReplyChannel) sentSnapshot() []c3types.ReplyArgs {
 	m.mu.Lock()

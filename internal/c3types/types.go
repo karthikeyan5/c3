@@ -24,6 +24,92 @@ type Inbound struct {
 	Attachments []Attachment
 	ReplyTo     *ReplyContext
 	Timestamp   time.Time
+
+	// Kind classifies this inbound. The zero value ("") is an ordinary text/
+	// media message — every pre-existing caller and the whole delivery path are
+	// unchanged when Kind is unset (back-compat). A non-empty Kind marks a
+	// synthesized channel EVENT (poll result, reaction, callback) whose payload
+	// rides in Event. The route worker treats a Kind != "" inbound specially:
+	// it flushes ALONE (never merged into a text debounce batch) and BYPASSES
+	// voice/STT handling (CB-1). See internal/broker/worker.go.
+	Kind InboundKind `json:",omitempty"`
+	// Event carries the channel-neutral payload for a non-message Kind. Nil for
+	// an ordinary message.
+	Event *InboundEvent `json:",omitempty"`
+}
+
+// IsEvent reports whether this inbound is a synthesized channel event (poll
+// result / reaction / callback) rather than an ordinary text/media message.
+// The route worker uses this to keep events out of the text-debounce/STT path.
+func (in *Inbound) IsEvent() bool {
+	return in != nil && in.Kind != InboundMessage
+}
+
+// InboundKind classifies an Inbound. The zero value is an ordinary message; the
+// other kinds mark synthesized channel events surfaced to the agent. All values
+// are channel-neutral — no Telegram identifier leaks into this type.
+type InboundKind string
+
+const (
+	// InboundMessage is the zero value: an ordinary text/media message. Existing
+	// callers that never set Kind produce exactly this, so delivery is unchanged.
+	InboundMessage InboundKind = ""
+	// InboundPollResult is an aggregate poll tally (counts per option, total
+	// voters, is_closed). Surfaced on poll close / stop_poll, never per-voter.
+	InboundPollResult InboundKind = "poll_result"
+	// InboundReaction is a change of reactions on a message (added/removed set).
+	InboundReaction InboundKind = "reaction"
+	// InboundCallback is an inline-keyboard button press (already auto-acked by
+	// the channel before this is surfaced).
+	InboundCallback InboundKind = "callback"
+)
+
+// InboundEvent is the channel-neutral payload for a non-message Inbound. Exactly
+// one field is set, matching the owning Inbound.Kind. No Telegram/gotgbot types
+// appear here — the channel converts its wire shapes into these neutral structs.
+type InboundEvent struct {
+	PollResult *PollResult    `json:",omitempty"`
+	Reaction   *ReactionEvent `json:",omitempty"`
+	Callback   *CallbackEvent `json:",omitempty"`
+}
+
+// PollResult is an aggregate poll tally. Q-RESULT-1 = AGGREGATE + FINAL-ON-CLOSE:
+// it surfaces counts per option + total voters + is_closed, NEVER per-individual-
+// voter identity.
+type PollResult struct {
+	PollID      string
+	Question    string
+	TotalVoters int
+	IsClosed    bool
+	Options     []PollOptionTally
+}
+
+// PollOptionTally is one option's vote count in a PollResult.
+type PollOptionTally struct {
+	Text       string
+	VoterCount int
+}
+
+// ReactionEvent is a change of reactions on a single message. Added/Removed are
+// the set-difference of the new vs old reaction lists, rendered as display
+// strings (standard emoji verbatim; custom/paid reactions as the sentinels
+// "[custom]"/"[paid]" so the agent sees that SOMETHING reacted, never silently
+// dropped).
+type ReactionEvent struct {
+	MessageID int64
+	Actor     Sender
+	Added     []string
+	Removed   []string
+}
+
+// CallbackEvent is an inline-keyboard button press. CallbackID is the id the
+// channel needs to answerCallbackQuery (it auto-acks before surfacing this).
+// Data is the opaque callback payload string attached to the button.
+type CallbackEvent struct {
+	CallbackID string
+	MessageID  int64
+	Actor      Sender
+	Data       string
 }
 
 // Sender identifies the originator of an Inbound or ReplyContext. UserID

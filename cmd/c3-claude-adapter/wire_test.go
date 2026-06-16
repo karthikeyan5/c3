@@ -345,6 +345,50 @@ func TestChannelFrameWireBytes(t *testing.T) {
 	}
 }
 
+// TestChannelFrame_PollResultEvent asserts a poll_result event renders into a
+// human-readable content string and string-only meta (the load-bearing contract:
+// Claude Code silently drops a frame with non-string meta). P4.
+func TestChannelFrame_PollResultEvent(t *testing.T) {
+	in := &c3types.Inbound{
+		Channel:   "telegram",
+		ChatID:    -100,
+		MessageID: 42,
+		Timestamp: time.Date(2026, 6, 16, 9, 0, 0, 0, time.UTC),
+		Kind:      c3types.InboundPollResult,
+		Event: &c3types.InboundEvent{PollResult: &c3types.PollResult{
+			PollID: "p1", Question: "Lunch?", TotalVoters: 3, IsClosed: true,
+			Options: []c3types.PollOptionTally{{Text: "Pizza", VoterCount: 2}, {Text: "Tacos", VoterCount: 1}},
+		}},
+	}
+	frame := buildClaudeChannelFrame(in)
+
+	content, ok := frame["content"].(string)
+	if !ok {
+		t.Fatalf("content must be a string; got %T", frame["content"])
+	}
+	for _, want := range []string{"Poll results:", "Lunch?", "3 votes", "Pizza:2", "Tacos:1", "(closed)"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("content missing %q; got %q", want, content)
+		}
+	}
+	meta, ok := frame["meta"].(map[string]any)
+	if !ok {
+		t.Fatalf("meta must be a map; got %T", frame["meta"])
+	}
+	// Every meta value MUST be a string (frame contract).
+	for k, v := range meta {
+		if _, ok := v.(string); !ok {
+			t.Errorf("meta.%s must be a string; got %T (%v)", k, v, v)
+		}
+	}
+	if meta["kind"] != "poll_result" {
+		t.Errorf("meta.kind: want poll_result; got %v", meta["kind"])
+	}
+	if meta["poll_id"] != "p1" || meta["total_voters"] != "3" || meta["is_closed"] != "true" {
+		t.Errorf("poll meta wrong: %+v", meta)
+	}
+}
+
 // ─── 3-state attach formatter tests moved 2026-05-19 ───────────────────────
 //
 // formatAttached was extracted to internal/ipc/format.go as part of the

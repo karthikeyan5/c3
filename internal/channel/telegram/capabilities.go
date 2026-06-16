@@ -71,6 +71,13 @@ func (c *Channel) Capabilities() c3types.Capabilities {
 				c3types.MediaAnimation,
 			},
 			SupportsReplyContext: true,
+			// P4: Telegram delivers aggregate poll tallies (poll update + stopPoll),
+			// inbound reaction changes (message_reaction), and inline-keyboard
+			// callbacks (auto-acked, then surfaced). Per-voter answers are NOT
+			// surfaced (Q-RESULT-1 aggregate-only).
+			DeliversPollResults: true,
+			DeliversReactions:   true,
+			DeliversCallbacks:   true,
 		},
 		Stream: c3types.StreamCaps{
 			StreamViaEdit:   false, // deferred in v1.

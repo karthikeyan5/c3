@@ -31,7 +31,12 @@ func telegramLikeCaps() c3types.Capabilities {
 		Threads:          true,
 		Typing:           true,
 		ExpandableQuotes: true,
-		Stream:           c3types.StreamCaps{StreamViaEdit: false},
+		Inbound: c3types.InboundCaps{
+			DeliversPollResults: true,
+			DeliversReactions:   true,
+			DeliversCallbacks:   true,
+		},
+		Stream: c3types.StreamCaps{StreamViaEdit: false},
 	}
 }
 
@@ -76,6 +81,14 @@ func TestGuidanceFor_PositiveLines(t *testing.T) {
 		"explanation",
 		"open_period",
 		"close_date",
+		// Poll-result reading (P4) — gated on Inbound.DeliversPollResults.
+		"delivered automatically as a `<channel>` event when the poll CLOSES",
+		"AGGREGATE tallies only",
+		"`stop_poll` tool",
+		// Inbound reaction + callback events (P4) — gated on the delivery bools.
+		"Inbound reactions:",
+		"Button presses:",
+		"auto-acknowledged",
 	})
 	// On a fully-supported channel, the feature negatives do not appear.
 	// (Streaming is OFF even on the full Telegram manifest in v1, so its
@@ -92,14 +105,20 @@ func TestGuidanceFor_NegativeLines(t *testing.T) {
 	caps.Polls = false
 	caps.Stream.StreamViaEdit = false // explicitly the v1 default
 	caps.ExpandableQuotes = false     // a channel without the Show-more affordance
+	caps.Inbound.DeliversPollResults = false
+	caps.Inbound.DeliversReactions = false
+	caps.Inbound.DeliversCallbacks = false
 	g := GuidanceFor(caps)
 	assertContainsAll(t, g, []string{
 		"Polls: NOT supported",
 		"Streaming of reasoning: NOT available",
 	})
-	// The expandable-quote guidance is gated on the manifest bool — a channel
-	// without ExpandableQuotes must NOT advertise the "Show more" trick.
+	// Inbound-event + expandable-quote guidance are gated on manifest bools — a
+	// channel without those capabilities must NOT advertise them.
 	assertContainsNone(t, g, []string{
 		"collapse behind a 'Show more' chevron",
+		"delivered automatically as a `<channel>` event when the poll CLOSES",
+		"Inbound reactions:",
+		"Button presses:",
 	})
 }

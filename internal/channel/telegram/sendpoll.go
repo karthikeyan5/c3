@@ -83,5 +83,24 @@ func (c *Channel) sendPoll(args c3types.ReplyArgs) (int64, error) {
 		return 0, fmt.Errorf("telegram: SendPoll: %w", err)
 	}
 	c.recordOutboundSuccess()
+
+	// P4: retain the poll's routing + ownership so a later aggregate `poll`
+	// update (which carries only the poll id + tallies — no chat, no user) can be
+	// routed back onto this route and pass the inbound gate (CB-2). For a DM
+	// (ChatID > 0) the chat id IS the owner's user id, which is the id the user
+	// paired into the allowlist; for a group the gate clears on chat_id so the
+	// owner is informational. msg.Poll is the just-created Poll carrying its Id.
+	if msg.Poll != nil && msg.Poll.Id != "" {
+		var owner int64
+		if args.ChatID > 0 {
+			owner = args.ChatID
+		}
+		c.sentPolls.Put(msg.Poll.Id, &sentPoll{
+			ChatID:      args.ChatID,
+			TopicID:     args.TopicID,
+			MessageID:   msg.MessageId,
+			OwnerUserID: owner,
+		})
+	}
 	return msg.MessageId, nil
 }

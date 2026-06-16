@@ -55,6 +55,7 @@ type Channel struct {
 	offsets    *offsetStore
 	dedup      *updateDedup
 	rate       *rateLimiter
+	sentPolls  *sentPollMap // pollID → route+owner for poll-result routing (P4)
 	httpClient *http.Client // shared transport for non-gotgbot calls (file downloads)
 
 	// lastPollReturn is the unix-nanos of the most recent moment the
@@ -151,6 +152,7 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 	c.authBrk = newAuthBreaker(auth401Threshold)
 	c.dedup = newUpdateDedup(2000, 5*time.Minute)
 	c.rate = newRateLimiter()
+	c.sentPolls = newSentPollMap(2000)
 	if store, sErr := newOffsetStore(Name); sErr == nil {
 		c.offsets = store
 	} else {
@@ -226,8 +228,8 @@ func (c *Channel) stallWatchdog() {
 // auth breaker (also tied to non-2xx errors) provides the actual
 // retry-storm protection; this is the diagnostic.
 const (
-	heartbeatInterval       = 5 * time.Minute
-	heartbeatFailThreshold  = 3
+	heartbeatInterval      = 5 * time.Minute
+	heartbeatFailThreshold = 3
 )
 
 func (c *Channel) heartbeat() {
