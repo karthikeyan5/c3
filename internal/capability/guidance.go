@@ -90,6 +90,18 @@ func GuidanceFor(c c3types.Capabilities) string {
 		b.WriteString("- Polls: NOT supported — render the choices as numbered text in a normal reply.\n")
 	}
 
+	// Inline keyboards (outbound buttons via the `reply` tool's `buttons` arg).
+	// Gated on the manifest bool so the guidance stays honest (anti-drift golden
+	// test). A `data` button's tap comes back as a callback event (see the
+	// inbound-callback line below) the agent can act on; a `url` button just opens
+	// a link.
+	if c.InlineKeyboards {
+		b.WriteString("- Buttons: attach an inline keyboard with the `buttons` arg (rows of buttons). A button is\n")
+		b.WriteString("  either {text, data} (a callback button — its tap comes back to you as a `<channel>` event\n")
+		b.WriteString("  carrying the data, so you can act on it) or {text, url} (just opens a link). Keep callback\n")
+		b.WriteString("  data short (<=64 bytes).\n")
+	}
+
 	// Reactions (outbound `react` tool).
 	if c.Reactions {
 		if c.ReactionsSingle {

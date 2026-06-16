@@ -553,6 +553,93 @@ func TestGate_Poll_LongOpenPeriodAllowed(t *testing.T) {
 	}
 }
 
+// TestGate_Buttons_KeptOnSupportedChannel asserts that when the channel
+// advertises InlineKeyboards, the gate carries the neutral keyboard through onto
+// the FIRST emitted part unchanged, with no note/alteration.
+func TestGate_Buttons_KeptOnSupportedChannel(t *testing.T) {
+	caps := richCaps()
+	caps.InlineKeyboards = true
+	btns := [][]c3types.Button{
+		{{Text: "Approve", Data: "approve:1"}, {Text: "Deny", Data: "deny:1"}},
+		{{Text: "Docs", URL: "https://example.com"}},
+	}
+	parts, notes, alts, err := Gate(caps, c3types.Outbound{
+		Channel: "telegram", ChatID: 1, Text: "decide:", Markup: c3types.MarkupMarkdown,
+		Buttons: btns,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(parts) != 1 {
+		t.Fatalf("expected 1 part; got %d", len(parts))
+	}
+	if len(parts[0].Buttons) != 2 || len(parts[0].Buttons[0]) != 2 || len(parts[0].Buttons[1]) != 1 {
+		t.Fatalf("keyboard shape not carried onto the first part; got %+v", parts[0].Buttons)
+	}
+	if parts[0].Buttons[0][0].Text != "Approve" || parts[0].Buttons[0][0].Data != "approve:1" {
+		t.Errorf("callback button not preserved; got %+v", parts[0].Buttons[0][0])
+	}
+	if parts[0].Buttons[1][0].URL != "https://example.com" {
+		t.Errorf("url button not preserved; got %+v", parts[0].Buttons[1][0])
+	}
+	if len(notes) != 0 || len(alts) != 0 {
+		t.Errorf("supported channel should not note/alter buttons; notes=%v alts=%v", notes, altKinds(alts))
+	}
+}
+
+// TestGate_Buttons_DroppedOnUnsupportedChannel asserts the graceful degradation:
+// a channel without InlineKeyboards has the keyboard DROPPED (not a hard error),
+// with a note + a buttons_dropped Alteration, and the message still sends.
+func TestGate_Buttons_DroppedOnUnsupportedChannel(t *testing.T) {
+	caps := richCaps()
+	caps.InlineKeyboards = false
+	parts, notes, alts, err := Gate(caps, c3types.Outbound{
+		Channel: "telegram", ChatID: 1, Text: "decide:", Markup: c3types.MarkupMarkdown,
+		Buttons: [][]c3types.Button{{{Text: "Approve", Data: "approve:1"}}},
+	})
+	if err != nil {
+		t.Fatalf("buttons on an unsupported channel must DEGRADE, not error; got %v", err)
+	}
+	if len(parts) != 1 {
+		t.Fatalf("expected the text part to still send; got %d parts", len(parts))
+	}
+	if parts[0].Buttons != nil {
+		t.Errorf("buttons should be dropped on an unsupported channel; got %+v", parts[0].Buttons)
+	}
+	if !notesContain(notes, "buttons are not supported") {
+		t.Errorf("expected a buttons-dropped note; got %v", notes)
+	}
+	found := false
+	for _, a := range alts {
+		if a.Kind == "buttons_dropped" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a buttons_dropped Alteration; got %v", altKinds(alts))
+	}
+}
+
+// TestGate_NoButtons_BackCompat asserts a reply with no buttons is unchanged: the
+// emitted part carries a nil Buttons field (byte-identical to pre-P7) and no
+// note/alteration is generated.
+func TestGate_NoButtons_BackCompat(t *testing.T) {
+	caps := richCaps()
+	caps.InlineKeyboards = true
+	parts, notes, alts, err := Gate(caps, c3types.Outbound{
+		Channel: "telegram", ChatID: 1, Text: "hello", Markup: c3types.MarkupMarkdown,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(parts) != 1 || parts[0].Buttons != nil {
+		t.Fatalf("a reply without buttons must carry nil Buttons; got %+v", parts)
+	}
+	if len(notes) != 0 || len(alts) != 0 {
+		t.Errorf("no-buttons reply should not note/alter; notes=%v alts=%v", notes, altKinds(alts))
+	}
+}
+
 func TestGate_NoLimit_SinglePart(t *testing.T) {
 	caps := richCaps()
 	caps.MaxMessageRunes = 0 // no advertised limit

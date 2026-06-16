@@ -89,6 +89,24 @@ func Gate(c c3types.Capabilities, out c3types.Outbound) (parts []c3types.Outboun
 		alts = append(alts, pollAlts...)
 	}
 
+	// --- Inline-keyboard support-or-degrade (neutral) --------------------
+	// Buttons ride the FIRST emitted part (the message the agent is sending).
+	// This is the pure NEUTRAL decision only: keep the keyboard when the channel
+	// advertises inline-keyboard support, otherwise DROP it with a note +
+	// Alteration (a graceful degradation, NOT a hard error — a leaner channel
+	// just loses the buttons). Any channel-specific limit (callback_data byte
+	// ceiling, max rows/buttons) is a channel fact and is validated in-package
+	// (internal/channel/telegram), never with a literal here.
+	buttons := out.Buttons
+	if len(buttons) > 0 && !c.InlineKeyboards {
+		notes = append(notes, "buttons are not supported on this channel — the inline keyboard was dropped")
+		alts = append(alts, c3types.Alteration{
+			Kind:   "buttons_dropped",
+			Detail: "inline keyboard dropped (channel InlineKeyboards=false)",
+		})
+		buttons = nil
+	}
+
 	// --- Markup degradation ----------------------------------------------
 	markup := out.Markup
 	if !c.RichText && markup != c3types.MarkupNone {
@@ -212,6 +230,11 @@ func Gate(c c3types.Capabilities, out c3types.Outbound) (parts []c3types.Outboun
 	// parts is non-empty whenever there is any content.
 	if out.ReplyTo != nil && len(parts) > 0 {
 		parts[0].ReplyTo = out.ReplyTo
+	}
+	// The inline keyboard (if kept) rides the FIRST part overall too — it attaches
+	// to the message the agent is sending. Dropped on an unsupported channel above.
+	if len(buttons) > 0 && len(parts) > 0 {
+		parts[0].Buttons = buttons
 	}
 	return parts, notes, alts, nil
 }

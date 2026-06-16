@@ -77,6 +77,18 @@ func (c *Channel) SendReply(args c3types.ReplyArgs) (int64, error) {
 			AllowSendingWithoutReply: true,
 		}
 	}
+	// Inline keyboard (P7). The gate has already dropped buttons on a channel
+	// that does not advertise InlineKeyboards, so reaching here means the
+	// keyboard is intended; build the Telegram markup and enforce the Telegram-
+	// specific limits (callback_data 1-64 bytes, max rows/buttons-per-row). A
+	// limit breach is a clear error (no send), not a silent drop.
+	if len(args.Buttons) > 0 {
+		markup, err := buildInlineKeyboard(args.Buttons)
+		if err != nil {
+			return 0, err
+		}
+		opts.ReplyMarkup = markup
+	}
 	opts.RequestOpts = requestOptsFor("sendMessage", longPollTimeoutSeconds)
 	if err := c.rate.Wait(c.ctx, args.ChatID); err != nil {
 		return 0, fmt.Errorf("telegram: rate-wait: %w", err)
@@ -114,6 +126,51 @@ func isParseEntityError(err error) bool {
 		strings.Contains(s, "parse entities") ||
 		strings.Contains(s, "find end of the entity") ||
 		strings.Contains(s, "Bad Request: can't parse")
+}
+
+// buildInlineKeyboard converts the channel-neutral [][]c3types.Button (rows of
+// buttons) into a gotgbot.InlineKeyboardMarkup and enforces the Telegram-
+// specific limits that belong in this package (the no-leak rule): each button
+// needs a non-empty Text and EXACTLY ONE of Data (a callback button) or URL (a
+// link button); callback_data must be 1-64 BYTES; and the keyboard shape stays
+// within the conservative row / per-row caps. Any breach returns a clear,
+// actionable error so the agent learns precisely what was wrong instead of
+// getting an opaque Telegram 400. Returns a *InlineKeyboardMarkup (the gotgbot
+// ReplyMarkup) on success.
+func buildInlineKeyboard(rows [][]c3types.Button) (*gotgbot.InlineKeyboardMarkup, error) {
+	if len(rows) > maxKeyboardRows {
+		return nil, fmt.Errorf("telegram: too many keyboard rows (%d > %d)", len(rows), maxKeyboardRows)
+	}
+	kb := make([][]gotgbot.InlineKeyboardButton, 0, len(rows))
+	for ri, row := range rows {
+		if len(row) > maxButtonsPerRow {
+			return nil, fmt.Errorf("telegram: too many buttons in row %d (%d > %d)", ri+1, len(row), maxButtonsPerRow)
+		}
+		outRow := make([]gotgbot.InlineKeyboardButton, 0, len(row))
+		for bi, b := range row {
+			if b.Text == "" {
+				return nil, fmt.Errorf("telegram: button at row %d position %d has no text", ri+1, bi+1)
+			}
+			hasData := b.Data != ""
+			hasURL := b.URL != ""
+			if hasData == hasURL {
+				return nil, fmt.Errorf("telegram: button %q must set EXACTLY ONE of data (callback) or url (link)", b.Text)
+			}
+			btn := gotgbot.InlineKeyboardButton{Text: b.Text}
+			if hasData {
+				if n := len(b.Data); n > maxCallbackDataBytes {
+					return nil, fmt.Errorf("telegram: button %q callback data is %d bytes, over the %d-byte limit — keep it short",
+						b.Text, n, maxCallbackDataBytes)
+				}
+				btn.CallbackData = b.Data
+			} else {
+				btn.Url = b.URL
+			}
+			outRow = append(outRow, btn)
+		}
+		kb = append(kb, outRow)
+	}
+	return &gotgbot.InlineKeyboardMarkup{InlineKeyboard: kb}, nil
 }
 
 // SendTyping sends a typing chat action. Used both for the typing indicator

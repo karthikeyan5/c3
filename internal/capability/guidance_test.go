@@ -31,6 +31,7 @@ func telegramLikeCaps() c3types.Capabilities {
 		Threads:          true,
 		Typing:           true,
 		ExpandableQuotes: true,
+		InlineKeyboards:  true,
 		Inbound: c3types.InboundCaps{
 			DeliversPollResults: true,
 			DeliversReactions:   true,
@@ -96,6 +97,11 @@ func TestGuidanceFor_PositiveLines(t *testing.T) {
 		"Inbound reactions:",
 		"Button presses:",
 		"auto-acknowledged",
+		// Outbound inline keyboards (P7) — gated on InlineKeyboards.
+		"Buttons: attach an inline keyboard with the `buttons` arg",
+		"{text, data}",
+		"{text, url}",
+		"Keep callback\n  data short (<=64 bytes)",
 	})
 	// On a fully-supported channel, the feature negatives do not appear.
 	// (Streaming is OFF even on the full Telegram manifest in v1, so its
@@ -112,6 +118,7 @@ func TestGuidanceFor_NegativeLines(t *testing.T) {
 	caps.Polls = false
 	caps.Stream.StreamViaEdit = false // explicitly the v1 default
 	caps.ExpandableQuotes = false     // a channel without the Show-more affordance
+	caps.InlineKeyboards = false      // a channel without outbound inline keyboards
 	caps.Inbound.DeliversPollResults = false
 	caps.Inbound.DeliversReactions = false
 	caps.Inbound.DeliversCallbacks = false
@@ -127,5 +134,7 @@ func TestGuidanceFor_NegativeLines(t *testing.T) {
 		"delivered automatically as a `<channel>` event when the poll CLOSES",
 		"Inbound reactions:",
 		"Button presses:",
+		// Outbound inline-keyboard guidance is gated on InlineKeyboards.
+		"Buttons: attach an inline keyboard with the `buttons` arg",
 	})
 }

@@ -159,6 +159,33 @@ type Outbound struct {
 	Media   []MediaItem
 	Poll    *PollSpec
 	ReplyTo *int64
+
+	// Buttons is an optional inline keyboard attached to the message: rows of
+	// Buttons (so [][]Button is rows-of-buttons). The zero value (nil/empty)
+	// means NO keyboard — a message without buttons is byte-identical to today,
+	// so this is fully back-compat. A channel that does not advertise inline-
+	// keyboard support degrades by dropping the keyboard (with a note); the
+	// channel that does support it translates these neutral Buttons into its own
+	// wire markup. No channel-specific limit (e.g. callback-data byte ceiling)
+	// is encoded here — those are enforced in the channel implementation.
+	Buttons [][]Button `json:",omitempty"`
+}
+
+// Button is one channel-neutral inline-keyboard button. Text is the visible
+// label. EXACTLY ONE of Data or URL is set:
+//   - Data is an opaque callback payload (callback_data): tapping the button
+//     comes back to the agent as an InboundCallback event carrying this string,
+//     so the agent can act on it (e.g. SSHGate-style approve/deny). Keep it
+//     short — channels cap callback payloads (Telegram: 1-64 bytes), enforced in
+//     the channel.
+//   - URL is a link the button opens; tapping it does NOT come back to the agent.
+//
+// A Button with neither (or both) of Data/URL is invalid; the reply-tool parser
+// and the channel reject it with a clear error rather than silently dropping it.
+type Button struct {
+	Text string
+	Data string `json:",omitempty"`
+	URL  string `json:",omitempty"`
 }
 
 // ReplyArgs is the argument shape for the `reply` MCP tool. Aliased to

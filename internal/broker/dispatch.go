@@ -53,6 +53,11 @@ func dispatchReply(ch channel.Channel, key RouteKey, args map[string]any) (map[s
 	if rt := argInt64Ptr(args, "reply_to"); rt != nil {
 		out.ReplyTo = rt
 	}
+	buttons, err := buttonsFromArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	out.Buttons = buttons
 
 	// Route through the pure capability gate: it validates (hard-reject), down-
 	// converts (e.g. markup→none), and splits the text into ordered parts that
@@ -248,6 +253,55 @@ func mediaFromArgs(args map[string]any) []c3types.MediaItem {
 		out = append(out, item)
 	}
 	return out
+}
+
+// buttonsFromArgs parses the reply tool's `buttons` arg into a channel-neutral
+// inline keyboard ([][]c3types.Button — ROWS of buttons). `buttons` is a JSON
+// 2-D array: an array of rows, each row an array of {text, data, url} objects.
+// Shape is validated here (mirroring mediaFromArgs' helper style) with a clear
+// error rather than a silent drop: each button needs a non-empty `text` and
+// EXACTLY ONE of `data` (a callback button) or `url` (a link button). Returns
+// (nil, nil) when the arg is absent or empty — a reply with no buttons is
+// byte-identical to today. Channel-specific limits (callback-data byte ceiling,
+// max rows) are NOT checked here; the channel enforces those.
+func buttonsFromArgs(args map[string]any) ([][]c3types.Button, error) {
+	raw, ok := args["buttons"]
+	if !ok {
+		return nil, nil
+	}
+	rows, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("buttons must be an array of rows (each row an array of buttons)")
+	}
+	out := make([][]c3types.Button, 0, len(rows))
+	for ri, r := range rows {
+		rowAny, ok := r.([]any)
+		if !ok {
+			return nil, fmt.Errorf("buttons row %d must be an array of buttons", ri+1)
+		}
+		row := make([]c3types.Button, 0, len(rowAny))
+		for bi, v := range rowAny {
+			m, ok := v.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("buttons row %d position %d must be an object {text, data|url}", ri+1, bi+1)
+			}
+			text := argString(m, "text", "")
+			if text == "" {
+				return nil, fmt.Errorf("buttons row %d position %d: text is required", ri+1, bi+1)
+			}
+			data := argString(m, "data", "")
+			urlStr := argString(m, "url", "")
+			if (data == "") == (urlStr == "") {
+				return nil, fmt.Errorf("button %q: set EXACTLY ONE of data (callback) or url (link)", text)
+			}
+			row = append(row, c3types.Button{Text: text, Data: data, URL: urlStr})
+		}
+		out = append(out, row)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
 }
 
 func dispatchReact(ch channel.Channel, key RouteKey, args map[string]any) (map[string]any, error) {

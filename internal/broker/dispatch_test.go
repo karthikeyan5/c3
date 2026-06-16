@@ -338,6 +338,116 @@ func TestSendParts_MediaPathAuditLogged(t *testing.T) {
 	}
 }
 
+// buttonChannel is a test channel that advertises inline-keyboard support and
+// records the parts it is asked to send, so dispatchReply's buttons-arg parsing
+// can be asserted end-to-end (parsed → gate keeps → SendReply part).
+type buttonChannel struct {
+	mu   sync.Mutex
+	sent []c3types.ReplyArgs
+}
+
+func (m *buttonChannel) Name() string                              { return "telegram" }
+func (m *buttonChannel) Start(context.Context, channel.Host) error { return nil }
+func (m *buttonChannel) Stop() error                               { return nil }
+func (m *buttonChannel) Capabilities() c3types.Capabilities {
+	return c3types.Capabilities{Channel: "telegram", RichText: true, InlineKeyboards: true}
+}
+func (m *buttonChannel) SendReply(args c3types.ReplyArgs) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sent = append(m.sent, args)
+	return int64(len(m.sent)), nil
+}
+func (m *buttonChannel) SendTyping(int64, *int64) error { return nil }
+func (m *buttonChannel) EditMessage(c3types.EditArgs) (*c3types.EditResult, error) {
+	return &c3types.EditResult{}, nil
+}
+func (m *buttonChannel) React(c3types.ReactArgs) error             { return nil }
+func (m *buttonChannel) DownloadAttachment(string) (string, error) { return "", nil }
+func (m *buttonChannel) CreateTopic(int64, string) (int64, error)  { return 0, nil }
+func (m *buttonChannel) ValidateTopic(int64, int64) error          { return nil }
+func (m *buttonChannel) StopPoll(int64, int64) (*c3types.PollResult, error) {
+	return &c3types.PollResult{}, nil
+}
+func (m *buttonChannel) sentSnapshot() []c3types.ReplyArgs {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]c3types.ReplyArgs, len(m.sent))
+	copy(out, m.sent)
+	return out
+}
+
+// TestDispatchReply_ButtonsArgParsed asserts the `buttons` 2-D array arg is
+// parsed into Outbound.Buttons and (on a keyboard-supporting channel) ridden onto
+// the first SendReply part.
+func TestDispatchReply_ButtonsArgParsed(t *testing.T) {
+	ch := &buttonChannel{}
+	key := RouteKey{Channel: "telegram", ChatID: -100}
+	args := map[string]any{
+		"text": "decide:",
+		"buttons": []any{
+			[]any{
+				map[string]any{"text": "Approve", "data": "approve:1"},
+				map[string]any{"text": "Deny", "data": "deny:1"},
+			},
+			[]any{
+				map[string]any{"text": "Docs", "url": "https://example.com"},
+			},
+		},
+	}
+	if _, err := dispatchReply(ch, key, args); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	sent := ch.sentSnapshot()
+	if len(sent) != 1 {
+		t.Fatalf("expected 1 part; got %d", len(sent))
+	}
+	kb := sent[0].Buttons
+	if len(kb) != 2 || len(kb[0]) != 2 || len(kb[1]) != 1 {
+		t.Fatalf("keyboard shape not parsed; got %+v", kb)
+	}
+	if kb[0][0].Text != "Approve" || kb[0][0].Data != "approve:1" {
+		t.Errorf("callback button not parsed; got %+v", kb[0][0])
+	}
+	if kb[1][0].URL != "https://example.com" || kb[1][0].Data != "" {
+		t.Errorf("url button not parsed; got %+v", kb[1][0])
+	}
+}
+
+// TestDispatchReply_ButtonsArgBadShape asserts a button that sets neither
+// data nor url is a clear error and nothing is sent.
+func TestDispatchReply_ButtonsArgBadShape(t *testing.T) {
+	ch := &buttonChannel{}
+	key := RouteKey{Channel: "telegram", ChatID: -100}
+	args := map[string]any{
+		"text": "decide:",
+		"buttons": []any{
+			[]any{map[string]any{"text": "Nothing"}}, // neither data nor url
+		},
+	}
+	_, err := dispatchReply(ch, key, args)
+	if err == nil || !strings.Contains(err.Error(), "EXACTLY ONE") {
+		t.Fatalf("expected an EXACTLY-ONE shape error; got %v", err)
+	}
+	if got := ch.sentSnapshot(); len(got) != 0 {
+		t.Errorf("nothing should be sent on a bad button shape; got %d", len(got))
+	}
+}
+
+// TestDispatchReply_NoButtons_BackCompat asserts a reply with no buttons arg
+// carries a nil Buttons field — byte-identical to pre-P7.
+func TestDispatchReply_NoButtons_BackCompat(t *testing.T) {
+	ch := &buttonChannel{}
+	key := RouteKey{Channel: "telegram", ChatID: -100}
+	if _, err := dispatchReply(ch, key, map[string]any{"text": "hi"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	sent := ch.sentSnapshot()
+	if len(sent) != 1 || sent[0].Buttons != nil {
+		t.Fatalf("a no-buttons reply must carry nil Buttons; got %+v", sent)
+	}
+}
+
 // typingRecorderChannel records SendTyping (chatID, threadID) calls so tests can
 // assert the legacy send_typing dispatch op and the validate_topic piggyback
 // (which routes ValidateTopic → SendTyping) still drive the channel after P5

@@ -70,6 +70,15 @@ type Capabilities struct {
 	// rendering live in the channel implementation.
 	ExpandableQuotes bool
 
+	// InlineKeyboards reports whether the channel can attach an inline keyboard
+	// (rows of Buttons) to an outbound message — {text + data} callback buttons
+	// (a tap comes back as an InboundCallback event) and {text + url} link
+	// buttons. When false the capability gate DROPS any Outbound.Buttons and
+	// records a degradation note, so a leaner channel fails gracefully rather
+	// than erroring. Channel-neutral: the wire markup + any byte/row limits live
+	// in the channel implementation.
+	InlineKeyboards bool
+
 	// Inbound describes inbound-direction capabilities.
 	Inbound InboundCaps
 	// Stream describes reasoning-streaming capabilities (DEFERRED in v1).

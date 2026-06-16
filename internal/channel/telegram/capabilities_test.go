@@ -60,6 +60,9 @@ func TestCapabilities_GoldenManifest(t *testing.T) {
 	if !caps.Threads {
 		t.Error("Threads = false; want true")
 	}
+	if !caps.InlineKeyboards {
+		t.Error("InlineKeyboards = false; want true (P7 outbound inline keyboards)")
+	}
 	if want := int64(20 * 1024 * 1024); caps.Inbound.MaxDownloadBytes != want {
 		t.Errorf("Inbound.MaxDownloadBytes = %d; want %d (20 MiB)", caps.Inbound.MaxDownloadBytes, want)
 	}

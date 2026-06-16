@@ -68,6 +68,32 @@ func ReplyMediaSchema(caps c3types.Capabilities) map[string]any {
 	}
 }
 
+// ReplyButtonsSchema is the JSON-schema for the reply tool's `buttons` arg (P7):
+// an optional inline keyboard, expressed as ROWS of buttons (a 2-D array). Each
+// button has a `text` label plus EXACTLY ONE of `data` (a callback button — its
+// tap comes back to the agent as a `<channel>` callback event) or `url` (a link
+// button that just opens the URL). Channel-neutral: the broker gate drops the
+// keyboard on a channel without inline-keyboard support, and the channel
+// enforces its own limits (Telegram: callback data <=64 bytes).
+func ReplyButtonsSchema() map[string]any {
+	return map[string]any{
+		"type":        "array",
+		"description": "Optional inline keyboard: an array of ROWS, each row an array of buttons. A button is {text, data} (a callback button — its tap comes back to you as a callback event) OR {text, url} (opens a link). Set exactly one of data/url. Keep callback data short (<=64 bytes).",
+		"items": map[string]any{
+			"type": "array",
+			"items": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"text": map[string]any{"type": "string", "description": "Button label."},
+					"data": map[string]any{"type": "string", "description": "Callback payload; tapping returns it to you as a callback event. <=64 bytes."},
+					"url":  map[string]any{"type": "string", "description": "Link the button opens; does NOT come back to you."},
+				},
+				"required": []string{"text"},
+			},
+		},
+	}
+}
+
 // PollToolSchema is the JSON-schema for the `poll` tool (P3; full surface in
 // P2). Channel-neutral — the gate hard-rejects on a channel that does not
 // support polls and owns all shape validation, so the schema itself is the same

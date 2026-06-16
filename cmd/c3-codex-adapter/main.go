@@ -634,6 +634,7 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 						"text":     map[string]any{"type": "string"},
 						"reply_to": map[string]any{"type": "integer"},
 						"media":    mcptools.ReplyMediaSchema(caps),
+						"buttons":  mcptools.ReplyButtonsSchema(),
 					},
 					"required": []string{"text"},
 				},

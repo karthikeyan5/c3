@@ -40,6 +40,21 @@ const (
 	// starts rate-limiting; unused while streaming is deferred but reported
 	// in the manifest for honesty.
 	minEditInterval = 1 * time.Second
+
+	// Inline-keyboard limits (P7). These are Telegram Bot API facts and live in
+	// this package only (the no-leak rule); the pure gate makes only the neutral
+	// keep-or-drop decision.
+	//
+	// maxCallbackDataBytes is Telegram's callback_data ceiling: 1-64 BYTES (not
+	// runes). A button whose Data exceeds this earns a raw 400, so we pre-check
+	// and return a clear error instead.
+	maxCallbackDataBytes = 64
+	// maxKeyboardRows / maxButtonsPerRow are conservative shape caps. Telegram
+	// does not document a hard per-row/row-count number for inline keyboards, but
+	// an enormous keyboard is rejected/unusable; these keep the agent honest and
+	// turn an over-large keyboard into a clear error rather than a 400.
+	maxKeyboardRows  = 100
+	maxButtonsPerRow = 8
 )
 
 // Capabilities returns the static Telegram capability manifest. This is the
@@ -76,6 +91,7 @@ func (c *Channel) Capabilities() c3types.Capabilities {
 		Threads:          true,
 		Typing:           true,
 		ExpandableQuotes: true,
+		InlineKeyboards:  true,
 		Inbound: c3types.InboundCaps{
 			MaxDownloadBytes: maxDownloadBytes,
 			// The attachment kinds Telegram delivers inbound. Mapped onto the
