@@ -116,6 +116,11 @@ func TestMdToTelegramHTML(t *testing.T) {
 		{"not-a-table-prose-pipe", "a | b is just text", "a | b is just text"},
 		// A pipe header with no delimiter row underneath is NOT a table.
 		{"not-a-table-no-delimiter", "| a | b |\n| 1 | 2 |", "| a | b |\n| 1 | 2 |"},
+		// A prose line containing a pipe followed by a bare `---` thematic break is
+		// NOT a table: the delimiter row's cell count (1) must equal the header's
+		// (2). Without the cell-count check this rendered as a corrupted <pre>.
+		{"not-a-table-prose-pipe-then-rule", "some prose | aside\n---\nmore text",
+			"some prose | aside\n---\nmore text"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

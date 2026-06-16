@@ -74,6 +74,18 @@ func (c *Channel) sendPoll(args c3types.ReplyArgs) (int64, error) {
 		opts.CloseDate = spec.CloseDateUnix
 	}
 
+	// Inline keyboard (P7). The gate rides any kept Buttons on the FIRST emitted
+	// part, which for a buttons+poll reply is this poll part. Build the Telegram
+	// markup here so buttons on a poll reply aren't silently dropped; a limit
+	// breach is a clear error (no send), matching the text path.
+	if len(args.Buttons) > 0 {
+		markup, err := buildInlineKeyboard(args.Buttons)
+		if err != nil {
+			return 0, err
+		}
+		opts.ReplyMarkup = markup
+	}
+
 	if err := c.rate.Wait(c.ctx, args.ChatID); err != nil {
 		return 0, fmt.Errorf("telegram: rate-wait: %w", err)
 	}

@@ -434,6 +434,80 @@ func TestDispatchReply_ButtonsArgBadShape(t *testing.T) {
 	}
 }
 
+// TestDispatchReply_EmptyButtonRowRejected asserts an empty inline-keyboard row
+// (`[[]]`) is a clear error, not silently sent as a buttonless "keyboard".
+// Telegram 400s on an empty keyboard row, so it must be caught up front.
+func TestDispatchReply_EmptyButtonRowRejected(t *testing.T) {
+	ch := &buttonChannel{}
+	key := RouteKey{Channel: "telegram", ChatID: -100}
+	args := map[string]any{
+		"text":    "decide:",
+		"buttons": []any{[]any{}}, // one empty row
+	}
+	_, err := dispatchReply(ch, key, args)
+	if err == nil || !strings.Contains(err.Error(), "row 1 is empty") {
+		t.Fatalf("expected an empty-row error; got %v", err)
+	}
+	if got := ch.sentSnapshot(); len(got) != 0 {
+		t.Errorf("nothing should be sent on an empty button row; got %d", len(got))
+	}
+}
+
+// TestDispatchPoll_QuizNullCorrectOptionRejected is the M2 regression: a quiz
+// whose correct_option is present-but-unparseable (JSON null, a non-numeric
+// string) must NOT be silently treated as option 0. argIntPtr returns nil for
+// such a value, so the gate surfaces the "quiz requires correct_option" reject
+// and NOTHING is sent.
+func TestDispatchPoll_QuizNullCorrectOptionRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		val  any
+	}{
+		{"null", nil},
+		{"non-numeric-string", "abc"},
+		{"bool", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ch := &pollChannel{polls: true}
+			key := RouteKey{Channel: "telegram", ChatID: -100}
+			_, err := dispatchPoll(ch, key, map[string]any{
+				"question":       "q?",
+				"options":        []any{"a", "b"},
+				"type":           "quiz",
+				"correct_option": tc.val,
+			})
+			if err == nil || !strings.Contains(err.Error(), "correct_option") {
+				t.Fatalf("expected a correct_option hard-reject; got %v", err)
+			}
+			if got := ch.sentSnapshot(); len(got) != 0 {
+				t.Errorf("nothing should be sent for an unparseable quiz correct_option; got %d", len(got))
+			}
+		})
+	}
+}
+
+// TestArgIntPtr_OnlyNonNilWhenParseable asserts argIntPtr directly: a present,
+// parseable value returns a pointer to it (0 is a valid index, distinct from
+// "not set"); a present-but-unparseable value returns nil (NOT &0); an absent
+// key returns nil.
+func TestArgIntPtr_OnlyNonNilWhenParseable(t *testing.T) {
+	if p := argIntPtr(map[string]any{"x": float64(0)}, "x"); p == nil || *p != 0 {
+		t.Errorf("a parseable 0 must return &0; got %v", p)
+	}
+	if p := argIntPtr(map[string]any{"x": float64(2)}, "x"); p == nil || *p != 2 {
+		t.Errorf("a parseable 2 must return &2; got %v", p)
+	}
+	if p := argIntPtr(map[string]any{"x": nil}, "x"); p != nil {
+		t.Errorf("a present null must return nil (not &0); got %v (*=%d)", p, *p)
+	}
+	if p := argIntPtr(map[string]any{"x": "abc"}, "x"); p != nil {
+		t.Errorf("a non-numeric string must return nil; got %v (*=%d)", p, *p)
+	}
+	if p := argIntPtr(map[string]any{}, "x"); p != nil {
+		t.Errorf("an absent key must return nil; got %v (*=%d)", p, *p)
+	}
+}
+
 // TestDispatchReply_NoButtons_BackCompat asserts a reply with no buttons arg
 // carries a nil Buttons field — byte-identical to pre-P7.
 func TestDispatchReply_NoButtons_BackCompat(t *testing.T) {

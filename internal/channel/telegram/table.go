@@ -47,12 +47,22 @@ func detectTable(lines []string, i int) (rows [][]string, end int, ok bool) {
 		return nil, 0, false
 	}
 
-	rows = append(rows, splitTableRow(header))
+	headerCells := splitTableRow(header)
 	// The header column count fixes the table's column count; the delimiter must
 	// describe at least one column and the header at least one cell.
-	if len(rows[0]) == 0 {
+	if len(headerCells) == 0 {
 		return nil, 0, false
 	}
+	// GFM requires the delimiter row to have the SAME number of cells as the
+	// header. Without this check, prose containing a pipe followed by a bare
+	// thematic break (`some prose | aside` then `---`) is mis-detected as a
+	// table and rendered as a corrupted <pre>. Split the delimiter the SAME way
+	// the header is split so the counts are comparable.
+	if len(splitTableRow(lines[i+1])) != len(headerCells) {
+		return nil, 0, false
+	}
+
+	rows = append(rows, headerCells)
 
 	j := i + 2
 	for j < len(lines) {

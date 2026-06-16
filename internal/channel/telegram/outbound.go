@@ -143,6 +143,11 @@ func buildInlineKeyboard(rows [][]c3types.Button) (*gotgbot.InlineKeyboardMarkup
 	}
 	kb := make([][]gotgbot.InlineKeyboardButton, 0, len(rows))
 	for ri, row := range rows {
+		// An empty row (`[]`) is rejected, not silently dropped: Telegram 400s on
+		// an empty keyboard row. A clear error tells the agent precisely which row.
+		if len(row) == 0 {
+			return nil, fmt.Errorf("telegram: buttons row %d is empty", ri+1)
+		}
 		if len(row) > maxButtonsPerRow {
 			return nil, fmt.Errorf("telegram: too many buttons in row %d (%d > %d)", ri+1, len(row), maxButtonsPerRow)
 		}

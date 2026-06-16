@@ -239,8 +239,10 @@ func (c *Channel) dispatchPollUpdate(updateID int64, poll *gotgbot.Poll) {
 	}
 
 	tally := pollTallyFromGotgbot(poll)
-	sp.LatestTally = tally
-	c.sentPolls.Put(poll.Id, sp) // refresh latest + LRU recency
+	// Refresh the retained latest tally under the map lock — the worker goroutine
+	// (StopPoll) can mutate the same *sentPoll concurrently, so a Get→mutate→Put
+	// read-modify-write would race. UpdateTally also bumps LRU recency.
+	c.sentPolls.UpdateTally(poll.Id, tally)
 
 	// Q-RESULT-1: the firm requirement is FINAL-ON-CLOSE (+ stop_poll). An
 	// open-poll aggregate update is retained above for on-demand reads but NOT

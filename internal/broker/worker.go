@@ -414,6 +414,17 @@ func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound) 
 		w.armTyping(holder)
 		return
 	}
+	// A synthesized channel EVENT (poll_result / reaction / callback) is NOT a
+	// human message awaiting a reply, so it must never be bounced back as the
+	// "no CLI attached" fallback boilerplate. A late timed/auto-close poll can
+	// fire after the session detaches; on an unclaimed route we drop it with a
+	// metadata-only log instead of spamming the chat. (A CLAIMED route still
+	// receives the event unchanged — handled in the claimed branch above.)
+	if in.IsEvent() {
+		log.Printf("drop chan=%s chat=%d topic=%s msg=%d: no claim, event not bounced as fallback (kind=%s)",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, in.Kind)
+		return
+	}
 	if !w.broker.Fallbacks.ShouldSend(w.key) {
 		log.Printf("drop chan=%s chat=%d topic=%s msg=%d: no claim, fallback in cooldown — %s",
 			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID,

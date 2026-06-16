@@ -208,6 +208,43 @@ func TestForwardOrFallback_AliveButDisconnectedHolder_SkipsDelivery(t *testing.T
 	}
 }
 
+// A synthesized channel EVENT (e.g. a late timed/auto-close poll_result) that is
+// forwarded on a route with NO live claim must NOT bounce the "no CLI attached"
+// fallback boilerplate into the chat — it is not a human message awaiting a
+// reply. It is dropped with a metadata-only log instead. Regression for the
+// completeness-batch finding: a poll closing after the session detached spammed
+// the topic with the fallback text.
+func TestForwardOrFallback_UnclaimedEvent_DoesNotBounceFallback(t *testing.T) {
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	tid := int64(914)
+	key := MakeRouteKey("telegram", -1001234567890, &tid)
+
+	// No claim is registered: the route is unclaimed (session detached).
+	w := newRouteWorker(context.Background(), key, time.Hour, b)
+	defer w.Stop()
+
+	event := &c3types.Inbound{
+		Channel:   "telegram",
+		ChatID:    -1001234567890,
+		TopicID:   &tid,
+		MessageID: 2200,
+		Kind:      c3types.InboundPollResult,
+		Event: &c3types.InboundEvent{PollResult: &c3types.PollResult{
+			PollID: "p-late", IsClosed: true,
+		}},
+	}
+	w.forwardOrFallback(context.Background(), event)
+
+	// The event must be dropped — no fallback boilerplate sent to the chat.
+	if got := len(fc.sendRepliesSnapshot()); got != 0 {
+		t.Errorf("expected no fallback send for an unclaimed event, got %d sends", got)
+	}
+}
+
 // brokerWithGenericChannel wires a broker pre-registered with an arbitrary
 // channel.Channel (not just *fakeChannel), mirroring brokerWithChannel's manual
 // registration so the typing-relay tests can use a SendTyping-recording channel.

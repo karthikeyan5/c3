@@ -161,6 +161,38 @@ func TestChunkMarkdown_NonTablePipeNotAtomic(t *testing.T) {
 	}
 }
 
+func TestTableRunEnd_ProsePipeThenRuleNotATable(t *testing.T) {
+	// A prose line containing a pipe followed by a bare `---` thematic break must
+	// NOT be detected as a table: GFM requires the delimiter row's cell count (1)
+	// to equal the header's (2). Without the cell-count check tableRunEnd grouped
+	// this prose as an atomic table block (and the telegram mirror rendered it as
+	// a corrupted <pre>).
+	lines := []string{"some prose | aside", "---", "more text"}
+	if end, ok := tableRunEnd(lines, 0); ok {
+		t.Errorf("prose-pipe + thematic break was mis-detected as a table block (end=%d)", end)
+	}
+	// A genuine 2-column table is still detected (regression guard for the fix).
+	good := []string{"| a | b |", "|---|---|", "| 1 | 2 |"}
+	if end, ok := tableRunEnd(good, 0); !ok || end != 3 {
+		t.Errorf("real table no longer detected: ok=%v end=%d (want ok=true end=3)", ok, end)
+	}
+}
+
+func TestChunkMarkdown_ProsePipeThenRuleNotAtomic(t *testing.T) {
+	// End-to-end mirror of TestTableRunEnd_ProsePipeThenRuleNotATable through the
+	// chunker: the prose+rule block must split on a normal boundary, not be glued
+	// into one atomic "table" block and hard-split mid-content.
+	limit := 20
+	src := "some prose | aside\n---\nmore text"
+	parts, _ := chunkMarkdown(src, limit)
+	partsWithinLimit(t, parts, limit)
+	for _, line := range []string{"some prose | aside", "more text"} {
+		if !constructInOnePart(parts, line) {
+			t.Errorf("prose line %q was bisected (mis-detected as a table); parts=%q", line, parts)
+		}
+	}
+}
+
 func TestChunkMarkdown_SingleLongLinkHardSplit(t *testing.T) {
 	limit := 30
 	// One indivisible link longer than the limit: there is no safe boundary

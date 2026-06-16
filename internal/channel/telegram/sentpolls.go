@@ -91,6 +91,26 @@ func (m *sentPollMap) Put(pollID string, sp *sentPoll) {
 	}
 }
 
+// UpdateTally sets LatestTally for an existing poll id under the lock and
+// promotes it to newest (LRU). No-op if the id is absent. This is the
+// thread-safe replacement for a Get→mutate→Put read-modify-write on the shared
+// *sentPoll pointee: the poll-loop goroutine (dispatchPollUpdate) and the worker
+// goroutine (StopPoll) can both touch the same poll id, so the mutation must
+// happen under m.mu rather than on a pointer handed back by Get.
+func (m *sentPollMap) UpdateTally(pollID string, tally *pollTally) {
+	if m == nil || pollID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	el, ok := m.index[pollID]
+	if !ok {
+		return
+	}
+	el.Value.(*sentPollEntry).val.LatestTally = tally
+	m.order.MoveToBack(el)
+}
+
 // Get returns the routing context for a poll id and whether it was found. A hit
 // is promoted to the newest slot (LRU recency).
 func (m *sentPollMap) Get(pollID string) (*sentPoll, bool) {

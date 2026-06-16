@@ -84,6 +84,19 @@ func (c *Channel) sendMedia(args c3types.ReplyArgs, item c3types.MediaItem) (int
 			captionUTF16Len(captionHTML), maxCaptionRunes)
 	}
 
+	// Inline keyboard (P7). The gate rides any kept Buttons on the FIRST emitted
+	// part, which may be this media part (e.g. a media reply with no text). Build
+	// the Telegram markup here too so buttons on a media reply aren't silently
+	// dropped; a limit breach is a clear error (no send), matching the text path.
+	var markup *gotgbot.InlineKeyboardMarkup
+	if len(args.Buttons) > 0 {
+		m, err := buildInlineKeyboard(args.Buttons)
+		if err != nil {
+			return 0, err
+		}
+		markup = m
+	}
+
 	if err := c.rate.Wait(c.ctx, args.ChatID); err != nil {
 		return 0, fmt.Errorf("telegram: rate-wait: %w", err)
 	}
@@ -104,6 +117,9 @@ func (c *Channel) sendMedia(args c3types.ReplyArgs, item c3types.MediaItem) (int
 		if caption != "" {
 			opts.ParseMode = "HTML"
 		}
+		if markup != nil {
+			opts.ReplyMarkup = markup
+		}
 		msg, err = c.bot.SendPhoto(args.ChatID, src, opts)
 	case c3types.MediaFile:
 		opts := &gotgbot.SendDocumentOpts{
@@ -114,6 +130,9 @@ func (c *Channel) sendMedia(args c3types.ReplyArgs, item c3types.MediaItem) (int
 		}
 		if caption != "" {
 			opts.ParseMode = "HTML"
+		}
+		if markup != nil {
+			opts.ReplyMarkup = markup
 		}
 		msg, err = c.bot.SendDocument(args.ChatID, src, opts)
 	case c3types.MediaVideo:
@@ -131,6 +150,9 @@ func (c *Channel) sendMedia(args c3types.ReplyArgs, item c3types.MediaItem) (int
 		if caption != "" {
 			opts.ParseMode = "HTML"
 		}
+		if markup != nil {
+			opts.ReplyMarkup = markup
+		}
 		msg, err = c.bot.SendVideo(args.ChatID, src, opts)
 	case c3types.MediaAudio:
 		opts := &gotgbot.SendAudioOpts{
@@ -141,6 +163,9 @@ func (c *Channel) sendMedia(args c3types.ReplyArgs, item c3types.MediaItem) (int
 		}
 		if caption != "" {
 			opts.ParseMode = "HTML"
+		}
+		if markup != nil {
+			opts.ReplyMarkup = markup
 		}
 		msg, err = c.bot.SendAudio(args.ChatID, src, opts)
 	case c3types.MediaVoice:
@@ -153,6 +178,9 @@ func (c *Channel) sendMedia(args c3types.ReplyArgs, item c3types.MediaItem) (int
 		if caption != "" {
 			opts.ParseMode = "HTML"
 		}
+		if markup != nil {
+			opts.ReplyMarkup = markup
+		}
 		msg, err = c.bot.SendVoice(args.ChatID, src, opts)
 	case c3types.MediaAnimation:
 		opts := &gotgbot.SendAnimationOpts{
@@ -164,6 +192,9 @@ func (c *Channel) sendMedia(args c3types.ReplyArgs, item c3types.MediaItem) (int
 		}
 		if caption != "" {
 			opts.ParseMode = "HTML"
+		}
+		if markup != nil {
+			opts.ReplyMarkup = markup
 		}
 		msg, err = c.bot.SendAnimation(args.ChatID, src, opts)
 	default:

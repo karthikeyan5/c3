@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/PaulSonOfLars/gotgbot/v2"
@@ -89,6 +90,53 @@ func TestDispatchPollUpdate_UnknownPollDropped(t *testing.T) {
 	c.dispatchPollUpdate(7, &gotgbot.Poll{Id: "unknown", IsClosed: true})
 	if h.emitCount() != 0 {
 		t.Errorf("an unknown poll id must be dropped; got %d emits", h.emitCount())
+	}
+}
+
+// TestPollTally_ConcurrentUpdateNoRace exercises the two sites that mutate a
+// shared *sentPoll's LatestTally concurrently — the poll-loop goroutine
+// (dispatchPollUpdate) and the worker goroutine (StopPoll). Both now funnel
+// through the in-lock sentPollMap.UpdateTally, so the previously-unsynchronized
+// read-modify-write is gone. StopPoll itself requires a live bot (network), so
+// this drives its mutation via UpdateTally directly — the exact in-lock write it
+// performs — alongside dispatchPollUpdate, and must pass under `go test -race`.
+func TestPollTally_ConcurrentUpdateNoRace(t *testing.T) {
+	h := &fakeHost{decision: channel.GateInboundAllow}
+	c := makeChannelWithPolls(h)
+	c.sentPolls.Put("p-race", &sentPoll{ChatID: 555, MessageID: 42, OwnerUserID: 555})
+
+	const iters = 2000
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Goroutine A: poll-loop path — an OPEN aggregate update refreshes the tally
+	// under the lock (not surfaced, but it mutates LatestTally via UpdateTally).
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			c.dispatchPollUpdate(int64(i), &gotgbot.Poll{
+				Id: "p-race", Question: "Q", TotalVoterCount: int64(i), IsClosed: false,
+				Options: []gotgbot.PollOption{{Text: "A", VoterCount: int64(i)}},
+			})
+		}
+	}()
+
+	// Goroutine B: StopPoll's mutation — the same in-lock UpdateTally write.
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			c.sentPolls.UpdateTally("p-race", &pollTally{
+				Question: "Q", TotalVoters: i, IsClosed: true,
+				Options: []pollOptionTally{{Text: "A", VoterCount: i}},
+			})
+		}
+	}()
+
+	wg.Wait()
+
+	// The entry still exists and carries a (non-nil) tally — sanity, not the point.
+	if sp, ok := c.sentPolls.Get("p-race"); !ok || sp.LatestTally == nil {
+		t.Errorf("poll entry should survive concurrent updates with a tally; got %+v", sp)
 	}
 }
 

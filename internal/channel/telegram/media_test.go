@@ -62,3 +62,25 @@ func TestSendMedia_CaptionGuardKeysOffConvertedLength(t *testing.T) {
 		t.Errorf("a short link caption should fit after conversion; got %d", got)
 	}
 }
+
+// TestSendMedia_HonorsButtons is the M1 regression: the gate rides a kept inline
+// keyboard on the FIRST emitted part, which may be a media part (a media reply
+// with no text). sendMedia previously ignored args.Buttons, silently dropping
+// the keyboard. It must now build the markup — proven here because an INVALID
+// keyboard (an empty row) returns the build error before any bot call. Were the
+// buttons still ignored, sendMedia would proceed past the build with no error.
+// (A URL item with a short caption reaches the button build without a live bot or
+// local file.)
+func TestSendMedia_HonorsButtons(t *testing.T) {
+	c := &Channel{}
+	item := c3types.MediaItem{
+		Kind:    c3types.MediaPhoto,
+		URL:     "https://example.com/pic.png",
+		Caption: "look",
+	}
+	args := c3types.ReplyArgs{ChatID: -100, Buttons: [][]c3types.Button{{}}} // empty row
+	_, err := c.sendMedia(args, item)
+	if err == nil || !strings.Contains(err.Error(), "row 1 is empty") {
+		t.Fatalf("sendMedia must honor (build) args.Buttons; got %v", err)
+	}
+}

@@ -41,12 +41,10 @@ func (c *Channel) StopPoll(chatID, messageID int64) (*c3types.PollResult, error)
 	tally := pollTallyFromGotgbot(poll)
 	// Refresh the retained tally if this is a poll we sent (keeps the sentPolls
 	// snapshot current; harmless no-op for a poll absent from the bounded map).
-	if poll.Id != "" {
-		if sp, ok := c.sentPolls.Get(poll.Id); ok {
-			sp.LatestTally = tally
-			c.sentPolls.Put(poll.Id, sp)
-		}
-	}
+	// UpdateTally mutates under the map lock — the poll-loop goroutine
+	// (dispatchPollUpdate) can touch the same *sentPoll concurrently, so a
+	// Get→mutate→Put read-modify-write would race.
+	c.sentPolls.UpdateTally(poll.Id, tally)
 
 	opts := make([]c3types.PollOptionTally, 0, len(tally.Options))
 	for _, o := range tally.Options {

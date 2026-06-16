@@ -470,6 +470,15 @@ func tableRunEnd(lines []string, i int) (end int, ok bool) {
 	if !isTableDelimiterLine(lines[i+1]) {
 		return 0, false
 	}
+	// GFM requires the delimiter row to have the SAME number of cells as the
+	// header. Without this check, prose containing a pipe followed by a bare
+	// thematic break (`some prose | aside` then `---`) is mis-grouped as an
+	// atomic table block. Split both rows the SAME way so the counts compare.
+	// Kept byte-for-byte consistent with the telegram package's detectTable.
+	headerCells := tableRowCellCount(lines[i])
+	if headerCells == 0 || tableRowCellCount(lines[i+1]) != headerCells {
+		return 0, false
+	}
 	j := i + 2
 	for j < len(lines) {
 		if !strings.Contains(lines[j], "|") {
@@ -505,6 +514,19 @@ func isTableDelimiterLine(line string) bool {
 		}
 	}
 	return true
+}
+
+// tableRowCellCount returns the number of cells a GFM table row splits into,
+// stripping one optional leading/trailing pipe before splitting on `|`. It is a
+// pure mirror of the telegram package's splitTableRow cell-count logic and is
+// used to enforce the GFM rule that a delimiter row must have the same cell count
+// as its header. Kept byte-for-byte consistent with that split so the two
+// detectors agree on what is (and is not) a table.
+func tableRowCellCount(line string) int {
+	t := strings.TrimSpace(line)
+	t = strings.TrimPrefix(t, "|")
+	t = strings.TrimSuffix(t, "|")
+	return len(strings.Split(t, "|"))
 }
 
 // isTableDelimiterCell reports whether c is a single GFM delimiter cell: optional

@@ -87,6 +87,23 @@ func TestBuildInlineKeyboard_RequiresText(t *testing.T) {
 	}
 }
 
+// TestBuildInlineKeyboard_EmptyRowRejected asserts an empty row (`[]`) is a clear
+// error, not silently sent — Telegram 400s on an empty keyboard row.
+func TestBuildInlineKeyboard_EmptyRowRejected(t *testing.T) {
+	_, err := buildInlineKeyboard([][]c3types.Button{{}})
+	if err == nil || !strings.Contains(err.Error(), "row 1 is empty") {
+		t.Fatalf("expected an empty-row error; got %v", err)
+	}
+	// An empty row sandwiched between valid rows is also caught (with its index).
+	_, err = buildInlineKeyboard([][]c3types.Button{
+		{{Text: "ok", Data: "d"}},
+		{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "row 2 is empty") {
+		t.Fatalf("expected an empty-row-2 error; got %v", err)
+	}
+}
+
 // TestBuildInlineKeyboard_ShapeLimits asserts the conservative row / per-row caps
 // turn an over-large keyboard into a clear error.
 func TestBuildInlineKeyboard_ShapeLimits(t *testing.T) {

@@ -279,6 +279,12 @@ func buttonsFromArgs(args map[string]any) ([][]c3types.Button, error) {
 		if !ok {
 			return nil, fmt.Errorf("buttons row %d must be an array of buttons", ri+1)
 		}
+		// An empty row (`[]`) is rejected, not silently sent: Telegram 400s on an
+		// empty keyboard row, and `[[]]` would otherwise pass as a "keyboard" with
+		// no actionable buttons.
+		if len(rowAny) == 0 {
+			return nil, fmt.Errorf("buttons row %d is empty", ri+1)
+		}
 		row := make([]c3types.Button, 0, len(rowAny))
 		for bi, v := range rowAny {
 			m, ok := v.(map[string]any)
@@ -488,15 +494,37 @@ func argInt64Ptr(args map[string]any, key string) *int64 {
 	return &v
 }
 
-// argIntPtr returns &v if args[key] is set and parseable; nil otherwise. Used
-// for nullable int args (e.g. a quiz poll's correct_option, where 0 is a valid
-// index and must be distinguishable from "not set").
+// argIntPtr returns &v ONLY when args[key] is present AND actually parses to an
+// int; nil otherwise. Used for nullable int args (e.g. a quiz poll's
+// correct_option, where 0 is a valid index and must be distinguishable from "not
+// set"). A present-but-unparseable value (JSON null, a non-numeric string) must
+// return nil — NOT &0 — so it is not silently treated as option 0; the downstream
+// validatePoll then surfaces "quiz requires correct_option" instead of marking
+// the first option correct by accident.
 func argIntPtr(args map[string]any, key string) *int {
-	if _, ok := args[key]; !ok {
+	v, ok := args[key]
+	if !ok {
 		return nil
 	}
-	v := int(argInt64(args, key, 0))
-	return &v
+	var n int
+	switch x := v.(type) {
+	case int64:
+		n = int(x)
+	case int:
+		n = x
+	case float64:
+		n = int(x)
+	case string:
+		var parsed int64
+		if _, err := fmt.Sscanf(x, "%d", &parsed); err != nil {
+			return nil
+		}
+		n = int(parsed)
+	default:
+		// JSON null, bool, nested object/array — not a parseable int.
+		return nil
+	}
+	return &n
 }
 
 // argTopicID returns *int64 for topic_id arg, falling back to the route key's
