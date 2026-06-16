@@ -38,6 +38,42 @@ leaks into core (enforced by a CI grep-guard, `internal/archguard`). Spec:
   Codex forwarder opt-out → Codex-only streaming (asymmetric); (b) pivot C3 to host the
   agent via the SDK/Messages-API → both CLIs (large). Manifest reports `StreamViaEdit=false`.
 
+## P0.5 — Channel completeness batch — `in-progress` (2026-06-16)
+
+The P0 build shipped, but a live smoke test surfaced **missed Telegram features**: the agent
+could not **read poll results**, polls were send-only/regular (no quiz/explanation/timed),
+the expandable **"show more"** blockquote was absent, and wide **tables** rendered as literal
+pipe-text. Root-caused: the build pipeline had **no completeness gate** — capabilities were
+carried as prose and re-summarized at each hop with no end-to-end ledger, so anything dropped
+by omission left no trace. Full analysis + a 79-row capability coverage matrix + hardened fix
+design: [`docs/specs/2026-06-16-capability-gaps-rootcause-safeguard.md`](docs/specs/2026-06-16-capability-gaps-rootcause-safeguard.md).
+The pipeline fix is the **completeness gate** (coverage matrix + pre-build sign-off +
+completeness-vs-research review lens + live-verify every rendering claim) — to be folded into
+`~/arogara/AGENTS.md`.
+
+**Build phases (signed off 2026-06-16):**
+- **P1** ✅ opportunistic in-channel fixes (reaction allowed-set validation + video streaming) — committed `a59e1bb`.
+- **P2** — full polls (send): quiz / explanation / timed (open_period·close_date) / correct-option.
+- **P3** — expandable show-more blockquote (`<blockquote expandable>`).
+- **P4** — reading poll results (`poll`/`poll_answer` inbound → agent; **aggregate + final-on-close**) + `stopPoll`.
+- **P5** — chunk HTML-overflow guard. **Typing-cap redesign DEFERRED (Karthi 2026-06-16)** — current ~60s-then-stops behavior stays until revisited.
+- **P6** — wide tables: auto-wrap pipe tables into aligned monospace `<pre>` (scrolls on Android, wraps desktop/web — **live-verify on phone**).
+- **P7** — inline keyboards + callbacks (tap-to-act / approve-deny / expand-next) — **`ship now`** per Karthi 2026-06-16.
+
+### To build later — discuss after this batch (Karthi 2026-06-16)
+Karthi wants these built; parked for a post-batch discussion (do **not** silently drop):
+- Inbound **+** outbound **albums** (media-group assembly + `sendMediaGroup`).
+- **Echo media by `file_id`** (zero-cost re-send of inbound media; sidesteps 20MB download / 50MB upload caps).
+- **Underline** + inline **user-mention** (`tg://user?id=`) formatting.
+- **Forwarding** messages.
+- **Location** sends (and likely venue/contact).
+- _(also deferred in the matrix, same bucket: link-preview control, partial-quote highlighting, `entities[]` path.)_
+
+### Roadmap discussion — shared Telegram adapter for SSHGate + C3 (Karthi 2026-06-16)
+Both SSHGate and C3 talk to Telegram (bot send/receive + approvals). Explore whether they can
+share **one Telegram adapter/implementation** instead of two parallel ones. Design + decision
+to discuss later — not yet scoped.
+
 ## P1 — Remote terminal-control (the main build feature — sequenced *after* the channel architecture above)
 
 - **Remote terminal-control of coding agents from Telegram** — `in-progress`

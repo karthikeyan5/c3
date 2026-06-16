@@ -1,4 +1,4 @@
-# C3 Channel-Capability Gaps — Root Cause, VelGate Safeguard, Coverage Matrix, and Hardened Fix Design
+# C3 Channel-Capability Gaps — Root Cause, Completeness-Gate Safeguard, Coverage Matrix, and Hardened Fix Design
 
 Date: 2026-06-16
 Repo: `/home/karthi/arogara/c3`
@@ -60,9 +60,9 @@ rendering claim was asserted without a live round-trip.
 
 ---
 
-## 2. The safeguard — "VelGate" (Karthi's term): a completeness gate in the build pipeline
+## 2. The safeguard — the completeness gate (capability-coverage gate) in the build pipeline
 
-VelGate is a process gate added to the multi-agent build pipeline so the Section-1 failure cannot
+The completeness gate is a process gate added to the multi-agent build pipeline so the Section-1 failure cannot
 recur. It has three mechanical parts:
 
 ### 2.1 Capability-coverage matrix + explicit pre-build sign-off
@@ -92,7 +92,7 @@ acceptable; "I sent a `<pre>` table to Desktop/macOS/Android and observed wrap v
 closes root cause 5. Where a real round-trip is impossible at design time, the claim is marked
 explicitly UNVERIFIED and the gate forces a verify step into the build phase.
 
-**Net:** VelGate = (matrix + pre-build sign-off) + (completeness-vs-research review lens) +
+**Net:** the completeness gate = (matrix + pre-build sign-off) + (completeness-vs-research review lens) +
 (live-verify rendering/behavior claims). It is cheap, mechanical, and attacks each root cause
 directly.
 
@@ -100,7 +100,7 @@ directly.
 
 ## 3. Full capability coverage matrix
 
-Every row from the audit (79 capabilities). Status = current code state; Rec = VelGate disposition.
+Every row from the audit (79 capabilities). Status = current code state; Rec = completeness-gate disposition.
 
 | Capability | Category | Telegram support | C3 status | Code detail | Rec | Rationale |
 |---|---|---|---|---|---|---|
@@ -253,7 +253,7 @@ horizontal scroll. Desktop (Win/Linux) + macOS + Web **wrap** `<pre>` (breaking 
 **Android scrolls** (preserves it). `<blockquote expandable>` collapses **vertically only** and does
 NOT add horizontal scroll. There is no parse_mode flag / entity / markup that forces cross-client
 horizontal scroll. **We do NOT assert "`<pre>` scrolls and stays aligned."** This claim must be
-re-confirmed by a real round-trip on Desktop+macOS+Android during Phase 6 (VelGate 2.3).
+re-confirmed by a real round-trip on Desktop+macOS+Android during Phase 6 (completeness-gate §2.3).
 
 **Design (faithful alternative, no false promise) — all inside `internal/channel/telegram/`:**
 
@@ -730,7 +730,7 @@ phase.
 Each phase ends green: `go build ./...`, `go test ./...`, and the **archguard tests**
 (`internal/archguard`) pass. New behavior gets unit tests; the P4 golden guidance test's expected
 string is updated **in the same phase** that changes guidance. Every rendering/behavior claim gets a
-**live round-trip verify** (VelGate 2.3) in its phase.
+**live round-trip verify** (completeness-gate §2.3) in its phase.
 
 **Phase 1 — Opportunistic in-channel fixes (no core changes).**
 Files: `internal/channel/telegram/outbound.go` (reaction-emoji allowed-set validation in `React`,
@@ -783,7 +783,7 @@ near-limit HTML-expanding chunk no longer 400s.
 Files: `internal/channel/telegram/table.go` (new), `internal/channel/telegram/format.go` (hook),
 `internal/capability/chunk.go` (atomic-table recognition), `internal/capability/guidance.go` +
 tests, `internal/channel/telegram/format_test.go`. Last (most rendering-judgment-heavy; benefits
-from Phase 5 chunk work). Gated on Q-TABLE-1. **Verify (live round-trip, mandatory — VelGate 2.3):
+from Phase 5 chunk work). Gated on Q-TABLE-1. **Verify (live round-trip, mandatory — completeness-gate §2.3):
 send a wide table to Telegram Desktop, macOS, and Android; confirm the wrap-vs-scroll reality and
 that the guidance line is honest. We are NOT claiming `<pre>` scrolls.**
 

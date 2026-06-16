@@ -30,7 +30,7 @@ feature-completeness-vs-research), and the orchestrator never diffed shipped-vs-
 surfaced the deferral list for sign-off. Plus rendering claims (table h-scroll) were asserted
 without live verification. Full analysis → the 2026-06-16 spec.
 
-**SAFEGUARD ("VelGate", Karthi's term):** add a completeness gate to the `~/arogara/AGENTS.md`
+**SAFEGUARD (the completeness gate):** add a completeness gate to the `~/arogara/AGENTS.md`
 build pipeline — after design, a capability-coverage matrix (every researched capability →
 ship / defer / cut + rationale) surfaced to Karthi for sign-off BEFORE build; a
 "completeness-vs-research" lens in the triple review; and live-verify any rendering claim.
@@ -41,7 +41,7 @@ ship / defer / cut + rationale) surfaced to Karthi for sign-off BEFORE build; a
 2. Implement the fixes via the design→harden→build→review pipeline **with the new completeness
    gate**: full polls (read via `poll_answer`/`poll` inbound surfaced to the agent + quiz/options/
    timed), expandable show-more blockquote, table h-scroll (per research), typing-cap tuning.
-3. Add the VelGate completeness gate to `~/arogara/AGENTS.md`.
+3. Add the completeness gate to `~/arogara/AGENTS.md`.
 4. After fixes: `go install ./cmd/...`, restart the broker (see broker note), re-run the live
    Telegram smoke test with Karthi (incl. typing on turn 2, table, full polls, show-more).
 5. Then terminal-control (design DECIDED: C3-brain + all-Go PTY stack + arbitrary TUIs);
