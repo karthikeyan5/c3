@@ -1,5 +1,67 @@
 # RESUME
 
+## 🔴 PAUSE POINT — compaction handoff (2026-06-16)
+
+**Resume map:** `cd ~/arogara/c3`, attach the c3 topic, then read this section +
+`docs/specs/2026-06-16-capability-gaps-rootcause-safeguard.md` + `ROADMAP.md`. Karthi is
+interacting via **Telegram (phone)**; a live rich-content smoke test is in progress.
+
+**Where we are:** the channel rich-content + capability build (P0–P7) is shipped + committed
+on `master` and was **live-smoke-tested on Telegram — 6/7 pass** (rich text, both polls,
+photo, file, reaction, long-reply split-into-2). Typing works and is programmatic.
+
+**GAPS the smoke test surfaced — the active work (Karthi wants these fixed):**
+1. **Tables** — a wide table in a fenced ``` block WRAPS on Telegram Android (does NOT
+   horizontally scroll), so columns fall apart. Need the correct way to render a
+   horizontally-scrolling wide table. (Workflow `w31qfwmm6` researching → the 2026-06-16 spec.)
+2. **Polls half-baked** — send-only: C3 can't READ poll results/votes (Telegram `poll` /
+   `poll_answer` updates aren't handled by inbound), and only regular polls (no quiz /
+   explanation / timed / full options). Karthi wants full polls incl. reading results.
+3. **Expandable "show more" long text** — NOT implemented (Telegram expandable blockquote
+   `<blockquote expandable>`). Karthi wants it.
+4. **Typing cap** — correct + programmatic (broker route-worker pulses ~4s; arms on inbound
+   once the session has replied; disarms on reply), but a 15-pulse/~60s safety cap stops it
+   during genuinely long turns. Tune: keep alive while actively working; stop on reply or true idle.
+
+**ROOT CAUSE (Karthi-requested):** the build pipeline had **no completeness gate**. The
+original research DID surface the full Telegram surface, but design chose "minimal-pragmatic,"
+scope-trims were approved, the 3 critique passes checked architecture + code-grounding (NOT
+feature-completeness-vs-research), and the orchestrator never diffed shipped-vs-researched or
+surfaced the deferral list for sign-off. Plus rendering claims (table h-scroll) were asserted
+without live verification. Full analysis → the 2026-06-16 spec.
+
+**SAFEGUARD ("VelGate", Karthi's term):** add a completeness gate to the `~/arogara/AGENTS.md`
+build pipeline — after design, a capability-coverage matrix (every researched capability →
+ship / defer / cut + rationale) surfaced to Karthi for sign-off BEFORE build; a
+"completeness-vs-research" lens in the triple review; and live-verify any rendering claim.
+
+**NEXT CONCRETE ACTIONS (post-compaction):**
+1. Read `docs/specs/2026-06-16-capability-gaps-rootcause-safeguard.md` (gap report + root-cause
+   + safeguard + fix-plan; written by workflow `w31qfwmm6` — commit it if uncommitted).
+2. Implement the fixes via the design→harden→build→review pipeline **with the new completeness
+   gate**: full polls (read via `poll_answer`/`poll` inbound surfaced to the agent + quiz/options/
+   timed), expandable show-more blockquote, table h-scroll (per research), typing-cap tuning.
+3. Add the VelGate completeness gate to `~/arogara/AGENTS.md`.
+4. After fixes: `go install ./cmd/...`, restart the broker (see broker note), re-run the live
+   Telegram smoke test with Karthi (incl. typing on turn 2, table, full polls, show-more).
+5. Then terminal-control (design DECIDED: C3-brain + all-Go PTY stack + arbitrary TUIs);
+   streaming after that.
+
+**Broker note (papercut to fix):** the broker is a persistent flock-singleton daemon;
+`/exit`+relaunch reconnects to the OLD broker (stale code after a rebuild). To load a new
+binary you must `pkill c3-broker` — a running adapter does NOT auto-respawn it, and graceful
+shutdown can hang ~60s (needed SIGKILL). The current broker was started manually after the
+rebuild. `/c3:build`'s "relaunch auto-spawns a fresh broker" is misleading. FIX: `/c3:build`
+should kill+respawn the broker or detect a binary-version mismatch.
+
+**Other durable notes:** STT keys must now live in an env var or `~/.claude/stt.env` (the
+OpenClaw scrub removed the `~/.openclaw` reads). Smoke-test assets: `/tmp/c3-smoke.png`,
+`/tmp/c3-smoke.txt`. Everything committed on `master` (build P0–P7, review fixes,
+SSHGate/proctor/ContestEval scrub, OpenClaw scrub `ddc0b7a`, ROADMAP/RESUME/spec updates,
+AGENTS.md build-pipeline). The only pending file is the 2026-06-16 gap-report (workflow writing it).
+
+---
+
 ## Update — 2026-06-15: channel-capability build SHIPPED
 
 The P0 **channel rich-content + capability architecture** is built and committed on
