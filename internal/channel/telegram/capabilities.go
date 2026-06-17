@@ -79,7 +79,7 @@ const (
 // phone that GFM tables render as REAL native tables (alignment + inline styling
 // survive) before flipping it on for good. Old-client graceful degradation is
 // undocumented, so the monospace fallback stays as the safety net.
-const richTablesEnabled = false
+const richTablesEnabled = true // ON: live-verified on Android 2026-06-17 (GFM tables render as native RichBlockTable); monospace <pre> kept as the error/old-client fallback
 
 // Capabilities returns the static Telegram capability manifest. This is the
 // authoritative inventory of what the Telegram channel can do; core code and
