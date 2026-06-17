@@ -10,6 +10,10 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/PaulSonOfLars/gotgbot/v2"
@@ -29,6 +33,18 @@ const longPollTimeoutSeconds = 25
 // retry-storm before it gets the bot banned.
 const auth401Threshold = 10
 
+// endpointFailoverThreshold is the consecutive-TRANSIENT-failure count that
+// triggers an endpoint advance when more than one Bot-API base is configured.
+// Transient failures (network/timeout/5xx) are the IP-block signature; 5 gives
+// the active endpoint a fair retry budget before swapping to the next one. Only
+// consulted when len(endpoints) > 1 (a single-endpoint setup never fails over).
+const endpointFailoverThreshold = 5
+
+// telegramAPIURLEnv is the env override for the primary Bot-API base URL. It
+// wins over APIBaseURL in mappings.json, matching the C3_LOG_FILE precedent
+// (env beats file). Empty/unset leaves the config field untouched.
+const telegramAPIURLEnv = "C3_TELEGRAM_API_URL"
+
 // Name is the canonical channel name used in mappings.json:channels.telegram.*.
 const Name = "telegram"
 
@@ -43,6 +59,19 @@ type Config struct {
 	DebounceMaxMessages int                             `json:"debounce_max_messages"`
 	FallbackCooldownS   int                             `json:"fallback_cooldown_s"`
 	STTPrefix           string                          `json:"stt_prefix"`
+
+	// APIBaseURL is the Bot-API base the channel talks to. Empty means
+	// gotgbot's default (api.telegram.org) — byte-for-byte today's behavior.
+	// Telegram's IPs are null-routed in India, so the maintainer can point this
+	// at a reverse proxy they OWN (e.g. a Cloudflare Worker on a custom domain).
+	// The bot token is interpolated into every request path, so this must ONLY
+	// ever be a maintainer-controlled host (validated https:// at Start). The
+	// C3_TELEGRAM_API_URL env var overrides this field (see Start).
+	APIBaseURL string `json:"api_base_url,omitempty"`
+	// APIBaseURLs is an optional ordered failover list appended after
+	// APIBaseURL. The poll loop advances to the next endpoint after a run of
+	// transient failures (the IP-block signature) and len(endpoints) > 1.
+	APIBaseURLs []string `json:"api_base_urls,omitempty"`
 }
 
 // Channel is the Telegram channel implementation. Construct via New, register
@@ -57,6 +86,18 @@ type Channel struct {
 	rate       *rateLimiter
 	sentPolls  *sentPollMap // pollID → route+owner for poll-result routing (P4)
 	httpClient *http.Client // shared transport for non-gotgbot calls (file downloads)
+
+	// endpoints is the ordered, deduped list of Bot-API base URLs the channel
+	// may use. It is always non-empty: with no config it is [""], where "" means
+	// gotgbot's DefaultAPIURL (api.telegram.org) — byte-for-byte today's default
+	// behavior. With config it is [APIBaseURL-or-"", ...APIBaseURLs] deduped.
+	// requestOptsFor reads endpoints[activeEndpoint] as the per-call APIURL, so a
+	// "" entry transparently resolves to gotgbot's default via GetAPIURL.
+	endpoints []string
+	// activeEndpoint indexes endpoints. The poll loop advances it on a run of
+	// transient failures (P2 failover) when len(endpoints) > 1; every other call
+	// site reads it via requestOptsFor, so the swap is picked up on the next call.
+	activeEndpoint atomic.Int32
 
 	// health is the single fetch-health state machine. It is the ONLY source
 	// of "is Telegram reachable?" — it replaced the two prior competing
@@ -80,6 +121,18 @@ type Channel struct {
 	cancel context.CancelFunc
 }
 
+// primaryBaseFromEnv applies the C3_TELEGRAM_API_URL env override to a config
+// primary base: a non-empty (trimmed) env value WINS over the config value
+// (env-beats-file, matching the C3_LOG_FILE precedent); an empty/unset env
+// leaves the config value untouched. Pure function so the precedence is unit-
+// testable without a live bot.
+func primaryBaseFromEnv(cfgPrimary string) string {
+	if v := strings.TrimSpace(os.Getenv(telegramAPIURLEnv)); v != "" {
+		return v
+	}
+	return cfgPrimary
+}
+
 // New returns an unstarted Telegram Channel. The bot connection is established
 // in Start; New just allocates.
 func New() *Channel {
@@ -99,6 +152,28 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 	}
 	if c.cfg.BotToken == "" {
 		return errors.New("telegram: bot_token missing in mappings.json:channels.telegram")
+	}
+
+	// Env override for the primary Bot-API base URL (env beats mappings.json,
+	// matching the C3_LOG_FILE precedent). Empty/unset leaves cfg.APIBaseURL.
+	c.cfg.APIBaseURL = primaryBaseFromEnv(c.cfg.APIBaseURL)
+
+	// Build the ordered, deduped endpoint list. [APIBaseURL-or-"" , ...APIBaseURLs].
+	// Both empty ⇒ [""] which means gotgbot's DefaultAPIURL (api.telegram.org) —
+	// byte-for-byte today's behavior. Each NON-empty base is validated so a typo
+	// can never send the bot token to a bad host. We never log the token or a
+	// token-bearing URL; only the active endpoint's host is logged.
+	endpoints, err := buildEndpoints(c.cfg.APIBaseURL, c.cfg.APIBaseURLs)
+	if err != nil {
+		return fmt.Errorf("telegram: %w", err)
+	}
+	c.endpoints = endpoints
+	c.activeEndpoint.Store(0)
+	if active := c.endpoints[0]; active != "" {
+		// Log only the host (never the token-bearing path).
+		if u, perr := url.Parse(active); perr == nil {
+			host.Logf("telegram: using Bot-API endpoint host=%s (%d configured)", u.Host, len(c.endpoints))
+		}
 	}
 
 	// Custom HTTP transport with explicit network-layer timeouts so a
@@ -132,9 +207,18 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 	// requestOptsFor — getUpdates gets the long-poll budget, getMe gets a
 	// short control budget, etc. The default catches anything we forget to
 	// override and prevents falling back to gotgbot's 5s.
+	//
+	// APIURL on DefaultRequestOpts is the client-level fallback base (the active
+	// endpoint at start). Per-call requestOptsFor sets APIURL too and takes
+	// precedence (GetAPIURL: per-call → default → DefaultAPIURL), so failover
+	// still works; this just ensures any call that ever forgets a per-call APIURL
+	// still honors the configured proxy. "" stays gotgbot's default.
 	botClient := &gotgbot.BaseBotClient{
-		Client:             http.Client{Transport: httpTransport},
-		DefaultRequestOpts: &gotgbot.RequestOpts{Timeout: 20 * time.Second},
+		Client: http.Client{Transport: httpTransport},
+		DefaultRequestOpts: &gotgbot.RequestOpts{
+			Timeout: 20 * time.Second,
+			APIURL:  c.activeEndpointURL(),
+		},
 	}
 	// Reuse the same transport for file downloads (DownloadAttachment).
 	// http.DefaultClient has Timeout: 0 (infinite) and no transport-layer
@@ -146,7 +230,7 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 	}
 	bot, err := gotgbot.NewBot(c.cfg.BotToken, &gotgbot.BotOpts{
 		BotClient:   botClient,
-		RequestOpts: requestOptsFor("getMe", longPollTimeoutSeconds),
+		RequestOpts: c.requestOptsFor("getMe"),
 	})
 	if err != nil {
 		return fmt.Errorf("telegram: NewBot: %w", err)
@@ -276,7 +360,7 @@ func (c *Channel) heartbeat() {
 		case <-timer.C:
 		}
 		_, err := c.bot.GetMe(&gotgbot.GetMeOpts{
-			RequestOpts: requestOptsFor("getMe", longPollTimeoutSeconds),
+			RequestOpts: c.requestOptsFor("getMe"),
 		})
 		if err != nil {
 			class, _ := classifyError(err)

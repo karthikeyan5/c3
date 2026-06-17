@@ -64,13 +64,14 @@ func TestCapabilities_GoldenManifest(t *testing.T) {
 		t.Error("InlineKeyboards = false; want true (P7 outbound inline keyboards)")
 	}
 	// Native rich messages: the channel CAN send them (raw sendRichMessage), so
-	// RichMessages is true; RichTables tracks the default-OFF switch so it must be
-	// false until the live-verify flips richTablesEnabled.
+	// RichMessages is true; RichTables is now ON (richTablesEnabled=true,
+	// commit 0c13abf) after the GFM-table → native RichBlockTable render was
+	// live-verified on Android 2026-06-17.
 	if !caps.RichMessages {
 		t.Error("RichMessages = false; want true (sendRichMessage via raw request)")
 	}
-	if caps.RichTables {
-		t.Error("RichTables = true; want false (default-OFF until live-verify)")
+	if !caps.RichTables {
+		t.Error("RichTables = false; want true (live-verified ON 2026-06-17)")
 	}
 	if want := int64(20 * 1024 * 1024); caps.Inbound.MaxDownloadBytes != want {
 		t.Errorf("Inbound.MaxDownloadBytes = %d; want %d (20 MiB)", caps.Inbound.MaxDownloadBytes, want)

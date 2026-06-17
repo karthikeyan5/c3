@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -145,11 +147,144 @@ func timeoutFor(method string, longPollSeconds int) time.Duration {
 	}
 }
 
-// requestOptsFor returns gotgbot.RequestOpts with the per-method timeout
-// already filled in. Use this in every outbound call so we never accidentally
-// fall back to gotgbot's 5s DefaultTimeout.
-func requestOptsFor(method string, longPollSeconds int) *gotgbot.RequestOpts {
-	return &gotgbot.RequestOpts{Timeout: timeoutFor(method, longPollSeconds)}
+// requestOptsFor returns gotgbot.RequestOpts with the per-method timeout AND the
+// active Bot-API base URL filled in. It is the SINGLE chokepoint for both the
+// timeout discipline (never fall back to gotgbot's 5s DefaultTimeout) and the
+// configurable/failover endpoint: it sets APIURL to endpoints[activeEndpoint],
+// where "" transparently means gotgbot's DefaultAPIURL (api.telegram.org). Per
+// GetAPIURL precedence (per-call APIURL → DefaultRequestOpts → DefaultAPIURL),
+// this per-call value wins, so a mid-run endpoint advance is picked up on the
+// very next call. Every outbound + poll site MUST use this method.
+func (c *Channel) requestOptsFor(method string) *gotgbot.RequestOpts {
+	return &gotgbot.RequestOpts{
+		Timeout: timeoutFor(method, longPollTimeoutSeconds),
+		APIURL:  c.activeEndpointURL(),
+	}
+}
+
+// activeEndpointURL returns the current Bot-API base, "" meaning gotgbot's
+// default. It is defensive against an unbuilt endpoints slice (e.g. a *Channel
+// constructed directly in a unit test, bypassing Start): an empty list resolves
+// to "" (the default), never panicking on an out-of-range index.
+func (c *Channel) activeEndpointURL() string {
+	if len(c.endpoints) == 0 {
+		return ""
+	}
+	i := int(c.activeEndpoint.Load())
+	if i < 0 || i >= len(c.endpoints) {
+		return ""
+	}
+	return c.endpoints[i]
+}
+
+// maybeFailover advances the active Bot-API endpoint when the consecutive
+// transient-failure streak (*consec) has reached endpointFailoverThreshold AND
+// more than one endpoint is configured. On advance it rotates activeEndpoint to
+// the next base, logs ONCE (host only, never the token), and resets *consec.
+// With a single endpoint configured it is a no-op (nothing to fail over to).
+// Driven from the poll loop, which owns the transient-failure count. The new
+// endpoint is picked up automatically by every requestOptsFor on the next call.
+func (c *Channel) maybeFailover(consec *int) {
+	if len(c.endpoints) <= 1 || *consec < endpointFailoverThreshold {
+		return
+	}
+	cur := c.activeEndpoint.Load()
+	next := (cur + 1) % int32(len(c.endpoints))
+	c.activeEndpoint.Store(next)
+	*consec = 0
+	c.host.Logf("telegram: endpoint failover after %d consecutive transient failures — advancing to endpoint %d/%d (%s)",
+		endpointFailoverThreshold, next+1, len(c.endpoints), endpointHostLabel(c.endpoints[next]))
+}
+
+// endpointHostLabel renders an endpoint for logging WITHOUT ever exposing the
+// token (the base never contains it, but parse defensively). "" → "default".
+func endpointHostLabel(base string) string {
+	if base == "" {
+		return "default (api.telegram.org)"
+	}
+	if u, err := url.Parse(base); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return "configured"
+}
+
+// buildEndpoints assembles the ordered, deduped Bot-API base list from the
+// primary base + an optional failover list. The result is ALWAYS non-empty:
+//   - both empty ⇒ [""], where "" means gotgbot's DefaultAPIURL — byte-for-byte
+//     today's default behavior, no validation performed.
+//   - otherwise ⇒ [primary-or-"" , ...extras], each NON-empty base validated and
+//     deduped (first occurrence wins, order preserved).
+//
+// Validation: every non-empty base must url.Parse cleanly and be https://,
+// EXCEPT http:// is allowed ONLY for an explicit localhost / 127.0.0.1 host (a
+// local reverse proxy). Anything else is rejected — the bot token is
+// interpolated into the request path, so a typo must never send it to a bad
+// host. We never return or log the token; errors name only the offending base.
+func buildEndpoints(primary string, extras []string) ([]string, error) {
+	primary = strings.TrimSpace(primary)
+	raw := make([]string, 0, 1+len(extras))
+	raw = append(raw, primary) // may be "" (= gotgbot default)
+	for _, e := range extras {
+		raw = append(raw, strings.TrimSpace(e))
+	}
+
+	seen := make(map[string]bool, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, base := range raw {
+		if base == "" {
+			if seen[""] {
+				continue
+			}
+			seen[""] = true
+			out = append(out, "") // gotgbot default; nothing to validate
+			continue
+		}
+		if err := validateAPIBaseURL(base); err != nil {
+			return nil, err
+		}
+		// Dedup on the NORMALIZED (trailing-slash-trimmed) form so
+		// "https://x/" and "https://x" collapse to a single endpoint.
+		norm := strings.TrimSuffix(base, "/")
+		if seen[norm] {
+			continue
+		}
+		seen[norm] = true
+		out = append(out, norm)
+	}
+	if len(out) == 0 {
+		// Defensive: raw always has at least the primary, so this can't happen,
+		// but never return an empty slice (requestOptsFor indexes [0]).
+		out = append(out, "")
+	}
+	return out, nil
+}
+
+// validateAPIBaseURL rejects a base URL that could leak the bot token to a bad
+// host. It must parse, carry a host, and be https:// — with the single
+// exception of http:// for an explicit localhost / 127.0.0.1 host (local
+// reverse proxy). The error names only the base (never the token).
+func validateAPIBaseURL(base string) error {
+	u, err := url.Parse(base)
+	if err != nil {
+		return errors.New("invalid api_base_url " + strconv.Quote(base) + ": " + err.Error())
+	}
+	if u.Host == "" {
+		return errors.New("invalid api_base_url " + strconv.Quote(base) + ": missing host")
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		host := u.Hostname()
+		if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+			return nil
+		}
+		return errors.New("refusing api_base_url " + strconv.Quote(base) +
+			": http:// is only allowed for a localhost reverse proxy (the bot token must not transit a non-TLS remote host)")
+	default:
+		return errors.New("refusing api_base_url " + strconv.Quote(base) +
+			": scheme must be https:// (got " + strconv.Quote(u.Scheme) + ")")
+	}
 }
 
 // authBreaker tracks consecutive 401s on the channel. Once `threshold` is

@@ -41,6 +41,14 @@ type ChannelConfig struct {
 	DebounceMaxMessages int                    `json:"debounce_max_messages,omitempty"`
 	FallbackCooldownS   int                    `json:"fallback_cooldown_s,omitempty"`
 	STTPrefix           string                 `json:"stt_prefix,omitempty"`
+	// APIBaseURL points the channel at a maintainer-owned Bot-API reverse proxy
+	// (Telegram's IPs are null-routed in India). Empty = the channel's default
+	// (api.telegram.org), unchanged behavior. The C3_TELEGRAM_API_URL env var
+	// overrides this. Neutral string — the channel validates it (https://) at
+	// start so a typo can never leak the bot token to a bad host.
+	APIBaseURL string `json:"api_base_url,omitempty"`
+	// APIBaseURLs is an optional ordered failover list appended after APIBaseURL.
+	APIBaseURLs []string `json:"api_base_urls,omitempty"`
 }
 
 // GroupConfig identifies a Telegram supergroup the bot can create topics in.

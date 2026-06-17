@@ -102,7 +102,7 @@ func (c *Channel) SendReply(args c3types.ReplyArgs) (int64, error) {
 		}
 		opts.ReplyMarkup = markup
 	}
-	opts.RequestOpts = requestOptsFor("sendMessage", longPollTimeoutSeconds)
+	opts.RequestOpts = c.requestOptsFor("sendMessage")
 	if err := c.rate.Wait(c.ctx, args.ChatID); err != nil {
 		return 0, fmt.Errorf("telegram: rate-wait: %w", err)
 	}
@@ -199,7 +199,7 @@ func (c *Channel) SendTyping(chatID int64, threadID *int64) error {
 		return errors.New("telegram: channel not started")
 	}
 	opts := &gotgbot.SendChatActionOpts{
-		RequestOpts: requestOptsFor("sendChatAction", longPollTimeoutSeconds),
+		RequestOpts: c.requestOptsFor("sendChatAction"),
 	}
 	if threadID != nil {
 		opts.MessageThreadId = *threadID
@@ -242,7 +242,7 @@ func (c *Channel) EditMessage(args c3types.EditArgs) (*c3types.EditResult, error
 	opts := &gotgbot.EditMessageTextOpts{
 		ChatId:      args.ChatID,
 		MessageId:   args.MessageID,
-		RequestOpts: requestOptsFor("editMessageText", longPollTimeoutSeconds),
+		RequestOpts: c.requestOptsFor("editMessageText"),
 	}
 	if convertMd {
 		text = mdToTelegramHTML(text)
@@ -299,7 +299,7 @@ func (c *Channel) React(args c3types.ReactArgs) error {
 		Reaction: []gotgbot.ReactionType{
 			gotgbot.ReactionTypeEmoji{Emoji: args.Emoji},
 		},
-		RequestOpts: requestOptsFor("setMessageReaction", longPollTimeoutSeconds),
+		RequestOpts: c.requestOptsFor("setMessageReaction"),
 	}
 	if err := c.rate.Wait(c.ctx, args.ChatID); err != nil {
 		return fmt.Errorf("telegram: rate-wait: %w", err)
@@ -324,7 +324,7 @@ func (c *Channel) DownloadAttachment(fileID string) (string, error) {
 		return "", errors.New("telegram: channel not started")
 	}
 	f, err := c.bot.GetFile(fileID, &gotgbot.GetFileOpts{
-		RequestOpts: requestOptsFor("getFile", longPollTimeoutSeconds),
+		RequestOpts: c.requestOptsFor("getFile"),
 	})
 	if err != nil {
 		c.recordOutboundErr(err)
@@ -364,9 +364,10 @@ func (c *Channel) DownloadAttachment(fileID string) (string, error) {
 
 	// The download URL contains the bot token; we never include it in
 	// any error or log line. The relative file path is enough for
-	// debugging.
+	// debugging. fileDownloadURL builds it against the ACTIVE endpoint (P2) so
+	// downloads follow the same reverse proxy as every other call.
 	filePath := strings.TrimPrefix(f.FilePath, "/")
-	dlURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", c.cfg.BotToken, url.PathEscape(filePath))
+	dlURL := c.fileDownloadURL(filePath)
 	req, err := http.NewRequestWithContext(c.ctx, http.MethodGet, dlURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("telegram: build download request for %q: %w", filePath, err)
@@ -392,6 +393,20 @@ func (c *Channel) DownloadAttachment(fileID string) (string, error) {
 	return localPath, nil
 }
 
+// fileDownloadURL builds the /file/bot<token>/<path> download URL against the
+// ACTIVE Bot-API endpoint (P2). This MUST use the configured base — not a
+// hardcoded api.telegram.org — or media downloads silently stay on the
+// IP-blocked host after a proxy swap. An empty active endpoint (default config)
+// falls back to gotgbot.DefaultAPIURL, preserving today's exact behavior. The
+// returned URL contains the bot token; NEVER log it.
+func (c *Channel) fileDownloadURL(filePath string) string {
+	apiBase := strings.TrimSuffix(c.activeEndpointURL(), "/")
+	if apiBase == "" {
+		apiBase = gotgbot.DefaultAPIURL
+	}
+	return fmt.Sprintf("%s/file/bot%s/%s", apiBase, c.cfg.BotToken, url.PathEscape(filePath))
+}
+
 // CreateTopic creates a new forum topic. Spec §6: rate-limit handling honors
 // parameters.retry_after but does NOT silently retry on 429 — instead it
 // surfaces the error so the agent can tell the user. Bulk topic creation is
@@ -404,7 +419,7 @@ func (c *Channel) CreateTopic(chatID int64, name string) (int64, error) {
 		return 0, fmt.Errorf("telegram: rate-wait: %w", err)
 	}
 	t, err := c.bot.CreateForumTopic(chatID, name, &gotgbot.CreateForumTopicOpts{
-		RequestOpts: requestOptsFor("createForumTopic", longPollTimeoutSeconds),
+		RequestOpts: c.requestOptsFor("createForumTopic"),
 	})
 	if err != nil {
 		c.recordOutboundErr(err)

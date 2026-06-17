@@ -129,14 +129,17 @@ func TestBuildRichParams_Shape(t *testing.T) {
 	})
 }
 
-// TestRichTablesEnabled_DefaultOff guards the DEFAULT-OFF invariant: the live-
-// verify gate must ship OFF so behavior is unchanged until the maintainer flips
-// it. If this fails, the switch was left ON by accident.
-func TestRichTablesEnabled_DefaultOff(t *testing.T) {
-	if richTablesEnabled {
-		t.Error("richTablesEnabled must default to false (behavior unchanged until live-verify)")
+// TestRichTablesEnabled_On guards the ON reality: rich-tables was intentionally
+// enabled (commit 0c13abf flipped richTablesEnabled=true) after the GFM-table →
+// native RichBlockTable render was live-verified on Android 2026-06-17. The
+// switch must stay ON and Capabilities().RichTables must reflect it. If this
+// fails, the switch was flipped back OFF by accident — do NOT "fix" by disabling
+// rich-tables; it is correctly ON.
+func TestRichTablesEnabled_On(t *testing.T) {
+	if !richTablesEnabled {
+		t.Error("richTablesEnabled must be true (intentionally ON; live-verified on Android 2026-06-17)")
 	}
-	if caps := New().Capabilities(); caps.RichTables {
-		t.Error("Capabilities().RichTables must reflect the default-OFF switch (false)")
+	if caps := New().Capabilities(); !caps.RichTables {
+		t.Error("Capabilities().RichTables must reflect the ON switch (true)")
 	}
 }

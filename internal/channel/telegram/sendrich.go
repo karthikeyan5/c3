@@ -123,7 +123,7 @@ func buildRichParams(chatID int64, md string, topicID, replyTo *int64) map[strin
 	}
 	if replyTo != nil {
 		params["reply_parameters"] = map[string]any{
-			"message_id":                   *replyTo,
+			"message_id":                  *replyTo,
 			"allow_sending_without_reply": true,
 		}
 	}
@@ -152,7 +152,7 @@ func (c *Channel) sendRich(args c3types.ReplyArgs) (int64, error) {
 		c.ctx,
 		"sendRichMessage",
 		params,
-		requestOptsFor("sendRichMessage", longPollTimeoutSeconds),
+		c.requestOptsFor("sendRichMessage"),
 	)
 	if err != nil {
 		c.recordOutboundErr(err)

@@ -46,7 +46,7 @@ func (c *Channel) sendPoll(args c3types.ReplyArgs) (int64, error) {
 		AllowsMultipleAnswers: spec.MultipleAnswers,
 		MessageThreadId:       threadID(args.TopicID),
 		ReplyParameters:       replyParams(args.ReplyTo),
-		RequestOpts:           requestOptsFor("sendPoll", longPollTimeoutSeconds),
+		RequestOpts:           c.requestOptsFor("sendPoll"),
 	}
 
 	// Quiz mode: set the wire type, the correct option (rc.34 uses the SINGULAR

@@ -110,7 +110,7 @@ func (c *Channel) sendMedia(args c3types.ReplyArgs, item c3types.MediaItem) (int
 		opts := &gotgbot.SendPhotoOpts{
 			Caption:         captionHTML,
 			HasSpoiler:      item.Spoiler,
-			RequestOpts:     requestOptsFor("sendPhoto", longPollTimeoutSeconds),
+			RequestOpts:     c.requestOptsFor("sendPhoto"),
 			MessageThreadId: threadID(args.TopicID),
 			ReplyParameters: replyParams(args.ReplyTo),
 		}
@@ -124,7 +124,7 @@ func (c *Channel) sendMedia(args c3types.ReplyArgs, item c3types.MediaItem) (int
 	case c3types.MediaFile:
 		opts := &gotgbot.SendDocumentOpts{
 			Caption:         captionHTML,
-			RequestOpts:     requestOptsFor("sendDocument", longPollTimeoutSeconds),
+			RequestOpts:     c.requestOptsFor("sendDocument"),
 			MessageThreadId: threadID(args.TopicID),
 			ReplyParameters: replyParams(args.ReplyTo),
 		}
@@ -143,7 +143,7 @@ func (c *Channel) sendMedia(args c3types.ReplyArgs, item c3types.MediaItem) (int
 			// can start playing before the full file downloads. Duration/size
 			// metadata is not plumbed through MediaItem yet (deferred).
 			SupportsStreaming: true,
-			RequestOpts:       requestOptsFor("sendVideo", longPollTimeoutSeconds),
+			RequestOpts:       c.requestOptsFor("sendVideo"),
 			MessageThreadId:   threadID(args.TopicID),
 			ReplyParameters:   replyParams(args.ReplyTo),
 		}
@@ -157,7 +157,7 @@ func (c *Channel) sendMedia(args c3types.ReplyArgs, item c3types.MediaItem) (int
 	case c3types.MediaAudio:
 		opts := &gotgbot.SendAudioOpts{
 			Caption:         captionHTML,
-			RequestOpts:     requestOptsFor("sendAudio", longPollTimeoutSeconds),
+			RequestOpts:     c.requestOptsFor("sendAudio"),
 			MessageThreadId: threadID(args.TopicID),
 			ReplyParameters: replyParams(args.ReplyTo),
 		}
@@ -171,7 +171,7 @@ func (c *Channel) sendMedia(args c3types.ReplyArgs, item c3types.MediaItem) (int
 	case c3types.MediaVoice:
 		opts := &gotgbot.SendVoiceOpts{
 			Caption:         captionHTML,
-			RequestOpts:     requestOptsFor("sendVoice", longPollTimeoutSeconds),
+			RequestOpts:     c.requestOptsFor("sendVoice"),
 			MessageThreadId: threadID(args.TopicID),
 			ReplyParameters: replyParams(args.ReplyTo),
 		}
@@ -186,7 +186,7 @@ func (c *Channel) sendMedia(args c3types.ReplyArgs, item c3types.MediaItem) (int
 		opts := &gotgbot.SendAnimationOpts{
 			Caption:         captionHTML,
 			HasSpoiler:      item.Spoiler,
-			RequestOpts:     requestOptsFor("sendAnimation", longPollTimeoutSeconds),
+			RequestOpts:     c.requestOptsFor("sendAnimation"),
 			MessageThreadId: threadID(args.TopicID),
 			ReplyParameters: replyParams(args.ReplyTo),
 		}

@@ -53,6 +53,16 @@ func (c *Channel) pollLoop() {
 		maxBackoff    = 30 * time.Second
 	)
 
+	// consecTransient counts consecutive TRANSIENT GetUpdates failures (the
+	// IP-block signature). When it reaches endpointFailoverThreshold AND more
+	// than one endpoint is configured, we advance activeEndpoint to the next
+	// base and reset the counter (P2 endpoint failover). It is reset on the
+	// first success and on any non-transient outcome — failover is for the
+	// "this base is unreachable" case ONLY, never for 401/403 (follow you
+	// everywhere) or 409 (conflict). This composes with the Phase-1 fetch-health
+	// machine: the health edge still fires; failover just also rotates the base.
+	var consecTransient int
+
 	var offset int64
 	if c.offsets != nil {
 		if loaded, err := c.offsets.Load(); err == nil && loaded > 0 {
@@ -87,7 +97,7 @@ func (c *Channel) pollLoop() {
 			Offset:         offset,
 			Timeout:        longPoll,
 			AllowedUpdates: allowedUpdates,
-			RequestOpts:    requestOptsFor("getUpdates", longPoll),
+			RequestOpts:    c.requestOptsFor("getUpdates"),
 		}
 		updates, err := c.bot.GetUpdates(opts)
 		if err != nil {
@@ -112,6 +122,9 @@ func (c *Channel) pollLoop() {
 				// breaker (token revoked / persistently rejected) drives the
 				// health machine DOWN — a couple of transient auth blips
 				// shouldn't raise the out-of-band alarm.
+				// Permanent (401/403) follows you to every endpoint — never a
+				// reason to fail over. Reset the transient streak.
+				consecTransient = 0
 				tripped := c.authBrk.RecordFail()
 				c.host.Logf("telegram: GetUpdates permanent error (consec=%d, tripped=%v): %v",
 					c.authBrk.Consec(), tripped, err)
@@ -138,7 +151,9 @@ func (c *Channel) pollLoop() {
 				// 429 is a healthy, reachable server pushing back — it is
 				// explicitly NOT a fetch-health failure. Do NOT call
 				// RecordFailure here (the central false-positive guard:
-				// "429 is NOT down").
+				// "429 is NOT down"). The endpoint is reachable, so it is not a
+				// failover trigger either — reset the transient streak.
+				consecTransient = 0
 				wait := time.Duration(retryAfter) * time.Second
 				if wait <= 0 {
 					wait = 5 * time.Second
@@ -161,6 +176,8 @@ func (c *Channel) pollLoop() {
 				// fans out the out-of-band alert.
 				c.host.Logf("telegram: GetUpdates transient error (backoff %v): %v", backoff, err)
 				c.reportHealth(c.health.RecordFailure("transient (network/timeout/5xx)"))
+				consecTransient++
+				c.maybeFailover(&consecTransient)
 				select {
 				case <-c.ctx.Done():
 					return
@@ -173,9 +190,13 @@ func (c *Channel) pollLoop() {
 				continue
 			default:
 				// Unclassified is treated as transient (see classifyError) —
-				// drive the health machine the same way.
+				// drive the health machine the same way, INCLUDING the failover
+				// counter (an unreachable host can surface as an unclassified
+				// network error).
 				c.host.Logf("telegram: GetUpdates unclassified error (treating as transient, backoff %v): %v", backoff, err)
 				c.reportHealth(c.health.RecordFailure("unclassified (treated as transient)"))
+				consecTransient++
+				c.maybeFailover(&consecTransient)
 				select {
 				case <-c.ctx.Done():
 					return
@@ -193,6 +214,9 @@ func (c *Channel) pollLoop() {
 		c.authBrk.RecordSuccess()
 		c.reportHealth(c.health.RecordSuccess())
 		backoff = baseBackoff
+		// A working endpoint sticks: the first success clears the failover streak
+		// so we don't rotate away from a base that just recovered.
+		consecTransient = 0
 
 		var advanced bool
 		for _, u := range updates {
