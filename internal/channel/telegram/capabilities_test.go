@@ -63,6 +63,15 @@ func TestCapabilities_GoldenManifest(t *testing.T) {
 	if !caps.InlineKeyboards {
 		t.Error("InlineKeyboards = false; want true (P7 outbound inline keyboards)")
 	}
+	// Native rich messages: the channel CAN send them (raw sendRichMessage), so
+	// RichMessages is true; RichTables tracks the default-OFF switch so it must be
+	// false until the live-verify flips richTablesEnabled.
+	if !caps.RichMessages {
+		t.Error("RichMessages = false; want true (sendRichMessage via raw request)")
+	}
+	if caps.RichTables {
+		t.Error("RichTables = true; want false (default-OFF until live-verify)")
+	}
 	if want := int64(20 * 1024 * 1024); caps.Inbound.MaxDownloadBytes != want {
 		t.Errorf("Inbound.MaxDownloadBytes = %d; want %d (20 MiB)", caps.Inbound.MaxDownloadBytes, want)
 	}

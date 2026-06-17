@@ -55,7 +55,31 @@ const (
 	// turn an over-large keyboard into a clear error rather than a 400.
 	maxKeyboardRows  = 100
 	maxButtonsPerRow = 8
+
+	// Rich-message limits (Bot API 10.1, sendRichMessage). These are Telegram Bot
+	// API facts and live in this package only (the no-leak rule R7) — no raw rich
+	// limit number reaches core. Verified against the live "Rich Message Limits"
+	// section (2026-06-17): a rich message allows ≤32768 UTF-8 chars and ≤500
+	// blocks (a table's ROWS count as blocks; cells do not), and a table allows
+	// ≤20 columns. richTableEligible (sendrich.go) enforces the per-table caps so
+	// an over-cap table falls back to the monospace renderer instead of earning a
+	// Telegram 400.
+	maxRichBlocks  = 500
+	maxRichColumns = 20
+	maxRichChars   = 32768
 )
+
+// richTablesEnabled is the DEFAULT-OFF switch for native rich-message tables
+// (sendRichMessage). It is false so behavior is unchanged: every detected GFM
+// table still renders as the proven monospace <pre> block. The native-table
+// route (SendReply → sendRich, sendrich.go) is wired and tested but dormant
+// until this is flipped.
+//
+// LIVE-VERIFY: change this single line to `true`, rebuild, and confirm on a
+// phone that GFM tables render as REAL native tables (alignment + inline styling
+// survive) before flipping it on for good. Old-client graceful degradation is
+// undocumented, so the monospace fallback stays as the safety net.
+const richTablesEnabled = false
 
 // Capabilities returns the static Telegram capability manifest. This is the
 // authoritative inventory of what the Telegram channel can do; core code and
@@ -92,6 +116,12 @@ func (c *Channel) Capabilities() c3types.Capabilities {
 		Typing:           true,
 		ExpandableQuotes: true,
 		InlineKeyboards:  true,
+		// RichMessages reflects that this channel CAN send native rich messages
+		// (Bot API 10.1 sendRichMessage via the raw request method). RichTables is
+		// gated on the default-OFF switch so the agent is only told tables render
+		// natively once the live-verify has flipped richTablesEnabled.
+		RichMessages: true,
+		RichTables:   richTablesEnabled,
 		Inbound: c3types.InboundCaps{
 			MaxDownloadBytes: maxDownloadBytes,
 			// The attachment kinds Telegram delivers inbound. Mapped onto the

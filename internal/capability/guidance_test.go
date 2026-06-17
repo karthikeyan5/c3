@@ -69,9 +69,9 @@ func TestGuidanceFor_PositiveLines(t *testing.T) {
 		// Expandable "Show more" blockquote guidance (gated on ExpandableQuotes).
 		"collapse behind a 'Show more' chevron",
 		"end the\n  blockquote with a line containing only `||`",
-		// Wide-table honesty line (P6) — gated on RichText. Asserts the HONEST
-		// cross-client claim (desktop/web WRAP, Android scrolls), not "scrolls
-		// everywhere".
+		// Wide-table honesty line (P6) — gated on RichTables=false (the default in
+		// telegramLikeCaps). Asserts the HONEST cross-client claim (desktop/web
+		// WRAP, Android scrolls), not "scrolls everywhere".
 		"Wide tables: rendered as a monospace block for column alignment",
 		"Telegram does NOT\n  scroll wide content uniformly",
 		"desktop/web WRAP (breaking alignment), Android scrolls",
@@ -110,6 +110,26 @@ func TestGuidanceFor_PositiveLines(t *testing.T) {
 		"Polls: NOT supported",
 		"Rich text: NOT supported",
 		"Media: NOT supported",
+		// RichTables is OFF in telegramLikeCaps, so the native-table line must NOT
+		// appear (the monospace wording asserted above is shown instead).
+		"Tables render natively as real tables",
+	})
+}
+
+// TestGuidanceFor_RichTablesOn asserts the table guidance flips when RichTables
+// is enabled: the native-table wording appears and the monospace wording is
+// suppressed. This pins both branches of the RichTables gate (anti-drift).
+func TestGuidanceFor_RichTablesOn(t *testing.T) {
+	caps := telegramLikeCaps()
+	caps.RichTables = true
+	g := GuidanceFor(caps)
+	assertContainsAll(t, g, []string{
+		"Tables render natively as real tables — just write a normal GFM pipe table;",
+		"no need to keep them narrow.",
+	})
+	assertContainsNone(t, g, []string{
+		"Wide tables: rendered as a monospace block for column alignment",
+		"Keep tables narrow (transpose, or fewer columns); for a truly wide table, send an image.",
 	})
 }
 

@@ -79,6 +79,20 @@ type Capabilities struct {
 	// in the channel implementation.
 	InlineKeyboards bool
 
+	// RichMessages reports whether the channel can send native rich messages
+	// (structured blocks beyond inline markup) — e.g. Telegram's Bot API 10.1
+	// sendRichMessage. Channel-neutral: the wire method, payload shape, and any
+	// rich-message limits live entirely in the channel implementation.
+	RichMessages bool
+
+	// RichTables reports whether the channel renders a GFM pipe table as a REAL
+	// native table (not a monospace approximation). When true the agent may write
+	// ordinary GFM pipe tables without keeping them narrow; when false the channel
+	// falls back to a monospace block and the guidance says to keep tables narrow.
+	// Channel-neutral: how a table is detected, capped, and sent lives in the
+	// channel implementation.
+	RichTables bool
+
 	// Inbound describes inbound-direction capabilities.
 	Inbound InboundCaps
 	// Stream describes reasoning-streaming capabilities (DEFERRED in v1).

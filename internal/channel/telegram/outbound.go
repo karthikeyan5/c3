@@ -56,6 +56,19 @@ func (c *Channel) SendReply(args c3types.ReplyArgs) (int64, error) {
 		return 0, fmt.Errorf("telegram: SendReply got %d media items in one part — the gate emits one item per part", len(args.Media))
 	}
 
+	// Native rich-message table route (Bot API 10.1 sendRichMessage), gated on the
+	// default-OFF richTablesEnabled switch. When the reply is rich-eligible (a
+	// detected GFM table within caps on a markdown reply), send the WHOLE reply as
+	// native markdown so Telegram renders real tables. On ANY error fall through to
+	// the existing monospace/plaintext path so a message is never lost.
+	if richTableEligible(richTablesEnabled, args.Markup, args.Text) {
+		if id, err := c.sendRich(args); err == nil {
+			return id, nil
+		} else {
+			c.host.Logf("telegram: sendRichMessage failed, falling back to monospace path: %v", err)
+		}
+	}
+
 	// Empty/zero-value Markup is the MARKDOWN DEFAULT (see doc comment).
 	convertMd := args.Markup == c3types.MarkupMarkdown || args.Markup == ""
 	useHTML := convertMd || args.Markup == c3types.MarkupNative
