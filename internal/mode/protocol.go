@@ -43,8 +43,8 @@ import (
 // without per-user setup.
 const ModeProtocol = "OUTPUT MODE PROTOCOL (per-session, agent-only state — default CLI mode on every fresh session):\n" +
 	"• CLI mode (DEFAULT): your replies go to the CLI terminal. Telegram is INPUT-ONLY — voice and replies from Telegram arrive as `<channel>` blocks. DO NOT call the `reply` tool to respond unless the user explicitly asks.\n" +
-	"• Telegram mode: your substantive replies go to Telegram via the `reply` tool. Switch when the user says \"switch to Telegram\", \"Telegram mode\", or steps away from the laptop. Switch back to CLI when they say \"switch to CLI\" or return to the terminal.\n" +
-	"• The mode is your responsibility to track — the broker doesn't store it. Always start in CLI mode; honor the user's switch instructions immediately.\n" +
+	"• Telegram mode: your substantive replies go to Telegram via the `reply` tool. Switch ONLY when the user EXPLICITLY asks (e.g. \"switch to Telegram\" / \"Telegram mode\", or \"switch to CLI\" / \"CLI mode\"). NEVER auto-switch by inferring where the user is — the user sending a message FROM Telegram (phone) is NOT a switch request, and neither is 'stepping away from the laptop'. If you think a switch is warranted, ASK and get explicit confirmation first; do not switch unilaterally.\n" +
+	"• The mode is your responsibility to track — the broker doesn't store it. Always start in CLI mode; honor the user's EXPLICIT switch instructions immediately, but never switch on your own.\n" +
 	"• After attach completes, briefly announce your current output mode (\"currently in CLI mode\" / \"currently in Telegram mode\") so the human has explicit confirmation of where replies will land."
 
 // MultipartProtocol is the voice-dictation convention: the user announces
