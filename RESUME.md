@@ -1,5 +1,45 @@
 # RESUME
 
+## 🔵 CHECKPOINT — 2026-06-17 (rich-tables shipped · Telegram India IP-block · proxy plan)
+
+**Mode:** CLI (Telegram is intermittently blocked from Karthi's network — see root cause — so CLI is the reliable channel). **Broker:** pid changes per restart; current one was built ~06:10 with rich-tables ON but does **NOT** have P1/P2 — **a broker restart is HELD until the proxy deploy** so it loads everything at once. Broker log: `~/.local/state/c3/broker.log`. Restart procedure: kill the live `c3-broker` (kill -9 if graceful hangs) + `setsid c3-broker` detached; it re-adopts claims.
+
+**SHIPPED since the 2026-06-16 handoff (all on `master`, unpushed):**
+- Completeness batch **P1–P7 + 4-lens review + fixes** (full polls, poll-read aggregate+on-close, expandable show-more, wide tables, inline buttons); race-clean.
+- **Native rich-message tables** (Bot API 10.1 `sendRichMessage`/`RichBlockTable`): C3 routes detected GFM tables through `sendRichMessage` (raw via gotgbot `RequestWithContext`, no lib bump); **LIVE-VERIFIED on Karthi's Android — renders as a real native table.** `richTablesEnabled = true` (`0c13abf`). Monospace `<pre>` kept as fallback. This **solved the original wide-table complaint.**
+- **Robustness for the block (committed, NOT yet live — needs the held broker restart):**
+  - **P1 graceful-fail-notify** (`39f2fc6`): fetch-health state machine (quiet-night = healthy; only transport errors → DOWN; kills the false-positive watchdog spam) + out-of-band fan-out — desktop `notify-send` + "⚠️ SYSTEM" broadcast to CLI sessions + `c3-broker status` health line. Stops the silent failure.
+  - **P2 base-url + failover** (`20f3217`): configurable Bot-API base URL (`C3_TELEGRAM_API_URL` env / `api_base_url` in mappings.json) via gotgbot `RequestOpts.APIURL` (no patch) + transient-only endpoint failover + fixed the hardcoded download URL. Default-unset = byte-identical to today. https-only validation; never `InsecureSkipVerify`; token never logged.
+
+**ROOT CAUSE of the whole connectivity saga: Telegram is IP-range-blocked in India.** Karthi's network null-routes `149.154.0.0/16` + `91.108.0.0/16` + IPv6. Probed + confirmed (DNS + general internet fine; all TCP to Telegram IPs times out; NOT SNI-DPI). Caused the overnight "HEARTBEAT FAILED" spam, intermittent/missing inbound, and Karthi's "not attached?" confusion. **Definitive: no zero-infra escape** (api.telegram.org single-homed in the blocked range, not CDN-fronted; the dynamic/DoH/fallback resilience is MTProto-*client*-only, not the Bot API). → **a maintainer-owned reverse proxy is required.**
+
+**PROXY PLAN (Karthi's decisions):**
+- **GCP e2-micro VM**, free-tier, **NON-India region** — Mumbai forbidden (Indian network = also blocked). Hosts BOTH: nginx Bot-API reverse proxy (for C3) + **mtg** MTProto proxy (for Karthi's Telegram client apps).
+- **Both on port 443, TWO subdomains** (Karthi's directive): a Bot-API subdomain + an MTProto subdomain. **(Actual subdomain values are kept OUT of this repo per Karthi — they live in local agent-memory + the gitignored `~/.config/c3/` + on the VM. Never commit them.)** **DNS = A records to a reserved static IP** (decided: NOT a CNAME — a reserved static IP is fully stable; the CNAME-to-`*.run.app` path is ruled out by Cloud Run's long-poll cost + mtg can't run on Cloud Run). Both subdomains → the one VM static IP; the VM SNI-routes `:443`. OPEN DETAIL to resolve at deploy: mtg fake-TLS makes the client present the *disguise* domain as SNI, complicating subdomain SNI-routing — fix by setting mtg's disguise = the MTProto subdomain, or give the VM a 2nd IP (decide via live mtg docs).
+- **Agent runs the deploy itself** via a scoped, budgeted GCP key (Proctor pattern, `proctor/night-run/GCP-SETUP-INSTRUCTIONS.md`).
+- **Token-safety:** strict TLS cert-verify on BOTH legs (C3→proxy Let's Encrypt; proxy→Telegram `proxy_ssl_verify on`). Owned proxy only; never a public/third-party proxy.
+
+**DELIVERABLES written:**
+- `docs/GCP-KEY-PROVISIONING.md` (committed) — for a full-access instance to mint an isolated project + scoped deployer SA + $15 budget + key → `~/.config/c3/gcp-proxy.env` (key at `~/.config/c3/gcp-proxy-sa.json`, **outside the repo**).
+- `docs/DEPLOY-telegram-proxy.md` (**UNTRACKED draft, 8443 version — STALE**; rewrite for both-on-443/two-subdomains + the mtg SNI detail; becomes the agent's deploy script).
+
+**NEXT CONCRETE ACTIONS (resume here):**
+1. **Wait for Karthi** to provision the key (via GCP-KEY-PROVISIONING.md) → `~/.config/c3/gcp-proxy.env` exists → he says "key's ready."
+2. **Rewrite** `docs/DEPLOY-telegram-proxy.md` for both-on-443 + two subdomains (resolve the mtg SNI detail via live mtg docs) as a runnable script.
+3. **Deploy** (agent via the key): reserve static IP → create e2-micro VM (non-India region) → give Karthi the IP → he points 2 subdomains → install/config nginx (Bot-API + Let's Encrypt) + mtg (MTProto) on 443/SNI + firewall.
+4. **Wire C3:** `C3_TELEGRAM_API_URL=https://<bot-api-subdomain>` → **rebuild + restart broker** (loads P1+P2 + proxy URL).
+5. **Live-verify with Karthi:** a real phone→Telegram message flows through the proxy from the blocked machine; graceful-fail-notify fires on a simulated down; native table renders; Karthi pastes the mtg `tg://` link into his Telegram apps.
+
+**STILL PARKED (not lost):**
+- **Inbound forwarded-message empty text** — CONFIRMED cause: forwarded Bot-API-10.1 rich messages carry the body in `Message.rich_message`, which gotgbot rc.34 silently drops → empty `.Text` (NOT the bot-to-bot rule). Karthi wants forwarding to WORK — fix = augmented `getUpdates` decode shim parsing `rich_message` blocks → text (works on rc.34, no bump). Design in research outputs w4ocivw74/wb63isan9.
+- Smoke-test tails: expandable show-more (visual confirm), inline-buttons callback (fresh-message tap — old ones stale-dropped).
+- Deferred 10.x (deleteMessageReaction, rich HTML tables w/ borders/spans, `sendRichMessageDraft` streaming, guest mode) + the build-later defer list (albums, echo-by-file_id, underline/mention, outbound forwarding, location).
+- Push decision pending (PII clean; unpushed).
+
+**Memories added this session:** `feedback_no_canonicalize_offhand_terms`, `feedback_no_auto_switch_output_mode`, `feedback_fetch_live_docs_not_memory`.
+
+---
+
 ## 🔴 PAUSE POINT — compaction handoff (2026-06-16)
 
 **Resume map:** `cd ~/arogara/c3`, attach the c3 topic, then read this section +
