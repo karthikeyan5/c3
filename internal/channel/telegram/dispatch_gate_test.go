@@ -17,6 +17,7 @@ type fakeHost struct {
 	emitted  []*c3types.Inbound
 	decision channel.GateInboundDecision
 	logs     []string
+	health   []c3types.HealthEvent
 }
 
 func (h *fakeHost) Config(name string, target any) error { return nil }
@@ -37,6 +38,20 @@ func (h *fakeHost) Done() <-chan struct{} { return nil }
 
 func (h *fakeHost) GateInbound(in *c3types.Inbound) channel.GateInboundDecision {
 	return h.decision
+}
+
+func (h *fakeHost) NotifyHealth(ev c3types.HealthEvent) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.health = append(h.health, ev)
+}
+
+func (h *fakeHost) healthEvents() []c3types.HealthEvent {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]c3types.HealthEvent, len(h.health))
+	copy(out, h.health)
+	return out
 }
 
 func (h *fakeHost) emitCount() int {

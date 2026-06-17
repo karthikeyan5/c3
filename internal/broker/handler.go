@@ -126,6 +126,8 @@ func (b *Broker) HandleConn(nc net.Conn) {
 			b.handleListTopics(conn)
 		case ipc.OpListClaims:
 			b.handleListClaims(conn)
+		case ipc.OpListHealth:
+			b.handleHealth(conn)
 		case ipc.OpRelease:
 			b.Routes.ReleaseAllByConnID(stub.ConnID)
 			stub.SetRoute(nil)
@@ -232,6 +234,27 @@ func (b *Broker) handleListClaims(conn *ipc.Conn) {
 			}
 		}
 		resp.Claims = append(resp.Claims, entry)
+	}
+	_ = conn.WriteJSON(resp)
+}
+
+// handleHealth returns a snapshot of the broker's per-channel cached
+// fetch-health (the last HealthEvent per channel). Used by `c3-broker status`
+// to render the "Channel health:" line. Mirrors handleListClaims.
+func (b *Broker) handleHealth(conn *ipc.Conn) {
+	resp := ipc.HealthListMsg{Op: ipc.OpHealthList}
+	for ch, ev := range b.lastHealthSnapshot() {
+		entry := ipc.HealthEntry{
+			Channel:   ch,
+			State:     string(ev.State),
+			SinceUnix: ev.Since.Unix(),
+			Consec:    ev.Consec,
+			Reason:    ev.Reason,
+		}
+		if ev.State == c3types.HealthStateDown {
+			entry.DownForSec = int64(ev.DownFor.Seconds())
+		}
+		resp.Health = append(resp.Health, entry)
 	}
 	_ = conn.WriteJSON(resp)
 }

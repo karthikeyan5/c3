@@ -48,6 +48,18 @@ type Broker struct {
 	chMu     sync.RWMutex
 	channels map[string]*channelRegistration
 
+	// desktopNotifier raises a local desktop popup for a channel-health edge.
+	// Snapshotted once at broker start (the launching shell carries the desktop
+	// session env). One of the out-of-band health sinks; never blocks/crashes.
+	// An interface so tests can inject a fake (real impl: *desktopNotifier).
+	desktopNotifier healthNotifier
+
+	// healthMu guards lastHealth — the most recent HealthEvent per channel,
+	// cached so `c3-broker status` can render a "Channel health:" line. Updated
+	// in NotifyHealth on every edge; read by handleHealth.
+	healthMu   sync.RWMutex
+	lastHealth map[string]c3types.HealthEvent
+
 	// sessionPIDResolver maps a registered stub's PID to the real CLI
 	// session pid by walking up the /proc tree (defaults to
 	// proctree.CLISessionPID). A Claude stub registers under its ADAPTER's
@@ -71,6 +83,8 @@ func New(mf *mappings.MappingsFile) *Broker {
 		ctx:                ctx,
 		cancel:             cancel,
 		channels:           map[string]*channelRegistration{},
+		desktopNotifier:    newDesktopNotifier(),
+		lastHealth:         map[string]c3types.HealthEvent{},
 		sessionPIDResolver: proctree.CLISessionPID,
 	}
 	b.mappings.Store(mf)
@@ -203,6 +217,26 @@ func (b *Broker) Shutdown() {
 	}
 	b.chMu.Unlock()
 	b.cancel()
+}
+
+// setLastHealth caches the most recent HealthEvent for a channel. Called from
+// BrokerHost.NotifyHealth on every edge; read by handleHealth for the
+// `c3-broker status` health line.
+func (b *Broker) setLastHealth(ev c3types.HealthEvent) {
+	b.healthMu.Lock()
+	defer b.healthMu.Unlock()
+	b.lastHealth[ev.Channel] = ev
+}
+
+// lastHealthSnapshot returns a copy of the per-channel last-health cache.
+func (b *Broker) lastHealthSnapshot() map[string]c3types.HealthEvent {
+	b.healthMu.RLock()
+	defer b.healthMu.RUnlock()
+	out := make(map[string]c3types.HealthEvent, len(b.lastHealth))
+	for k, v := range b.lastHealth {
+		out[k] = v
+	}
+	return out
 }
 
 // SetMappings atomically swaps the in-memory mappings pointer. Called on

@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
+	"time"
 
 	"github.com/karthikeyan5/c3/internal/c3types"
 	"github.com/karthikeyan5/c3/internal/channel"
+	"github.com/karthikeyan5/c3/internal/ipc"
 )
 
 // BrokerHost is the broker's concrete implementation of channel.Host.
@@ -83,6 +86,134 @@ func (h *BrokerHost) GateInbound(in *c3types.Inbound) channel.GateInboundDecisio
 	default:
 		return channel.GateInboundDrop
 	}
+}
+
+// NotifyHealth fans a channel fetch-health edge out to FOUR independent
+// out-of-band sinks, so a dead channel still raises an alarm through a different
+// path. The alert NEVER re-enters the reporting channel (e.g. when Telegram is
+// down we do not try to alert over Telegram). Each sink runs in its own
+// goroutine with a recover, so one slow/failing sink can't block or crash the
+// others or the broker:
+//
+//	(a) desktop notify  — a local popup (notify-send/zenity), best-effort.
+//	(b) CLI broadcast   — a trusted, broker-originated system InboundEvent
+//	                      written to EVERY live CLI session (bypasses the
+//	                      worker pool / debounce / allowlist gate — see
+//	                      broadcastSystemEvent for why that bypass is safe).
+//	(c) status cache    — caches the event so `c3-broker status` can render a
+//	                      "Channel health:" line.
+//	(d) broker log      — one loud line per edge (the per-attempt detail stays
+//	                      at the channel's existing log tier).
+//
+// (b) and (c) are the guaranteed backstops: even if the desktop popup fails,
+// silent failure is impossible.
+func (h *BrokerHost) NotifyHealth(ev c3types.HealthEvent) {
+	// (c) cache for the status line — synchronous, cheap, lock-guarded.
+	h.broker.setLastHealth(ev)
+
+	// (d) broker log — one loud edge line.
+	if ev.State == c3types.HealthStateDown {
+		log.Printf("HEALTH chan=%s state=DOWN since=%s consec=%d reason=%q — inbound offline; out-of-band alerting (desktop + CLI broadcast + status)",
+			ev.Channel, ev.Since.Format("15:04:05"), ev.Consec, ev.Reason)
+	} else {
+		log.Printf("HEALTH chan=%s state=UP (recovered, was down %s) — inbound restored",
+			ev.Channel, ev.DownFor.Round(time.Second))
+	}
+
+	// (a) desktop notify — isolated goroutine + recover (inside Notify).
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("health-notify: desktop sink panic recovered: %v", r)
+			}
+		}()
+		if h.broker.desktopNotifier != nil {
+			h.broker.desktopNotifier.Notify(ev)
+		}
+	}()
+
+	// (b) CLI broadcast — isolated goroutine + recover.
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("health-notify: CLI-broadcast sink panic recovered: %v", r)
+			}
+		}()
+		h.broker.broadcastSystemEvent(systemEventForHealth(ev))
+	}()
+}
+
+// systemEventForHealth renders a channel-neutral SystemEvent advisory for a
+// health edge. The message is operational (no user content); it tells the agent
+// whether phone messages will arrive. Level is "warn" for DOWN, "info" for UP.
+func systemEventForHealth(ev c3types.HealthEvent) *c3types.SystemEvent {
+	ch := ev.Channel
+	if ch == "" {
+		ch = "channel"
+	}
+	if ev.State == c3types.HealthStateDown {
+		return &c3types.SystemEvent{
+			Source: ev.Channel,
+			Level:  "warn",
+			Title:  fmt.Sprintf("%s fetch DOWN", ch),
+			Message: fmt.Sprintf("Cannot reach %s since %s (%d consecutive %s). Your phone messages won't arrive until this recovers.",
+				ch, ev.Since.Format("15:04"), ev.Consec, strings.TrimSpace(ev.Reason)),
+		}
+	}
+	return &c3types.SystemEvent{
+		Source:  ev.Channel,
+		Level:   "info",
+		Title:   fmt.Sprintf("%s fetch RECOVERED", ch),
+		Message: fmt.Sprintf("%s is reachable again (was down %s). Phone messages will arrive normally now.", ch, ev.DownFor.Round(time.Second)),
+	}
+}
+
+// broadcastSystemEvent writes a broker-originated system InboundEvent to EVERY
+// live CLI session. Whichever CLI the user is looking at sees the advisory.
+//
+// SECURITY BOUNDARY (explicit): this BYPASSES the inbound allowlist gate
+// (host.GateInbound / broker.Gate) and the per-route worker pool / debounce.
+// That bypass is sound ONLY because the event is BROKER-ORIGINATED and TRUSTED
+// — it carries no user content and is not user input, so the default-deny
+// allowlist (which exists to keep STRANGERS' messages out) does not apply. This
+// path must NEVER be used to deliver anything user-sourced; user inbound ALWAYS
+// goes through host.Emit → GateInbound. The only producer of these events is
+// NotifyHealth, deep inside the broker.
+//
+// Delivery is a direct write to each alive stub's conn (mirrors the worker's
+// forwardOrFallback write), best-effort per conn: a failed write to one session
+// is logged and skipped, never fatal.
+func (b *Broker) broadcastSystemEvent(sysev *c3types.SystemEvent) {
+	if sysev == nil {
+		return
+	}
+	in := c3types.Inbound{
+		Channel: sysev.Source,
+		Kind:    c3types.InboundSystem,
+		Event:   &c3types.InboundEvent{System: sysev},
+		// No ChatID/Sender/Text — this is broker-originated, not a routed
+		// user message.
+	}
+	delivered := 0
+	for _, s := range b.Stubs.Snapshot() {
+		// Skip the transient CLI clients (status/topics/etc.) — they're not
+		// long-lived agent sessions and close immediately.
+		if s.CLI == "c3-broker-cli" {
+			continue
+		}
+		conn, ok := s.ConnValue().(*ipc.Conn)
+		if !ok || conn == nil {
+			continue
+		}
+		if err := conn.WriteJSON(ipc.InboundMsg{Op: ipc.OpInbound, Inbound: in}); err != nil {
+			log.Printf("health-broadcast: write to cli=%s pid=%d conn=%d failed: %v",
+				s.CLI, s.PID, s.ConnID, err)
+			continue
+		}
+		delivered++
+	}
+	log.Printf("health-broadcast: system advisory %q delivered to %d live CLI session(s)",
+		sysev.Title, delivered)
 }
 
 // channelRegistration entries inside the broker.

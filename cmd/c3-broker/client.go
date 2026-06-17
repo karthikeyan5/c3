@@ -102,3 +102,24 @@ func fetchClaimsList() (*ipc.ClaimsListMsg, error) {
 	}
 	return &msg, nil
 }
+
+// fetchHealthList connects, sends OpListHealth, reads the response, closes.
+func fetchHealthList() (*ipc.HealthListMsg, error) {
+	conn, err := dialBroker()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	if err := conn.WriteJSON(ipc.ListHealthReq{Op: ipc.OpListHealth}); err != nil {
+		return nil, fmt.Errorf("write list_health: %w", err)
+	}
+	raw, err := conn.ReadFrame()
+	if err != nil {
+		return nil, fmt.Errorf("read health_list: %w", err)
+	}
+	var msg ipc.HealthListMsg
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return nil, fmt.Errorf("parse health_list: %w", err)
+	}
+	return &msg, nil
+}

@@ -436,6 +436,10 @@ func formatEventBody(in *c3types.Inbound) string {
 	case ev != nil && ev.Callback != nil:
 		cb := ev.Callback
 		return fmt.Sprintf("button pressed (data=%q) on message %d", cb.Data, cb.MessageID)
+	case ev != nil && ev.System != nil:
+		// Broker-originated system advisory (e.g. a channel-health alert).
+		// Operational, not user content.
+		return "⚠️ SYSTEM: " + ev.System.Message
 	default:
 		return fmt.Sprintf("(%s event)", in.Kind)
 	}

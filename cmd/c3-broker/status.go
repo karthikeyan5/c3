@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/karthikeyan5/c3/internal/broker"
 	"github.com/karthikeyan5/c3/internal/mappings"
@@ -83,6 +84,36 @@ func runStatus() error {
 		for name, cfg := range mf.Plugins {
 			enabled, _ := cfg["enabled"].(bool)
 			fmt.Fprintf(&b, "  - %-10s enabled=%v\n", name, enabled)
+		}
+	}
+
+	// Channel health via OpListHealth. Shows the last fetch-health edge per
+	// channel (DOWN since … / UP). Only channels that have reported at least one
+	// edge appear; a freshly-started healthy broker shows "(no health events
+	// reported yet)".
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "Channel health:")
+	if healthList, err := fetchHealthList(); err != nil {
+		fmt.Fprintf(&b, "  (broker unreachable: %v)\n", err)
+	} else if len(healthList.Health) == 0 {
+		fmt.Fprintln(&b, "  (no health events reported yet)")
+	} else {
+		for _, h := range healthList.Health {
+			ch := h.Channel
+			if ch == "" {
+				ch = "channel"
+			}
+			if h.State == "down" {
+				since := time.Unix(h.SinceUnix, 0).Format("15:04")
+				reason := h.Reason
+				if reason == "" {
+					reason = "transport failures"
+				}
+				fmt.Fprintf(&b, "  • %s fetch: DOWN since %s (%d consecutive %s, down %s)\n",
+					ch, since, h.Consec, reason, (time.Duration(h.DownForSec) * time.Second).String())
+			} else {
+				fmt.Fprintf(&b, "  • %s fetch: UP\n", ch)
+			}
 		}
 	}
 

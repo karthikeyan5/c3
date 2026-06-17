@@ -657,6 +657,24 @@ func buildEventFrame(in *c3types.Inbound) (string, map[string]any) {
 		meta["data"] = cb.Data
 		return content, meta
 
+	case ev != nil && ev.System != nil:
+		// Broker-originated system advisory (e.g. a channel-health alert
+		// broadcast to every CLI session). Surfaced loud so the user sees that
+		// their phone messages won't arrive while the channel is down. NOT user
+		// content — purely operational.
+		sysev := ev.System
+		content := "⚠️ SYSTEM: " + sysev.Message
+		if sysev.Source != "" {
+			meta["source"] = sysev.Source
+		}
+		if sysev.Level != "" {
+			meta["level"] = sysev.Level
+		}
+		if sysev.Title != "" {
+			meta["title"] = sysev.Title
+		}
+		return content, meta
+
 	default:
 		return fmt.Sprintf("(%s event)", in.Kind), meta
 	}

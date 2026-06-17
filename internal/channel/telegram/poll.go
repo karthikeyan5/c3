@@ -90,8 +90,6 @@ func (c *Channel) pollLoop() {
 			RequestOpts:    requestOptsFor("getUpdates", longPoll),
 		}
 		updates, err := c.bot.GetUpdates(opts)
-		// Record return time for stallWatchdog regardless of err vs success.
-		c.lastPollReturn.Store(time.Now().UnixNano())
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return
@@ -102,14 +100,24 @@ func (c *Channel) pollLoop() {
 				// 409 — another poller has this token. Stop. The other process
 				// (often the Python POC, sometimes a leaked broker) needs to
 				// be killed before we can safely poll again. Logging loud so
-				// the user sees it in DEBUGGING.md flow.
+				// the user sees it in DEBUGGING.md flow. A conflict also means
+				// inbound is effectively dead (we can't poll), so it drives the
+				// health machine DOWN before we exit — the out-of-band alert is
+				// the only way the user learns the bot stopped fetching.
 				c.host.Logf("telegram: 409 CONFLICT — another poller holds this bot token; pollLoop exiting. Kill the other process and restart c3-broker. Error: %v", err)
+				c.reportHealth(c.health.RecordFailure("409 conflict (another poller)"))
 				return
 			case errClassPermanent:
-				// 401/403 — token issue. Trip-on-N pattern.
+				// 401/403 — token issue. Trip-on-N pattern. Only a TRIPPED
+				// breaker (token revoked / persistently rejected) drives the
+				// health machine DOWN — a couple of transient auth blips
+				// shouldn't raise the out-of-band alarm.
 				tripped := c.authBrk.RecordFail()
 				c.host.Logf("telegram: GetUpdates permanent error (consec=%d, tripped=%v): %v",
 					c.authBrk.Consec(), tripped, err)
+				if tripped {
+					c.reportHealth(c.health.RecordFailure("token revoked / persistent 401"))
+				}
 				wait := backoff
 				if tripped {
 					wait = trippedSleep
@@ -127,6 +135,10 @@ func (c *Channel) pollLoop() {
 				}
 				continue
 			case errClassRateLimited:
+				// 429 is a healthy, reachable server pushing back — it is
+				// explicitly NOT a fetch-health failure. Do NOT call
+				// RecordFailure here (the central false-positive guard:
+				// "429 is NOT down").
 				wait := time.Duration(retryAfter) * time.Second
 				if wait <= 0 {
 					wait = 5 * time.Second
@@ -143,7 +155,12 @@ func (c *Channel) pollLoop() {
 				}
 				continue
 			case errClassTransient:
+				// Transient network/timeout/5xx — the IP-block / unreachable
+				// signature. Feed the health machine; it flips DOWN after
+				// downAfterFails consecutive transient failures and the edge
+				// fans out the out-of-band alert.
 				c.host.Logf("telegram: GetUpdates transient error (backoff %v): %v", backoff, err)
+				c.reportHealth(c.health.RecordFailure("transient (network/timeout/5xx)"))
 				select {
 				case <-c.ctx.Done():
 					return
@@ -155,7 +172,10 @@ func (c *Channel) pollLoop() {
 				}
 				continue
 			default:
+				// Unclassified is treated as transient (see classifyError) —
+				// drive the health machine the same way.
 				c.host.Logf("telegram: GetUpdates unclassified error (treating as transient, backoff %v): %v", backoff, err)
+				c.reportHealth(c.health.RecordFailure("unclassified (treated as transient)"))
 				select {
 				case <-c.ctx.Done():
 					return
@@ -164,8 +184,14 @@ func (c *Channel) pollLoop() {
 				continue
 			}
 		}
-		// Success — clear auth breaker and reset transient backoff.
+		// Success — clear auth breaker, reset transient backoff, and record a
+		// healthy fetch. A GetUpdates that returned without a transport error is
+		// HEALTHY even when it carried ZERO updates (the normal quiet-night
+		// long-poll timeout) — that's the central false-positive fix: success
+		// here, not a failure. The FIRST success after an outage fires the
+		// RECOVERED edge.
 		c.authBrk.RecordSuccess()
+		c.reportHealth(c.health.RecordSuccess())
 		backoff = baseBackoff
 
 		var advanced bool

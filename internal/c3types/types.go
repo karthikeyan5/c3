@@ -62,6 +62,12 @@ const (
 	// InboundCallback is an inline-keyboard button press (already auto-acked by
 	// the channel before this is surfaced).
 	InboundCallback InboundKind = "callback"
+	// InboundSystem is a broker-originated system advisory (NOT user input):
+	// e.g. a channel-health alert broadcast to every live CLI session. It is
+	// trusted (broker-sourced) and therefore bypasses the inbound allowlist
+	// gate — see broker.broadcastSystemEvent. The payload rides in
+	// InboundEvent.System.
+	InboundSystem InboundKind = "system"
 )
 
 // InboundEvent is the channel-neutral payload for a non-message Inbound. Exactly
@@ -71,6 +77,48 @@ type InboundEvent struct {
 	PollResult *PollResult    `json:",omitempty"`
 	Reaction   *ReactionEvent `json:",omitempty"`
 	Callback   *CallbackEvent `json:",omitempty"`
+	System     *SystemEvent   `json:",omitempty"`
+}
+
+// SystemEvent is a broker-originated advisory surfaced to the agent (Inbound.Kind
+// == InboundSystem). It carries NO user content — it is an operational signal
+// (e.g. "the Telegram fetch is DOWN, your phone messages won't arrive"). It is
+// channel-neutral: Source names which channel/subsystem raised it as a plain
+// string; no Telegram/gotgbot type appears here. Level is a coarse severity the
+// adapters can render ("warn"/"info"). Title is a short headline; Message is the
+// one-line detail.
+type SystemEvent struct {
+	Source  string // e.g. "telegram" — the channel/subsystem that raised this
+	Level   string // "warn" | "info"
+	Title   string
+	Message string
+}
+
+// HealthState is the coarse fetch-health state of a channel's inbound path.
+type HealthState string
+
+const (
+	// HealthStateUp means the channel's inbound fetch is healthy (recently
+	// succeeded).
+	HealthStateUp HealthState = "up"
+	// HealthStateDown means the channel cannot reach its upstream to fetch
+	// inbound — phone messages will not arrive until it recovers.
+	HealthStateDown HealthState = "down"
+)
+
+// HealthEvent is a channel-neutral fetch-health transition the broker fans out
+// to its out-of-band sinks (desktop notify, CLI broadcast, status line, log).
+// It is emitted EXACTLY on an edge (UP→DOWN / DOWN→UP), never per attempt, so a
+// consumer sees two loud signals per outage cycle. No Telegram/gotgbot type
+// appears here — the channel translates its transport state into this neutral
+// shape.
+type HealthEvent struct {
+	Channel string      // e.g. "telegram"
+	State   HealthState // "up" | "down"
+	Since   time.Time   // when the channel entered this state
+	Consec  int         // consecutive transport failures (for a DOWN edge)
+	Reason  string      // short human cause, e.g. "dial failures" / "timeout"
+	DownFor time.Duration
 }
 
 // PollResult is an aggregate poll tally. Q-RESULT-1 = AGGREGATE + FINAL-ON-CLOSE:

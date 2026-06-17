@@ -10,11 +10,11 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"sync/atomic"
 	"time"
 
 	"github.com/PaulSonOfLars/gotgbot/v2"
 
+	"github.com/karthikeyan5/c3/internal/c3types"
 	"github.com/karthikeyan5/c3/internal/channel"
 	"github.com/karthikeyan5/c3/internal/mappings"
 )
@@ -58,12 +58,16 @@ type Channel struct {
 	sentPolls  *sentPollMap // pollID → route+owner for poll-result routing (P4)
 	httpClient *http.Client // shared transport for non-gotgbot calls (file downloads)
 
-	// lastPollReturn is the unix-nanos of the most recent moment the
-	// pollLoop's GetUpdates call returned (success OR error). The stall
-	// watchdog reads it to detect the half-open / silent-death case where
-	// the call hangs past gotgbot's own request timeout. See pollLoop +
-	// stallWatchdog. Pattern from grammyjs/runner POLL_STALL_THRESHOLD_MS.
-	lastPollReturn atomic.Int64
+	// health is the single fetch-health state machine. It is the ONLY source
+	// of "is Telegram reachable?" — it replaced the two prior competing
+	// false-positive watchdogs (stallWatchdog + heartbeat's HEARTBEAT-FAILED
+	// alarm). Driven from pollLoop (RecordSuccess/RecordFailure), the
+	// silenceWatchdog (CheckSilence), and the heartbeat (RecordFailure on
+	// getMe failure). The machine's own lastSuccess timestamp now owns
+	// silence detection (the old standalone lastPollReturn atomic was
+	// retired). On an edge it fires host.NotifyHealth OUTSIDE the machine's
+	// lock — see reportHealth.
+	health *fetchHealth
 
 	// pollDone is closed when pollLoop returns (cleanly via 409 conflict
 	// or ctx-cancel). The stall watchdog watches this so it stops emitting
@@ -150,6 +154,7 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 	c.bot = bot
 	c.host = host
 	c.authBrk = newAuthBreaker(auth401Threshold)
+	c.health = newFetchHealth()
 	c.dedup = newUpdateDedup(2000, 5*time.Minute)
 	c.rate = newRateLimiter()
 	c.sentPolls = newSentPollMap(2000)
@@ -162,9 +167,9 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 
 	host.Logf("telegram: connected as @%s", bot.Username)
 
-	// Initialize the stall-watchdog clock so the first ~90s after start
-	// don't spuriously trip the watchdog (no actual GetUpdates returns yet).
-	c.lastPollReturn.Store(time.Now().UnixNano())
+	// The fetch-health machine seeds its lastSuccess to now on construction
+	// (see newFetchHealth), so the first ~90s after start don't spuriously
+	// trip the silence arm before any GetUpdates has returned.
 	c.pollDone = make(chan struct{})
 
 	// Start the long-poll loop in a goroutine. Returns immediately after
@@ -174,46 +179,69 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 		defer close(c.pollDone)
 		c.pollLoop()
 	}()
-	go c.stallWatchdog()
+	go c.silenceWatchdog()
 	go c.heartbeat()
 	return nil
 }
 
-// stallWatchdog observes lastPollReturn and logs a loud warning if the
-// pollLoop hasn't completed a GetUpdates call (success or error) in
-// pollStallThreshold. Intended for the "silent death" failure mode where
-// HTTP-layer timeouts somehow fail to fire and the call hangs indefinitely
-// — patterned after grammyjs/runner's POLL_STALL_THRESHOLD_MS=90s
-// (sub-agent research 2026-05-09).
-//
-// Currently observe-and-log only. If it fires, we log loud enough that
-// it's obvious in DEBUGGING.md flow. A future iteration can promote this
-// to force-cancel by switching pollLoop to use a per-call context the
-// watchdog can cancel; doing so safely requires teaching gotgbot to
-// accept our context (it currently builds its own from RequestOpts).
-const (
-	pollStallThreshold = 90 * time.Second
-	stallCheckInterval = 30 * time.Second
-)
+// reportHealth fires host.NotifyHealth for a transition edge, building the
+// channel-neutral HealthEvent from the health machine's snapshot. It is called
+// OUTSIDE the machine's lock (the Record*/Check* methods return the edge under
+// lock; the caller then invokes this) — we never hold the state mutex across a
+// notify fan-out. A healthNoChange transition is a no-op. host.NotifyHealth is
+// itself non-blocking (the broker fans out asynchronously). The alert NEVER
+// re-enters this channel — it is delivered entirely out-of-band (desktop +
+// CLI broadcast + status + log), because Telegram is the dead path.
+func (c *Channel) reportHealth(tr healthTransition) {
+	if tr == healthNoChange {
+		return
+	}
+	_, consec, since, reason, downFor, lastSuccess := c.health.snapshot()
+	ev := c3types.HealthEvent{
+		Channel: c.Name(),
+		Since:   since,
+		Consec:  consec,
+		Reason:  reason,
+		DownFor: downFor,
+	}
+	switch tr {
+	case healthWentDown:
+		ev.State = c3types.HealthStateDown
+		c.host.Logf("telegram: FETCH DOWN — cannot reach Telegram to fetch updates (consec=%d, reason=%s). Inbound is offline until this recovers; alerting out-of-band (desktop + CLI + status).",
+			consec, reason)
+	case healthRecovered:
+		ev.State = c3types.HealthStateUp
+		c.host.Logf("telegram: FETCH RECOVERED — Telegram reachable again (last success %s).",
+			lastSuccess.Format("15:04:05"))
+	}
+	c.host.NotifyHealth(ev)
+}
 
-func (c *Channel) stallWatchdog() {
-	ticker := time.NewTicker(stallCheckInterval)
+// silenceWatchdog drives the fetch-health machine's max-silence arm: the
+// "silent death" failure mode where HTTP-layer timeouts somehow fail to fire and
+// GetUpdates hangs past the long-poll budget, producing neither a success nor a
+// fast error. It replaced the old observe-and-log-only stallWatchdog: instead of
+// emitting a separate "STALL DETECTED" line (a SECOND competing dead-bot
+// signal), it folds the 90s threshold into the ONE health machine via
+// CheckSilence and routes any resulting edge through the same reportHealth
+// notification path. Patterned after grammyjs/runner's POLL_STALL_THRESHOLD_MS
+// (sub-agent research 2026-05-09).
+const silenceCheckInterval = 30 * time.Second
+
+func (c *Channel) silenceWatchdog() {
+	ticker := time.NewTicker(silenceCheckInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
 		case <-c.pollDone:
-			// pollLoop exited (e.g., 409 conflict, ctx cancel). The stall
-			// concept doesn't apply anymore; stop nagging. The broker
+			// pollLoop exited (e.g., 409 conflict, ctx cancel). The silence
+			// concept doesn't apply anymore; stop checking. The broker
 			// supervisor (or operator) should restart at this point.
 			return
 		case <-ticker.C:
-			since := time.Since(time.Unix(0, c.lastPollReturn.Load()))
-			if since > pollStallThreshold {
-				c.host.Logf("telegram: STALL DETECTED — %v since last GetUpdates return (threshold %v). Polling loop appears hung; HTTP transport timeouts should have fired by now. Manual intervention may be needed (restart broker).",
-					since.Round(time.Second), pollStallThreshold)
-			}
+			c.reportHealth(c.health.CheckSilence())
 		}
 	}
 }
@@ -224,20 +252,23 @@ func (c *Channel) stallWatchdog() {
 // surfaced), this catches it within a few minutes regardless of whether
 // any users are sending messages.
 //
-// On consecutive failures past heartbeatFailThreshold, log loud — the
-// auth breaker (also tied to non-2xx errors) provides the actual
-// retry-storm protection; this is the diagnostic.
-const (
-	heartbeatInterval      = 5 * time.Minute
-	heartbeatFailThreshold = 3
-)
+// Single-notification-path change (2026-06-17): the heartbeat no longer keeps
+// its OWN consecutive-fail count or emits a separate "HEARTBEAT FAILED" line —
+// that was a second competing dead-bot signal that produced false-positive
+// spam alongside the poll loop. Instead it feeds the SAME fetch-health machine:
+//   - getMe error => health.RecordFailure (a transport-class failure to reach
+//     Telegram, EXCEPT a 429, which is the server pushing back — reachable, so
+//     it is NOT recorded as down), and
+//   - getMe success => health.RecordSuccess (proof Telegram is reachable),
+//
+// routing any edge through the same reportHealth fan-out.
+const heartbeatInterval = 5 * time.Minute
 
 func (c *Channel) heartbeat() {
 	// Wait one full interval before the first probe so startup races
 	// don't cause spurious early failures.
 	timer := time.NewTimer(heartbeatInterval)
 	defer timer.Stop()
-	consecFails := 0
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -248,16 +279,18 @@ func (c *Channel) heartbeat() {
 			RequestOpts: requestOptsFor("getMe", longPollTimeoutSeconds),
 		})
 		if err != nil {
-			consecFails++
-			c.host.Logf("telegram: heartbeat getMe failed (consec=%d): %v",
-				consecFails, err)
-			if consecFails >= heartbeatFailThreshold {
-				c.host.Logf("telegram: HEARTBEAT FAILED %d consecutive times — bot may be silently dead. Polling loop status: %v since last GetUpdates return.",
-					consecFails, time.Since(time.Unix(0, c.lastPollReturn.Load())).Round(time.Second))
+			class, _ := classifyError(err)
+			// 429 is a reachable server pushing back — never "down". Every
+			// other class (transient/permanent/conflict) means we couldn't
+			// complete a control call, which feeds the health machine.
+			if class != errClassRateLimited {
+				c.host.Logf("telegram: heartbeat getMe failed (class=%s): %v", class, err)
+				c.reportHealth(c.health.RecordFailure("heartbeat getMe " + class.String()))
+			} else {
+				c.host.Logf("telegram: heartbeat getMe 429 rate-limited (reachable; not counted as down): %v", err)
 			}
-		} else if consecFails > 0 {
-			c.host.Logf("telegram: heartbeat recovered after %d failures", consecFails)
-			consecFails = 0
+		} else {
+			c.reportHealth(c.health.RecordSuccess())
 		}
 		timer.Reset(heartbeatInterval)
 	}

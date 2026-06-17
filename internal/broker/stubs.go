@@ -84,6 +84,16 @@ func (s *Stub) IsConnected() bool {
 	return s.Conn != nil
 }
 
+// ConnValue returns the stub's current conn under the conn lock (or nil when
+// disconnected). Use this for a race-free read of Conn from outside the handler
+// goroutine — e.g. broker.broadcastSystemEvent, which writes to every live
+// session concurrently with MarkDisconnected/Reattach.
+func (s *Stub) ConnValue() any {
+	s.connMu.RLock()
+	defer s.connMu.RUnlock()
+	return s.Conn
+}
+
 // IsAlive returns whether the stub is in a state where its claims are
 // protected. A connected stub is always alive. A disconnected stub is alive
 // if its PID still exists in the OS process table — meaning the user's

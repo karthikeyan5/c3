@@ -138,6 +138,33 @@ type ClaimEntry struct {
 	Connected bool   `json:"connected"`
 }
 
+// ListHealthReq is sent by a status-style client to fetch a snapshot of the
+// broker's per-channel cached fetch-health (the last HealthEvent per channel).
+type ListHealthReq struct {
+	Op Op `json:"op"` // = OpListHealth
+}
+
+// HealthListMsg is the broker's response to ListHealthReq. One entry per channel
+// that has reported at least one health edge. Renders into the `c3-broker
+// status` "Channel health:" section.
+type HealthListMsg struct {
+	Op     Op            `json:"op"` // = OpHealthList
+	Health []HealthEntry `json:"health"`
+}
+
+// HealthEntry is one channel's last-known fetch-health for status rendering.
+// SinceUnix / DownForSec are wire-friendly encodings (the status client formats
+// them). State is "up" | "down". LastSuccessAgoSec is the seconds since the last
+// successful fetch (for the UP line); omitted (0) when unknown.
+type HealthEntry struct {
+	Channel    string `json:"channel"`
+	State      string `json:"state"` // "up" | "down"
+	SinceUnix  int64  `json:"since_unix,omitempty"`
+	Consec     int    `json:"consec,omitempty"`
+	Reason     string `json:"reason,omitempty"`
+	DownForSec int64  `json:"down_for_sec,omitempty"`
+}
+
 // TopicEntry is one row in TopicsListMsg.Topics. Also reused by Proposal.Existing
 // to describe a found-but-not-claimed topic (in which case ClaimedBy is nil).
 type TopicEntry struct {

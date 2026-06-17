@@ -46,6 +46,16 @@ type Host interface {
 	Logf(format string, args ...any)
 	Done() <-chan struct{}
 
+	// NotifyHealth reports a channel fetch-health transition (UP→DOWN /
+	// DOWN→UP). The broker fans this out to OUT-OF-BAND sinks (desktop
+	// notification, system-event broadcast to all CLI sessions, the
+	// `c3-broker status` health line, the broker log) so a dead channel can
+	// still raise an alarm through a different path. MUST be called only on an
+	// edge (not per attempt) and MUST NOT block — the broker fans out
+	// asynchronously. The alert path never re-enters the reporting channel
+	// (the dead channel can't carry its own outage alert).
+	NotifyHealth(ev c3types.HealthEvent)
+
 	// GateInbound runs an inbound through the allowlist + pairing gate.
 	// Channels MUST call this before Emit and act on the decision:
 	//   - GateInboundAllow:        forward to Emit.
