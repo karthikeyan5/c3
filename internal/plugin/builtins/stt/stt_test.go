@@ -2,6 +2,7 @@ package stt
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,16 +50,14 @@ func (h *fakeHost) ChannelConfig(name string, target any) error {
 	if !ok {
 		return nil
 	}
-	t, ok2 := target.(*struct {
-		BotToken string `json:"bot_token"`
-	})
-	if !ok2 {
-		return nil
+	// Mirror the real host: JSON round-trip into whatever struct the caller
+	// passes, so adding fields to the read struct (e.g. api_base_url) doesn't
+	// break this mock the way an exact type-assertion did.
+	b, err := json.Marshal(cc)
+	if err != nil {
+		return err
 	}
-	if m, ok := cc.(map[string]string); ok {
-		t.BotToken = m["bot_token"]
-	}
-	return nil
+	return json.Unmarshal(b, target)
 }
 
 func (h *fakeHost) State(name string) plugin.StateDir          { return nil }

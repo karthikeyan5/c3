@@ -88,8 +88,16 @@ def load_env(path):
 
 # ── Telegram API helpers ───────────────────────────────────────────────────────
 
+# Bot-API base URL. Defaults to Telegram direct, but honors C3_TELEGRAM_API_URL
+# (injected by the Go STT shim from mappings.json:channels.telegram.api_base_url
+# or the env of the same name). This routes BOTH the getFile call and the voice
+# file download through the same reverse proxy the broker uses — direct
+# api.telegram.org is IP-blocked in some networks (e.g. India), which made the
+# download time out (`<urlopen error timed out>`) even though the proxy was live.
+API_BASE = os.environ.get('C3_TELEGRAM_API_URL', 'https://api.telegram.org').rstrip('/')
+
 def tg(token, method, **params):
-    url = f'https://api.telegram.org/bot{token}/{method}'
+    url = f'{API_BASE}/bot{token}/{method}'
     data = json.dumps(params).encode()
     req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
     with urllib.request.urlopen(req, timeout=15) as r:
@@ -98,7 +106,7 @@ def tg(token, method, **params):
 def download_file(token, file_id, dest_path):
     result = tg(token, 'getFile', file_id=file_id)
     file_path = result['result']['file_path']
-    url = f'https://api.telegram.org/file/bot{token}/{file_path}'
+    url = f'{API_BASE}/file/bot{token}/{file_path}'
     req = urllib.request.Request(url)
     with urllib.request.urlopen(req, timeout=30) as r:
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)

@@ -105,12 +105,12 @@ func Register(host plugin.Host) error {
 			host.Logf("stt: msg=%d handler missing at %s (%v)", p.MessageID, cfg.HandlerPath, err)
 			return sttFailureMarker("handler_missing"), nil
 		}
-		token, err := readTelegramToken(host)
+		token, apiBaseURL, err := readTelegramConn(host)
 		if err != nil {
 			host.Logf("stt: token read failed for msg=%d: %v", p.MessageID, err)
 			return sttFailureMarker("token_unavailable"), nil
 		}
-		return runHandler(ctx, host, cfg, token, p)
+		return runHandler(ctx, host, cfg, token, apiBaseURL, p)
 	})
 	return nil
 }
@@ -149,7 +149,7 @@ func sttLogHintPath() string {
 	return filepath.Join(state, "c3", "broker.log")
 }
 
-func runHandler(ctx context.Context, host plugin.Host, cfg Config, token string, p c3types.VoicePayload) (string, error) {
+func runHandler(ctx context.Context, host plugin.Host, cfg Config, token, apiBaseURL string, p c3types.VoicePayload) (string, error) {
 	// argv: <chat_id> <msg_id> <file_id> [<thread_id>]
 	// token is fed via stdin (see package doc).
 	args := []string{
@@ -171,6 +171,15 @@ func runHandler(ctx context.Context, host plugin.Host, cfg Config, token string,
 	start := time.Now()
 	cmd := exec.CommandContext(tctx, "python3", args...)
 	cmd.Stdin = strings.NewReader(token + "\n")
+	// Route the handler's getFile + voice-file download through the same
+	// Bot-API base the broker uses (the reverse proxy, when configured).
+	// Direct api.telegram.org is IP-blocked in some networks (e.g. India),
+	// which times out the download even with the proxy live. Empty =>
+	// handler defaults to api.telegram.org.
+	cmd.Env = os.Environ()
+	if apiBaseURL != "" {
+		cmd.Env = append(cmd.Env, "C3_TELEGRAM_API_URL="+apiBaseURL)
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -209,19 +218,27 @@ func runHandler(ctx context.Context, host plugin.Host, cfg Config, token string,
 	return transcript, nil
 }
 
-// readTelegramToken pulls the bot token from mappings.json via the host's
-// ChannelConfig helper. The plugin doesn't store its own copy.
-func readTelegramToken(host plugin.Host) (string, error) {
+// readTelegramConn pulls the bot token and the optional Bot-API base URL from
+// mappings.json via the host's ChannelConfig helper. The plugin doesn't store
+// its own copy. The base URL lets the STT handler download voice files through
+// the same reverse proxy the broker uses; env C3_TELEGRAM_API_URL wins over the
+// mappings.json value, mirroring the telegram channel's own precedence.
+func readTelegramConn(host plugin.Host) (token, apiBaseURL string, err error) {
 	var cc struct {
-		BotToken string `json:"bot_token"`
+		BotToken   string `json:"bot_token"`
+		APIBaseURL string `json:"api_base_url"`
 	}
 	if err := host.ChannelConfig("telegram", &cc); err != nil {
-		return "", fmt.Errorf("stt: read telegram channel config: %w", err)
+		return "", "", fmt.Errorf("stt: read telegram channel config: %w", err)
 	}
 	if cc.BotToken == "" {
-		return "", fmt.Errorf("stt: bot_token is empty in mappings.json:channels.telegram")
+		return "", "", fmt.Errorf("stt: bot_token is empty in mappings.json:channels.telegram")
 	}
-	return cc.BotToken, nil
+	base := os.Getenv("C3_TELEGRAM_API_URL")
+	if base == "" {
+		base = cc.APIBaseURL
+	}
+	return cc.BotToken, base, nil
 }
 
 // ensureSTTDefaultDirs creates the default handler-side log and inbox
