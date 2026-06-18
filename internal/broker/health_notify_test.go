@@ -11,14 +11,21 @@ import (
 	"github.com/karthikeyan5/c3/internal/mappings"
 )
 
-// fakeNotifier records desktop-notify calls instead of spawning a real popup.
+// fakeNotifier records desktop-notify calls instead of spawning a real popup,
+// and reports a controllable delivered result.
 type fakeNotifier struct {
-	ch chan c3types.HealthEvent
+	ch        chan c3types.HealthEvent
+	delivered bool
 }
 
-func newFakeNotifier() *fakeNotifier { return &fakeNotifier{ch: make(chan c3types.HealthEvent, 4)} }
+func newFakeNotifier() *fakeNotifier {
+	return &fakeNotifier{ch: make(chan c3types.HealthEvent, 4), delivered: true}
+}
 
-func (f *fakeNotifier) Notify(ev c3types.HealthEvent) { f.ch <- ev }
+func (f *fakeNotifier) Notify(ev c3types.HealthEvent) bool {
+	f.ch <- ev
+	return f.delivered
+}
 
 func newTestBroker() *Broker {
 	return New(&mappings.MappingsFile{SchemaVersion: 1, Channels: map[string]mappings.ChannelConfig{}, Mappings: map[string]mappings.Mapping{}})
