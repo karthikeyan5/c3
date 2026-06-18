@@ -3,6 +3,7 @@ package broker
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/karthikeyan5/c3/internal/c3types"
 	"github.com/karthikeyan5/c3/internal/mappings"
@@ -54,5 +55,31 @@ func TestBrokerHost_EmitSubmitsToWorker(t *testing.T) {
 
 	if b.Workers.Active() == 0 {
 		t.Error("expected a worker active after Emit")
+	}
+}
+
+func TestSystemEventForHealth_DesktopUnavailableNote(t *testing.T) {
+	ev := c3types.HealthEvent{Channel: "telegram", State: c3types.HealthStateDown, Since: time.Now(), Consec: 3, Reason: "dial failures"}
+	withNote := systemEventForHealth(ev, true)
+	if !strings.Contains(withNote.Message, "desktop notification unavailable") {
+		t.Errorf("desktopUnavailable=true message missing note: %q", withNote.Message)
+	}
+	noNote := systemEventForHealth(ev, false)
+	if strings.Contains(noNote.Message, "desktop notification unavailable") {
+		t.Errorf("desktopUnavailable=false message should not have note: %q", noNote.Message)
+	}
+	if noNote.Level != "warn" {
+		t.Errorf("down event level = %q, want warn", noNote.Level)
+	}
+}
+
+func TestSystemEventForHealth_RecoveryHasNoNote(t *testing.T) {
+	ev := c3types.HealthEvent{Channel: "telegram", State: c3types.HealthStateUp, DownFor: 5 * time.Minute}
+	up := systemEventForHealth(ev, true) // even with true, a recovery message carries no down note
+	if strings.Contains(up.Message, "desktop notification unavailable") {
+		t.Errorf("recovery message should never have the desktop note: %q", up.Message)
+	}
+	if up.Level != "info" {
+		t.Errorf("recovery level = %q, want info", up.Level)
 	}
 }

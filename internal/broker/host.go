@@ -139,25 +139,29 @@ func (h *BrokerHost) NotifyHealth(ev c3types.HealthEvent) {
 				log.Printf("health-notify: CLI-broadcast sink panic recovered: %v", r)
 			}
 		}()
-		h.broker.broadcastSystemEvent(systemEventForHealth(ev))
+		h.broker.broadcastSystemEvent(systemEventForHealth(ev, false))
 	}()
 }
 
 // systemEventForHealth renders a channel-neutral SystemEvent advisory for a
 // health edge. The message is operational (no user content); it tells the agent
 // whether phone messages will arrive. Level is "warn" for DOWN, "info" for UP.
-func systemEventForHealth(ev c3types.HealthEvent) *c3types.SystemEvent {
+func systemEventForHealth(ev c3types.HealthEvent, desktopUnavailable bool) *c3types.SystemEvent {
 	ch := ev.Channel
 	if ch == "" {
 		ch = "channel"
 	}
 	if ev.State == c3types.HealthStateDown {
+		msg := fmt.Sprintf("Cannot reach %s since %s (%d consecutive %s). Your phone messages won't arrive until this recovers.",
+			ch, ev.Since.Format("15:04"), ev.Consec, strings.TrimSpace(ev.Reason))
+		if desktopUnavailable {
+			msg += " (desktop notification unavailable — shown here instead)"
+		}
 		return &c3types.SystemEvent{
-			Source: ev.Channel,
-			Level:  "warn",
-			Title:  fmt.Sprintf("%s fetch DOWN", ch),
-			Message: fmt.Sprintf("Cannot reach %s since %s (%d consecutive %s). Your phone messages won't arrive until this recovers.",
-				ch, ev.Since.Format("15:04"), ev.Consec, strings.TrimSpace(ev.Reason)),
+			Source:  ev.Channel,
+			Level:   "warn",
+			Title:   fmt.Sprintf("%s fetch DOWN", ch),
+			Message: msg,
 		}
 	}
 	return &c3types.SystemEvent{
