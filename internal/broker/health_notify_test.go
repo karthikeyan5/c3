@@ -19,6 +19,7 @@ import (
 type fakeNotifier struct {
 	ch        chan c3types.HealthEvent
 	delivered bool
+	onNotify  func() // optional: invoked inside Notify before returning (simulate a concurrent edge)
 }
 
 func newFakeNotifier() *fakeNotifier {
@@ -27,6 +28,9 @@ func newFakeNotifier() *fakeNotifier {
 
 func (f *fakeNotifier) Notify(ev c3types.HealthEvent) bool {
 	f.ch <- ev
+	if f.onNotify != nil {
+		f.onNotify()
+	}
 	return f.delivered
 }
 
@@ -224,5 +228,83 @@ func TestBroadcastSystemEvent_GateBypassIsBrokerOriginated(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("broker-originated system event was not delivered (gate bypass failed)")
+	}
+}
+
+// TestSetLastHealth_OlderEdgeDoesNotOverwriteNewer (Fix A): the compare-and-skip
+// keeps the newest edge in the cache even when an older edge is processed later
+// (NotifyHealth runs lock-free across 3 goroutines, so processing can invert).
+func TestSetLastHealth_OlderEdgeDoesNotOverwriteNewer(t *testing.T) {
+	b := newTestBroker()
+	t2 := time.Now()
+	t1 := t2.Add(-1 * time.Minute)
+	b.setLastHealth(c3types.HealthEvent{Channel: "telegram", State: c3types.HealthStateUp, Since: t2})
+	b.setLastHealth(c3types.HealthEvent{Channel: "telegram", State: c3types.HealthStateDown, Since: t1}) // older — must be skipped
+	if got := b.lastHealthSnapshot()["telegram"].State; got != c3types.HealthStateUp {
+		t.Errorf("older down edge overwrote newer up: state=%q, want up", got)
+	}
+}
+
+// TestNotifyHealth_RecoveryDuringDesktopProbe_SuppressesStaleFallback (Fix B):
+// if a recovery edge lands while the (blocking) desktop probe runs, the stale
+// DOWN advisory must NOT be injected into the CLI — recovery never injects, so
+// a stale DOWN would never be retracted.
+func TestNotifyHealth_RecoveryDuringDesktopProbe_SuppressesStaleFallback(t *testing.T) {
+	hf := filepath.Join(t.TempDir(), "health.json")
+	t.Setenv("C3_HEALTH_FILE", hf)
+	b, fn, agentConn := brokerWithAgent(t)
+	fn.delivered = false // desktop "unavailable" → would normally fall back to CLI
+	t2 := time.Now()
+	fn.onNotify = func() {
+		// recovery lands while the (fake) desktop probe runs
+		b.setLastHealth(c3types.HealthEvent{Channel: "telegram", State: c3types.HealthStateUp, Since: t2})
+	}
+	host := NewBrokerHost(b, "telegram")
+	host.NotifyHealth(c3types.HealthEvent{Channel: "telegram", State: c3types.HealthStateDown, Since: t2.Add(-1 * time.Minute), Consec: 3, Reason: "dial failures"})
+	select {
+	case <-fn.ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("desktop notifier not invoked")
+	}
+	if _, got := readBroadcastWithin(agentConn, 300*time.Millisecond); got {
+		t.Fatal("stale DOWN advisory broadcast after recovery landed during the probe")
+	}
+}
+
+// TestBroadcastSystemEvent_SkipsTransientAndDisconnected (restores deleted FanOut
+// coverage): a down fallback broadcast reaches ONLY live long-lived sessions —
+// the transient c3-broker-cli stub and disconnected stubs are skipped. Driven
+// through host.NotifyHealth with a down edge + unavailable desktop.
+func TestBroadcastSystemEvent_SkipsTransientAndDisconnected(t *testing.T) {
+	hf := filepath.Join(t.TempDir(), "health.json")
+	t.Setenv("C3_HEALTH_FILE", hf)
+	b, fn, agentConn := brokerWithAgent(t) // registers a live "claude" stub on agentConn
+	fn.delivered = false                   // desktop unavailable → CLI fallback fires
+
+	// A transient CLI client (status/topics) — must be skipped.
+	b.Stubs.Register("c3-broker-cli", 9999, "/tmp", struct{}{})
+	// A disconnected long-lived session — must be skipped.
+	dead := b.Stubs.Register("codex", 7, "/dead", nil)
+	dead.MarkDisconnected()
+
+	host := NewBrokerHost(b, "telegram")
+	host.NotifyHealth(c3types.HealthEvent{Channel: "telegram", State: c3types.HealthStateDown, Since: time.Now(), Consec: 3, Reason: "dial failures"})
+	select {
+	case <-fn.ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("desktop notifier not invoked")
+	}
+
+	// The live stub receives exactly one InboundSystem frame...
+	msg, got := readBroadcastWithin(agentConn, 2*time.Second)
+	if !got {
+		t.Fatal("live CLI session did not receive the fallback advisory")
+	}
+	if msg.Inbound.Kind != c3types.InboundSystem {
+		t.Fatalf("Kind = %q, want system", msg.Inbound.Kind)
+	}
+	// ...and no second frame arrives (transient/disconnected contributed nothing).
+	if _, got := readBroadcastWithin(agentConn, 300*time.Millisecond); got {
+		t.Fatal("more than one frame delivered — a transient/disconnected stub was not skipped")
 	}
 }

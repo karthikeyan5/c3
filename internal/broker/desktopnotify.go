@@ -20,8 +20,9 @@ type healthNotifier interface {
 }
 
 // desktopNotifier raises a local desktop popup for a channel-health edge. It is
-// ONE of the four out-of-band sinks (the CLI broadcast + the status line are the
-// guaranteed backstops if this fails) — a notify failure is logged once and
+// the PRIMARY surface of the invasive notification tier; the CLI turn-injection
+// fires only when this does not deliver, and the ambient status line
+// (health.json) is the always-on backstop. A notify failure is logged once and
 // NEVER blocks or crashes the broker.
 //
 // Environment snapshot: the broker is manually launched (not a systemd unit),

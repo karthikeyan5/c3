@@ -128,6 +128,14 @@ func (h *BrokerHost) NotifyHealth(ev c3types.HealthEvent) {
 		// deliver, and only on a DOWN edge. Recovery never injects into the
 		// CLI — the status line clearing is the closure.
 		if !delivered && ev.State == c3types.HealthStateDown {
+			// desktopNotifier.Notify above can block up to 2s; a recovery edge
+			// may have landed meanwhile. Recovery never injects to the CLI, so a
+			// stale DOWN advisory would never be retracted — suppress it if the
+			// channel is no longer down. lastHealth is compare-and-skip ordered
+			// (setLastHealth), so this reflects the latest edge.
+			if cur, ok := h.broker.lastHealthSnapshot()[ev.Channel]; !ok || cur.State != c3types.HealthStateDown {
+				return
+			}
 			h.broker.broadcastSystemEvent(systemEventForHealth(ev, true))
 		}
 	}()

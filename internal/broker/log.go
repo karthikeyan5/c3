@@ -28,7 +28,8 @@ func LogPath() string {
 // HealthFilePath returns the path of the connectivity status file the Claude
 // Code status line reads. Mirrors LogPath()'s XDG_STATE_HOME convention so it
 // sits next to broker.log ($XDG_STATE_HOME/c3/health.json, fallback
-// $HOME/.local/state/c3/health.json). C3_HEALTH_FILE overrides it (tests).
+// $HOME/.local/state/c3/health.json). C3_HEALTH_FILE overrides the path (a real
+// runtime override, mirroring C3_LOG_FILE).
 // IMPORTANT: do NOT use plugin_host.go:stateRoot() — it appends /state, which
 // the status-line script does not look in.
 func HealthFilePath() string {

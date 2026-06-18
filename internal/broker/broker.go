@@ -225,6 +225,15 @@ func (b *Broker) Shutdown() {
 func (b *Broker) setLastHealth(ev c3types.HealthEvent) {
 	b.healthMu.Lock()
 	defer b.healthMu.Unlock()
+	// Compare-and-skip: edges are detected in order (under fetchHealth.mu) but
+	// processed by NotifyHealth on un-serialized goroutines, so an older edge
+	// can be processed after a newer one. ev.Since is when the state was entered
+	// and increases strictly across alternating edges, so never let an older
+	// edge overwrite a newer one — otherwise the cache/status line could stick
+	// on a stale state until the next genuine transition.
+	if prev, ok := b.lastHealth[ev.Channel]; ok && ev.Since.Before(prev.Since) {
+		return
+	}
 	b.lastHealth[ev.Channel] = ev
 }
 

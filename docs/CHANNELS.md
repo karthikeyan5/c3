@@ -121,6 +121,20 @@ Your channel defines its own subkey schema. Common fields by convention:
 
 The broker doesn't introspect anything beyond `enabled`. Your channel reads what it needs via `host.Config(name, &cfg)`.
 
+### Connectivity notifications
+
+A top-level `notifications` block (sibling of `channels`, not per-channel) governs the *invasive* health-alert surfaces:
+
+```json
+{
+  "notifications": { "invasive": true }
+}
+```
+
+- Default is `true` (absent ⇒ enabled).
+- `false` silences the desktop popup **and** the CLI turn-injection, but **keeps** the always-on ambient status-line indicator (`health.json`).
+- It is SIGHUP-reloadable, like other mappings changes (`/c3:reload-config`).
+
 ## Channel lifecycle
 
 ```
