@@ -59,6 +59,23 @@ func TestClone_DeepCopyIsolatesMutations(t *testing.T) {
 	}
 }
 
+func TestClone_PreservesNotifications(t *testing.T) {
+	no := false
+	original := &MappingsFile{SchemaVersion: 1, Notifications: &NotificationsConfig{Invasive: &no}}
+	clone := original.Clone()
+	if clone.Notifications == nil || clone.Notifications.Invasive == nil {
+		t.Fatal("clone dropped Notifications")
+	}
+	if *clone.Notifications.Invasive != false {
+		t.Errorf("clone Invasive = %v, want false", *clone.Notifications.Invasive)
+	}
+	// Mutating the clone must not touch the original (deep copy).
+	*clone.Notifications.Invasive = true
+	if *original.Notifications.Invasive != false {
+		t.Error("clone leak: mutating clone changed original Invasive")
+	}
+}
+
 func TestClone_NilSafe(t *testing.T) {
 	var mf *MappingsFile
 	if got := mf.Clone(); got != nil {

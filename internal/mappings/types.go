@@ -12,6 +12,26 @@ type MappingsFile struct {
 	Mappings      map[string]Mapping        `json:"mappings"`
 	Plugins       map[string]map[string]any `json:"plugins,omitempty"`
 	Allowlist     *Allowlist                `json:"allowlist,omitempty"`
+	Notifications *NotificationsConfig      `json:"notifications,omitempty"`
+}
+
+// NotificationsConfig governs the "invasive" health-notification surfaces
+// (desktop popup + CLI turn-injection). The ambient status-line indicator is
+// always on and is NOT governed here.
+type NotificationsConfig struct {
+	// Invasive gates the desktop popup + CLI fallback. nil ⇒ default true.
+	// (A plain bool would zero-value to false and silently disable alerts for
+	// every user who never set it.)
+	Invasive *bool `json:"invasive,omitempty"`
+}
+
+// InvasiveNotifications reports whether invasive health notifications (desktop
+// popup + CLI fallback) are enabled. Absent config ⇒ true (preserve behavior).
+func (mf *MappingsFile) InvasiveNotifications() bool {
+	if mf == nil || mf.Notifications == nil || mf.Notifications.Invasive == nil {
+		return true
+	}
+	return *mf.Notifications.Invasive
 }
 
 // Allowlist enforces default-deny inbound traffic. The channel layer drops
