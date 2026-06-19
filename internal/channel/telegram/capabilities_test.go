@@ -12,6 +12,13 @@ import (
 // broker gate read from; a silent drift here would silently mis-advertise what
 // the channel can do. Spec 2026-06-14-channel-capability-architecture §P4
 // ("a per-channel golden manifest test").
+func TestCapabilities_DeliversRichMessages(t *testing.T) {
+	caps := (&Channel{}).Capabilities()
+	if !caps.Inbound.DeliversRichMessages {
+		t.Error("telegram should advertise DeliversRichMessages=true")
+	}
+}
+
 func TestCapabilities_GoldenManifest(t *testing.T) {
 	caps := New().Capabilities()
 

@@ -139,7 +139,8 @@ func (c *Channel) Capabilities() c3types.Capabilities {
 			// surfaced (Q-RESULT-1 aggregate-only).
 			DeliversPollResults: true,
 			DeliversReactions:   true,
-			DeliversCallbacks:   true,
+			DeliversCallbacks:    true,
+			DeliversRichMessages: true,
 		},
 		Stream: c3types.StreamCaps{
 			StreamViaEdit:   false, // deferred in v1.
