@@ -77,7 +77,7 @@ func textMsg(text string, userID int64) *gotgbot.Message {
 func TestDispatchMessage_GateDrop_DoesNotEmit(t *testing.T) {
 	h := &fakeHost{decision: channel.GateInboundDrop}
 	c := makeChannel(h)
-	c.dispatchMessage(1, textMsg("stranger", 99), false)
+	c.dispatchMessage(1, textMsg("stranger", 99), false, nil)
 	if got := h.emitCount(); got != 0 {
 		t.Errorf("Emit called %d times for dropped inbound; want 0", got)
 	}
@@ -86,7 +86,7 @@ func TestDispatchMessage_GateDrop_DoesNotEmit(t *testing.T) {
 func TestDispatchMessage_GatePairConsumed_DoesNotEmit(t *testing.T) {
 	h := &fakeHost{decision: channel.GateInboundPairConsumed}
 	c := makeChannel(h)
-	c.dispatchMessage(1, textMsg("5829", 99), false)
+	c.dispatchMessage(1, textMsg("5829", 99), false, nil)
 	if got := h.emitCount(); got != 0 {
 		t.Errorf("Emit called %d times after pair-consumed; want 0 (control-plane signal, not content)", got)
 	}
@@ -95,7 +95,7 @@ func TestDispatchMessage_GatePairConsumed_DoesNotEmit(t *testing.T) {
 func TestDispatchMessage_GateAllow_Emits(t *testing.T) {
 	h := &fakeHost{decision: channel.GateInboundAllow}
 	c := makeChannel(h)
-	c.dispatchMessage(1, textMsg("hi", 42), false)
+	c.dispatchMessage(1, textMsg("hi", 42), false, nil)
 	if got := h.emitCount(); got != 1 {
 		t.Errorf("Emit called %d times for allowed inbound; want 1", got)
 	}

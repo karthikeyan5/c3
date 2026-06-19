@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/PaulSonOfLars/gotgbot/v2"
@@ -14,7 +15,7 @@ func TestConvertInbound_TextMessage(t *testing.T) {
 		Date:      1715151931,
 		Text:      "hello",
 	}
-	in := convertInbound("telegram", msg, "")
+	in := convertInbound("telegram", msg, "", nil)
 	if in == nil {
 		t.Fatal("expected Inbound, got nil")
 	}
@@ -40,7 +41,7 @@ func TestConvertInbound_TopicMessage(t *testing.T) {
 		Chat:            gotgbot.Chat{Id: -100},
 		Text:            "in topic",
 	}
-	in := convertInbound("telegram", msg, "")
+	in := convertInbound("telegram", msg, "", nil)
 	if in.TopicID == nil || *in.TopicID != 281 {
 		t.Errorf("TopicID = %v, want &281", in.TopicID)
 	}
@@ -59,7 +60,7 @@ func TestConvertInbound_VoiceMessage(t *testing.T) {
 			FileSize:     2997348,
 		},
 	}
-	in := convertInbound("telegram", msg, "[Transcribed voice]: ")
+	in := convertInbound("telegram", msg, "[Transcribed voice]: ", nil)
 	if in == nil {
 		t.Fatal("nil")
 	}
@@ -85,7 +86,7 @@ func TestConvertInbound_ReplyContext(t *testing.T) {
 		ReplyToMessage: parent,
 		Text:           "reply",
 	}
-	in := convertInbound("telegram", msg, "")
+	in := convertInbound("telegram", msg, "", nil)
 	if in.ReplyTo == nil {
 		t.Fatal("ReplyTo nil")
 	}
@@ -112,7 +113,7 @@ func TestConvertInbound_PhotoPicksHighestResolution(t *testing.T) {
 		},
 		Caption: "look",
 	}
-	in := convertInbound("telegram", msg, "")
+	in := convertInbound("telegram", msg, "", nil)
 	if len(in.Attachments) != 1 || in.Attachments[0].Kind != "photo" {
 		t.Fatalf("Attachments=%+v", in.Attachments)
 	}
@@ -130,13 +131,59 @@ func TestConvertInbound_ServiceMessageDropped(t *testing.T) {
 		Chat:              gotgbot.Chat{Id: -100},
 		ForumTopicCreated: &gotgbot.ForumTopicCreated{Name: "new topic", IconColor: 0},
 	}
-	if in := convertInbound("telegram", msg, ""); in != nil {
+	if in := convertInbound("telegram", msg, "", nil); in != nil {
 		t.Errorf("expected nil for forum_topic_created service message, got %+v", in)
 	}
 }
 
 func TestConvertInbound_NilMessageReturnsNil(t *testing.T) {
-	if in := convertInbound("telegram", nil, ""); in != nil {
+	if in := convertInbound("telegram", nil, "", nil); in != nil {
 		t.Errorf("expected nil, got %+v", in)
+	}
+}
+
+func TestConvertInbound_RichMessage(t *testing.T) {
+	msg := &gotgbot.Message{
+		MessageId: 5,
+		From:      &gotgbot.User{Id: 42, Username: "alice"},
+		Chat:      gotgbot.Chat{Id: -100},
+		Date:      1715151931,
+		// No Text — the body is in rich_message (captured separately by poll.go).
+	}
+	rich := json.RawMessage(`{"blocks":[{"type":"heading","size":1,"text":"Hi"},{"type":"paragraph","text":"there"}]}`)
+	in := convertInbound("telegram", msg, "", rich)
+	if in == nil {
+		t.Fatal("nil")
+	}
+	if in.Text != "# Hi\n\nthere" {
+		t.Errorf("Text=%q", in.Text)
+	}
+}
+
+func TestConvertInbound_RichMessageWithMedia(t *testing.T) {
+	msg := &gotgbot.Message{MessageId: 6, From: &gotgbot.User{Id: 1}, Chat: gotgbot.Chat{Id: -100}}
+	rich := json.RawMessage(`{"blocks":[{"type":"photo","photo":[{"file_id":"pid","file_size":3,"width":9,"height":9}],"caption":{"text":"pic"}}]}`)
+	in := convertInbound("telegram", msg, "", rich)
+	if in.Text != "[photo: pic]" {
+		t.Errorf("Text=%q", in.Text)
+	}
+	if len(in.Attachments) != 1 || in.Attachments[0].FileID != "pid" {
+		t.Fatalf("Attachments=%+v", in.Attachments)
+	}
+}
+
+func TestConvertInbound_NoRichRawUsesPlainText(t *testing.T) {
+	msg := &gotgbot.Message{MessageId: 7, From: &gotgbot.User{Id: 1}, Chat: gotgbot.Chat{Id: -100}, Text: "plain"}
+	in := convertInbound("telegram", msg, "", nil) // toggle-off / non-rich path
+	if in.Text != "plain" {
+		t.Errorf("Text=%q", in.Text)
+	}
+}
+
+func TestConvertInbound_RichDecodeFailFallsBackToMarker(t *testing.T) {
+	msg := &gotgbot.Message{MessageId: 8, From: &gotgbot.User{Id: 1}, Chat: gotgbot.Chat{Id: -100}}
+	in := convertInbound("telegram", msg, "", json.RawMessage(`{bad`))
+	if in.Text != "[rich message]" {
+		t.Errorf("Text=%q", in.Text)
 	}
 }

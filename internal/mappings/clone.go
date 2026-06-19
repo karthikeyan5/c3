@@ -77,5 +77,9 @@ func cloneChannelConfig(cc ChannelConfig) ChannelConfig {
 	if cc.Topics != nil {
 		out.Topics = append([]Topic(nil), cc.Topics...)
 	}
+	if cc.RichInbound != nil {
+		v := *cc.RichInbound
+		out.RichInbound = &v
+	}
 	return out
 }

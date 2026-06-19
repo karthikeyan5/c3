@@ -69,6 +69,11 @@ type ChannelConfig struct {
 	APIBaseURL string `json:"api_base_url,omitempty"`
 	// APIBaseURLs is an optional ordered failover list appended after APIBaseURL.
 	APIBaseURLs []string `json:"api_base_urls,omitempty"`
+	// RichInbound gates decoding of inbound Bot API 10.1 rich messages into
+	// markdown (telegram channel). nil/absent ⇒ true (enabled). A bare bool
+	// would zero-value to false and silently disable decoding for everyone who
+	// never set it — the trap documented for notifications.invasive.
+	RichInbound *bool `json:"rich_inbound,omitempty"`
 }
 
 // GroupConfig identifies a Telegram supergroup the bot can create topics in.

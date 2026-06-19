@@ -121,6 +121,10 @@ type InboundCaps struct {
 	// button presses (callbacks) to the agent as inbound events. The channel
 	// auto-acks the callback before surfacing it (Q-RESULT-2).
 	DeliversCallbacks bool
+	// DeliversRichMessages reports that the channel decodes inbound Bot API 10.1
+	// rich messages (Message.rich_message) into the agent-facing Text + media
+	// attachments, rather than surfacing them empty.
+	DeliversRichMessages bool
 }
 
 // StreamCaps describes a channel's ability to stream in-flight reasoning.

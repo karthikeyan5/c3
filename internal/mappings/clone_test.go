@@ -76,6 +76,27 @@ func TestClone_PreservesNotifications(t *testing.T) {
 	}
 }
 
+func TestClone_PreservesRichInbound(t *testing.T) {
+	no := false
+	original := &MappingsFile{
+		SchemaVersion: 1,
+		Channels:      map[string]ChannelConfig{"telegram": {RichInbound: &no}},
+	}
+	clone := original.Clone()
+	cc := clone.Channels["telegram"]
+	if cc.RichInbound == nil {
+		t.Fatal("clone dropped ChannelConfig.RichInbound")
+	}
+	if *cc.RichInbound != false {
+		t.Errorf("clone RichInbound = %v, want false", *cc.RichInbound)
+	}
+	// Deep copy: mutating the clone must not touch the original.
+	*cc.RichInbound = true
+	if *original.Channels["telegram"].RichInbound != false {
+		t.Error("clone leak: mutating clone changed original RichInbound")
+	}
+}
+
 func TestClone_NilSafe(t *testing.T) {
 	var mf *MappingsFile
 	if got := mf.Clone(); got != nil {
