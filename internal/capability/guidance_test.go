@@ -63,9 +63,12 @@ func TestGuidanceFor_PositiveLines(t *testing.T) {
 	g := GuidanceFor(telegramLikeCaps())
 	assertContainsAll(t, g, []string{
 		"CHANNEL CAPABILITIES (telegram):",
-		// Rich text.
+		// Rich text — prescriptive (format-for-readability), not merely permissive.
 		"Rich text: YES",
 		"Write standard markdown",
+		"you SHOULD use it whenever structure makes a reply easier to read",
+		"never leave\n  structured content (steps, comparisons, multiple points, code) as an unbroken wall of text",
+		"render three findings as a numbered list, not one run-on sentence",
 		// Expandable "Show more" blockquote guidance (gated on ExpandableQuotes).
 		"collapse behind a 'Show more' chevron",
 		"end the\n  blockquote with a line containing only `||`",
