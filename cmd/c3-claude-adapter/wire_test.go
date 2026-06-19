@@ -431,3 +431,109 @@ func TestNotifyTransport_DisconnectClearsConn(t *testing.T) {
 		t.Errorf("Notify after Disconnect: want 'not yet established' sentinel, got %v", err)
 	}
 }
+
+// TestChannelFrame_MultipleAttachments asserts that an inbound carrying several
+// attachments (album / media-group, or a rich message with several media blocks)
+// surfaces EVERY attachment to the agent: the first on the canonical unsuffixed
+// keys, extras under _N keys, plus attachment_count.
+func TestChannelFrame_MultipleAttachments(t *testing.T) {
+	tid := int64(914)
+	in := &c3types.Inbound{
+		Channel:   "telegram",
+		ChatID:    -1001234567890,
+		MessageID: 2382,
+		TopicID:   &tid,
+		Text:      "two photos",
+		Sender:    c3types.Sender{UserID: 42, Username: "alice"},
+		Timestamp: time.Date(2026, 6, 20, 1, 6, 16, 0, time.UTC),
+		Attachments: []c3types.Attachment{
+			{Kind: "photo", FileID: "photo_one", Size: 195428},
+			{Kind: "photo", FileID: "photo_two", Size: 104814},
+		},
+	}
+	frame := buildClaudeChannelFrame(in)
+	meta, ok := frame["meta"].(map[string]any)
+	if !ok {
+		t.Fatalf("meta: want map[string]any, got %T", frame["meta"])
+	}
+	// First attachment stays on the canonical unsuffixed keys.
+	if meta["attachment_file_id"] != "photo_one" {
+		t.Errorf("attachment_file_id: want photo_one, got %v", meta["attachment_file_id"])
+	}
+	if meta["attachment_kind"] != "photo" {
+		t.Errorf("attachment_kind: want photo, got %v", meta["attachment_kind"])
+	}
+	// Count reflects all attachments.
+	if meta["attachment_count"] != "2" {
+		t.Errorf("attachment_count: want 2, got %v", meta["attachment_count"])
+	}
+	// Second attachment surfaced under _2 keys so the agent can download it.
+	if meta["attachment_file_id_2"] != "photo_two" {
+		t.Errorf("attachment_file_id_2: want photo_two, got %v", meta["attachment_file_id_2"])
+	}
+	if meta["attachment_kind_2"] != "photo" {
+		t.Errorf("attachment_kind_2: want photo, got %v", meta["attachment_kind_2"])
+	}
+	if meta["attachment_size_2"] != "104814" {
+		t.Errorf("attachment_size_2: want 104814, got %v", meta["attachment_size_2"])
+	}
+	// content is the message text when present.
+	if frame["content"] != "two photos" {
+		t.Errorf("content: want %q, got %v", "two photos", frame["content"])
+	}
+}
+
+// TestChannelFrame_SingleAttachmentUnchanged guards backward compatibility: a
+// single attachment must emit NO attachment_count and NO _N keys, so existing
+// single-attachment frames are byte-identical to before the multi-attachment fix.
+func TestChannelFrame_SingleAttachmentUnchanged(t *testing.T) {
+	in := &c3types.Inbound{
+		Channel:   "telegram",
+		ChatID:    -100,
+		MessageID: 1,
+		Text:      "one photo",
+		Timestamp: time.Date(2026, 6, 20, 1, 0, 0, 0, time.UTC),
+		Attachments: []c3types.Attachment{
+			{Kind: "photo", FileID: "only", Size: 5},
+		},
+	}
+	frame := buildClaudeChannelFrame(in)
+	meta := frame["meta"].(map[string]any)
+	if meta["attachment_file_id"] != "only" {
+		t.Errorf("attachment_file_id: want only, got %v", meta["attachment_file_id"])
+	}
+	if _, ok := meta["attachment_count"]; ok {
+		t.Error("attachment_count must be ABSENT for a single attachment")
+	}
+	if _, ok := meta["attachment_file_id_2"]; ok {
+		t.Error("attachment_file_id_2 must be ABSENT for a single attachment")
+	}
+}
+
+// TestChannelFrame_MultipleAttachmentsEmptyTextLabel asserts the empty-text
+// fallback reports the count (so an uncaptioned album does not masquerade as a
+// single "(photo message)").
+func TestChannelFrame_MultipleAttachmentsEmptyTextLabel(t *testing.T) {
+	in := &c3types.Inbound{
+		Channel:   "telegram",
+		ChatID:    -100,
+		MessageID: 1,
+		Timestamp: time.Date(2026, 6, 20, 1, 0, 0, 0, time.UTC),
+		Attachments: []c3types.Attachment{
+			{Kind: "photo", FileID: "a"},
+			{Kind: "photo", FileID: "b"},
+			{Kind: "video", FileID: "c"},
+		},
+	}
+	frame := buildClaudeChannelFrame(in)
+	if frame["content"] != "(3 attachments)" {
+		t.Errorf("content: want %q, got %v", "(3 attachments)", frame["content"])
+	}
+	meta := frame["meta"].(map[string]any)
+	if meta["attachment_count"] != "3" {
+		t.Errorf("attachment_count: want 3, got %v", meta["attachment_count"])
+	}
+	if meta["attachment_file_id_3"] != "c" {
+		t.Errorf("attachment_file_id_3: want c, got %v", meta["attachment_file_id_3"])
+	}
+}
