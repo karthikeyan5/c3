@@ -88,6 +88,30 @@ func TestMdToTelegramHTML(t *testing.T) {
 		{"link-in-bold", "**see [here](http://y)**", `<b>see <a href="http://y">here</a></b>`},
 		{"italic-in-blockquote", "> a *quoted* word", "<blockquote>a <i>quoted</i> word</blockquote>"},
 
+		// --- Same-type emphasis nesting (mixed spellings) must COLLAPSE ---
+		// Telegram's HTML parser rejects an entity nested inside another entity of
+		// the SAME type (a <b> inside a <b>) with a 400 that strips ALL formatting.
+		// When an agent mixes the two spellings of one level we render the inner
+		// span WITHOUT re-wrapping (it is already bold/italic).
+		{"same-type-bold-collapse", "**a __b__ c**", "<b>a b c</b>"},
+		{"same-type-italic-collapse", "*a _b_ c*", "<i>a b c</i>"},
+		{"same-type-bold-collapse-unders-outer", "__x **y** z__", "<b>x y z</b>"},
+		{"same-type-italic-collapse-unders-outer", "_x *y* z_", "<i>x y z</i>"},
+
+		// --- Different-type emphasis nesting must be PRESERVED ---
+		// Telegram ALLOWS <b><i>…</i></b>; only same-type nesting is illegal.
+		{"diff-type-bold-italic", "**bold _it_ end**", "<b>bold <i>it</i> end</b>"},
+		{"diff-type-italic-bold", "_it **bo** end_", "<i>it <b>bo</b> end</i>"},
+
+		// --- Bold+italic triple marker → <b><i>…</i></b> ---
+		{"triple-stars", "***text***", "<b><i>text</i></b>"},
+		{"triple-unders", "___text___", "<b><i>text</i></b>"},
+
+		// --- Same-type collapse must hold INSIDE other constructs ---
+		{"same-type-in-list-item", "- **a __b__**", "• <b>a b</b>"},
+		{"same-type-in-blockquote", "> **a __b__**", "<blockquote><b>a b</b></blockquote>"},
+		{"same-type-in-link-label", "[**a __b__**](https://x)", `<a href="https://x"><b>a b</b></a>`},
+
 		// --- Intraword underscores stay literal (CommonMark rule) ---
 		{"underscores-stay", "mcp__plugin_c3_c3__attach", "mcp__plugin_c3_c3__attach"},
 		{"snake-case-stays", "snake_case_var here", "snake_case_var here"},
@@ -129,5 +153,97 @@ func TestMdToTelegramHTML(t *testing.T) {
 				t.Errorf("mdToTelegramHTML(%q):\n  got:  %q\n  want: %q", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// assertNoSameTypeNesting scans rendered Telegram HTML's tag stream with a stack
+// and fails if a <b> is opened while a <b> is already open, or a <i> while a <i>
+// is already open. Telegram rejects same-type nested entities at ANY depth with a
+// 400 that strips all formatting, so this is the durable regression guard the
+// audit said was missing. (Different-type nesting — <b><i> — is legal and must
+// pass.) Only the emphasis tags <b>/<i> are tracked; other tags are ignored.
+func assertNoSameTypeNesting(t *testing.T, in, htmlOut string) {
+	t.Helper()
+	var stack []string
+	runes := []rune(htmlOut)
+	for i := 0; i < len(runes); i++ {
+		if runes[i] != '<' {
+			continue
+		}
+		// Read the tag up to '>'.
+		j := i + 1
+		for j < len(runes) && runes[j] != '>' {
+			j++
+		}
+		if j >= len(runes) {
+			break
+		}
+		tag := string(runes[i+1 : j])
+		i = j
+		closing := false
+		if len(tag) > 0 && tag[0] == '/' {
+			closing = true
+			tag = tag[1:]
+		}
+		// Reduce to the tag name (first token; e.g. "blockquote expandable").
+		name := tag
+		if sp := indexByte(name, ' '); sp >= 0 {
+			name = name[:sp]
+		}
+		if name != "b" && name != "i" {
+			continue // only emphasis tags can collide same-type
+		}
+		if closing {
+			if len(stack) > 0 && stack[len(stack)-1] == name {
+				stack = stack[:len(stack)-1]
+			}
+			continue
+		}
+		for _, open := range stack {
+			if open == name {
+				t.Errorf("same-type <%s> nesting in output for input %q:\n  %q", name, in, htmlOut)
+				return
+			}
+		}
+		stack = append(stack, name)
+	}
+}
+
+func indexByte(s string, b byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == b {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestNoSameTypeNesting runs the property guard over every mixed-spelling input,
+// each wrapped in plain text, a list item, a blockquote, and a link label — the
+// four places renderInline is reused.
+func TestNoSameTypeNesting(t *testing.T) {
+	mixed := []string{
+		"**a __b__ c**",
+		"*a _b_ c*",
+		"__x **y** z__",
+		"_x *y* z_",
+		"**bold _it_ end**",
+		"_it **bo** end_",
+		"***text***",
+		"___text___",
+		"**a __b__ c** and *d _e_ f*",
+	}
+	for _, m := range mixed {
+		wrappers := map[string]string{
+			"plain":      m,
+			"list-item":  "- " + m,
+			"blockquote": "> " + m,
+			"link-label": "[" + m + "](https://x)",
+		}
+		for wname, in := range wrappers {
+			t.Run(wname+":"+m, func(t *testing.T) {
+				assertNoSameTypeNesting(t, in, mdToTelegramHTML(in))
+			})
+		}
 	}
 }
