@@ -83,6 +83,9 @@ func TestCapabilities_GoldenManifest(t *testing.T) {
 	if want := int64(20 * 1024 * 1024); caps.Inbound.MaxDownloadBytes != want {
 		t.Errorf("Inbound.MaxDownloadBytes = %d; want %d (20 MiB)", caps.Inbound.MaxDownloadBytes, want)
 	}
+	if !caps.Inbound.DeliversRichMessages {
+		t.Error("Inbound.DeliversRichMessages = false; want true (Bot API 10.1 rich-message inbound decode)")
+	}
 
 	wantKinds := []c3types.MediaKind{
 		c3types.MediaPhoto, c3types.MediaFile, c3types.MediaVideo,
