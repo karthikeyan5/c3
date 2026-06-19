@@ -206,17 +206,17 @@ func plainText(rt *richText) string {
 type richBlock struct {
 	Type       string          `json:"type"`
 	Text       *richText       `json:"text"`
-	Size       int             `json:"size"`        // heading: 1=largest..6
-	Language   string          `json:"language"`    // pre
-	Blocks     []richBlock     `json:"blocks"`      // blockquote/details/collage/slideshow
-	Credit     *richText       `json:"credit"`      // blockquote/pullquote
-	Summary    *richText       `json:"summary"`     // details
-	Items      []richListItem  `json:"items"`       // list
-	Cells      [][]richCell    `json:"cells"`       // table
-	Expression string          `json:"expression"`  // math
-	Name       string          `json:"name"`        // anchor
-	Caption    json.RawMessage `json:"caption"`     // table=RichText, media=RichBlockCaption
-	Photo      []photoSize     `json:"photo"`       // media
+	Size       int             `json:"size"`       // heading: 1=largest..6
+	Language   string          `json:"language"`   // pre
+	Blocks     []richBlock     `json:"blocks"`     // blockquote/details/collage/slideshow
+	Credit     *richText       `json:"credit"`     // blockquote/pullquote
+	Summary    *richText       `json:"summary"`    // details
+	Items      []richListItem  `json:"items"`      // list
+	Cells      [][]richCell    `json:"cells"`      // table
+	Expression string          `json:"expression"` // math
+	Name       string          `json:"name"`       // anchor
+	Caption    json.RawMessage `json:"caption"`    // table=RichText, media=RichBlockCaption
+	Photo      []photoSize     `json:"photo"`      // media
 	Video      *fileObj        `json:"video"`
 	Animation  *fileObj        `json:"animation"`
 	Audio      *fileObj        `json:"audio"`
