@@ -126,3 +126,35 @@ func TestRenderBlocks_JoinsWithBlankLine(t *testing.T) {
 		t.Errorf("got %q", md)
 	}
 }
+
+func TestRenderTable(t *testing.T) {
+	// Header row (is_header), one body row, per-column alignment.
+	in := `{"type":"table","cells":[
+		[{"text":"Name","is_header":true,"align":"left"},{"text":"Age","is_header":true,"align":"right"}],
+		[{"text":"Al","align":"left"},{"text":"30","align":"right"}]]}`
+	want := "| Name | Age |\n| :-- | --: |\n| Al | 30 |"
+	if got := renderBlk(t, in); got != want {
+		t.Errorf("table:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestRenderTable_NoHeaderSynthesizesOne(t *testing.T) {
+	in := `{"type":"table","cells":[
+		[{"text":"a"},{"text":"b"}],
+		[{"text":"c"},{"text":"d"}]]}`
+	// No is_header cell: synthesize an empty header so GFM still renders.
+	want := "|  |  |\n| --- | --- |\n| a | b |\n| c | d |"
+	if got := renderBlk(t, in); got != want {
+		t.Errorf("noheader:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestRenderTable_OmittedCellAndCenterAlign(t *testing.T) {
+	in := `{"type":"table","cells":[
+		[{"text":"H","is_header":true,"align":"center"},{"is_header":true,"align":"center"}],
+		[{"text":"x","align":"center"},{"text":"y","align":"center"}]]}`
+	want := "| H |  |\n| :-: | :-: |\n| x | y |"
+	if got := renderBlk(t, in); got != want {
+		t.Errorf("omitted:\n got %q\nwant %q", got, want)
+	}
+}

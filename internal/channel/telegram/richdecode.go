@@ -380,8 +380,97 @@ func prefixLines(s, prefix string) string {
 	return strings.Join(lines, "\n")
 }
 
-// TEMP STUB — removed in Task 4.
-func renderTable(b *richBlock) string { return "[table]" }
+// renderTable renders a RichBlockTable as a GFM pipe table. The header is the
+// first row whose cells are is_header; if no row is a header, an empty header is
+// synthesized (GFM requires one). colspan/rowspan cannot be expressed in GFM —
+// each cell renders in its primary position and spans are left blank (documented
+// lossy degradation, spec §5.3). align maps left→:--, center→:-:, right→--:.
+func renderTable(b *richBlock) string {
+	rows := b.Cells
+	if len(rows) == 0 {
+		return ""
+	}
+	// Column count = widest row.
+	cols := 0
+	for _, r := range rows {
+		if len(r) > cols {
+			cols = len(r)
+		}
+	}
+	if cols == 0 {
+		return ""
+	}
+	// Find the header row (first all/any is_header row); default to none.
+	headerIdx := -1
+	for i, r := range rows {
+		for _, c := range r {
+			if c.IsHeader {
+				headerIdx = i
+				break
+			}
+		}
+		if headerIdx >= 0 {
+			break
+		}
+	}
+
+	cell := func(r []richCell, ci int) string {
+		if ci < len(r) {
+			return renderRichText(r[ci].Text)
+		}
+		return ""
+	}
+	align := func(r []richCell, ci int) string {
+		a := ""
+		if ci < len(r) {
+			a = r[ci].Align
+		}
+		switch a {
+		case "center":
+			return ":-:"
+		case "right":
+			return "--:"
+		case "left":
+			return ":--"
+		default:
+			return "---"
+		}
+	}
+	rowLine := func(r []richCell) string {
+		fields := make([]string, cols)
+		for ci := 0; ci < cols; ci++ {
+			fields[ci] = cell(r, ci)
+		}
+		return "| " + strings.Join(fields, " | ") + " |"
+	}
+
+	var out []string
+	var headerRow []richCell
+	var bodyRows [][]richCell
+	if headerIdx >= 0 {
+		headerRow = rows[headerIdx]
+		for i, r := range rows {
+			if i != headerIdx {
+				bodyRows = append(bodyRows, r)
+			}
+		}
+	} else {
+		headerRow = nil // synthesize empty header
+		bodyRows = rows
+	}
+
+	out = append(out, rowLine(headerRow))
+	// Delimiter row: use header's per-column align when present, else "---".
+	delims := make([]string, cols)
+	for ci := 0; ci < cols; ci++ {
+		delims[ci] = align(headerRow, ci)
+	}
+	out = append(out, "| "+strings.Join(delims, " | ")+" |")
+	for _, r := range bodyRows {
+		out = append(out, rowLine(r))
+	}
+	return strings.Join(out, "\n")
+}
 
 // TEMP STUB — removed in Task 5.
 func renderMedia(b *richBlock) (string, []c3types.Attachment) { return "[media]", nil }
