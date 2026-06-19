@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"encoding/json"
 	"strconv"
 	"time"
 
@@ -16,7 +17,7 @@ import (
 //
 // Returns nil for messages we don't surface (service messages like
 // forum_topic_created — spec §10 deferred).
-func convertInbound(channel string, msg *gotgbot.Message, sttPrefix string) *c3types.Inbound {
+func convertInbound(channel string, msg *gotgbot.Message, sttPrefix string, richRaw json.RawMessage) *c3types.Inbound {
 	if msg == nil {
 		return nil
 	}
@@ -42,6 +43,21 @@ func convertInbound(channel string, msg *gotgbot.Message, sttPrefix string) *c3t
 			User:      convertSender(msg.ReplyToMessage.From),
 			Text:      replyText(msg.ReplyToMessage),
 		}
+	}
+
+	// Rich message (Bot API 10.1) takes precedence: a rich message IS the
+	// message. richRaw is non-nil only when the channel captured a rich_message
+	// AND the rich_inbound toggle is on (see poll.go). Decode to markdown +
+	// attachments; on decode failure fall back to a non-empty marker so a rich
+	// message is never surfaced empty.
+	if len(richRaw) > 0 {
+		md, atts, ok := decodeRichMessage(richRaw)
+		if !ok {
+			md = "[rich message]"
+		}
+		in.Text = md
+		in.Attachments = append(in.Attachments, atts...)
+		return in
 	}
 
 	// Body + attachments. Order matters: voice handled first because it gets

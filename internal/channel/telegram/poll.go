@@ -536,7 +536,7 @@ func topicPtrFromThread(threadID int64) *int64 {
 // code is consumed by the broker (allowlist updated + persisted) and
 // the message itself is not forwarded.
 func (c *Channel) dispatchMessage(updateID int64, msg *gotgbot.Message, edited bool) {
-	in := convertInbound(c.Name(), msg, c.cfg.STTPrefix)
+	in := convertInbound(c.Name(), msg, c.cfg.STTPrefix, nil)
 	if in == nil {
 		c.host.Logf("telegram: skip update=%d msg=%d chat=%d thread=%d (unsupported service)",
 			updateID, msg.MessageId, msg.Chat.Id, msg.MessageThreadId)
