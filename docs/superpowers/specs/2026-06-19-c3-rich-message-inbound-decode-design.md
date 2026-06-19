@@ -283,6 +283,14 @@ result threaded to the call site. When disabled, rich messages surface exactly a
 today (empty `Text`, i.e. pre-feature behavior). Exact plumbing is finalized in
 the plan; the **behavior contract** is what's fixed here.
 
+**Decision (2026-06-19):** the kill-switch gates *decoding only*; the raw
+`getUpdates` capture path (§7) is **always active**. A fuller fallback — flag-off
+reverting the poll loop to gotgbot's typed `GetUpdates` path — was considered and
+**declined** as over-engineering ("keep it sane"). Critical-path reliability
+rests on (a) exact request-opts parity with gotgbot's `GetUpdates`, (b) the
+`recover()`-guarded decoder that lives off the critical path and cannot panic the
+loop, and (c) a live-poll verification after deploy (§12, R-1).
+
 **Capability flag:** add `DeliversRichMessages bool` to `c3types.InboundCaps`,
 set in `Capabilities()` to the same value the toggle would yield (true by
 default). This advertises inbound rich support symmetrically with the existing
