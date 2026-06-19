@@ -57,7 +57,7 @@ func (c *Channel) SendReply(args c3types.ReplyArgs) (int64, error) {
 	}
 
 	// Native rich-message table route (Bot API 10.1 sendRichMessage), gated on the
-	// default-OFF richTablesEnabled switch. When the reply is rich-eligible (a
+	// richTablesEnabled switch (now ENABLED). When the reply is rich-eligible (a
 	// detected GFM table within caps on a markdown reply), send the WHOLE reply as
 	// native markdown so Telegram renders real tables. On ANY error fall through to
 	// the existing monospace/plaintext path so a message is never lost.

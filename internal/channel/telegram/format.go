@@ -235,6 +235,18 @@ func listItem(line string) (marker, rest string, ok bool) {
 // spans are extracted first (their content is literal). Links are recognized,
 // then emphasis markers (bold/italic/strike/spoiler).
 func renderInline(s string) string {
+	return renderInlineState(s, false, false)
+}
+
+// renderInlineState is renderInline's worker, threading the current emphasis
+// context (inBold/inItalic) through the recursion. Telegram's HTML parser
+// REJECTS an entity nested inside another entity of the SAME type (a <b> inside a
+// <b>, or an <i> inside an <i>) with a 400 that strips ALL formatting via the
+// plaintext fallback. So when an agent mixes the two spellings of one emphasis
+// level (e.g. `**a __b__ c**`), we must NOT re-wrap: a same-type inner span is
+// COLLAPSED (its content is rendered, still inside the outer tag, with no fresh
+// tag). DIFFERENT-type nesting (<b><i>…</i></b>) is legal and is preserved.
+func renderInlineState(s string, inBold, inItalic bool) string {
 	var b strings.Builder
 	runes := []rune(s)
 	i := 0
@@ -260,8 +272,9 @@ func renderInline(s string) string {
 				b.WriteString(`<a href="`)
 				b.WriteString(escapeURL(url))
 				b.WriteString(`">`)
-				// The label may itself contain emphasis; render it recursively.
-				b.WriteString(renderInline(label))
+				// The label may itself contain emphasis; render it recursively,
+				// carrying the current emphasis context.
+				b.WriteString(renderInlineState(label, inBold, inItalic))
 				b.WriteString("</a>")
 				i = next
 				continue
@@ -272,7 +285,7 @@ func renderInline(s string) string {
 		if c == '|' && i+1 < n && runes[i+1] == '|' {
 			if inner, next, ok := matchDelim(runes, i, "||", false); ok {
 				b.WriteString(`<span class="tg-spoiler">`)
-				b.WriteString(renderInline(inner))
+				b.WriteString(renderInlineState(inner, inBold, inItalic))
 				b.WriteString(`</span>`)
 				i = next
 				continue
@@ -283,8 +296,28 @@ func renderInline(s string) string {
 		if c == '~' && i+1 < n && runes[i+1] == '~' {
 			if inner, next, ok := matchDelim(runes, i, "~~", false); ok {
 				b.WriteString("<s>")
-				b.WriteString(renderInline(inner))
+				b.WriteString(renderInlineState(inner, inBold, inItalic))
 				b.WriteString("</s>")
+				i = next
+				continue
+			}
+		}
+
+		// Bold+italic triple: ***...*** or ___...___ → <b><i>...</i></b>. Checked
+		// BEFORE the ** / __ bold case so the third marker isn't left as a stray
+		// literal. Each level is collapsed independently if already open (a <b>
+		// inside a <b>, or <i> inside <i>, is illegal); the surviving wrapper(s)
+		// keep different-type nesting legal.
+		if c == '*' && i+2 < n && runes[i+1] == '*' && runes[i+2] == '*' {
+			if inner, next, ok := matchDelim(runes, i, "***", false); ok {
+				b.WriteString(wrapEmphasis(inner, inBold, inItalic, true, true))
+				i = next
+				continue
+			}
+		}
+		if c == '_' && i+2 < n && runes[i+1] == '_' && runes[i+2] == '_' {
+			if inner, next, ok := matchDelim(runes, i, "___", true); ok {
+				b.WriteString(wrapEmphasis(inner, inBold, inItalic, true, true))
 				i = next
 				continue
 			}
@@ -293,18 +326,14 @@ func renderInline(s string) string {
 		// Bold: **...** or __...__
 		if c == '*' && i+1 < n && runes[i+1] == '*' {
 			if inner, next, ok := matchDelim(runes, i, "**", false); ok {
-				b.WriteString("<b>")
-				b.WriteString(renderInline(inner))
-				b.WriteString("</b>")
+				b.WriteString(wrapEmphasis(inner, inBold, inItalic, true, false))
 				i = next
 				continue
 			}
 		}
 		if c == '_' && i+1 < n && runes[i+1] == '_' {
 			if inner, next, ok := matchDelim(runes, i, "__", true); ok {
-				b.WriteString("<b>")
-				b.WriteString(renderInline(inner))
-				b.WriteString("</b>")
+				b.WriteString(wrapEmphasis(inner, inBold, inItalic, true, false))
 				i = next
 				continue
 			}
@@ -314,18 +343,14 @@ func renderInline(s string) string {
 		// already consumed ** and __, so a bare single marker remains).
 		if c == '*' {
 			if inner, next, ok := matchDelim(runes, i, "*", false); ok {
-				b.WriteString("<i>")
-				b.WriteString(renderInline(inner))
-				b.WriteString("</i>")
+				b.WriteString(wrapEmphasis(inner, inBold, inItalic, false, true))
 				i = next
 				continue
 			}
 		}
 		if c == '_' {
 			if inner, next, ok := matchDelim(runes, i, "_", true); ok {
-				b.WriteString("<i>")
-				b.WriteString(renderInline(inner))
-				b.WriteString("</i>")
+				b.WriteString(wrapEmphasis(inner, inBold, inItalic, false, true))
 				i = next
 				continue
 			}
@@ -336,6 +361,33 @@ func renderInline(s string) string {
 		i++
 	}
 
+	return b.String()
+}
+
+// wrapEmphasis renders an emphasis span, applying <b> and/or <i> for the levels
+// the span ADDS (wantBold/wantItalic) — but only for levels NOT already active in
+// the surrounding context (inBold/inItalic). A level already open is COLLAPSED:
+// the inner text is rendered (with that level still marked active) but no
+// redundant same-type tag is emitted, since Telegram rejects same-type nesting.
+// Tags are closed in reverse open order so the output stays well-formed.
+func wrapEmphasis(inner string, inBold, inItalic, wantBold, wantItalic bool) string {
+	openBold := wantBold && !inBold
+	openItalic := wantItalic && !inItalic
+
+	var b strings.Builder
+	if openBold {
+		b.WriteString("<b>")
+	}
+	if openItalic {
+		b.WriteString("<i>")
+	}
+	b.WriteString(renderInlineState(inner, inBold || wantBold, inItalic || wantItalic))
+	if openItalic {
+		b.WriteString("</i>")
+	}
+	if openBold {
+		b.WriteString("</b>")
+	}
 	return b.String()
 }
 

@@ -69,16 +69,12 @@ const (
 	maxRichChars   = 32768
 )
 
-// richTablesEnabled is the DEFAULT-OFF switch for native rich-message tables
-// (sendRichMessage). It is false so behavior is unchanged: every detected GFM
-// table still renders as the proven monospace <pre> block. The native-table
-// route (SendReply → sendRich, sendrich.go) is wired and tested but dormant
-// until this is flipped.
-//
-// LIVE-VERIFY: change this single line to `true`, rebuild, and confirm on a
-// phone that GFM tables render as REAL native tables (alignment + inline styling
-// survive) before flipping it on for good. Old-client graceful degradation is
-// undocumented, so the monospace fallback stays as the safety net.
+// richTablesEnabled is the switch for native rich-message tables
+// (sendRichMessage). It is true (ENABLED 2026-06-17, live-verified on Android):
+// every detected GFM table renders as a REAL native RichBlockTable via the
+// native-table route (SendReply → sendRich, sendrich.go). The proven monospace
+// <pre> block remains the fallback for over-cap tables, send errors, and old
+// clients whose graceful degradation is undocumented.
 const richTablesEnabled = true // ON: live-verified on Android 2026-06-17 (GFM tables render as native RichBlockTable); monospace <pre> kept as the error/old-client fallback
 
 // Capabilities returns the static Telegram capability manifest. This is the
@@ -117,9 +113,10 @@ func (c *Channel) Capabilities() c3types.Capabilities {
 		ExpandableQuotes: true,
 		InlineKeyboards:  true,
 		// RichMessages reflects that this channel CAN send native rich messages
-		// (Bot API 10.1 sendRichMessage via the raw request method). RichTables is
-		// gated on the default-OFF switch so the agent is only told tables render
-		// natively once the live-verify has flipped richTablesEnabled.
+		// (Bot API 10.1 sendRichMessage via the raw request method). RichTables
+		// follows richTablesEnabled, now ENABLED (live-verified on Android
+		// 2026-06-17), so the agent is told tables render natively; the monospace
+		// <pre> path stays as the error/old-client fallback.
 		RichMessages: true,
 		RichTables:   richTablesEnabled,
 		Inbound: c3types.InboundCaps{
