@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -10,6 +11,47 @@ import (
 	"github.com/karthikeyan5/c3/internal/c3types"
 	"github.com/karthikeyan5/c3/internal/channel"
 )
+
+// updateProbe captures ONLY the rich_message raw JSON that gotgbot rc.34 drops
+// during typed unmarshal (it has no RichMessage field). We unmarshal the raw
+// getUpdates response a second time into this minimal shape and pair it with the
+// typed updates by array index.
+type updateProbe struct {
+	Message       *messageProbe `json:"message"`
+	EditedMessage *messageProbe `json:"edited_message"`
+}
+
+type messageProbe struct {
+	RichMessage json.RawMessage `json:"rich_message"`
+}
+
+// parseUpdates unmarshals a raw getUpdates result array into BOTH the typed
+// gotgbot updates (the existing downstream path, byte-identical to what
+// Bot.GetUpdates produced) and the rich-message probes (same array, same order).
+// Pure — unit-tested without network.
+func parseUpdates(raw []byte) ([]gotgbot.Update, []updateProbe, error) {
+	var updates []gotgbot.Update
+	if err := json.Unmarshal(raw, &updates); err != nil {
+		return nil, nil, err
+	}
+	var probes []updateProbe
+	// Best-effort: if the probe unmarshal somehow fails, proceed with no rich
+	// data rather than dropping the whole batch.
+	_ = json.Unmarshal(raw, &probes)
+	return updates, probes, nil
+}
+
+// richRawFor returns the rich_message raw JSON for an update's message (or edited
+// message), or nil if absent.
+func richRawFor(p updateProbe) json.RawMessage {
+	if p.Message != nil && len(p.Message.RichMessage) > 0 {
+		return p.Message.RichMessage
+	}
+	if p.EditedMessage != nil && len(p.EditedMessage.RichMessage) > 0 {
+		return p.EditedMessage.RichMessage
+	}
+	return nil
+}
 
 // allowedUpdates is the explicit opt-in list for getUpdates. Telegram's
 // allowed_updates is a RE-LISTING contract: ONLY the listed types are delivered,
@@ -93,13 +135,17 @@ func (c *Channel) pollLoop() {
 			}
 		}
 
-		opts := &gotgbot.GetUpdatesOpts{
-			Offset:         offset,
-			Timeout:        longPoll,
-			AllowedUpdates: allowedUpdates,
-			RequestOpts:    c.requestOptsFor("getUpdates"),
+		params := map[string]any{
+			"offset":          offset,
+			"timeout":         longPoll,
+			"allowed_updates": allowedUpdates,
 		}
-		updates, err := c.bot.GetUpdates(opts)
+		raw, err := c.bot.RequestWithContext(c.ctx, "getUpdates", params, c.requestOptsFor("getUpdates"))
+		var updates []gotgbot.Update
+		var probes []updateProbe
+		if err == nil {
+			updates, probes, err = parseUpdates(raw)
+		}
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return
@@ -219,7 +265,8 @@ func (c *Channel) pollLoop() {
 		consecTransient = 0
 
 		var advanced bool
-		for _, u := range updates {
+		for i := range updates {
+			u := updates[i]
 			if c.dedup != nil && c.dedup.SeenOrAdd(&u) {
 				c.host.Logf("telegram: dedup skip update=%d (recent duplicate)", u.UpdateId)
 				if u.UpdateId >= offset {
@@ -228,7 +275,11 @@ func (c *Channel) pollLoop() {
 				}
 				continue
 			}
-			c.dispatchUpdate(&u)
+			var richRaw json.RawMessage
+			if i < len(probes) {
+				richRaw = richRawFor(probes[i])
+			}
+			c.dispatchUpdate(&u, richRaw)
 			if u.UpdateId >= offset {
 				offset = u.UpdateId + 1
 				advanced = true
@@ -246,12 +297,12 @@ func (c *Channel) pollLoop() {
 // dispatchUpdate converts a single Update into an Inbound (or several) and
 // emits to the host. EditedMessage is treated like a fresh Message for v1 —
 // edits flow as new inbound. Plugins (future) can dedupe if needed.
-func (c *Channel) dispatchUpdate(u *gotgbot.Update) {
+func (c *Channel) dispatchUpdate(u *gotgbot.Update, richRaw json.RawMessage) {
 	switch {
 	case u.Message != nil:
-		c.dispatchMessage(u.UpdateId, u.Message, false)
+		c.dispatchMessage(u.UpdateId, u.Message, false, richRaw)
 	case u.EditedMessage != nil:
-		c.dispatchMessage(u.UpdateId, u.EditedMessage, true)
+		c.dispatchMessage(u.UpdateId, u.EditedMessage, true, richRaw)
 	case u.Poll != nil:
 		c.dispatchPollUpdate(u.UpdateId, u.Poll)
 	case u.CallbackQuery != nil:
@@ -535,8 +586,11 @@ func topicPtrFromThread(threadID int64) *int64 {
 // during an active pairing window, where a body matching the 4-digit
 // code is consumed by the broker (allowlist updated + persisted) and
 // the message itself is not forwarded.
-func (c *Channel) dispatchMessage(updateID int64, msg *gotgbot.Message, edited bool) {
-	in := convertInbound(c.Name(), msg, c.cfg.STTPrefix, nil)
+func (c *Channel) dispatchMessage(updateID int64, msg *gotgbot.Message, edited bool, richRaw json.RawMessage) {
+	if !c.cfg.RichInboundEnabled() {
+		richRaw = nil // toggle off ⇒ rich messages surface as today (empty)
+	}
+	in := convertInbound(c.Name(), msg, c.cfg.STTPrefix, richRaw)
 	if in == nil {
 		c.host.Logf("telegram: skip update=%d msg=%d chat=%d thread=%d (unsupported service)",
 			updateID, msg.MessageId, msg.Chat.Id, msg.MessageThreadId)
