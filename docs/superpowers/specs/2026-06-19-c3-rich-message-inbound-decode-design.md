@@ -254,20 +254,34 @@ The one change to the critical inbound loop:
 
 ## 8. Config kill-switch + capability flag
 
-**Config** (mirrors the `notifications.invasive` `*bool`-nil-means-true pattern,
-including the established traps):
+**Config** (per-channel, mirrors how `STTPrefix` already flows; uses the
+`*bool`-nil-means-true pattern):
 
-- Add an `Inbound *InboundConfig` field to `MappingsFile` with
-  `RichMessages *bool` (`json:"rich_messages,omitempty"`). **nil / absent ⇒
-  true** (decoder enabled). A plain `bool` would zero-value to `false` and
-  silently disable the feature for everyone who never set it — exactly the trap
-  documented for `Invasive`.
-- Accessor `(*MappingsFile).RichInboundEnabled() bool` — returns `true` when
-  `mf == nil || mf.Inbound == nil || mf.Inbound.RichMessages == nil`.
-- **`Clone()` must deep-copy `Inbound`** (new struct + new `*bool`). `Clone()` is
-  on the broker's copy-on-write mutation path and **silently drops any field not
-  explicitly copied** — this is a known footgun; the plan includes a Clone test
-  asserting the field survives a round-trip.
+- Add `RichInbound *bool` (`json:"rich_inbound,omitempty"`) to **both**
+  `mappings.ChannelConfig` (`internal/mappings/types.go`) and the channel's own
+  `telegram.Config` (`internal/channel/telegram/telegram.go`), with the **same**
+  json tag. **nil / absent ⇒ true** (decoder enabled). A plain `bool` would
+  zero-value to `false` and silently disable the feature for everyone who never
+  set it — the trap documented for `notifications.invasive`.
+- **Why both structs:** `host.Config(name, &c.cfg)` bridges config by
+  `json.Marshal(mappings.ChannelConfig)` → `json.Unmarshal(into telegram.Config)`
+  (`internal/broker/host.go:43-49`). The field must exist on the marshal SOURCE
+  (`mappings.ChannelConfig`) to survive the round-trip, and on the unmarshal
+  TARGET (`telegram.Config`) to be read — with matching tags.
+- Accessor `(Config).RichInboundEnabled() bool` on `telegram.Config` — returns
+  `true` when `c.RichInbound == nil || *c.RichInbound`.
+- **`cloneChannelConfig` (`internal/mappings/clone.go`) must deep-copy the new
+  `*bool`** (allocate a new pointer, not the shared one from `out := cc`).
+  `Clone()` is on the broker's copy-on-write path and a shared pointer violates
+  the deep-copy contract — a known footgun; the plan includes a Clone test
+  asserting the field both survives the round-trip AND is isolated.
+- **Reload semantics:** `telegram.Config` is a startup snapshot read once in
+  `Start` (like `STTPrefix`/`APIBaseURL`). Toggling therefore takes effect on the
+  next **broker restart**, NOT a hot SIGHUP reload. Accepted trade-off for "keep
+  it sane": the decoder is `recover()`-guarded and off the critical path, so a
+  leisurely restart-to-disable is sufficient and avoids giving the channel a live
+  mappings getter. (Hot-reload, if ever wanted, is a follow-up: re-read the
+  toggle via `host.Config` instead of the snapshot.)
 
 > **Interpretation note for review:** Karthi said *"add the flag default to true
 > if not present."* "If not present" maps exactly to the nil-`*bool` default-true
@@ -276,12 +290,11 @@ including the established traps):
 > decoder if it ever misbehaves. If only a static capability flag was intended,
 > this can be simplified at review.
 
-**Wiring of the toggle:** the decoder is invoked only when `RichInboundEnabled()`
-is true. `convertInbound` is a pure function today; the toggle is read where
-config is available (the dispatch layer / `Channel`, which owns config) and the
-result threaded to the call site. When disabled, rich messages surface exactly as
-today (empty `Text`, i.e. pre-feature behavior). Exact plumbing is finalized in
-the plan; the **behavior contract** is what's fixed here.
+**Wiring of the toggle:** `dispatchMessage` reads `c.cfg.RichInboundEnabled()`;
+when true it passes the captured `rich_message` raw into `convertInbound`, when
+false it passes `nil`. A disabled toggle therefore makes rich messages surface
+exactly as today (empty `Text`, pre-feature behavior). `convertInbound` stays a
+pure function — the toggle is resolved at the call site, not inside it.
 
 **Decision (2026-06-19):** the kill-switch gates *decoding only*; the raw
 `getUpdates` capture path (§7) is **always active**. A fuller fallback — flag-off
@@ -334,8 +347,10 @@ outbound `RichMessages` cap.
   `ok=false`.
 - **Integration:** `convertInbound` with a rich raw → `Text` + `Attachments`
   populated; with toggle off → pre-feature (empty) behavior.
-- **Config:** `RichInboundEnabled()` nil-safety; **`Clone()` round-trip
-  preserves `Inbound.RichMessages`** (the footgun guard).
+- **Config:** `(Config).RichInboundEnabled()` nil-safety; **`cloneChannelConfig`
+  round-trip preserves AND isolates `ChannelConfig.RichInbound`** (the footgun
+  guard); the `host.Config` marshal→unmarshal bridge carries `rich_inbound` from
+  `mappings.ChannelConfig` into `telegram.Config`.
 - **poll.go:** the double-unmarshal pairing pure helper tested without network
   (raw array → aligned `[]Update` + `[]updateProbe`).
 
