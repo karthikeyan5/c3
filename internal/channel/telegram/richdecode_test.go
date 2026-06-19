@@ -54,3 +54,75 @@ func TestEscapeInline(t *testing.T) {
 		t.Errorf("code raw: got %q", got)
 	}
 }
+
+func renderBlk(t *testing.T, jsonStr string) string {
+	t.Helper()
+	var b richBlock
+	if err := json.Unmarshal([]byte(jsonStr), &b); err != nil {
+		t.Fatalf("unmarshal %s: %v", jsonStr, err)
+	}
+	md, _ := renderBlock(&b)
+	return md
+}
+
+func TestRenderBlock_Structural(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"paragraph", `{"type":"paragraph","text":"hi there"}`, "hi there"},
+		{"heading1", `{"type":"heading","size":1,"text":"Title"}`, "# Title"},
+		{"heading3", `{"type":"heading","size":3,"text":"Sub"}`, "### Sub"},
+		{"heading_clamp_low", `{"type":"heading","size":0,"text":"X"}`, "# X"},
+		{"heading_clamp_high", `{"type":"heading","size":9,"text":"X"}`, "###### X"},
+		{"pre", `{"type":"pre","language":"go","text":"a := 1"}`, "```go\na := 1\n```"},
+		{"divider", `{"type":"divider"}`, "---"},
+		{"math_block", `{"type":"mathematical_expression","expression":"e=mc^2"}`, "$$e=mc^2$$"},
+		{"footer", `{"type":"footer","text":"end"}`, "---\n*end*"},
+		{"blockquote", `{"type":"blockquote","blocks":[{"type":"paragraph","text":"q"}],"credit":"me"}`, "> q\n> — me"},
+		{"pullquote", `{"type":"pullquote","text":"big","credit":"src"}`, "> big\n> — src"},
+		{"details", `{"type":"details","summary":"More","blocks":[{"type":"paragraph","text":"body"}]}`, "**More**\n\nbody"},
+		{"anchor_empty", `{"type":"anchor","name":"x"}`, ""},
+		{"thinking_empty", `{"type":"thinking","text":"hidden"}`, ""},
+		{"unknown_with_text", `{"type":"futureblock","text":"salvage"}`, "salvage"},
+		{"unknown_bare", `{"type":"weird"}`, "[unsupported block: weird]"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := renderBlk(t, c.in); got != c.want {
+				t.Errorf("got %q want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestRenderList(t *testing.T) {
+	unordered := `{"type":"list","items":[
+		{"blocks":[{"type":"paragraph","text":"one"}]},
+		{"blocks":[{"type":"paragraph","text":"two"}]}]}`
+	if got := renderBlk(t, unordered); got != "- one\n- two" {
+		t.Errorf("unordered: %q", got)
+	}
+	checkbox := `{"type":"list","items":[
+		{"has_checkbox":true,"is_checked":true,"blocks":[{"type":"paragraph","text":"done"}]},
+		{"has_checkbox":true,"is_checked":false,"blocks":[{"type":"paragraph","text":"todo"}]}]}`
+	if got := renderBlk(t, checkbox); got != "- [x] done\n- [ ] todo" {
+		t.Errorf("checkbox: %q", got)
+	}
+	ordered := `{"type":"list","items":[
+		{"type":"1","value":1,"blocks":[{"type":"paragraph","text":"a"}]},
+		{"type":"1","value":2,"blocks":[{"type":"paragraph","text":"b"}]}]}`
+	if got := renderBlk(t, ordered); got != "1. a\n2. b" {
+		t.Errorf("ordered: %q", got)
+	}
+}
+
+func TestRenderBlocks_JoinsWithBlankLine(t *testing.T) {
+	var blocks []richBlock
+	if err := json.Unmarshal([]byte(`[
+		{"type":"heading","size":1,"text":"T"},
+		{"type":"paragraph","text":"p"}]`), &blocks); err != nil {
+		t.Fatal(err)
+	}
+	md, _ := renderBlocks(blocks)
+	if md != "# T\n\np" {
+		t.Errorf("got %q", md)
+	}
+}

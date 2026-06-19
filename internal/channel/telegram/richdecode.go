@@ -200,6 +200,188 @@ func plainText(rt *richText) string {
 	return ""
 }
 
-// _ ensures c3types is imported for future tasks that extend this file with
-// block/table/media handling (those use c3types.Attachment etc.).
-var _ = (*c3types.Capabilities)(nil)
+// richBlock is a single RichBlock. A union over all block types; only the fields
+// for its Type are populated. Caption is raw because it has two shapes: RichText
+// (table) vs RichBlockCaption (media) — decoded per-type by the handler.
+type richBlock struct {
+	Type       string          `json:"type"`
+	Text       *richText       `json:"text"`
+	Size       int             `json:"size"`        // heading: 1=largest..6
+	Language   string          `json:"language"`    // pre
+	Blocks     []richBlock     `json:"blocks"`      // blockquote/details/collage/slideshow
+	Credit     *richText       `json:"credit"`      // blockquote/pullquote
+	Summary    *richText       `json:"summary"`     // details
+	Items      []richListItem  `json:"items"`       // list
+	Cells      [][]richCell    `json:"cells"`       // table
+	Expression string          `json:"expression"`  // math
+	Name       string          `json:"name"`        // anchor
+	Caption    json.RawMessage `json:"caption"`     // table=RichText, media=RichBlockCaption
+	Photo      []photoSize     `json:"photo"`       // media
+	Video      *fileObj        `json:"video"`
+	Animation  *fileObj        `json:"animation"`
+	Audio      *fileObj        `json:"audio"`
+	VoiceNote  *fileObj        `json:"voice_note"`
+}
+
+type richListItem struct {
+	Label       string      `json:"label"`
+	Blocks      []richBlock `json:"blocks"`
+	HasCheckbox bool        `json:"has_checkbox"`
+	IsChecked   bool        `json:"is_checked"`
+	Value       int         `json:"value"`
+	Type        string      `json:"type"` // "a"/"A"/"i"/"I"/"1"
+}
+
+type richCell struct {
+	Text     *richText `json:"text"`
+	IsHeader bool      `json:"is_header"`
+	Colspan  int       `json:"colspan"`
+	Rowspan  int       `json:"rowspan"`
+	Align    string    `json:"align"`
+	Valign   string    `json:"valign"`
+}
+
+type photoSize struct {
+	FileID   string `json:"file_id"`
+	FileSize int64  `json:"file_size"`
+	Width    int64  `json:"width"`
+	Height   int64  `json:"height"`
+}
+
+type fileObj struct {
+	FileID   string `json:"file_id"`
+	FileSize int64  `json:"file_size"`
+	MimeType string `json:"mime_type"`
+	FileName string `json:"file_name"`
+}
+
+type richBlockCaption struct {
+	Text   *richText `json:"text"`
+	Credit *richText `json:"credit"`
+}
+
+// renderBlock renders one block to markdown and any embedded media attachments.
+func renderBlock(b *richBlock) (string, []c3types.Attachment) {
+	switch b.Type {
+	case "paragraph":
+		return renderRichText(b.Text), nil
+	case "heading":
+		level := b.Size
+		if level < 1 {
+			level = 1
+		}
+		if level > 6 {
+			level = 6
+		}
+		return strings.Repeat("#", level) + " " + renderRichText(b.Text), nil
+	case "pre":
+		return "```" + b.Language + "\n" + plainText(b.Text) + "\n```", nil
+	case "divider":
+		return "---", nil
+	case "mathematical_expression":
+		return "$$" + b.Expression + "$$", nil
+	case "footer":
+		return "---\n*" + renderRichText(b.Text) + "*", nil
+	case "blockquote":
+		body, atts := renderBlocks(b.Blocks)
+		out := prefixLines(body, "> ")
+		if b.Credit != nil {
+			out += "\n> — " + renderRichText(b.Credit)
+		}
+		return out, atts
+	case "pullquote":
+		out := prefixLines(renderRichText(b.Text), "> ")
+		if b.Credit != nil {
+			out += "\n> — " + renderRichText(b.Credit)
+		}
+		return out, nil
+	case "details":
+		body, atts := renderBlocks(b.Blocks)
+		return "**" + renderRichText(b.Summary) + "**\n\n" + body, atts
+	case "list":
+		return renderList(b.Items)
+	case "collage", "slideshow":
+		return renderBlocks(b.Blocks)
+	case "anchor", "thinking":
+		// anchor has no readable text; thinking is outbound-only (never inbound).
+		return "", nil
+	case "table":
+		return renderTable(b), nil // Task 4
+	case "map":
+		return "[map]", nil
+	case "photo", "video", "animation", "audio", "voice_note":
+		return renderMedia(b) // Task 5
+	default:
+		// Graceful degradation for unknown/future block types: salvage any text
+		// or child blocks; never silently empty.
+		if b.Text != nil {
+			return renderRichText(b.Text), nil
+		}
+		if len(b.Blocks) > 0 {
+			return renderBlocks(b.Blocks)
+		}
+		return "[unsupported block: " + b.Type + "]", nil
+	}
+}
+
+// renderBlocks renders a slice of blocks, joining non-empty results with a blank
+// line and aggregating their attachments in order.
+func renderBlocks(blocks []richBlock) (string, []c3types.Attachment) {
+	var parts []string
+	var atts []c3types.Attachment
+	for i := range blocks {
+		md, a := renderBlock(&blocks[i])
+		if md != "" {
+			parts = append(parts, md)
+		}
+		atts = append(atts, a...)
+	}
+	return strings.Join(parts, "\n\n"), atts
+}
+
+// renderList renders a RichBlockList's items as GFM list lines.
+func renderList(items []richListItem) (string, []c3types.Attachment) {
+	var lines []string
+	var atts []c3types.Attachment
+	for i := range items {
+		it := &items[i]
+		marker := "-"
+		switch {
+		case it.HasCheckbox && it.IsChecked:
+			marker = "- [x]"
+		case it.HasCheckbox:
+			marker = "- [ ]"
+		case it.Type != "" || it.Value != 0:
+			n := it.Value
+			if n == 0 {
+				n = i + 1
+			}
+			marker = strconv.Itoa(n) + "."
+		}
+		body, a := renderBlocks(it.Blocks)
+		atts = append(atts, a...)
+		if body == "" {
+			body = escapeInline(it.Label)
+		}
+		lines = append(lines, marker+" "+body)
+	}
+	return strings.Join(lines, "\n"), atts
+}
+
+// prefixLines prefixes every line of s with prefix (used for blockquotes).
+func prefixLines(s, prefix string) string {
+	if s == "" {
+		return prefix
+	}
+	lines := strings.Split(s, "\n")
+	for i, ln := range lines {
+		lines[i] = prefix + ln
+	}
+	return strings.Join(lines, "\n")
+}
+
+// TEMP STUB — removed in Task 4.
+func renderTable(b *richBlock) string { return "[table]" }
+
+// TEMP STUB — removed in Task 5.
+func renderMedia(b *richBlock) (string, []c3types.Attachment) { return "[media]", nil }
