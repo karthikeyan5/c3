@@ -500,8 +500,8 @@ func renderMedia(b *richBlock) (string, []c3types.Attachment) {
 		att = fileAttachment("voice", b.VoiceNote)
 	}
 	marker := "[" + b.Type + "]"
-	if cap := mediaCaption(b.Caption); cap != "" {
-		marker = "[" + b.Type + ": " + cap + "]"
+	if caption := mediaCaption(b.Caption); caption != "" {
+		marker = "[" + b.Type + ": " + caption + "]"
 	}
 	if att.FileID == "" {
 		return marker, nil
