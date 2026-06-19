@@ -72,6 +72,16 @@ type Config struct {
 	// APIBaseURL. The poll loop advances to the next endpoint after a run of
 	// transient failures (the IP-block signature) and len(endpoints) > 1.
 	APIBaseURLs []string `json:"api_base_urls,omitempty"`
+	// RichInbound gates decoding of inbound rich messages. nil/absent ⇒ true.
+	// Bridged from mappings.ChannelConfig via host.Config (json.Marshal →
+	// json.Unmarshal); the json tag MUST match the mappings side.
+	RichInbound *bool `json:"rich_inbound,omitempty"`
+}
+
+// RichInboundEnabled reports whether inbound rich-message decoding is on.
+// Absent config (nil) ⇒ true (decode by default).
+func (c Config) RichInboundEnabled() bool {
+	return c.RichInbound == nil || *c.RichInbound
 }
 
 // Channel is the Telegram channel implementation. Construct via New, register
