@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -52,6 +53,17 @@ func TestEscapeInline(t *testing.T) {
 	// Code content is NOT escaped (raw monospace).
 	if got := renderRT(t, `{"type":"code","text":"a*b|c"}`); got != "`a*b|c`" {
 		t.Errorf("code raw: got %q", got)
+	}
+}
+
+// TestEscapeInline_FullCharSet pins EVERY structural character escapeInline
+// handles, so a future edit to inlineEscaper can't silently drop one. The set is
+// the eight chars: \ ` * _ [ ] | ~ — each gets a single leading backslash.
+func TestEscapeInline_FullCharSet(t *testing.T) {
+	in := "\\`*_[]|~" // the 8 structural chars, in order
+	want := "\\\\" + "\\`" + "\\*" + "\\_" + "\\[" + "\\]" + "\\|" + "\\~"
+	if got := escapeInline(in); got != want {
+		t.Errorf("escapeInline(%q)\n got %q\nwant %q", in, got, want)
 	}
 }
 
@@ -159,6 +171,19 @@ func TestRenderTable_OmittedCellAndCenterAlign(t *testing.T) {
 	}
 }
 
+// TestRenderTable_RaggedRow covers a body row NARROWER than the header (fewer
+// cells than the column count): the missing trailing cells render as empty,
+// padded to the table width so the GFM grid stays rectangular.
+func TestRenderTable_RaggedRow(t *testing.T) {
+	in := `{"type":"table","cells":[
+		[{"text":"A","is_header":true},{"text":"B","is_header":true},{"text":"C","is_header":true}],
+		[{"text":"x"},{"text":"y"}]]}`
+	want := "| A | B | C |\n| --- | --- | --- |\n| x | y |  |"
+	if got := renderBlk(t, in); got != want {
+		t.Errorf("ragged:\n got %q\nwant %q", got, want)
+	}
+}
+
 func TestRenderMedia_Photo(t *testing.T) {
 	in := `{"type":"photo","photo":[
 		{"file_id":"small","file_size":10,"width":100,"height":100},
@@ -229,5 +254,42 @@ func TestDecodeRichMessage_Invariants(t *testing.T) {
 	md2, _, ok2 := decodeRichMessage(json.RawMessage(`{"blocks":[{"type":"mystery"}]}`))
 	if !ok2 || md2 != "[unsupported block: mystery]" {
 		t.Errorf("unknown: md=%q ok=%v", md2, ok2)
+	}
+}
+
+// TestDecodeRichMessage_DeepBlocksNoPanicMarker drives a block tree nested far
+// past maxDecodeDepth (Telegram never sends this; it is the untrusted-input
+// contract). The decoder must (a) NOT panic — the depth guard + the top-level
+// recover() are the backstops — and (b) cut the recursion off with depthMarker
+// rather than walking the whole tree. A valid-but-deep tree still decodes
+// (ok=true).
+func TestDecodeRichMessage_DeepBlocksNoPanicMarker(t *testing.T) {
+	n := maxDecodeDepth + 50
+	var sb strings.Builder
+	for i := 0; i < n; i++ {
+		sb.WriteString(`{"type":"blockquote","blocks":[`)
+	}
+	sb.WriteString(`{"type":"paragraph","text":"deep"}`)
+	for i := 0; i < n; i++ {
+		sb.WriteString(`]}`)
+	}
+	raw := json.RawMessage(`{"blocks":[` + sb.String() + `]}`)
+	md, _, ok := decodeRichMessage(raw)
+	if !ok {
+		t.Fatal("deep-but-valid tree should decode (ok=true), got ok=false")
+	}
+	if !strings.Contains(md, depthMarker) {
+		t.Errorf("expected depth marker %q in output; got %q", depthMarker, md)
+	}
+}
+
+// TestRenderRichText_DeepInlineMarker is the inline (RichText) analogue: deeply
+// nested inline tags also cut off with depthMarker instead of recursing without
+// bound.
+func TestRenderRichText_DeepInlineMarker(t *testing.T) {
+	n := maxDecodeDepth + 10
+	in := strings.Repeat(`{"type":"bold","text":`, n) + `"x"` + strings.Repeat(`}`, n)
+	if got := renderRT(t, in); !strings.Contains(got, depthMarker) {
+		t.Errorf("expected depth marker in deeply-nested inline text; got %q", got)
 	}
 }

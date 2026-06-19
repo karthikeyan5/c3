@@ -121,10 +121,28 @@ var inlineEscaper = strings.NewReplacer(
 
 func escapeInline(s string) string { return inlineEscaper.Replace(s) }
 
+// maxDecodeDepth bounds recursion in the rich-message renderers as
+// defense-in-depth on untrusted input. Telegram-rendered trees are shallow
+// (articles cap at ≤500 blocks, typically a handful of nesting levels) and Go's
+// json decoder already errors out past its own deep-nesting limit before any
+// stack-overflow risk — so this cap should never fire on legitimate content. It
+// is a belt-and-suspenders guarantee independent of those upstream limits: past
+// the cap the renderer emits depthMarker instead of recursing further. (The
+// top-level recover() in decodeRichMessage is the final backstop.)
+const maxDecodeDepth = 256
+
+// depthMarker is emitted in place of content cut off at maxDecodeDepth.
+const depthMarker = "[nesting too deep]"
+
 // renderRichText renders a RichText node to GFM markdown, escaping plain text.
-func renderRichText(rt *richText) string {
+func renderRichText(rt *richText) string { return renderRichTextAt(rt, 0) }
+
+func renderRichTextAt(rt *richText, depth int) string {
 	if rt == nil {
 		return ""
+	}
+	if depth > maxDecodeDepth {
+		return depthMarker
 	}
 	switch rt.kind {
 	case richLeaf:
@@ -132,11 +150,11 @@ func renderRichText(rt *richText) string {
 	case richArray:
 		var b strings.Builder
 		for i := range rt.items {
-			b.WriteString(renderRichText(&rt.items[i]))
+			b.WriteString(renderRichTextAt(&rt.items[i], depth+1))
 		}
 		return b.String()
 	case richTagged:
-		inner := renderRichText(rt.inner)
+		inner := renderRichTextAt(rt.inner, depth+1)
 		switch rt.typ {
 		case "bold":
 			return "**" + inner + "**"
@@ -151,7 +169,7 @@ func renderRichText(rt *richText) string {
 		case "marked":
 			return "==" + inner + "=="
 		case "code":
-			return "`" + plainText(rt.inner) + "`"
+			return "`" + plainTextAt(rt.inner, depth+1) + "`"
 		case "url":
 			return "[" + inner + "](" + rt.url + ")"
 		case "text_mention":
@@ -174,8 +192,13 @@ func renderRichText(rt *richText) string {
 
 // plainText returns a node's text WITHOUT markdown escaping — used for inline
 // code spans where the content is literal monospace.
-func plainText(rt *richText) string {
+func plainText(rt *richText) string { return plainTextAt(rt, 0) }
+
+func plainTextAt(rt *richText, depth int) string {
 	if rt == nil {
+		return ""
+	}
+	if depth > maxDecodeDepth {
 		return ""
 	}
 	switch rt.kind {
@@ -184,7 +207,7 @@ func plainText(rt *richText) string {
 	case richArray:
 		var b strings.Builder
 		for i := range rt.items {
-			b.WriteString(plainText(&rt.items[i]))
+			b.WriteString(plainTextAt(&rt.items[i], depth+1))
 		}
 		return b.String()
 	case richTagged:
@@ -194,7 +217,7 @@ func plainText(rt *richText) string {
 		case "mathematical_expression":
 			return rt.expr
 		default:
-			return plainText(rt.inner)
+			return plainTextAt(rt.inner, depth+1)
 		}
 	}
 	return ""
@@ -261,7 +284,12 @@ type richBlockCaption struct {
 }
 
 // renderBlock renders one block to markdown and any embedded media attachments.
-func renderBlock(b *richBlock) (string, []c3types.Attachment) {
+func renderBlock(b *richBlock) (string, []c3types.Attachment) { return renderBlockAt(b, 0) }
+
+func renderBlockAt(b *richBlock, depth int) (string, []c3types.Attachment) {
+	if depth > maxDecodeDepth {
+		return depthMarker, nil
+	}
 	switch b.Type {
 	case "paragraph":
 		return renderRichText(b.Text), nil
@@ -283,7 +311,7 @@ func renderBlock(b *richBlock) (string, []c3types.Attachment) {
 	case "footer":
 		return "---\n*" + renderRichText(b.Text) + "*", nil
 	case "blockquote":
-		body, atts := renderBlocks(b.Blocks)
+		body, atts := renderBlocksAt(b.Blocks, depth+1)
 		out := prefixLines(body, "> ")
 		if b.Credit != nil {
 			out += "\n> — " + renderRichText(b.Credit)
@@ -296,12 +324,12 @@ func renderBlock(b *richBlock) (string, []c3types.Attachment) {
 		}
 		return out, nil
 	case "details":
-		body, atts := renderBlocks(b.Blocks)
+		body, atts := renderBlocksAt(b.Blocks, depth+1)
 		return "**" + renderRichText(b.Summary) + "**\n\n" + body, atts
 	case "list":
-		return renderList(b.Items)
+		return renderListAt(b.Items, depth+1)
 	case "collage", "slideshow":
-		return renderBlocks(b.Blocks)
+		return renderBlocksAt(b.Blocks, depth+1)
 	case "anchor", "thinking":
 		// anchor has no readable text; thinking is outbound-only (never inbound).
 		return "", nil
@@ -318,7 +346,7 @@ func renderBlock(b *richBlock) (string, []c3types.Attachment) {
 			return renderRichText(b.Text), nil
 		}
 		if len(b.Blocks) > 0 {
-			return renderBlocks(b.Blocks)
+			return renderBlocksAt(b.Blocks, depth+1)
 		}
 		return "[unsupported block: " + b.Type + "]", nil
 	}
@@ -327,10 +355,19 @@ func renderBlock(b *richBlock) (string, []c3types.Attachment) {
 // renderBlocks renders a slice of blocks, joining non-empty results with a blank
 // line and aggregating their attachments in order.
 func renderBlocks(blocks []richBlock) (string, []c3types.Attachment) {
+	return renderBlocksAt(blocks, 0)
+}
+
+func renderBlocksAt(blocks []richBlock, depth int) (string, []c3types.Attachment) {
+	if depth > maxDecodeDepth {
+		return depthMarker, nil
+	}
 	var parts []string
 	var atts []c3types.Attachment
 	for i := range blocks {
-		md, a := renderBlock(&blocks[i])
+		// Siblings share depth; renderBlockAt deepens when it descends into a
+		// block's own children.
+		md, a := renderBlockAt(&blocks[i], depth)
 		if md != "" {
 			parts = append(parts, md)
 		}
@@ -341,6 +378,13 @@ func renderBlocks(blocks []richBlock) (string, []c3types.Attachment) {
 
 // renderList renders a RichBlockList's items as GFM list lines.
 func renderList(items []richListItem) (string, []c3types.Attachment) {
+	return renderListAt(items, 0)
+}
+
+func renderListAt(items []richListItem, depth int) (string, []c3types.Attachment) {
+	if depth > maxDecodeDepth {
+		return depthMarker, nil
+	}
 	var lines []string
 	var atts []c3types.Attachment
 	for i := range items {
@@ -358,7 +402,7 @@ func renderList(items []richListItem) (string, []c3types.Attachment) {
 			}
 			marker = strconv.Itoa(n) + "."
 		}
-		body, a := renderBlocks(it.Blocks)
+		body, a := renderBlocksAt(it.Blocks, depth)
 		atts = append(atts, a...)
 		if body == "" {
 			body = escapeInline(it.Label)
