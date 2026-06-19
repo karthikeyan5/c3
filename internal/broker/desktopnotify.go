@@ -16,12 +16,13 @@ import (
 // interface so tests can substitute a fake without spawning real desktop
 // processes (the real impl is *desktopNotifier).
 type healthNotifier interface {
-	Notify(ev c3types.HealthEvent)
+	Notify(ev c3types.HealthEvent) (delivered bool)
 }
 
 // desktopNotifier raises a local desktop popup for a channel-health edge. It is
-// ONE of the four out-of-band sinks (the CLI broadcast + the status line are the
-// guaranteed backstops if this fails) — a notify failure is logged once and
+// the PRIMARY surface of the invasive notification tier; the CLI turn-injection
+// fires only when this does not deliver, and the ambient status line
+// (health.json) is the always-on backstop. A notify failure is logged once and
 // NEVER blocks or crashes the broker.
 //
 // Environment snapshot: the broker is manually launched (not a systemd unit),
@@ -64,21 +65,24 @@ func snapshotDesktopEnv() []string {
 	return env
 }
 
-// Notify fires a desktop popup for the given health event. It runs with a 2s
-// context timeout + the snapshotted env, and recovers from any panic — a notify
-// failure must never propagate. Caller already runs this in its own goroutine
-// (see BrokerHost.NotifyHealth), so this is synchronous within that goroutine.
-func (dn *desktopNotifier) Notify(ev c3types.HealthEvent) {
+// Notify fires a desktop popup for the given health event and reports whether
+// it was DELIVERED — meaning the notifier binary was resolved and exec'd to a
+// zero exit within the 2s timeout. NOTE: "delivered" is a proxy for "spawned
+// successfully", NOT proof the user saw it (notify-send/zenity exit 0 even with
+// the screen locked, DND on, or no notification daemon running). The reliable
+// not-delivered signal is a missing binary (the common headless/SSH case). The
+// CLI fallback + status line are the backstops. Runs with the snapshotted env;
+// recovers from panic (a notify failure must never propagate).
+func (dn *desktopNotifier) Notify(ev c3types.HealthEvent) (delivered bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("health-notify: desktop notify panic recovered: %v", r)
+			delivered = false
 		}
 	}()
 	if dn == nil || dn.bin == "" {
-		// No notifier available — the CLI broadcast + status line are the
-		// backstops. Log once at the per-event tier so its absence is visible.
-		log.Printf("health-notify: no desktop notifier (notify-send/zenity) found; relying on CLI broadcast + status")
-		return
+		log.Printf("health-notify: no desktop notifier (notify-send/zenity) found; relying on CLI fallback + status")
+		return false
 	}
 
 	title, body, urgency := formatHealthPopup(ev)
@@ -91,15 +95,16 @@ func (dn *desktopNotifier) Notify(ev c3types.HealthEvent) {
 	case "notify-send":
 		cmd = exec.CommandContext(ctx, dn.bin, "-u", urgency, "-a", "C3", title, body)
 	case "zenity":
-		// zenity --notification has no urgency/app flags; collapse to one line.
 		cmd = exec.CommandContext(ctx, dn.bin, "--notification", "--text", title+" — "+body)
 	default:
-		return
+		return false
 	}
 	cmd.Env = dn.env
 	if err := cmd.Run(); err != nil {
 		log.Printf("health-notify: desktop notify exec failed (tool=%s): %v", dn.tool, err)
+		return false
 	}
+	return true
 }
 
 // formatHealthPopup renders the title/body/urgency for a health event. DOWN is
@@ -113,7 +118,7 @@ func formatHealthPopup(ev c3types.HealthEvent) (title, body, urgency string) {
 	switch ev.State {
 	case c3types.HealthStateDown:
 		title = fmt.Sprintf("C3: %s fetch DOWN", ch)
-		body = fmt.Sprintf("Cannot reach %s since %s (%d %s). Inbound offline — alerts here only.",
+		body = fmt.Sprintf("Cannot reach %s since %s (%d %s). Inbound offline until it recovers.",
 			ch, ev.Since.Format("15:04"), ev.Consec, reasonOr(ev.Reason, "failures"))
 		urgency = "critical"
 	default: // up / recovered

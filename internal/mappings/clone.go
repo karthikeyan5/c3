@@ -55,6 +55,14 @@ func (mf *MappingsFile) Clone() *MappingsFile {
 		}
 		out.Allowlist = &al
 	}
+	if mf.Notifications != nil {
+		nc := NotificationsConfig{}
+		if mf.Notifications.Invasive != nil {
+			v := *mf.Notifications.Invasive
+			nc.Invasive = &v
+		}
+		out.Notifications = &nc
+	}
 	return out
 }
 

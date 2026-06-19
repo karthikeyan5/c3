@@ -88,76 +88,78 @@ func (h *BrokerHost) GateInbound(in *c3types.Inbound) channel.GateInboundDecisio
 	}
 }
 
-// NotifyHealth fans a channel fetch-health edge out to FOUR independent
-// out-of-band sinks, so a dead channel still raises an alarm through a different
-// path. The alert NEVER re-enters the reporting channel (e.g. when Telegram is
-// down we do not try to alert over Telegram). Each sink runs in its own
-// goroutine with a recover, so one slow/failing sink can't block or crash the
-// others or the broker:
-//
-//	(a) desktop notify  — a local popup (notify-send/zenity), best-effort.
-//	(b) CLI broadcast   — a trusted, broker-originated system InboundEvent
-//	                      written to EVERY live CLI session (bypasses the
-//	                      worker pool / debounce / allowlist gate — see
-//	                      broadcastSystemEvent for why that bypass is safe).
-//	(c) status cache    — caches the event so `c3-broker status` can render a
-//	                      "Channel health:" line.
-//	(d) broker log      — one loud line per edge (the per-attempt detail stays
-//	                      at the channel's existing log tier).
-//
-// (b) and (c) are the guaranteed backstops: even if the desktop popup fails,
-// silent failure is impossible.
 func (h *BrokerHost) NotifyHealth(ev c3types.HealthEvent) {
-	// (c) cache for the status line — synchronous, cheap, lock-guarded.
+	// --- Ambient tier: always on, synchronous, never gated. ---
+	// (c) status cache for `c3-broker status`.
 	h.broker.setLastHealth(ev)
 
 	// (d) broker log — one loud edge line.
 	if ev.State == c3types.HealthStateDown {
-		log.Printf("HEALTH chan=%s state=DOWN since=%s consec=%d reason=%q — inbound offline; out-of-band alerting (desktop + CLI broadcast + status)",
+		log.Printf("HEALTH chan=%s state=DOWN since=%s consec=%d reason=%q — inbound offline; desktop primary, CLI fallback, status line",
 			ev.Channel, ev.Since.Format("15:04:05"), ev.Consec, ev.Reason)
 	} else {
 		log.Printf("HEALTH chan=%s state=UP (recovered, was down %s) — inbound restored",
 			ev.Channel, ev.DownFor.Round(time.Second))
 	}
 
-	// (a) desktop notify — isolated goroutine + recover (inside Notify).
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("health-notify: desktop sink panic recovered: %v", r)
-			}
-		}()
-		if h.broker.desktopNotifier != nil {
-			h.broker.desktopNotifier.Notify(ev)
-		}
-	}()
+	// (e) status file the Claude Code status line reads.
+	h.broker.WriteHealthFile()
 
-	// (b) CLI broadcast — isolated goroutine + recover.
+	// --- Invasive tier: desktop popup primary, CLI broadcast fallback. ---
+	// Gated by notifications.invasive (default true). Read the toggle ONCE
+	// here (a single atomic snapshot load) — never inside the goroutine, so a
+	// concurrent SIGHUP SetMappings can't tear the read.
+	if !h.broker.Mappings().InvasiveNotifications() {
+		return
+	}
+
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("health-notify: CLI-broadcast sink panic recovered: %v", r)
+				log.Printf("health-notify: invasive sink panic recovered: %v", r)
 			}
 		}()
-		h.broker.broadcastSystemEvent(systemEventForHealth(ev))
+		// Desktop popup is the primary surface.
+		delivered := false
+		if h.broker.desktopNotifier != nil {
+			delivered = h.broker.desktopNotifier.Notify(ev)
+		}
+		// CLI turn-injection is the FALLBACK: only when the popup did not
+		// deliver, and only on a DOWN edge. Recovery never injects into the
+		// CLI — the status line clearing is the closure.
+		if !delivered && ev.State == c3types.HealthStateDown {
+			// desktopNotifier.Notify above can block up to 2s; a recovery edge
+			// may have landed meanwhile. Recovery never injects to the CLI, so a
+			// stale DOWN advisory would never be retracted — suppress it if the
+			// channel is no longer down. lastHealth is compare-and-skip ordered
+			// (setLastHealth), so this reflects the latest edge.
+			if cur, ok := h.broker.lastHealthSnapshot()[ev.Channel]; !ok || cur.State != c3types.HealthStateDown {
+				return
+			}
+			h.broker.broadcastSystemEvent(systemEventForHealth(ev, true))
+		}
 	}()
 }
 
 // systemEventForHealth renders a channel-neutral SystemEvent advisory for a
 // health edge. The message is operational (no user content); it tells the agent
 // whether phone messages will arrive. Level is "warn" for DOWN, "info" for UP.
-func systemEventForHealth(ev c3types.HealthEvent) *c3types.SystemEvent {
+func systemEventForHealth(ev c3types.HealthEvent, desktopUnavailable bool) *c3types.SystemEvent {
 	ch := ev.Channel
 	if ch == "" {
 		ch = "channel"
 	}
 	if ev.State == c3types.HealthStateDown {
+		msg := fmt.Sprintf("Cannot reach %s since %s (%d consecutive %s). Your phone messages won't arrive until this recovers.",
+			ch, ev.Since.Format("15:04"), ev.Consec, strings.TrimSpace(ev.Reason))
+		if desktopUnavailable {
+			msg += " (desktop notification unavailable — shown here instead)"
+		}
 		return &c3types.SystemEvent{
-			Source: ev.Channel,
-			Level:  "warn",
-			Title:  fmt.Sprintf("%s fetch DOWN", ch),
-			Message: fmt.Sprintf("Cannot reach %s since %s (%d consecutive %s). Your phone messages won't arrive until this recovers.",
-				ch, ev.Since.Format("15:04"), ev.Consec, strings.TrimSpace(ev.Reason)),
+			Source:  ev.Channel,
+			Level:   "warn",
+			Title:   fmt.Sprintf("%s fetch DOWN", ch),
+			Message: msg,
 		}
 	}
 	return &c3types.SystemEvent{

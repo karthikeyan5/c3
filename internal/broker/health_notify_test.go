@@ -3,6 +3,9 @@ package broker
 import (
 	"encoding/json"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,112 +14,172 @@ import (
 	"github.com/karthikeyan5/c3/internal/mappings"
 )
 
-// fakeNotifier records desktop-notify calls instead of spawning a real popup.
+// fakeNotifier records desktop-notify calls instead of spawning a real popup,
+// and reports a controllable delivered result.
 type fakeNotifier struct {
-	ch chan c3types.HealthEvent
+	ch        chan c3types.HealthEvent
+	delivered bool
+	onNotify  func() // optional: invoked inside Notify before returning (simulate a concurrent edge)
 }
 
-func newFakeNotifier() *fakeNotifier { return &fakeNotifier{ch: make(chan c3types.HealthEvent, 4)} }
+func newFakeNotifier() *fakeNotifier {
+	return &fakeNotifier{ch: make(chan c3types.HealthEvent, 4), delivered: true}
+}
 
-func (f *fakeNotifier) Notify(ev c3types.HealthEvent) { f.ch <- ev }
+func (f *fakeNotifier) Notify(ev c3types.HealthEvent) bool {
+	f.ch <- ev
+	if f.onNotify != nil {
+		f.onNotify()
+	}
+	return f.delivered
+}
 
 func newTestBroker() *Broker {
 	return New(&mappings.MappingsFile{SchemaVersion: 1, Channels: map[string]mappings.ChannelConfig{}, Mappings: map[string]mappings.Mapping{}})
 }
 
-// TestNotifyHealth_FanOut asserts the four-sink fan-out: (a) the desktop
-// notifier is invoked, (b) the system advisory is broadcast to the live CLI
-// session conn (and ONLY there — not to a transient client or a disconnected
-// stub), and (c) the status cache records the event.
-func TestNotifyHealth_FanOut(t *testing.T) {
+func brokerWithAgent(t *testing.T) (*Broker, *fakeNotifier, *ipc.Conn) {
+	t.Helper()
 	b := newTestBroker()
 	fn := newFakeNotifier()
 	b.desktopNotifier = fn
-
-	// A live agent CLI session with a real conn (net.Pipe).
 	agentSide, brokerSide := net.Pipe()
-	defer agentSide.Close()
-	defer brokerSide.Close()
+	t.Cleanup(func() { agentSide.Close(); brokerSide.Close() })
 	agentConn := ipc.NewConn(agentSide)
 	b.Stubs.Register("claude", 4242, "/work", ipc.NewConn(brokerSide))
+	return b, fn, agentConn
+}
 
-	// A transient status-client stub — must be SKIPPED by the broadcast.
-	b.Stubs.Register("c3-broker-cli", 9999, "/tmp", struct{}{})
-
-	// A disconnected stub — must be SKIPPED (no live conn).
-	dead := b.Stubs.Register("codex", 7, "/dead", nil)
-	dead.MarkDisconnected()
-
-	host := NewBrokerHost(b, "telegram")
-	ev := c3types.HealthEvent{
-		Channel: "telegram",
-		State:   c3types.HealthStateDown,
-		Since:   time.Now(),
-		Consec:  3,
-		Reason:  "transient (network/timeout/5xx)",
-	}
-
-	// Read the broadcast frame off the agent side concurrently (the broadcast
-	// runs in its own goroutine inside NotifyHealth).
-	type readResult struct {
-		msg ipc.InboundMsg
+// readBroadcastWithin returns (msg, true) if an InboundMsg arrives within d,
+// else (zero, false). Used to assert both presence and ABSENCE of a broadcast.
+func readBroadcastWithin(agentConn *ipc.Conn, d time.Duration) (ipc.InboundMsg, bool) {
+	type rr struct {
+		m   ipc.InboundMsg
 		err error
 	}
-	got := make(chan readResult, 1)
+	ch := make(chan rr, 1)
 	go func() {
 		raw, err := agentConn.ReadFrame()
 		if err != nil {
-			got <- readResult{err: err}
+			ch <- rr{err: err}
 			return
 		}
 		var m ipc.InboundMsg
 		err = json.Unmarshal(raw, &m)
-		got <- readResult{msg: m, err: err}
+		ch <- rr{m: m, err: err}
 	}()
-
-	host.NotifyHealth(ev)
-
-	// (c) status cache set synchronously.
-	snap := b.lastHealthSnapshot()
-	if cached, ok := snap["telegram"]; !ok || cached.State != c3types.HealthStateDown {
-		t.Fatalf("status cache: got %+v ok=%v, want a DOWN telegram entry", cached, ok)
-	}
-
-	// (a) desktop notifier invoked.
 	select {
-	case ne := <-fn.ch:
-		if ne.Channel != "telegram" || ne.State != c3types.HealthStateDown {
-			t.Fatalf("desktop notify got %+v, want DOWN telegram", ne)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("desktop notifier was not invoked")
-	}
-
-	// (b) broadcast delivered to the live agent CLI session only.
-	select {
-	case r := <-got:
+	case r := <-ch:
 		if r.err != nil {
-			t.Fatalf("agent read broadcast frame: %v", r.err)
+			return ipc.InboundMsg{}, false
 		}
-		if r.msg.Op != ipc.OpInbound {
-			t.Fatalf("broadcast op = %s, want %s", r.msg.Op, ipc.OpInbound)
-		}
-		in := r.msg.Inbound
-		if in.Kind != c3types.InboundSystem {
-			t.Fatalf("broadcast Kind = %q, want %q", in.Kind, c3types.InboundSystem)
-		}
-		if in.Event == nil || in.Event.System == nil {
-			t.Fatalf("broadcast missing System event payload: %+v", in.Event)
-		}
-		if in.Event.System.Level != "warn" {
-			t.Fatalf("system event Level = %q, want warn", in.Event.System.Level)
-		}
-		if in.Event.System.Message == "" {
-			t.Fatalf("system event Message empty")
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("broadcast was not delivered to the live agent CLI session")
+		return r.m, true
+	case <-time.After(d):
+		return ipc.InboundMsg{}, false
 	}
+}
+
+func assertHealthFileState(t *testing.T, path, want string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read health file: %v", err)
+	}
+	var got map[string]healthFileEntry
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("health file invalid JSON: %v (%s)", err, data)
+	}
+	if got["telegram"].State != want {
+		t.Errorf("health file telegram.state = %q, want %q", got["telegram"].State, want)
+	}
+}
+
+func TestNotifyHealth_DesktopDelivered_NoCLIBroadcast(t *testing.T) {
+	hf := filepath.Join(t.TempDir(), "health.json")
+	t.Setenv("C3_HEALTH_FILE", hf)
+	b, fn, agentConn := brokerWithAgent(t)
+	fn.delivered = true
+	host := NewBrokerHost(b, "telegram")
+	host.NotifyHealth(c3types.HealthEvent{Channel: "telegram", State: c3types.HealthStateDown, Since: time.Now(), Consec: 3, Reason: "dial failures"})
+	select {
+	case <-fn.ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("desktop notifier not invoked")
+	}
+	if _, got := readBroadcastWithin(agentConn, 300*time.Millisecond); got {
+		t.Fatal("CLI broadcast fired even though desktop delivered")
+	}
+	if b.lastHealthSnapshot()["telegram"].State != c3types.HealthStateDown {
+		t.Error("status cache not set")
+	}
+	assertHealthFileState(t, hf, "down")
+}
+
+func TestNotifyHealth_DesktopUnavailable_CLIFallbackWithNote(t *testing.T) {
+	hf := filepath.Join(t.TempDir(), "health.json")
+	t.Setenv("C3_HEALTH_FILE", hf)
+	b, fn, agentConn := brokerWithAgent(t)
+	fn.delivered = false
+	host := NewBrokerHost(b, "telegram")
+	host.NotifyHealth(c3types.HealthEvent{Channel: "telegram", State: c3types.HealthStateDown, Since: time.Now(), Consec: 3, Reason: "dial failures"})
+	select {
+	case <-fn.ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("desktop notifier not invoked")
+	}
+	msg, got := readBroadcastWithin(agentConn, 2*time.Second)
+	if !got {
+		t.Fatal("CLI fallback did not fire when desktop unavailable")
+	}
+	sys := msg.Inbound.Event.System
+	if sys == nil || !strings.Contains(sys.Message, "desktop notification unavailable") {
+		t.Errorf("fallback message missing note: %+v", sys)
+	}
+}
+
+func TestNotifyHealth_Recovery_NoCLIBroadcast_FileSaysUp(t *testing.T) {
+	hf := filepath.Join(t.TempDir(), "health.json")
+	t.Setenv("C3_HEALTH_FILE", hf)
+	b, fn, agentConn := brokerWithAgent(t)
+	fn.delivered = false // even "unavailable" desktop must not cause a recovery injection
+	host := NewBrokerHost(b, "telegram")
+	host.NotifyHealth(c3types.HealthEvent{Channel: "telegram", State: c3types.HealthStateUp, DownFor: 3 * time.Minute})
+	select {
+	case <-fn.ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("desktop notifier not invoked on recovery")
+	}
+	if _, got := readBroadcastWithin(agentConn, 300*time.Millisecond); got {
+		t.Fatal("CLI broadcast fired on recovery (must never)")
+	}
+	assertHealthFileState(t, hf, "up")
+}
+
+func TestNotifyHealth_InvasiveOff_NeitherButAmbientWritten(t *testing.T) {
+	hf := filepath.Join(t.TempDir(), "health.json")
+	t.Setenv("C3_HEALTH_FILE", hf)
+	b, fn, agentConn := brokerWithAgent(t)
+	off := false
+	b.SetMappings(&mappings.MappingsFile{
+		SchemaVersion: 1,
+		Channels:      map[string]mappings.ChannelConfig{},
+		Mappings:      map[string]mappings.Mapping{},
+		Notifications: &mappings.NotificationsConfig{Invasive: &off},
+	})
+	host := NewBrokerHost(b, "telegram")
+	host.NotifyHealth(c3types.HealthEvent{Channel: "telegram", State: c3types.HealthStateDown, Since: time.Now(), Consec: 3})
+	select {
+	case <-fn.ch:
+		t.Fatal("desktop notifier invoked despite invasive:false")
+	case <-time.After(300 * time.Millisecond):
+	}
+	if _, got := readBroadcastWithin(agentConn, 300*time.Millisecond); got {
+		t.Fatal("CLI broadcast fired despite invasive:false")
+	}
+	if b.lastHealthSnapshot()["telegram"].State != c3types.HealthStateDown {
+		t.Error("status cache not set under invasive:false")
+	}
+	assertHealthFileState(t, hf, "down")
 }
 
 // TestBroadcastSystemEvent_GateBypassIsBrokerOriginated documents + asserts the
@@ -165,5 +228,83 @@ func TestBroadcastSystemEvent_GateBypassIsBrokerOriginated(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("broker-originated system event was not delivered (gate bypass failed)")
+	}
+}
+
+// TestSetLastHealth_OlderEdgeDoesNotOverwriteNewer (Fix A): the compare-and-skip
+// keeps the newest edge in the cache even when an older edge is processed later
+// (NotifyHealth runs lock-free across 3 goroutines, so processing can invert).
+func TestSetLastHealth_OlderEdgeDoesNotOverwriteNewer(t *testing.T) {
+	b := newTestBroker()
+	t2 := time.Now()
+	t1 := t2.Add(-1 * time.Minute)
+	b.setLastHealth(c3types.HealthEvent{Channel: "telegram", State: c3types.HealthStateUp, Since: t2})
+	b.setLastHealth(c3types.HealthEvent{Channel: "telegram", State: c3types.HealthStateDown, Since: t1}) // older — must be skipped
+	if got := b.lastHealthSnapshot()["telegram"].State; got != c3types.HealthStateUp {
+		t.Errorf("older down edge overwrote newer up: state=%q, want up", got)
+	}
+}
+
+// TestNotifyHealth_RecoveryDuringDesktopProbe_SuppressesStaleFallback (Fix B):
+// if a recovery edge lands while the (blocking) desktop probe runs, the stale
+// DOWN advisory must NOT be injected into the CLI — recovery never injects, so
+// a stale DOWN would never be retracted.
+func TestNotifyHealth_RecoveryDuringDesktopProbe_SuppressesStaleFallback(t *testing.T) {
+	hf := filepath.Join(t.TempDir(), "health.json")
+	t.Setenv("C3_HEALTH_FILE", hf)
+	b, fn, agentConn := brokerWithAgent(t)
+	fn.delivered = false // desktop "unavailable" → would normally fall back to CLI
+	t2 := time.Now()
+	fn.onNotify = func() {
+		// recovery lands while the (fake) desktop probe runs
+		b.setLastHealth(c3types.HealthEvent{Channel: "telegram", State: c3types.HealthStateUp, Since: t2})
+	}
+	host := NewBrokerHost(b, "telegram")
+	host.NotifyHealth(c3types.HealthEvent{Channel: "telegram", State: c3types.HealthStateDown, Since: t2.Add(-1 * time.Minute), Consec: 3, Reason: "dial failures"})
+	select {
+	case <-fn.ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("desktop notifier not invoked")
+	}
+	if _, got := readBroadcastWithin(agentConn, 300*time.Millisecond); got {
+		t.Fatal("stale DOWN advisory broadcast after recovery landed during the probe")
+	}
+}
+
+// TestBroadcastSystemEvent_SkipsTransientAndDisconnected (restores deleted FanOut
+// coverage): a down fallback broadcast reaches ONLY live long-lived sessions —
+// the transient c3-broker-cli stub and disconnected stubs are skipped. Driven
+// through host.NotifyHealth with a down edge + unavailable desktop.
+func TestBroadcastSystemEvent_SkipsTransientAndDisconnected(t *testing.T) {
+	hf := filepath.Join(t.TempDir(), "health.json")
+	t.Setenv("C3_HEALTH_FILE", hf)
+	b, fn, agentConn := brokerWithAgent(t) // registers a live "claude" stub on agentConn
+	fn.delivered = false                   // desktop unavailable → CLI fallback fires
+
+	// A transient CLI client (status/topics) — must be skipped.
+	b.Stubs.Register("c3-broker-cli", 9999, "/tmp", struct{}{})
+	// A disconnected long-lived session — must be skipped.
+	dead := b.Stubs.Register("codex", 7, "/dead", nil)
+	dead.MarkDisconnected()
+
+	host := NewBrokerHost(b, "telegram")
+	host.NotifyHealth(c3types.HealthEvent{Channel: "telegram", State: c3types.HealthStateDown, Since: time.Now(), Consec: 3, Reason: "dial failures"})
+	select {
+	case <-fn.ch:
+	case <-time.After(2 * time.Second):
+		t.Fatal("desktop notifier not invoked")
+	}
+
+	// The live stub receives exactly one InboundSystem frame...
+	msg, got := readBroadcastWithin(agentConn, 2*time.Second)
+	if !got {
+		t.Fatal("live CLI session did not receive the fallback advisory")
+	}
+	if msg.Inbound.Kind != c3types.InboundSystem {
+		t.Fatalf("Kind = %q, want system", msg.Inbound.Kind)
+	}
+	// ...and no second frame arrives (transient/disconnected contributed nothing).
+	if _, got := readBroadcastWithin(agentConn, 300*time.Millisecond); got {
+		t.Fatal("more than one frame delivered — a transient/disconnected stub was not skipped")
 	}
 }

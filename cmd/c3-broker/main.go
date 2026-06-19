@@ -230,6 +230,14 @@ func runDaemon() error {
 		return fmt.Errorf("register plugins: %w", err)
 	}
 
+	// One-time startup write of the connectivity status file the Claude Code
+	// status line reads. At boot lastHealth is empty ⇒ writes "{}", which
+	// clears any stale file left by a prior crash without falsely asserting
+	// up/down. Ambient-only (never via NotifyHealth — no spurious popup). Done
+	// before channels start emitting so the empty boot snapshot can never race
+	// a detection-driven write.
+	br.WriteHealthFile()
+
 	if cc, ok := mf.Channels["telegram"]; ok && cc.BotToken != "" {
 		if err := br.RegisterChannel(telegram.New()); err != nil {
 			return fmt.Errorf("register telegram channel: %w", err)
