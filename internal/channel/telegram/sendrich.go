@@ -30,9 +30,10 @@ import (
 // survive. The RichBlock* tree is only the RECEIVED representation (inbound, a
 // later phase); the send path never constructs it.
 //
-// DEFAULT-OFF: the route is gated behind richTablesEnabled (capabilities.go),
-// which is false, so behavior is unchanged until the maintainer's live-verify
-// flips it. See SendReply for the routing branch and the monospace fallback.
+// ENABLED: the route is gated behind richTablesEnabled (capabilities.go), which
+// is true (live-verified 2026-06-17), so detected GFM tables send as native rich
+// tables. See SendReply for the routing branch and the monospace fallback (used
+// for over-cap tables, send errors, and old clients).
 
 // richTableEligible reports whether a reply should be sent as a native rich
 // message (sendRichMessage) instead of the existing monospace path. It is a PURE
