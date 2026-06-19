@@ -472,5 +472,97 @@ func renderTable(b *richBlock) string {
 	return strings.Join(out, "\n")
 }
 
-// TEMP STUB — removed in Task 5.
-func renderMedia(b *richBlock) (string, []c3types.Attachment) { return "[media]", nil }
+// renderMedia maps a media block to a downloadable Attachment plus an inline
+// text marker at its position. Mirrors convertInbound's media mapping so the
+// existing download path + size caps apply unchanged.
+func renderMedia(b *richBlock) (string, []c3types.Attachment) {
+	var att c3types.Attachment
+	switch b.Type {
+	case "photo":
+		if len(b.Photo) == 0 {
+			return "[photo]", nil
+		}
+		best := b.Photo[0]
+		bestArea := best.Width * best.Height
+		for _, p := range b.Photo[1:] {
+			if a := p.Width * p.Height; a > bestArea {
+				best, bestArea = p, a
+			}
+		}
+		att = c3types.Attachment{Kind: "photo", FileID: best.FileID, Size: best.FileSize}
+	case "video":
+		att = fileAttachment("video", b.Video)
+	case "animation":
+		att = fileAttachment("animation", b.Animation)
+	case "audio":
+		att = fileAttachment("audio", b.Audio)
+	case "voice_note":
+		att = fileAttachment("voice", b.VoiceNote)
+	}
+	marker := "[" + b.Type + "]"
+	if cap := mediaCaption(b.Caption); cap != "" {
+		marker = "[" + b.Type + ": " + cap + "]"
+	}
+	if att.FileID == "" {
+		return marker, nil
+	}
+	return marker, []c3types.Attachment{att}
+}
+
+func fileAttachment(kind string, f *fileObj) c3types.Attachment {
+	if f == nil {
+		return c3types.Attachment{}
+	}
+	return c3types.Attachment{
+		Kind:   kind,
+		FileID: f.FileID,
+		Size:   f.FileSize,
+		MIME:   f.MimeType,
+		Name:   f.FileName,
+	}
+}
+
+// mediaCaption decodes a media block's caption (a RichBlockCaption object) into
+// plain marker text. Returns "" if absent or undecodable.
+func mediaCaption(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var c richBlockCaption
+	if err := json.Unmarshal(raw, &c); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(plainText(c.Text))
+}
+
+// richMessage is the inbound RichMessage envelope: blocks + is_rtl.
+type richMessage struct {
+	Blocks []richBlock `json:"blocks"`
+	IsRTL  bool        `json:"is_rtl"`
+}
+
+// decodeRichMessage parses a Bot API 10.1 rich_message payload into GFM markdown
+// plus embedded media attachments. ok=false on malformed JSON (caller falls back
+// to a marker). When the tree is present but yields no content, returns the
+// "[rich message]" marker with ok=true — a present rich_message NEVER yields
+// empty text. NEVER panics: a top-level recover turns any panic into ok=false.
+func decodeRichMessage(raw json.RawMessage) (markdown string, atts []c3types.Attachment, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			markdown, atts, ok = "", nil, false
+		}
+	}()
+	if len(raw) == 0 {
+		return "", nil, false
+	}
+	var rm richMessage
+	if err := json.Unmarshal(raw, &rm); err != nil {
+		return "", nil, false
+	}
+	md, a := renderBlocks(rm.Blocks)
+	md = strings.TrimSpace(md)
+	if md == "" && len(a) == 0 {
+		return "[rich message]", nil, true
+	}
+	return md, a, true
+}

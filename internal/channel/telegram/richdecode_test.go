@@ -158,3 +158,76 @@ func TestRenderTable_OmittedCellAndCenterAlign(t *testing.T) {
 		t.Errorf("omitted:\n got %q\nwant %q", got, want)
 	}
 }
+
+func TestRenderMedia_Photo(t *testing.T) {
+	in := `{"type":"photo","photo":[
+		{"file_id":"small","file_size":10,"width":100,"height":100},
+		{"file_id":"big","file_size":99,"width":1000,"height":1000}],
+		"caption":{"text":"a cat"}}`
+	var b richBlock
+	if err := json.Unmarshal([]byte(in), &b); err != nil {
+		t.Fatal(err)
+	}
+	md, atts := renderMedia(&b)
+	if md != "[photo: a cat]" {
+		t.Errorf("marker: %q", md)
+	}
+	if len(atts) != 1 || atts[0].Kind != "photo" || atts[0].FileID != "big" {
+		t.Fatalf("atts: %+v", atts)
+	}
+	if atts[0].Size != 99 {
+		t.Errorf("size: %d", atts[0].Size)
+	}
+}
+
+func TestRenderMedia_VideoNoCaption(t *testing.T) {
+	in := `{"type":"video","video":{"file_id":"v1","file_size":5,"mime_type":"video/mp4"}}`
+	var b richBlock
+	if err := json.Unmarshal([]byte(in), &b); err != nil {
+		t.Fatal(err)
+	}
+	md, atts := renderMedia(&b)
+	if md != "[video]" {
+		t.Errorf("marker: %q", md)
+	}
+	if len(atts) != 1 || atts[0].Kind != "video" || atts[0].FileID != "v1" || atts[0].MIME != "video/mp4" {
+		t.Fatalf("atts: %+v", atts)
+	}
+}
+
+func TestDecodeRichMessage_FullDocument(t *testing.T) {
+	raw := json.RawMessage(`{"blocks":[
+		{"type":"heading","size":1,"text":"Report"},
+		{"type":"paragraph","text":"See table:"},
+		{"type":"table","cells":[
+			[{"text":"K","is_header":true,"align":"left"},{"text":"V","is_header":true,"align":"left"}],
+			[{"text":"a","align":"left"},{"text":"1","align":"left"}]]}]}`)
+	md, atts, ok := decodeRichMessage(raw)
+	if !ok {
+		t.Fatal("ok=false for valid doc")
+	}
+	want := "# Report\n\nSee table:\n\n| K | V |\n| :-- | :-- |\n| a | 1 |"
+	if md != want {
+		t.Errorf("md:\n got %q\nwant %q", md, want)
+	}
+	if len(atts) != 0 {
+		t.Errorf("unexpected atts: %+v", atts)
+	}
+}
+
+func TestDecodeRichMessage_Invariants(t *testing.T) {
+	// Malformed JSON → ok=false.
+	if _, _, ok := decodeRichMessage(json.RawMessage(`{not json`)); ok {
+		t.Error("malformed JSON should give ok=false")
+	}
+	// Empty/no-content tree → marker, ok=true (never empty when rich present).
+	md, _, ok := decodeRichMessage(json.RawMessage(`{"blocks":[]}`))
+	if !ok || md != "[rich message]" {
+		t.Errorf("empty tree: md=%q ok=%v", md, ok)
+	}
+	// Unknown block alone → its marker, never empty.
+	md2, _, ok2 := decodeRichMessage(json.RawMessage(`{"blocks":[{"type":"mystery"}]}`))
+	if !ok2 || md2 != "[unsupported block: mystery]" {
+		t.Errorf("unknown: md=%q ok=%v", md2, ok2)
+	}
+}
