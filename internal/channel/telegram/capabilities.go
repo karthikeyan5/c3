@@ -113,9 +113,10 @@ func (c *Channel) Capabilities() c3types.Capabilities {
 		ExpandableQuotes: true,
 		InlineKeyboards:  true,
 		// RichMessages reflects that this channel CAN send native rich messages
-		// (Bot API 10.1 sendRichMessage via the raw request method). RichTables is
-		// gated on the default-OFF switch so the agent is only told tables render
-		// natively once the live-verify has flipped richTablesEnabled.
+		// (Bot API 10.1 sendRichMessage via the raw request method). RichTables
+		// follows richTablesEnabled, now ENABLED (live-verified on Android
+		// 2026-06-17), so the agent is told tables render natively; the monospace
+		// <pre> path stays as the error/old-client fallback.
 		RichMessages: true,
 		RichTables:   richTablesEnabled,
 		Inbound: c3types.InboundCaps{

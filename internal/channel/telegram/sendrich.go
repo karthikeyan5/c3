@@ -40,7 +40,7 @@ import (
 // decision (no network, no channel state) so it can be unit-tested directly.
 //
 // All of these must hold:
-//   - rich tables are enabled (the default-OFF switch is flipped);
+//   - rich tables are enabled (richTablesEnabled is true);
 //   - the markup intent is markdown (empty/zero value is the markdown default) —
 //     a native pass-through (MarkupNative) or plain (MarkupNone) reply is left on
 //     the existing path;
