@@ -564,6 +564,8 @@ func buildClaudeChannelFrame(in *c3types.Inbound) map[string]any {
 		}
 	}
 	if len(in.Attachments) > 0 {
+		// First attachment keeps the canonical unsuffixed keys (backward
+		// compatible: single-attachment output is unchanged).
 		att := in.Attachments[0]
 		if att.Kind != "" {
 			meta["attachment_kind"] = att.Kind
@@ -580,14 +582,47 @@ func buildClaudeChannelFrame(in *c3types.Inbound) map[string]any {
 		if att.Name != "" {
 			meta["attachment_name"] = att.Name
 		}
+		// Multiple attachments (album / media-group, or a rich message with
+		// several media blocks): surface EVERY attachment so the agent can
+		// download each one. The first stays on the unsuffixed keys above;
+		// extras get an _N suffix (N starts at 2). attachment_count is emitted
+		// ONLY when there is more than one, so single-attachment frames are
+		// byte-identical to before.
+		if len(in.Attachments) > 1 {
+			meta["attachment_count"] = strconv.Itoa(len(in.Attachments))
+			for i := 1; i < len(in.Attachments); i++ {
+				a := in.Attachments[i]
+				n := strconv.Itoa(i + 1)
+				if a.Kind != "" {
+					meta["attachment_kind_"+n] = a.Kind
+				}
+				if a.FileID != "" {
+					meta["attachment_file_id_"+n] = a.FileID
+				}
+				if a.Size > 0 {
+					meta["attachment_size_"+n] = strconv.FormatInt(a.Size, 10)
+				}
+				if a.MIME != "" {
+					meta["attachment_mime_"+n] = a.MIME
+				}
+				if a.Name != "" {
+					meta["attachment_name_"+n] = a.Name
+				}
+			}
+		}
 	}
 
 	text := in.Text
 	if text == "" && len(in.Attachments) > 0 {
 		// Channel may have left text empty for voice (STT plugin not yet
-		// substituting). Fall back to a kind-based label so the agent at
-		// least sees something.
-		text = fmt.Sprintf("(%s message)", in.Attachments[0].Kind)
+		// substituting). Fall back to a label so the agent at least sees
+		// something. With several attachments (album/media-group), report the
+		// count so the agent knows more than one arrived.
+		if len(in.Attachments) > 1 {
+			text = fmt.Sprintf("(%d attachments)", len(in.Attachments))
+		} else {
+			text = fmt.Sprintf("(%s message)", in.Attachments[0].Kind)
+		}
 	}
 
 	return map[string]any{
