@@ -68,14 +68,21 @@ const MultipartProtocol = "MULTI-PART REPLY PROTOCOL:\n" +
 // behaviour stay byte-identical for the ModeProtocol section. Between
 // the protocols we use a single "\n\n" for separation.
 //
-// The trailing capability.GuidanceFor(c) section is the channel-capability
-// surface (CMG spec §L5) — folded in so the agent learns, in the SAME
-// init/setup delivery as the mode/multipart protocols, what the channel can
-// render (rich text, media, polls, typing, streaming). c is the resolvable
-// channel's manifest; callers source it from the hello_ack / attached payload
-// (live adapters) or from the static channel literal (broker setup, which has
-// no live connection). A zero Capabilities value renders honest all-NO
-// guidance, so a nil-caps fallback never panics.
+// The capability.GuidanceFor(c) section is the channel-capability surface (CMG
+// spec §L5) — folded in so the agent learns, in the SAME init/setup delivery as
+// the mode/multipart protocols, what the channel can render (rich text, media,
+// polls, typing, streaming). c is the resolvable channel's manifest; callers
+// source it from the hello_ack / attached payload (live adapters) or from the
+// static channel literal (broker setup, which has no live connection). A zero
+// Capabilities value renders honest all-NO guidance, so a nil-caps fallback
+// never panics.
+//
+// Ordering (2026-06-20): ModeProtocol stays FIRST — it is the safety-critical
+// no-auto-reply / no-auto-switch contract and must not be demoted. The capability
+// guidance moves to the MIDDLE (right after the mode contract, read while the
+// rules are fresh) so the formatting guidance is no longer the forgotten tail;
+// the narrow MultipartProtocol voice-burst convention moves LAST. The leading
+// "\n\n" + ModeProtocol byte-shape is preserved for the existing wire tests.
 func Combined(c c3types.Capabilities) string {
-	return "\n\n" + ModeProtocol + "\n\n" + MultipartProtocol + "\n\n" + capability.GuidanceFor(c)
+	return "\n\n" + ModeProtocol + "\n\n" + capability.GuidanceFor(c) + "\n\n" + MultipartProtocol
 }

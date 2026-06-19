@@ -20,15 +20,22 @@ func GuidanceFor(c c3types.Capabilities) string {
 
 	fmt.Fprintf(&b, "CHANNEL CAPABILITIES (%s):\n", c.Channel)
 
-	// Rich text.
+	// Rich text. Prescriptive, not merely permissive: format for readability.
+	// The dividing line is the CONTENT, not a blanket rule — short conversational
+	// answers stay plain, but structured/dense content gets the matching markdown.
 	if c.RichText {
-		b.WriteString("- Rich text: YES. Write standard markdown (bold, italic, links, lists, inline code, code blocks,\n")
-		b.WriteString("  block quotes, strikethrough, spoilers). C3 converts + escapes for you — do NOT hand-write HTML or\n")
+		b.WriteString("- Rich text: YES — and you SHOULD use it whenever structure makes a reply easier to read.\n")
+		b.WriteString("  Write standard markdown: bold/italic for emphasis, lists for steps or enumerations, tables for\n")
+		b.WriteString("  comparisons, inline code and fenced blocks for code/commands/paths, block quotes for quoted\n")
+		b.WriteString("  text, plus links, strikethrough, spoilers. Keep a one-line answer plain, but never leave\n")
+		b.WriteString("  structured content (steps, comparisons, multiple points, code) as an unbroken wall of text —\n")
+		b.WriteString("  e.g. render three findings as a numbered list, not one run-on sentence. C3 converts + escapes\n")
+		b.WriteString("  for you — do NOT hand-write HTML or channel tags.\n")
 		if c.MaxMessageRunes > 0 {
-			fmt.Fprintf(&b, "  channel tags. A reply longer than ~%d chars is split automatically into several messages\n", c.MaxMessageRunes)
+			fmt.Fprintf(&b, "  A reply longer than ~%d chars is split automatically into several messages\n", c.MaxMessageRunes)
 			b.WriteString("  (edits/replies reference the first).\n")
 		} else {
-			b.WriteString("  channel tags. Long replies are split automatically into several messages (edits/replies reference the first).\n")
+			b.WriteString("  Long replies are split automatically into several messages (edits/replies reference the first).\n")
 		}
 		if c.ExpandableQuotes {
 			b.WriteString("  For a long quoted block that should collapse behind a 'Show more' chevron, end the\n")

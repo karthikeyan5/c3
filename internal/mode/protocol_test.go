@@ -112,6 +112,25 @@ func TestCombined_FoldsInCapabilityGuidance(t *testing.T) {
 	}
 }
 
+// TestCombined_CapabilityGuidanceOrdering locks in the 2026-06-20 reorder:
+// ModeProtocol (the safety-critical no-auto-reply/no-auto-switch contract) stays
+// FIRST, the capability/formatting guidance moves to the MIDDLE (so it is no
+// longer the forgotten tail), and the narrow MultipartProtocol voice convention
+// moves LAST. Order: Mode → CHANNEL CAPABILITIES → Multipart.
+func TestCombined_CapabilityGuidanceOrdering(t *testing.T) {
+	got := Combined(testCaps)
+	idxMode := strings.Index(got, "OUTPUT MODE PROTOCOL")
+	idxCaps := strings.Index(got, "CHANNEL CAPABILITIES")
+	idxMulti := strings.Index(got, "MULTI-PART REPLY PROTOCOL")
+	if idxMode < 0 || idxCaps < 0 || idxMulti < 0 {
+		t.Fatalf("a required section is missing: mode=%d caps=%d multi=%d", idxMode, idxCaps, idxMulti)
+	}
+	if !(idxMode < idxCaps && idxCaps < idxMulti) {
+		t.Errorf("Combined() order must be Mode < Capabilities < Multipart; got mode=%d caps=%d multi=%d",
+			idxMode, idxCaps, idxMulti)
+	}
+}
+
 // TestCombined_ProtocolsSeparated guards against the two protocols being
 // fused with no blank line between them (which would make the rendered
 // text harder to read for the agent and for humans inspecting the MCP

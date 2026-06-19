@@ -99,13 +99,21 @@ func TestServerInfoName(t *testing.T) {
 		"edit_message", "poll", "download_attachment", "codex_forward",
 	}
 	got := map[string]bool{}
+	gotDesc := map[string]string{}
 	for _, tool := range listResult.Tools {
 		got[tool.Name] = true
+		gotDesc[tool.Name] = tool.Description
 	}
 	for _, name := range wantTools {
 		if !got[name] {
 			t.Errorf("tools/list missing %q (got %v)", name, got)
 		}
+	}
+	// The reply tool Description is the compose-time surface; it must carry the
+	// format-for-readability nudge (formatting-policy 2026-06-20), in parity with
+	// the Claude adapter.
+	if d := gotDesc["reply"]; !strings.Contains(d, "whenever it makes the reply easier to read") {
+		t.Errorf("reply Description missing the formatting nudge; got %q", d)
 	}
 	// send_typing must NOT be agent-facing (P5): the broker relays typing
 	// programmatically. A regression that re-registers it would let an LLM
