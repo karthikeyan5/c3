@@ -118,7 +118,10 @@ def _transcribe_batch(audio_path, key):
     job = client.speech_to_text_job.create_job(model="saaras:v3", mode="translate", language_code="unknown")
     job.upload_files(file_paths=[audio_path])
     job.start()
-    job.wait_until_complete(timeout=120)
+    # 240s: long notes need more than the old 120s; kept under stt-handler.py's
+    # 270s subprocess cap so the job returns/raises here before the handler
+    # hard-kills the process.
+    job.wait_until_complete(timeout=240)
 
     if job.is_successful():
         with tempfile.TemporaryDirectory() as td:

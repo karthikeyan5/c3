@@ -126,9 +126,13 @@ def run_stt(audio_path, extra_env):
     # Use stt.py's own chain logic via its main internals
     import subprocess
     env = {**os.environ, **extra_env}
+    # 270s: long voice notes (esp. via the Sarvam batch API) routinely take
+    # >120s; the old 120s cap silently failed them. Ordered under the broker's
+    # Go-side 5m (300s) context with ~30s margin; Sarvam's own wait is set lower
+    # (240s) so it returns gracefully before this kill fires.
     result = subprocess.run(
         [sys.executable, STT_PKG, audio_path],
-        capture_output=True, text=True, env=env, timeout=120
+        capture_output=True, text=True, env=env, timeout=270
     )
     transcript = result.stdout.strip()
     if result.returncode != 0 or not transcript:
