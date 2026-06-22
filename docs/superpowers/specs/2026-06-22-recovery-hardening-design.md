@@ -73,9 +73,13 @@ Important = needs manual restart but is visible/alerted. Minor = ungraceful but 
 - **B3 (Important) malformed mappings.json resilience** — broker-lifecycle-2. A parse/validate
   error makes every boot fatally exit, silently. Fix: log loud to broker.log; try `path+'.bak'`
   and validate; if good run with it + warn. Do NOT silently run a skeleton (could mis-route).
-- **B4 (Minor) pidAlive hardening** — broker-lifecycle-5. `kill(pid,0)` only checks existence; a
-  reused pid on a persistent-/tmp host can false-positive a sibling. Confirm `/proc/<pid>` is
-  actually c3-broker (comm/exe) or compare start-time before declaring a live sibling.
+- **B4 (Minor) pidAlive hardening — DROPPED (2026-06-22).** broker-lifecycle-5. Investigated and
+  rejected: `pidAlive` is consulted ONLY after `flock` already FAILED (a live process holds the
+  lock on this pid file → can only be a real broker). A reboot that leaves a stale pid file
+  releases the dead holder's flock, so the next broker's flock simply succeeds and pidAlive is
+  never reached. A comm/start-time downgrade in the flock-held path would only WEAKEN the
+  singleton guarantee (a false "stale" lets a second broker unlink + win). flock is the
+  authority. Left an explanatory NOTE in singleton.go instead.
 
 ## Batch C — STT venv + graceful degrade + dependency (live STT break)
 - **Live status:** venv created at `~/.config/c3/stt-venv` (pyenv 3.12.3) with `sarvamai 0.1.28`.

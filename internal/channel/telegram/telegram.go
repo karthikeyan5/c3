@@ -132,6 +132,12 @@ type Channel struct {
 	conflictBackoffBase time.Duration
 	conflictBackoffMax  time.Duration
 
+	// identityLogged guards the one-time "connected as @<name>" log emitted by
+	// the heartbeat on its first successful getMe. Because boot is offline-safe
+	// (DisableTokenCheck), Bot.User is "<missing>" at start, so the familiar
+	// identity line is logged later, once, when Telegram is first reachable.
+	identityLogged atomic.Bool
+
 	// conflictActive is true while a getUpdates 409 conflict is the current
 	// reason inbound is down (set on a 409, cleared on the first non-conflict
 	// getUpdates outcome — success OR any other error). It exists because the
@@ -270,9 +276,18 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 		Transport: httpTransport,
 		Timeout:   60 * time.Second, // Bot API caps at 20MB; a healthy download is seconds.
 	}
+	// DisableTokenCheck makes NewBot construction OFFLINE-SAFE: gotgbot otherwise
+	// does a blocking GetMe at construction, so on a flaky-wake / IP-blocked
+	// network the broker would fail to start at all (RegisterChannel → runDaemon
+	// → exit) — the exact incident class the poll-loop 409 fix addresses, but one
+	// beat earlier, before the resilient poll/heartbeat machinery even exists.
+	// Unreachability is now handled by that machinery instead of aborting boot.
+	// Trade-off: Bot.User is "<missing>" until the first successful call, so the
+	// heartbeat logs the confirmed @username on its first success.
 	bot, err := gotgbot.NewBot(c.cfg.BotToken, &gotgbot.BotOpts{
-		BotClient:   botClient,
-		RequestOpts: c.requestOptsFor("getMe"),
+		BotClient:         botClient,
+		DisableTokenCheck: true,
+		RequestOpts:       c.requestOptsFor("getMe"),
 	})
 	if err != nil {
 		return fmt.Errorf("telegram: NewBot: %w", err)
@@ -291,7 +306,10 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 	}
 	c.ctx, c.cancel = context.WithCancel(ctx)
 
-	host.Logf("telegram: connected as @%s", bot.Username)
+	// Token check is deferred (offline-safe boot), so bot.Username is "<missing>"
+	// here. The heartbeat logs "connected as @<name>" once it confirms identity
+	// on its first successful getMe.
+	host.Logf("telegram: started (token-check deferred; identity confirmed on first successful call)")
 
 	// The fetch-health machine seeds its lastSuccess to now on construction
 	// (see newFetchHealth), so the first ~90s after start don't spuriously
@@ -451,9 +469,14 @@ func (c *Channel) heartbeat() {
 			return
 		case <-timer.C:
 		}
-		_, err := c.bot.GetMe(&gotgbot.GetMeOpts{
+		me, err := c.bot.GetMe(&gotgbot.GetMeOpts{
 			RequestOpts: c.requestOptsFor("getMe"),
 		})
+		if err == nil && me != nil && c.identityLogged.CompareAndSwap(false, true) {
+			// First reachable getMe — confirm the bot identity (deferred from
+			// boot by DisableTokenCheck). Preserves the familiar log signal.
+			c.host.Logf("telegram: connected as @%s (identity confirmed)", me.Username)
+		}
 		if err != nil {
 			class, _ := classifyError(err)
 			// 429 is a reachable server pushing back — never "down". Every

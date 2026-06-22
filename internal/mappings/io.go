@@ -22,6 +22,46 @@ func Read(path string) (*MappingsFile, error) {
 	return &mf, nil
 }
 
+// ReadWithBak reads AND validates the mappings file at path, with a one-
+// generation backup fallback. It exists so a hand-edit that corrupts
+// mappings.json no longer dead-ends the broker at startup the way it did before
+// (every successful Write leaves a last-good path+".bak").
+//
+//   - Missing primary: returns the os.IsNotExist error UNCHANGED so the caller
+//     can seed a skeleton (do not mask "no config" as "bad config").
+//   - Primary parses AND validates: returns it, usedBak=false.
+//   - Primary missing-fields / unparseable: if path+".bak" parses AND validates,
+//     returns THAT with usedBak=true; otherwise returns the primary's original
+//     error (usedBak=false) so the caller can surface it.
+func ReadWithBak(path string) (mf *MappingsFile, usedBak bool, err error) {
+	mf, err = Read(path)
+	switch {
+	case err != nil:
+		if os.IsNotExist(err) {
+			return nil, false, err // caller seeds a skeleton
+		}
+		// primary unparseable — fall through to the .bak attempt
+	default:
+		if verr := mf.Validate(); verr != nil {
+			err = fmt.Errorf("validate %s: %w", path, verr)
+			mf = nil
+		} else {
+			return mf, false, nil // primary good
+		}
+	}
+
+	// Primary is present but bad (parse or validate). Try the last-good backup.
+	primaryErr := err
+	bmf, berr := Read(path + ".bak")
+	if berr != nil {
+		return nil, false, primaryErr // no usable backup — surface the primary error
+	}
+	if verr := bmf.Validate(); verr != nil {
+		return nil, false, primaryErr // backup also bad — surface the primary error
+	}
+	return bmf, true, nil
+}
+
 // Write atomically rewrites the mappings file at path. The file is created
 // (or replaced) at mode 0600 because it contains the bot token. Atomicity is
 // achieved by writing to a sibling tempfile and then renaming.

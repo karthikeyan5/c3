@@ -95,3 +95,14 @@ func pidAlive(pidFile string) (bool, error) {
 	}
 	return true, nil
 }
+
+// NOTE (recovery audit broker-lifecycle-5, 2026-06-22): we deliberately do NOT
+// add a /proc/<pid>/comm "is it really a c3-broker?" check here. pidAlive is
+// consulted ONLY when flock(LOCK_EX|LOCK_NB) already FAILED — i.e. a live
+// process is holding the lock on THIS pid file, which can only be a real broker.
+// A reboot that leaves a stale pid file releases the dead holder's flock, so the
+// next broker's flock simply SUCCEEDS and pidAlive is never reached. Adding a
+// comm/start-time downgrade in the flock-held path would only WEAKEN the
+// singleton guarantee (a false "stale" would unlink + let a second broker win),
+// guarding a near-unreachable pid-reuse case at real cost. flock is the
+// authority; keep pidAlive a pure liveness check.

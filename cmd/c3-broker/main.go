@@ -178,7 +178,7 @@ Usage:
   c3-broker --help      This text.
 `
 
-func runDaemon() error {
+func runDaemon() (err error) {
 	pidFile := broker.PidFilePath()
 	lock, err := broker.AcquireSingleton(pidFile)
 	if err != nil {
@@ -194,29 +194,48 @@ func runDaemon() error {
 		fmt.Fprintf(os.Stderr, "c3-broker: log file %s\n", logPath)
 	}
 
+	// From here on, log any FATAL error to broker.log (SetupLogging wired the
+	// stdlib logger above). An adapter-spawned broker's stderr is /dev/null, so
+	// without this every boot-time death is invisible — no breadcrumb to debug,
+	// which is exactly the silent-death class the recovery audit flagged.
+	// Registered AFTER logFile.Close so (LIFO) it runs while the file is open.
+	defer func() {
+		if err != nil {
+			log.Printf("c3-broker: FATAL: %v", err)
+		}
+	}()
+
 	mfPath, err := mappings.DefaultPath()
 	if err != nil {
 		return fmt.Errorf("resolve mappings path: %w", err)
 	}
-	var mf *mappings.MappingsFile
-	mf, err = mappings.Read(mfPath)
-	if err != nil {
-		if os.IsNotExist(err) {
+	// Resilient load: ReadWithBak falls back to the last-good mappings.json.bak
+	// if the primary is present but corrupt (a hand-edit typo), so a bad edit no
+	// longer dead-ends boot. A MISSING primary still seeds a skeleton; a corrupt
+	// primary with NO usable .bak fails loudly (we do NOT seed a skeleton over a
+	// real-but-broken config — that could silently mis-route messages).
+	mf, usedBak, rerr := mappings.ReadWithBak(mfPath)
+	if rerr != nil {
+		if os.IsNotExist(rerr) {
 			mf = &mappings.MappingsFile{
 				SchemaVersion: 1,
 				Channels:      map[string]mappings.ChannelConfig{},
 				Mappings:      map[string]mappings.Mapping{},
 			}
-			if err := os.MkdirAll(filepath.Dir(mfPath), 0700); err != nil {
-				return fmt.Errorf("mkdir mappings parent: %w", err)
+			if mkErr := os.MkdirAll(filepath.Dir(mfPath), 0700); mkErr != nil {
+				return fmt.Errorf("mkdir mappings parent: %w", mkErr)
 			}
-			if err := mappings.Write(mfPath, mf); err != nil {
-				return fmt.Errorf("write skeleton mappings: %w", err)
+			if wErr := mappings.Write(mfPath, mf); wErr != nil {
+				return fmt.Errorf("write skeleton mappings: %w", wErr)
 			}
+			log.Printf("c3-broker: wrote skeleton %s — run `c3-broker setup` to configure", mfPath)
 			fmt.Fprintf(os.Stderr, "c3-broker: wrote skeleton %s — run `c3-broker setup` to configure\n", mfPath)
 		} else {
-			return fmt.Errorf("read mappings %s: %w", mfPath, err)
+			return fmt.Errorf("read mappings %s (present but invalid, no usable .bak): %w", mfPath, rerr)
 		}
+	} else if usedBak {
+		log.Printf("c3-broker: WARNING %s was invalid; loaded %s.bak instead — re-run `c3-broker setup` or fix the file", mfPath, mfPath)
+		fmt.Fprintf(os.Stderr, "c3-broker: WARNING %s was invalid; loaded %s.bak instead\n", mfPath, mfPath)
 	}
 	if err := mf.Validate(); err != nil {
 		return fmt.Errorf("validate mappings: %w", err)
