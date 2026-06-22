@@ -171,11 +171,13 @@ func TestForwardOrFallback_StaleClaim_ReleasesAndFallsThrough(t *testing.T) {
 	}
 }
 
-// Companion: a holder that IS alive but currently has nil Conn (between
-// reconnects) must NOT be released; deliver-skip is the correct behavior,
-// because the adapter will be back on the wire shortly. Otherwise a
-// momentary network blip would race against the inbound flow.
-func TestForwardOrFallback_AliveButDisconnectedHolder_SkipsDelivery(t *testing.T) {
+// Companion (D2 / adapter-ipc-1): a holder that IS alive but currently has nil
+// Conn (between adapter reconnects) must keep its claim — the adapter will be
+// back on the wire shortly, so we don't release it. But THIS inbound must NOT
+// be dropped silently: a message sent during the reconnect window used to be
+// lost forever with nothing to replay it. Instead it bounces to the SAME
+// Telegram fallback the STALE branch uses, so the user is told to resend.
+func TestForwardOrFallback_AliveButDisconnectedHolder_BouncesToFallback(t *testing.T) {
 	mf := mfWithTelegram()
 	fc := &fakeChannel{}
 	b := brokerWithChannel(t, mf, fc)
@@ -200,11 +202,50 @@ func TestForwardOrFallback_AliveButDisconnectedHolder_SkipsDelivery(t *testing.T
 	}
 	w.forwardOrFallback(context.Background(), in)
 
+	// The claim is preserved: the holder is alive and will rebind on reconnect.
 	if _, held := b.Routes.Holder(key); !held {
 		t.Error("alive-but-disconnected claim must be preserved (adapter may reconnect)")
 	}
+	// The inbound is bounced to the Telegram fallback (not silently dropped) so
+	// the user knows to resend once the adapter reconnects.
+	if got := len(fc.sendRepliesSnapshot()); got != 1 {
+		t.Errorf("expected fallback SendReply for alive-but-disconnected holder, got %d sends", got)
+	}
+}
+
+// Companion to the bounce: a synthesized EVENT (not a human message) on an
+// alive-but-disconnected route must NOT bounce the fallback boilerplate into
+// the chat — events are never bounced (a late poll close shouldn't spam the
+// topic). It falls through and is dropped with a metadata-only log, same as the
+// unclaimed-event path.
+func TestForwardOrFallback_AliveButDisconnectedHolder_EventNotBounced(t *testing.T) {
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	tid := int64(914)
+	key := MakeRouteKey("telegram", -1001234567890, &tid)
+
+	aliveStub := &Stub{CLI: "claude", PID: os.Getpid(), CWD: "/home/u/proj", ConnID: 99}
+	aliveStub.MarkDisconnected()
+	b.Routes.Claim(key, aliveStub)
+
+	w := newRouteWorker(context.Background(), key, time.Hour, b)
+	defer w.Stop()
+
+	event := &c3types.Inbound{
+		Channel: "telegram", ChatID: -1001234567890, TopicID: &tid,
+		MessageID: 2201, Kind: c3types.InboundPollResult,
+		Event: &c3types.InboundEvent{PollResult: &c3types.PollResult{PollID: "p-late", IsClosed: true}},
+	}
+	w.forwardOrFallback(context.Background(), event)
+
+	if _, held := b.Routes.Holder(key); !held {
+		t.Error("alive-but-disconnected claim must be preserved for an event too")
+	}
 	if got := len(fc.sendRepliesSnapshot()); got != 0 {
-		t.Errorf("expected no fallback for alive disconnected holder, got %d sends", got)
+		t.Errorf("an event must not bounce the fallback boilerplate; got %d sends", got)
 	}
 }
 

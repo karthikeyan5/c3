@@ -58,6 +58,7 @@ import (
 	"github.com/karthikeyan5/c3/internal/ipc"
 	"github.com/karthikeyan5/c3/internal/mcptools"
 	"github.com/karthikeyan5/c3/internal/mode"
+	"github.com/karthikeyan5/c3/internal/spawn"
 	"github.com/karthikeyan5/c3/internal/termtitle"
 )
 
@@ -224,6 +225,11 @@ type adapter struct {
 	// notifications/claude/channel frame for live debugging.
 	firstInbound atomic.Bool
 
+	// brokerDownAdvised guards the D5 one-shot "broker unreachable" advisory so
+	// it surfaces once per outage, not on every recovery cycle. Cleared on a
+	// successful reconnect so a later outage re-advises. Mirrors the Codex adapter.
+	brokerDownAdvised atomic.Bool
+
 	// dispatched is set the first time the SDK runs a method handler — i.e.
 	// Claude Code has sent at least one MCP frame. The idle-startup watchdog
 	// uses this to distinguish "live session" from "orphaned spawn that
@@ -259,43 +265,10 @@ func (a *adapter) connectBroker() error {
 }
 
 // spawnBroker forks a `c3-broker` process detached from our process group so
-// it survives our shutdown.
+// it survives our shutdown. The detached-launch semantics (setsid, no stdio,
+// async reap) live in internal/spawn, shared with the Codex adapter (D7).
 func spawnBroker() error {
-	return spawnDetached(exec.Command("c3-broker"))
-}
-
-// spawnDetached starts cmd in a new session (detached from the adapter's
-// process group via sysSetsid) with no inherited stdio, then reaps it
-// asynchronously so a child that exits never lingers as a <defunct> zombie.
-//
-// Why reap: spawnBroker is racy by design — several adapters can call it at
-// once, but the broker's singleton flock lets only ONE win; the losers exit
-// within milliseconds. setsid creates a new SESSION but does NOT reparent the
-// child to init, so until the adapter process itself exits an unreaped loser
-// stays a zombie child of the adapter (the <defunct> accumulation observed
-// 2026-06-22). The Wait() goroutine reaps it the moment it dies.
-//
-// Stderr is explicitly NOT inherited from the adapter. The adapter's stderr is
-// piped to Claude Code's plugin host; piping broker log lines through that
-// channel made the plugin host appear distressed (lots of unexplained stderr
-// noise during normal broker bounces), which we suspect contributes to CC
-// closing the adapter's stdin during /c3:restart-broker. The broker has its own
-// structured log at $XDG_STATE_HOME/c3/broker.log via SetupLogging; CC has no
-// reason to see broker stderr.
-func spawnDetached(cmd *exec.Cmd) error {
-	cmd.Stdin = nil
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	cmd.SysProcAttr = sysSetsid()
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	// Reap on exit so a broker that loses the flock race (or dies later) never
-	// lingers as a <defunct> zombie. One goroutine per spawn; for the winning
-	// broker it simply blocks for the daemon's lifetime, and if the adapter
-	// exits first the broker is reparented to init, which reaps it instead.
-	go func() { _ = cmd.Wait() }()
-	return nil
+	return spawn.Detached(exec.Command("c3-broker"))
 }
 
 // hello sends the hello frame and reads hello_ack.
@@ -384,10 +357,19 @@ func (a *adapter) reconnectBroker() error {
 	return a.hello()
 }
 
+// recoverBrokerAdviseAfter bounds how long recovery retries silently before the
+// D5 loud advisory. ~30s at the 0.5→30s backoff (0.5+1+2+4+8+16 ≈ 31.5s), so
+// attempt 6 trips it — long enough to ride out an ordinary broker rebuild, short
+// enough that a real outage is surfaced before the user assumes inbound works.
+const recoverBrokerAdviseAfter = 6
+
 // recoverBroker loops with exponential backoff until reconnectBroker
 // succeeds, or ctx cancellation aborts the loop (returns false).
 // After a successful reconnect, replays the last successful attach
-// (best-effort) so the route claim is restored.
+// (best-effort) so the route claim is restored. If the broker is still
+// unreachable after recoverBrokerAdviseAfter attempts (~30s), it surfaces a
+// one-shot loud advisory so the user knows inbound is down (D5 / adapter-ipc-5)
+// — the session otherwise looks alive.
 func (a *adapter) recoverBroker(ctx context.Context) bool {
 	const (
 		base       = 500 * time.Millisecond
@@ -402,10 +384,14 @@ func (a *adapter) recoverBroker(ctx context.Context) bool {
 		err := a.reconnectBroker()
 		if err == nil {
 			log.Printf("broker reconnected (attempt %d)", attempt)
+			a.clearBrokerDownAdvisory()
 			a.replayLastAttach()
 			return true
 		}
 		log.Printf("broker reconnect attempt %d failed: %v (retry in %v)", attempt, err, backoff)
+		if attempt >= recoverBrokerAdviseAfter {
+			a.adviseBrokerDown(attempt)
+		}
 		select {
 		case <-ctx.Done():
 			log.Printf("broker recovery canceled mid-backoff: %v", ctx.Err())
@@ -417,6 +403,47 @@ func (a *adapter) recoverBroker(ctx context.Context) bool {
 			backoff = maxBackoff
 		}
 	}
+}
+
+// adviseBrokerDown surfaces a LOUD one-shot advisory to the Claude session when
+// the broker can't be re-established after several recovery cycles (D5 /
+// adapter-ipc-5). It synthesizes the SAME broker-originated InboundSystem event
+// the broker's health broadcast uses (ChatID-less, rendered via
+// buildClaudeChannelFrame's System case — the proven-visible path), but emits it
+// adapter-side since the whole point is that the broker is unreachable.
+// brokerDownAdvised keeps it from spamming on every retry; it is cleared on the
+// next successful reconnect. (Batch E's status line also shows "C3 broker down"
+// when the broker PROCESS is dead; this covers the case where THIS adapter can't
+// reach an otherwise-live broker.)
+func (a *adapter) adviseBrokerDown(attempt int) {
+	if !a.brokerDownAdvised.CompareAndSwap(false, true) {
+		return
+	}
+	if a.notifyTx == nil {
+		return
+	}
+	sysev := &c3types.SystemEvent{
+		Source:  "c3",
+		Level:   "warn",
+		Title:   "C3 broker unreachable",
+		Message: fmt.Sprintf("C3 lost its connection to the broker and could not reconnect after %d attempts. Inbound Telegram messages will NOT arrive until this recovers (the adapter is still retrying in the background).", attempt),
+	}
+	in := &c3types.Inbound{
+		Channel: "c3",
+		Kind:    c3types.InboundSystem,
+		Event:   &c3types.InboundEvent{System: sysev},
+	}
+	frame := buildClaudeChannelFrame(in)
+	if err := a.notifyTx.Notify(context.Background(), "notifications/claude/channel", frame); err != nil {
+		log.Printf("broker-down advisory notify failed: %v", err)
+		return
+	}
+	log.Printf("broker-down advisory surfaced (attempt %d)", attempt)
+}
+
+// clearBrokerDownAdvisory re-arms the D5 advisory after a successful reconnect.
+func (a *adapter) clearBrokerDownAdvisory() {
+	a.brokerDownAdvised.Store(false)
 }
 
 // rememberAttach stores the last successful attach request for replay on
@@ -508,12 +535,64 @@ func (a *adapter) handleInbound(ctx context.Context, raw []byte) {
 	}
 
 	if err := a.notifyTx.Notify(ctx, "notifications/claude/channel", frame); err != nil {
-		log.Printf("notify FAIL chan=%s chat=%d topic=%s msg=%d kind=%s: %v",
-			in.Inbound.Channel, in.Inbound.ChatID, topic, in.Inbound.MessageID, kind, err)
+		// D4 (adapter-ipc-4): the broker already counted this inbound as
+		// "delivered" the moment it wrote it to our IPC socket — if the
+		// adapter→CLI notify now fails, the message is otherwise lost with no
+		// record anywhere. Log the FULL content (not just metadata) so it's
+		// recoverable from adapter.log. This is the same "don't lose
+		// undelivered content" rule the broker's failure paths follow
+		// (DEBUGGING.md / worker.go fallbackSummary). A broker-side nack op
+		// to bounce to the Telegram fallback is out of scope here.
+		log.Printf("notify FAIL chan=%s chat=%d topic=%s msg=%d kind=%s: %v — LOST CONTENT: %s",
+			in.Inbound.Channel, in.Inbound.ChatID, topic, in.Inbound.MessageID, kind, err,
+			inboundContentSummary(&in.Inbound))
 		return
 	}
 	log.Printf("notified chan=%s chat=%d topic=%s msg=%d kind=%s",
 		in.Inbound.Channel, in.Inbound.ChatID, topic, in.Inbound.MessageID, kind)
+}
+
+// inboundContentSummary renders a one-line, content-bearing summary of an
+// inbound for the notify-FAIL log path (D4). UNLIKE the success path (which
+// logs metadata only, per DEBUGGING.md), this is a failure path where the
+// message is otherwise lost with no record — so we DO include content
+// (sender, text, attachment summary) so it's recoverable from adapter.log.
+func inboundContentSummary(in *c3types.Inbound) string {
+	var parts []string
+	switch {
+	case in.Sender.Username != "":
+		parts = append(parts, "from=@"+in.Sender.Username)
+	case in.Sender.UserID != 0:
+		parts = append(parts, fmt.Sprintf("from=uid=%d", in.Sender.UserID))
+	}
+	if in.Text != "" {
+		parts = append(parts, fmt.Sprintf("text=%q", capRunes(in.Text, 200)))
+	}
+	if in.ReplyTo != nil {
+		parts = append(parts, fmt.Sprintf("reply_to=%d", in.ReplyTo.MessageID))
+	}
+	for _, att := range in.Attachments {
+		parts = append(parts, fmt.Sprintf("attach=%s/%d", att.Kind, att.Size))
+	}
+	if in.IsEvent() {
+		parts = append(parts, fmt.Sprintf("event=%s", in.Kind))
+	}
+	if len(parts) == 0 {
+		return "(no content)"
+	}
+	return strings.Join(parts, " ")
+}
+
+// capRunes truncates s to at most n runes (rune-safe, so the log can't emit a
+// split UTF-8 sequence), appending an ellipsis when it trims. Matches the
+// broker's 200-char content-log cap (worker.go) so the failure-path logs are
+// consistent and a multi-KB paste can't dump in full into adapter.log.
+func capRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 // buildClaudeChannelFrame converts a c3types.Inbound into the params for

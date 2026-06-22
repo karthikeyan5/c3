@@ -1,0 +1,259 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"net"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/karthikeyan5/c3/internal/c3types"
+	"github.com/karthikeyan5/c3/internal/ipc"
+)
+
+// TestRecoverBroker_CtxCancelStopsLoop guards the D1 (adapter-ipc-2) reconnect-
+// forever loop's exit condition: it must be ctx-aware and return promptly
+// (false) when ctx is cancelled, instead of spinning forever. The previous
+// one-shot brokerReader had no such loop at all; the new loop MUST honor
+// cancellation so a clean shutdown isn't blocked by a perpetual reconnect.
+//
+// We pre-cancel ctx so the loop's first guard (ctx.Err()) trips before it ever
+// dials — this never spawns or contacts a real broker.
+func TestRecoverBroker_CtxCancelStopsLoop(t *testing.T) {
+	a := newAdapter()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled
+
+	done := make(chan bool, 1)
+	go func() { done <- a.recoverBroker(ctx) }()
+
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("recoverBroker must return false when ctx is cancelled")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("recoverBroker did not honor ctx cancellation (spun forever?)")
+	}
+}
+
+// NOTE: an end-to-end "retry then cancel mid-backoff" test is deliberately
+// omitted. recoverBroker → reconnectBroker → connectBroker dials the real
+// broker socket (path probes /run/user/$UID independent of env) and would
+// either connect to the LIVE broker or spawn a fresh one — both forbidden in a
+// unit test (recovery-hardening constraint: don't touch the live broker). The
+// ctx-aware loop exit is proven by TestRecoverBroker_CtxCancelStopsLoop; the
+// retry/replay/advisory sub-behaviors are proven by the focused tests below.
+// The reconnect machinery itself (reconnectBroker/connectBroker) is the same
+// code the Claude adapter has run in production since the reconnect-forever
+// upgrade.
+
+// TestAutoAttach_DoesNotRegisterPendingSlot guards the D6 (adapter-ipc-7)
+// correlation fix: autoAttach must NOT register the shared pending["attached"]
+// slot, so it can never collide with / strand the `attach` tool's waiter. We
+// give the adapter a live (piped) broker conn, run autoAttach, drain the
+// written frame, and assert the pending map stayed empty the whole time.
+func TestAutoAttach_DoesNotRegisterPendingSlot(t *testing.T) {
+	a := newAdapter()
+	cliEnd, brokerEnd := net.Pipe()
+	defer cliEnd.Close()
+	defer brokerEnd.Close()
+
+	a.bmu.Lock()
+	a.conn = ipc.NewConn(cliEnd)
+	a.bmu.Unlock()
+
+	// Reader on the broker end so the adapter's WriteJSON doesn't block on the
+	// synchronous pipe.
+	read := make(chan []byte, 1)
+	go func() {
+		bc := ipc.NewConn(brokerEnd)
+		raw, err := bc.ReadFrame()
+		if err == nil {
+			read <- raw
+		} else {
+			read <- nil
+		}
+	}()
+
+	a.autoAttach("my-topic")
+
+	// The attach frame must have been written...
+	select {
+	case raw := <-read:
+		if raw == nil {
+			t.Fatal("autoAttach did not write an attach frame")
+		}
+		var req ipc.AttachReq
+		if err := json.Unmarshal(raw, &req); err != nil {
+			t.Fatalf("attach frame unmarshal: %v", err)
+		}
+		if req.Op != ipc.OpAttach || req.Name != "my-topic" {
+			t.Fatalf("unexpected attach frame: %+v", req)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for autoAttach frame")
+	}
+
+	// ...and crucially, autoAttach must NOT have claimed the shared slot.
+	a.pmu.Lock()
+	_, claimed := a.pending["attached"]
+	n := len(a.pending)
+	a.pmu.Unlock()
+	if claimed {
+		t.Error("autoAttach must NOT register pending[\"attached\"] (D6 collision)")
+	}
+	if n != 0 {
+		t.Errorf("autoAttach must leave the pending map empty; got %d entries", n)
+	}
+
+	// And it must remember the attach for D3 replay.
+	a.amu.Lock()
+	last := a.lastAttach
+	a.amu.Unlock()
+	if last == nil || last.Name != "my-topic" {
+		t.Errorf("autoAttach must rememberAttach for D3 replay; got %+v", last)
+	}
+}
+
+// TestReplayLastAttach_SendsReplayFrame covers the D3 (adapter-ipc-3) replay:
+// after a reconnect, the remembered attach is re-sent with Replay=true so the
+// route claim is re-established silently (no welcome message).
+func TestReplayLastAttach_SendsReplayFrame(t *testing.T) {
+	a := newAdapter()
+	a.rememberAttach(ipc.AttachReq{Op: ipc.OpAttach, Name: "proj", CWD: "/x"})
+
+	cliEnd, brokerEnd := net.Pipe()
+	defer cliEnd.Close()
+	defer brokerEnd.Close()
+	a.bmu.Lock()
+	a.conn = ipc.NewConn(cliEnd)
+	a.bmu.Unlock()
+
+	read := make(chan []byte, 1)
+	go func() {
+		bc := ipc.NewConn(brokerEnd)
+		raw, _ := bc.ReadFrame()
+		read <- raw
+	}()
+
+	a.replayLastAttach()
+
+	select {
+	case raw := <-read:
+		var req ipc.AttachReq
+		if err := json.Unmarshal(raw, &req); err != nil {
+			t.Fatalf("replay frame unmarshal: %v", err)
+		}
+		if !req.Replay {
+			t.Error("replayed attach must set Replay=true (suppress welcome)")
+		}
+		if req.Name != "proj" {
+			t.Errorf("replayed attach lost fields: %+v", req)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for replay frame")
+	}
+}
+
+// TestReplayLastAttach_NoopWhenNeverAttached: a session that never attached must
+// not send anything on reconnect.
+func TestReplayLastAttach_NoopWhenNeverAttached(t *testing.T) {
+	a := newAdapter()
+	cliEnd, brokerEnd := net.Pipe()
+	defer cliEnd.Close()
+	defer brokerEnd.Close()
+	a.bmu.Lock()
+	a.conn = ipc.NewConn(cliEnd)
+	a.bmu.Unlock()
+
+	wrote := make(chan struct{}, 1)
+	go func() {
+		bc := ipc.NewConn(brokerEnd)
+		if _, err := bc.ReadFrame(); err == nil {
+			wrote <- struct{}{}
+		}
+	}()
+
+	a.replayLastAttach()
+
+	select {
+	case <-wrote:
+		t.Fatal("replayLastAttach must be a no-op when nothing was ever attached")
+	case <-time.After(200 * time.Millisecond):
+		// good — nothing written
+	}
+}
+
+// TestInboundContentSummary_CapturesContent guards D4 (adapter-ipc-4) for the
+// Codex adapter: the notify-FAIL log summary must include actual content so a
+// dropped notify is recoverable from adapter.log. Mirrors the Claude adapter's
+// test of the same name.
+func TestInboundContentSummary_CapturesContent(t *testing.T) {
+	in := &c3types.Inbound{
+		Channel:   "telegram",
+		ChatID:    -100,
+		MessageID: 7,
+		Text:      "must not be lost",
+		Sender:    c3types.Sender{Username: "alice", UserID: 42},
+		Attachments: []c3types.Attachment{
+			{Kind: "document", Size: 1234},
+		},
+	}
+	got := inboundContentSummary(in)
+	for _, want := range []string{"from=@alice", `text="must not be lost"`, "attach=document/1234"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("summary missing %q; got %q", want, got)
+		}
+	}
+	if got := inboundContentSummary(&c3types.Inbound{}); got != "(no content)" {
+		t.Errorf("empty inbound summary: want (no content); got %q", got)
+	}
+}
+
+// TestAdviseBrokerDown_OneShotAndRearm guards the D5 (adapter-ipc-5) loud
+// advisory: it surfaces exactly once per outage (no spam across retry cycles)
+// and re-arms after a successful reconnect so a later outage advises again. It
+// also buffers the advisory into the inbox ring so a Codex session that drains
+// `inbox` sees it.
+func TestAdviseBrokerDown_OneShotAndRearm(t *testing.T) {
+	a := newAdapter()
+	// A transport is required for the notify leg; an unconnected logNotify
+	// transport returns an error on Notify, which adviseBrokerDown logs and
+	// tolerates — the inbox-buffer leg still runs. That's the behavior we
+	// assert (advisory is durable even if the notify frame can't be sent).
+	a.transport = newLogNotifyTransport(nil)
+
+	a.adviseBrokerDown(6)
+	a.adviseBrokerDown(7) // must be suppressed (one-shot)
+	a.adviseBrokerDown(8)
+
+	a.imu.Lock()
+	got := len(a.inbox)
+	var sysCount int
+	for _, in := range a.inbox {
+		if in.Kind == c3types.InboundSystem {
+			sysCount++
+		}
+	}
+	a.imu.Unlock()
+	if sysCount != 1 {
+		t.Fatalf("adviseBrokerDown must buffer exactly one system advisory per outage; got %d (inbox=%d)", sysCount, got)
+	}
+
+	// After a reconnect clears the flag, a new outage must advise again.
+	a.clearBrokerDownAdvisory()
+	a.adviseBrokerDown(6)
+	a.imu.Lock()
+	sysCount = 0
+	for _, in := range a.inbox {
+		if in.Kind == c3types.InboundSystem {
+			sysCount++
+		}
+	}
+	a.imu.Unlock()
+	if sysCount != 2 {
+		t.Fatalf("after clearBrokerDownAdvisory a fresh outage must re-advise; got %d system advisories", sysCount)
+	}
+}

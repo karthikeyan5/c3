@@ -385,18 +385,33 @@ func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound) 
 		holder = nil
 	}
 
+	// Holder is alive (kill -0 succeeded) but its conn is nil — the adapter
+	// is between reconnects (D2 / adapter-ipc-1). Previously this DROPPED the
+	// inbound silently ("alive but disconnected"); a message sent during the
+	// adapter's reconnect window was lost forever, with nothing to replay it.
+	// Instead, treat an unreachable-but-alive holder like "no live CLI" and
+	// fall through to the SAME Telegram fallback the STALE branch uses, so the
+	// user is told to resend rather than left wondering where their message
+	// went. We do NOT release the claim — the holder is still alive and will
+	// rebind its conn on reconnect; only THIS inbound bounces.
+	// Snapshot the holder's conn ONCE under its lock (ConnValue is race-safe vs
+	// the handler goroutine's MarkDisconnected/Reattach), and use that one value
+	// for both the bounce-check and the delivery — a second raw read could race
+	// to a different value mid-delivery.
+	var holderConn *ipc.Conn
 	if claimed {
-		conn, ok := holder.Conn.(*ipc.Conn)
-		if !ok {
-			// Holder is alive (kill -0 succeeded) but its conn is nil —
-			// the adapter is between reconnects. Don't deliver to a half-
-			// dead stub; drop with a log line. The adapter will catch up
-			// when it reconnects (route-conn transfer rebinds the stub).
-			log.Printf("deliver SKIP chan=%s chat=%d topic=%s msg=%d: holder cli=%s pid=%d alive but disconnected — %s",
+		holderConn, _ = holder.ConnValue().(*ipc.Conn)
+		if holderConn == nil {
+			log.Printf("deliver BOUNCE chan=%s chat=%d topic=%s msg=%d: holder cli=%s pid=%d alive but disconnected — falling back so user can resend — %s",
 				w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID,
 				holder.CLI, holder.PID, fallbackSummary(in))
-			return
+			claimed = false
+			holder = nil
 		}
+	}
+
+	if claimed {
+		conn := holderConn
 		if err := conn.WriteJSON(ipc.InboundMsg{Op: ipc.OpInbound, Inbound: *in}); err != nil {
 			log.Printf("deliver FAIL chan=%s chat=%d topic=%s msg=%d to cli=%s pid=%d: %v — %s",
 				w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID,
