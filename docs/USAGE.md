@@ -67,6 +67,50 @@ From there:
 - **Quote-replying** — long-press a CLI message, hit Reply, type. The CLI sees the inbound with `reply_to_message_id`, `reply_to_user`, and `reply_to_text` so it knows which prior message you're answering.
 - **Multi-message bursts** — multiple **text** messages in quick succession are collapsed by the debounce window (default 1500ms). Saves your CLI from getting confused by interleaved partial thoughts. Photo/file **albums** are not assembled as a unit in v0.1 — album siblings arrive as separate inbounds merged only by the debounce window; reliable album handling is a known gap (see RESUME.md FIX #1).
 
+## Durable inbound queue & backlog
+
+Once C3 has *received* a Telegram message, it never loses it — even if no CLI is attached or the broker was down when it later caught up. Inbound messages are held on disk and delivered when a session attaches. You never have to re-forward a voice note or babysit delivery.
+
+How it works:
+
+- **Held, never dropped.** A message that arrives while no session is attached to its topic is appended to a durable per-route queue under `$XDG_STATE_HOME/c3/queue/` (fallback `~/.local/state/c3/queue/`) and `fsync`'d to disk. The broker only advances the Telegram read offset *after* the message is durably persisted, so a broker crash mid-flight can't lose anything — Telegram redelivers it on the next poll.
+- **Held-count auto-reply.** The first held message in a topic gets one reassurance reply: *"📨 Held — nothing lost. No CLI is attached to this topic right now. N message(s) queued — they'll be delivered when you attach a session here. Send /status to check."* It repeats at most once per 5-minute cooldown with the *running* count; messages in between are queued silently (no reply per voice note).
+- **Backlog on attach.** When you `attach` to a topic with held messages, the session is told how many are queued (with a short per-message preview) and instructed to call `fetch_queue` to retrieve them. The agent decides whether to drain all at once or work through them in batches.
+- **Live messages are unaffected.** When a session is attached, messages still push through immediately; they're removed from the queue once the agent has actually taken them. The queue earns its keep only when there's no live consumer.
+
+### Pulling the backlog — the `fetch_queue` tool
+
+Your CLI agent retrieves held messages with the `fetch_queue` MCP tool (both Claude Code and Codex have it):
+
+- `limit` — how many oldest messages to pull. Default **3**, max **50**, or the string `"all"` to drain everything. Small batches let the agent process carefully one group at a time; `"all"` is for bulk catch-up.
+- `ack` — default **true**, which *consumes* the messages (walks the cursor forward; the queue files are deleted once fully drained). Pass `ack=false` to *peek* without consuming.
+
+Each returned message carries full content — sender, kind, timestamp, the text or voice transcript, any quote-reply context, and attachments (each with `file_id`) — plus `remaining`, the count still queued.
+
+### Fixing a failed transcription — the `retranscribe` tool
+
+STT failures are usually a transient or down provider, not lost audio. When transcription fails, the *agent* sees a self-documenting recovery message (not a dead end): it states the audio is saved, that you don't need to resend, and exactly how to recover it — `download_attachment` to fetch the audio, or `retranscribe` to re-run STT once the provider is healthy.
+
+`retranscribe(file_id)` re-runs the STT provider chain on the saved audio (downloading it if not cached) and returns the fresh transcript. Pass the optional `message_id` and, if that message is still sitting in the queue, its stored transcript is refreshed **in place** — so when you later `fetch_queue` it, you get the corrected text. The audio is always preserved, so a failed transcription never means re-recording.
+
+### Checking queue depth — `/status` in Telegram
+
+Type `/status` directly into a Telegram chat (it autocompletes in the `/` menu) to see queue depth and attach state. This is a *Telegram bot command*, distinct from the `/c3:status` CLI slash command — the broker answers it directly and never routes it to an agent.
+
+- **In a topic** → that topic's status, e.g. `📊 arogara · 3 queued (oldest 2h) · no CLI attached · broker up`.
+- **In DM or General** → a global summary across all routes (empty queues omitted), e.g.:
+  ```
+  📊 Broker up (pid 12345). Active queues:
+  • arogara — 3 (oldest 2h)
+  • proctor — 1 (oldest 10m)
+  1 attached · 1 idle
+  ```
+
+### Limits
+
+- Per-route cap: **1000 messages OR 14 days**, whichever comes first. On overflow the oldest held messages are dropped, logged to `broker.log`, **and** announced in the topic (*"⚠️ queue full — dropped N oldest held message(s); attach a session soon."*) — never a silent truncation.
+- **24-hour Telegram bound (outside C3's control).** Telegram itself keeps undelivered updates for at most 24 hours. C3 can only queue what it has actually received, so a gap longer than 24 hours with **no broker polling anywhere** loses messages at Telegram's level before C3 ever sees them. Keeping a broker polling (the opt-in `systemd --user` unit helps) is the only guard against that window.
+
 ## Multi-group setups
 
 Configure multiple Telegram supergroups in `mappings.json`:
@@ -119,9 +163,9 @@ C3 doesn't auto-delete. From your phone (Telegram), long-press the topic in the 
 
 ## When things go wrong
 
-- **No CLI is attached, but messages keep arriving** — the broker sends a one-shot fallback reply (cooldown 5 min) telling you to attach a CLI. Open a session in the project directory and `attach`.
+- **No CLI is attached, but messages keep arriving** — nothing is lost. They're held in the durable queue and you get a "Held — nothing lost" reply (cooldown 5 min) with the running count; send `/status` to check depth. Open a session in the project directory and `attach`, and the agent retrieves the backlog with `fetch_queue`. See "Durable inbound queue & backlog" above.
 - **`attach` says the topic is held** — `topics` lists who. If it's a stale claim (the holder crashed), the broker now sweeps dead-pid holders on dispatch (2026-05-14 fix); just retry `attach`. If that doesn't free it, quit Claude Code and relaunch — the new session's broker auto-spawn starts clean. Don't bounce the broker from inside CC (killing the broker also kills this session's MCP server, requiring a manual `/mcp` reconnect). From an external terminal, `pkill c3-broker` works. For mappings.json edits, `/c3:reload-config` is non-disruptive.
-- **Voice transcription is wrong** — re-record (Telegram preserves the original audio; the CLI can `download_attachment` to re-listen). The STT plugin's confidence isn't surfaced in v1; treat the transcript as a hint when accuracy matters.
+- **Voice transcription is wrong or failed** — never re-record. The original audio is saved; the CLI can `download_attachment` to re-listen, or `retranscribe` to re-run STT (e.g. once a flaky provider recovers). On an outright STT failure the agent sees a self-documenting message telling it exactly how to recover. The STT plugin's confidence isn't surfaced in v1; treat the transcript as a hint when accuracy matters.
 - **No typing indicator while the agent is working** — the typing indicator only shows when the agent explicitly signals it; it does not auto-pulse during long background work (an auto-ticker is on the roadmap).
 - **`codex` doesn't seem to be using C3** — check `which codex` returns the C3 launcher (`$GOBIN/codex` after install). Long-running shells hash; open a new terminal or `hash -r`. The launcher logs to `/tmp/c3-codex-supervisor.log` — `tail` it during a `codex` invocation to see what it thinks it's doing.
 - **`reply` says to attach first** — your adapter lost local state but the broker may still hold your claim. Try `attach` again with the same target; the adapter recovers from the broker's claim (both Claude and Codex adapters do this). If that fails, `topics` shows who's holding what; `c3-broker status` from a separate shell tells you the same with more detail.
