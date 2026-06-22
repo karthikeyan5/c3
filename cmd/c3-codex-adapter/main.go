@@ -201,23 +201,44 @@ func (a *adapter) connectBroker() error {
 // spawnBroker forks a `c3-broker` process detached from our process group
 // so it survives our shutdown.
 //
-// Stderr is explicitly NOT inherited from the adapter. Matches the Claude
-// adapter (cmd/c3-claude-adapter/main.go::spawnBroker) verbatim per
-// Karthi's "every flow must work the same in Codex" principle: the
-// adapter's stderr is piped to the host's plugin host; piping broker log
-// lines through that channel can make the host appear distressed (lots
-// of unexplained stderr noise during normal broker bounces). The broker
-// has its own structured log at $XDG_STATE_HOME/c3/broker.log via
-// SetupLogging; the host has no reason to see broker stderr.
-//
 // Closes report MINOR m3 (2026-05-19).
 func spawnBroker() error {
-	cmd := exec.Command("c3-broker")
+	return spawnDetached(exec.Command("c3-broker"))
+}
+
+// spawnDetached starts cmd in a new session (detached from the adapter's
+// process group via sysSetsid) with no inherited stdio, then reaps it
+// asynchronously so a child that exits never lingers as a <defunct> zombie.
+// Matches the Claude adapter (cmd/c3-claude-adapter/main.go::spawnDetached)
+// verbatim per Karthi's "every flow must work the same in Codex" principle.
+//
+// Why reap: spawnBroker is racy by design — several adapters can call it at
+// once, but the broker's singleton flock lets only ONE win; the losers exit
+// within milliseconds. setsid creates a new SESSION but does NOT reparent the
+// child to init, so until the adapter process itself exits an unreaped loser
+// stays a zombie child of the adapter (the <defunct> accumulation observed
+// 2026-06-22). The Wait() goroutine reaps it the moment it dies.
+//
+// Stderr is explicitly NOT inherited from the adapter. The adapter's stderr is
+// piped to the host's plugin host; piping broker log lines through that channel
+// can make the host appear distressed (lots of unexplained stderr noise during
+// normal broker bounces). The broker has its own structured log at
+// $XDG_STATE_HOME/c3/broker.log via SetupLogging; the host has no reason to see
+// broker stderr.
+func spawnDetached(cmd *exec.Cmd) error {
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	cmd.SysProcAttr = sysSetsid()
-	return cmd.Start()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	// Reap on exit so a broker that loses the flock race (or dies later) never
+	// lingers as a <defunct> zombie. One goroutine per spawn; for the winning
+	// broker it simply blocks for the daemon's lifetime, and if the adapter
+	// exits first the broker is reparented to init, which reaps it instead.
+	go func() { _ = cmd.Wait() }()
+	return nil
 }
 
 func (a *adapter) hello() error {
