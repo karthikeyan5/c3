@@ -120,6 +120,11 @@ func (b *Broker) handleRetranscribe(conn *ipc.Conn, stub *Stub, raw []byte) {
 // off the head (not 1, which would orphan Count-1 as phantom backlog). OK=false
 // leaves it queued (backlog + recovery nudge). No response is sent — it is a
 // one-way ack.
+//
+// Count is forwarded VERBATIM (no 0→1 bump): a Count<=0 ack covered no stored
+// lines (the adapter should not even ack events now, but an older one might echo
+// Covered=0), and handleConsume skips Count<=0 so it never consumes a real
+// backlog message the push didn't deliver (C1).
 func (b *Broker) handleInboundDelivered(stub *Stub, raw []byte) {
 	var msg ipc.InboundDeliveredMsg
 	if err := json.Unmarshal(raw, &msg); err != nil {
@@ -134,9 +139,17 @@ func (b *Broker) handleInboundDelivered(stub *Stub, raw []byte) {
 	if route == nil {
 		return
 	}
-	count := msg.Count
-	if count < 1 {
-		count = 1 // older adapter / single-message push
+	// Drop a zero-/negative-covered ack outright — there is nothing to consume and
+	// no job worth dispatching (handleConsume would skip it anyway).
+	if msg.Count < 1 {
+		log.Printf("inbound_delivered update=%d count=%d — nothing to consume (event / zero-covered ack)", msg.UpdateID, msg.Count)
+		return
 	}
-	b.Workers.Submit(*route, Job{Kind: JobConsume, Consume: &ConsumeJob{MessageID: msg.UpdateID, Count: count}})
+	// ALSO (whole-branch review): surface a dropped consume like the sibling
+	// handlers (handleFetchQueue / handleToolCall) do, so a full/stopped worker
+	// queue that silently swallows the live-ack — leaving Count lines stranded as
+	// phantom backlog — is visible in broker.log rather than lost.
+	if ok := b.Workers.Submit(*route, Job{Kind: JobConsume, Consume: &ConsumeJob{MessageID: msg.UpdateID, Count: msg.Count}}); !ok {
+		log.Printf("inbound_delivered update=%d count=%d: worker queue full or stopped — consume DROPPED (Count lines remain as backlog)", msg.UpdateID, msg.Count)
+	}
 }

@@ -23,14 +23,25 @@ type fakeHost struct {
 	// the not-routed test in 5b); defaults to declining so the channel routes
 	// normally.
 	cmdHandled bool
+
+	// emitDrops makes Emit return false (the worker-queue-full / stopped DROP
+	// case) so the I4 stranded-update test can drive the drop branch. Default
+	// false ⇒ Emit accepts (returns true), matching the steady-state path.
+	emitDrops bool
+
+	// cmdCalled records whether HandleCommand was invoked, so the I-SEC gate-order
+	// tests can assert a stranger's /status NEVER reaches the command handler (the
+	// gate must drop it first).
+	cmdCalled bool
 }
 
 func (h *fakeHost) Config(name string, target any) error { return nil }
 
-func (h *fakeHost) Emit(in *c3types.Inbound) {
+func (h *fakeHost) Emit(in *c3types.Inbound) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.emitted = append(h.emitted, in)
+	return !h.emitDrops
 }
 
 func (h *fakeHost) Logf(format string, args ...any) {
@@ -47,12 +58,22 @@ func (h *fakeHost) GateInbound(in *c3types.Inbound) channel.GateInboundDecision 
 
 // HandleCommand satisfies channel.Host. cmdHandled lets a test opt this double
 // into claiming "/status" (used by the not-routed test in 5b); it defaults to
-// declining so the channel routes normally.
+// declining so the channel routes normally. cmdCalled records invocation so the
+// I-SEC tests can assert a stranger's /status never reaches it (gate-first).
 func (h *fakeHost) HandleCommand(in *c3types.Inbound) (string, bool) {
+	h.mu.Lock()
+	h.cmdCalled = true
+	h.mu.Unlock()
 	if h.cmdHandled && in != nil && in.Text == "/status" {
 		return "📊 ok", true
 	}
 	return "", false
+}
+
+func (h *fakeHost) handleCommandCalled() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.cmdCalled
 }
 
 func (h *fakeHost) NotifyHealth(ev c3types.HealthEvent) {

@@ -52,16 +52,24 @@ func (h *BrokerHost) Config(name string, target any) error {
 
 // Emit submits an inbound to the per-route worker pool. The worker drains
 // the pipeline (STT, OnInbound chain, debounce, forward to claimed stub).
-// Phase 4A: dispatch is stubbed; Plan 4B+5 wire the real pipeline.
-func (h *BrokerHost) Emit(in *c3types.Inbound) {
+//
+// Returns true when the inbound was accepted onto the worker queue, false when
+// it was DROPPED (worker queue full — cap 64 — or stopped). A dropped inbound
+// never reaches the durable queue, so its source update_id would otherwise stay
+// in-flight forever; the caller (telegram dispatchMessage) reacts to a false
+// return by marking the update done so the contiguous-prefix offset advances past
+// it instead of wedging ALL inbound on a >64 burst (I4).
+func (h *BrokerHost) Emit(in *c3types.Inbound) bool {
 	if in == nil {
-		return
+		return false
 	}
 	key := MakeRouteKey(in.Channel, in.ChatID, in.TopicID)
 	if !h.broker.Workers.Submit(key, Job{Kind: JobInbound, Inbound: in}) {
 		log.Printf("emit DROP chan=%s chat=%d topic=%s msg=%d: worker queue full or stopped",
 			in.Channel, in.ChatID, TopicPtrStr(in.TopicID), in.MessageID)
+		return false
 	}
+	return true
 }
 
 // Logf writes to the broker's structured log (currently stdlib log).

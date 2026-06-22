@@ -220,6 +220,30 @@ func (s *Store) Pending(rk RouteKey) (int, time.Time) {
 	return len(pending), pending[0].Timestamp
 }
 
+// StatusFor returns the single-route snapshot from the in-memory status index
+// (Pending + OldestUnix). Cheap; touches NO files — so a per-topic /status read
+// is race-free against the route worker's concurrent Append/Consume/rewrite (it
+// reads the same mutex-guarded counters StatusAll uses, not the .jsonl/.cur off
+// the worker goroutine). A route with nothing queued returns the zero Status
+// (Pending 0). See I7.
+//
+// RouteKey's TopicID is a *int64, so two RouteKeys for the same route can carry
+// distinct pointers and would NOT be equal as Go map keys. We therefore match by
+// VALUE identity (the canonical File() basename, which is what the rest of the
+// store and the on-disk layout key on), never by raw map lookup — the same reason
+// statusGlobal rebuilds keys from StatusAll rather than reusing the stored ones.
+func (s *Store) StatusFor(rk RouteKey) Status {
+	want := rk.File()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, v := range s.idx {
+		if k.File() == want {
+			return v
+		}
+	}
+	return Status{}
+}
+
 // StatusAll returns a snapshot of the in-memory status index (all known routes
 // with pending > 0). Cheap; touches no files.
 func (s *Store) StatusAll() map[RouteKey]Status {

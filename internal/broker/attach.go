@@ -792,23 +792,37 @@ const backlogSummaryMax = 3
 // to backlogSummaryMax) for the just-claimed route. Peek only — never consumes;
 // the agent drains via fetch_queue. Empty/zero when nothing is queued or the
 // queue is disabled.
+//
+// I7: the total + preview are read ATOMICALLY through a SINGLE route-worker job
+// (JobBacklog), mirroring JobFetch/JobConsume — never via a separate Pending-then-
+// Peek off the worker goroutine, which could race the worker's concurrent Append/
+// Consume/rewrite (TOCTOU: count>0 with an empty/stale preview). Called on the
+// attach handler goroutine, which safely blocks on the worker's result channel
+// (same pattern as handleFetchQueue). If the worker queue is full/stopped we log
+// and return empty (the agent still learns of backlog via the next push's
+// recovery nudge / fetch_queue).
 func (b *Broker) backlogSummary(key RouteKey) (int, []ipc.QueuedItem) {
-	if b.Queue == nil {
+	if b.Queue == nil || b.Workers == nil {
 		return 0, nil
 	}
-	qrk := queueRouteKey(key)
-	count, _ := b.Queue.Pending(qrk)
-	if count == 0 {
+	resultCh := make(chan BacklogResult, 1)
+	job := Job{Kind: JobBacklog, Backlog: &BacklogJob{PeekN: backlogSummaryMax, ResultCh: resultCh}}
+	if !b.Workers.Submit(key, job) {
+		log.Printf("backlog summary %s: worker queue full or stopped — skipping summary", routeKeyStr(key))
 		return 0, nil
 	}
-	preview, err := b.Queue.Peek(qrk, backlogSummaryMax)
-	if err != nil {
-		log.Printf("backlog summary peek FAIL %s: %v", routeKeyStr(key), err)
-		return count, nil
+	res := <-resultCh
+	if res.Err != nil {
+		log.Printf("backlog summary peek FAIL %s: %v", routeKeyStr(key), res.Err)
+		// Total still came back fine; render the count without a preview.
+		return res.Total, nil
 	}
-	items := make([]ipc.QueuedItem, 0, len(preview))
-	for i := range preview {
-		in := &preview[i]
+	if res.Total == 0 {
+		return 0, nil
+	}
+	items := make([]ipc.QueuedItem, 0, len(res.Preview))
+	for i := range res.Preview {
+		in := &res.Preview[i]
 		items = append(items, ipc.QueuedItem{
 			MessageID: in.MessageID,
 			Sender:    senderLabel(in.Sender),
@@ -817,7 +831,7 @@ func (b *Broker) backlogSummary(key RouteKey) (int, []ipc.QueuedItem) {
 			Preview:   previewText(in, 80),
 		})
 	}
-	return count, items
+	return res.Total, items
 }
 
 // senderLabel renders a compact sender label for the backlog preview.

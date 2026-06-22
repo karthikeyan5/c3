@@ -33,12 +33,22 @@ func (h *BrokerHost) HandleCommand(in *c3types.Inbound) (string, bool) {
 }
 
 // statusForTopic renders the per-topic status line.
+//
+// I7: reads the mutex-guarded in-memory status index (StatusFor) — NOT the queue
+// files via Pending — so a /status answered on a poll goroutine never races the
+// route worker's concurrent Append/Consume/rewrite (the global StatusAll path was
+// already index-based; this brings the per-topic path to the same single-owner
+// discipline).
 func (b *Broker) statusForTopic(channelName string, chatID int64, topicID *int64) string {
 	key := MakeRouteKey(channelName, chatID, topicID)
 	name := b.topicDisplayName(channelName, chatID, topicID)
 	pending, oldest := 0, time.Time{}
 	if b.Queue != nil {
-		pending, oldest = b.Queue.Pending(queueRouteKey(key))
+		st := b.Queue.StatusFor(queueRouteKey(key))
+		pending = st.Pending
+		if st.OldestUnix > 0 {
+			oldest = time.Unix(st.OldestUnix, 0)
+		}
 	}
 	attached := "no CLI attached"
 	if _, held := b.Routes.Holder(key); held {

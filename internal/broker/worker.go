@@ -23,6 +23,7 @@ const (
 	JobFetch
 	JobConsume
 	JobRefreshText
+	JobBacklog
 )
 
 // Job is one unit of work for a route worker. Exactly one of the payload
@@ -34,6 +35,25 @@ type Job struct {
 	Fetch    *FetchJob
 	Consume  *ConsumeJob
 	Refresh  *RefreshTextJob
+	Backlog  *BacklogJob
+}
+
+// BacklogJob asks the worker to read the route's queued total AND a compact
+// oldest-first preview ATOMICALLY on the single-owner worker goroutine (I7), so
+// an attach-time backlog summary never races the worker's Append/Consume/rewrite
+// (a separate Pending-then-Peek off-goroutine could report count>0 with an empty
+// or stale preview). PeekN bounds the preview; the result returns via ResultCh.
+type BacklogJob struct {
+	PeekN    int
+	ResultCh chan<- BacklogResult
+}
+
+// BacklogResult carries the route's total queued count + oldest-first preview
+// (up to PeekN) back to the attach handler.
+type BacklogResult struct {
+	Total   int
+	Preview []c3types.Inbound
+	Err     error
 }
 
 // FetchJob asks the worker to Peek/Consume the route's durable queue. Limit<0
@@ -285,6 +305,8 @@ func (w *RouteWorker) run(ctx context.Context) {
 				w.handleConsume(ctx, job.Consume)
 			case JobRefreshText:
 				w.handleRefreshText(ctx, job.Refresh)
+			case JobBacklog:
+				w.handleBacklog(ctx, job.Backlog)
 			case JobRelease:
 				flushDeb()
 				return
@@ -353,25 +375,50 @@ func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inboun
 	// does not merge stored lines. Append failure = persist failure: do NOT mark
 	// the update_id done (markPersisted is only called on success), so the
 	// Telegram offset can't pass it and the message is redelivered (loss-free).
+	// appended counts the lines this batch ACTUALLY persisted (a successful
+	// Append). It is NOT len(batch): dedup-suppressed messages are skipped, and an
+	// Append failure does not count. The live push's Covered must equal this count
+	// so the Claude delivered-ack Consumes exactly the lines this push added — not
+	// len(batch), which would over-consume and eat later backlog (I5).
+	appended := 0
 	if w.broker != nil && w.broker.Queue != nil {
 		qrk := queueRouteKey(w.key)
 		for _, in := range batch {
 			// Dedup the at-least-once REPLAY a crash-mid-consume can produce
-			// (spec: "dedupe by message_id"). See newDeliveredDedup below.
-			if w.dedup != nil && w.dedup.seenBefore(in.MessageID) {
+			// (spec: "dedupe by message_id"). alreadySeen is PURE (it does not
+			// record), so a failed Append below never poisons the dedup set (C2).
+			if w.dedup != nil && w.dedup.alreadySeen(in.MessageID) {
 				log.Printf("dedup chan=%s chat=%d topic=%s msg=%d: already delivered, suppressing replay",
 					w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID)
+				// C3: the FIRST delivery of this message_id already persisted it and
+				// recorded its update_id; this redelivery is a no-op for storage but
+				// its source update_id is still in-flight in the tracker (dispatchMessage
+				// recorded msgToUpdate before Emit). markPersisted resolves that
+				// update_id → MarkDone so the contiguous-prefix offset advances over
+				// the redelivery instead of wedging ALL inbound permanently.
+				w.markPersisted(in)
 				continue
 			}
 			if err := w.broker.Queue.Append(qrk, in); err != nil {
 				log.Printf("queue append FAIL chan=%s chat=%d topic=%s msg=%d: %v — offset will NOT advance; Telegram redelivers — %s",
 					w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, err, fallbackSummary(in))
+				// C2: do NOT record the id as seen — the Append failed, so a later
+				// Telegram redelivery of this same message_id must be allowed to
+				// persist (not dedup-suppressed and lost). markPersisted is
+				// deliberately NOT called either, so the offset holds and Telegram
+				// retains/redelivers (loss-free).
 				// Best-effort Telegram notice (spec Error-handling: disk-full =
 				// persist failure → log + best-effort Telegram notice). Cooldown'd
 				// via the existing fallback tracker so a stuck disk doesn't spam.
 				w.notePersistFailure(in)
 				continue
 			}
+			// Record as seen ONLY after a successful Append (C2): this is the point
+			// at which a future redelivery is a true duplicate worth suppressing.
+			if w.dedup != nil {
+				w.dedup.record(in.MessageID)
+			}
+			appended++
 			w.markPersisted(in)
 			w.evictIfOverCap(qrk)
 		}
@@ -389,7 +436,9 @@ func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inboun
 		merged = next
 	}
 
-	w.forwardOrFallback(ctx, merged, len(batch))
+	// Covered = lines ACTUALLY appended by this push (I5), not len(batch). When no
+	// queue is wired (unit tests) appended stays 0 and covEffective normalizes to 1.
+	w.forwardOrFallback(ctx, merged, appended)
 }
 
 // sttFailureText renders the agent-facing STT-failure recovery message. It is
@@ -542,7 +591,16 @@ func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound, 
 		// adapter can append the recovery nudge. The covered lines are STILL queued
 		// at push time (only Consumed on the ack), so subtract covered from the
 		// route's pending count → a fully-caught-up live session shows Pending:0.
+		//
+		// C1: a synthesized EVENT (poll_result / reaction / callback) is NEVER
+		// queued, so it covers ZERO stored lines. Forcing Covered=0 here is
+		// defense-in-depth alongside the adapter's IsEvent() ack-guard: even an
+		// older adapter that acked an event push would Consume 0 (handleConsume
+		// skips Count<=0), so a live event can never over-consume real backlog.
 		covered := covEffective(covered) // >=1
+		if in.IsEvent() {
+			covered = 0
+		}
 		pending := 0
 		if w.broker != nil && w.broker.Queue != nil {
 			if n, _ := w.broker.Queue.Pending(queueRouteKey(w.key)); n > covered {
@@ -584,12 +642,18 @@ func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound, 
 	// MessageID is recorded in w.dedup) in flushInbounds. A direct-call/test path
 	// (or any future caller that reaches forwardOrFallback without flushInbounds)
 	// has NOT — so append it here, gated by the SAME dedup set so the normal path
-	// does not double-store (flushInbounds already recorded the id, so seenBefore
-	// returns true here and we skip). This keeps the running count below accurate
-	// for the message the user just sent. Events are never queued.
+	// does not double-store (flushInbounds already recorded the id, so alreadySeen
+	// returns true here and we skip). We use the alreadySeen/record split (C2) so a
+	// failed Append never poisons the dedup set: only record on a successful Append.
+	// This keeps the running count below accurate for the message the user just
+	// sent. Events are never queued.
 	if w.broker.Queue != nil {
-		if w.dedup == nil || !w.dedup.seenBefore(in.MessageID) {
-			_ = w.broker.Queue.Append(queueRouteKey(w.key), in)
+		if w.dedup == nil || !w.dedup.alreadySeen(in.MessageID) {
+			if err := w.broker.Queue.Append(queueRouteKey(w.key), in); err == nil {
+				if w.dedup != nil {
+					w.dedup.record(in.MessageID)
+				}
+			}
 		}
 	}
 	// No live claim: the message is already durably queued (flushInbounds — or
@@ -774,13 +838,51 @@ func (w *RouteWorker) handleFetch(_ context.Context, job *FetchJob) {
 	job.ResultCh <- FetchResult{Messages: msgs, Remaining: remaining}
 }
 
+// handleBacklog reads the route's total queued count + an oldest-first preview
+// ATOMICALLY on the single-owner worker goroutine (I7), so an attach-time backlog
+// summary is consistent with itself and never races a concurrent Append/Consume/
+// rewrite. Peek does not advance the cursor (the agent drains via fetch_queue).
+func (w *RouteWorker) handleBacklog(_ context.Context, job *BacklogJob) {
+	if job == nil || job.ResultCh == nil {
+		return
+	}
+	defer recoverGoroutineThen("worker.handleBacklog", func() {
+		select {
+		case job.ResultCh <- BacklogResult{Err: fmt.Errorf("internal panic in backlog")}:
+		default:
+		}
+	})
+	if w.broker == nil || w.broker.Queue == nil {
+		job.ResultCh <- BacklogResult{}
+		return
+	}
+	qrk := queueRouteKey(w.key)
+	total, _ := w.broker.Queue.Pending(qrk)
+	if total == 0 {
+		job.ResultCh <- BacklogResult{}
+		return
+	}
+	preview, err := w.broker.Queue.Peek(qrk, job.PeekN)
+	if err != nil {
+		// Surface the total even when the preview read failed (the count came back
+		// fine); the handler logs and renders count without items.
+		job.ResultCh <- BacklogResult{Total: total, Err: err}
+		return
+	}
+	job.ResultCh <- BacklogResult{Total: total, Preview: preview}
+}
+
 // handleConsume drops the oldest Count queued messages (Claude live-ack: a
 // pushed notification the adapter accepted, which may have MERGED a debounced
 // batch of Count stored lines). Consuming Count off the head matches exactly the
 // lines the push covered — otherwise a merged push of N would orphan N-1 stored
-// lines as phantom backlog. Count defaults to 1 (defensive: an older adapter or
-// a single-message push). MessageID is logged for audit; consumption is strictly
-// oldest-first (live delivery is in arrival order).
+// lines as phantom backlog. MessageID is logged for audit; consumption is
+// strictly oldest-first (live delivery is in arrival order).
+//
+// C1: Count<=0 means the push covered ZERO stored lines (an EVENT push, which is
+// never queued). We SKIP the consume entirely — bumping 0→1 here would Consume a
+// real queued backlog message that the event never delivered, silently dropping
+// it. Only a push that actually added lines (Count>=1) consumes.
 func (w *RouteWorker) handleConsume(_ context.Context, job *ConsumeJob) {
 	if job == nil || w.broker == nil || w.broker.Queue == nil {
 		return
@@ -788,7 +890,8 @@ func (w *RouteWorker) handleConsume(_ context.Context, job *ConsumeJob) {
 	defer recoverGoroutine("worker.handleConsume")
 	n := job.Count
 	if n < 1 {
-		n = 1
+		// Event / zero-covered ack: nothing to consume. Skip rather than consume 1.
+		return
 	}
 	qrk := queueRouteKey(w.key)
 	if _, err := w.broker.Queue.Consume(qrk, n); err != nil {
@@ -843,14 +946,28 @@ func newDeliveredDedup(capN int) *deliveredDedup {
 	return &deliveredDedup{seen: make(map[int64]struct{}, capN), cap: capN}
 }
 
-// seenBefore reports whether id was already delivered; otherwise records it
-// (dropping the oldest when over cap) and returns false.
-func (d *deliveredDedup) seenBefore(id int64) bool {
+// alreadySeen reports whether id was already delivered. PURE — it never records,
+// so a caller may check-then-Append-then-record and skip recording on an Append
+// failure (C2: a disk-full Append must not poison the dedup set, or every later
+// Telegram redelivery of the same message is suppressed and the message is lost).
+// id==0 is unidentifiable and never deduped.
+func (d *deliveredDedup) alreadySeen(id int64) bool {
 	if id == 0 {
 		return false // unidentifiable; never dedup
 	}
+	_, ok := d.seen[id]
+	return ok
+}
+
+// record marks id as delivered (dropping the oldest when over cap). Call ONLY
+// after the message is durably persisted (a successful Append) so a failed
+// Append never records the id (C2). A no-op for id==0 or an already-recorded id.
+func (d *deliveredDedup) record(id int64) {
+	if id == 0 {
+		return // unidentifiable; never dedup
+	}
 	if _, ok := d.seen[id]; ok {
-		return true
+		return
 	}
 	d.seen[id] = struct{}{}
 	d.order = append(d.order, id)
@@ -859,7 +976,6 @@ func (d *deliveredDedup) seenBefore(id int64) bool {
 		d.order = d.order[1:]
 		delete(d.seen, old)
 	}
-	return false
 }
 
 // dispatchOutbound translates an OutboundJob into a channel call, returning

@@ -644,7 +644,12 @@ func (c *Channel) emitEvent(updateID int64, in *c3types.Inbound, kind string) {
 		return
 	}
 	c.host.Logf("telegram: inbound update=%d kind=%s chat=%d msg=%d", updateID, kind, in.ChatID, in.MessageID)
-	c.host.Emit(in)
+	// The bool return is intentionally ignored for events: the event update_id's
+	// offset marking is owned by dispatchUpdate (it calls markUpdateDone after the
+	// event-dispatch case unconditionally), so a queue-full Emit drop of an event
+	// does not strand its update — the offset advances regardless. Events are
+	// never persisted, so there is no msgToUpdate seam to clean up here.
+	_ = c.host.Emit(in)
 }
 
 // pollTallyFromGotgbot converts a gotgbot.Poll into the in-package aggregate
@@ -793,32 +798,16 @@ func (c *Channel) dispatchMessage(updateID int64, msg *gotgbot.Message, edited b
 		c.markUpdateDone(updateID)
 		return
 	}
-	// Broker-owned command intercept: a "/status" inbound is handled by the
-	// broker directly (it answers + is NEVER gated, queued, or routed to an
-	// agent). Other commands fall through to normal gating.
-	if c.isStatusCommand(in.Text) {
-		if reply, handled := c.host.HandleCommand(in); handled {
-			var topicID *int64
-			if in.TopicID != nil {
-				topicID = in.TopicID
-			}
-			if _, err := c.SendReply(c3types.ReplyArgs{
-				Channel: c.Name(), ChatID: in.ChatID, TopicID: topicID, Text: reply,
-				Markup: c3types.MarkupMarkdown,
-			}); err != nil {
-				c.host.Logf("telegram: /status reply send failed update=%d chat=%d: %v", updateID, in.ChatID, err)
-			}
-			c.host.Logf("telegram: /status handled update=%d chat=%d thread=%d (not routed)",
-				updateID, msg.Chat.Id, msg.MessageThreadId)
-			// Handled, never persisted — unblock the offset over this update.
-			c.markUpdateDone(updateID)
-			return
-		}
-	}
 	kind := "text"
 	if len(in.Attachments) > 0 && in.Attachments[0].Kind != "" {
 		kind = in.Attachments[0].Kind
 	}
+	// I-SEC: the allowlist gate runs FIRST — BEFORE the /status intercept. A
+	// non-allowlisted stranger must get nothing back (no reply) and must never
+	// leak the broker-wide /status summary (topic names, pending counts, session
+	// counts) in a DM / group-General. So a stranger's "/status" falls into the
+	// GateInboundDrop branch below (silent default-deny). Only a GateInboundAllow
+	// result reaches the /status intercept that follows the switch.
 	switch c.host.GateInbound(in) {
 	case channel.GateInboundDrop:
 		// Silent drop. Do NOT log content; metadata only — surface enough
@@ -840,6 +829,30 @@ func (c *Channel) dispatchMessage(updateID int64, msg *gotgbot.Message, edited b
 		c.markUpdateDone(updateID)
 		return
 	}
+	// Gate ALLOWED (allowlisted sender). Broker-owned command intercept: a
+	// "/status" inbound from an allowlisted sender is handled by the broker
+	// directly (it answers + is NEVER queued or routed to an agent). It is
+	// intercepted AFTER the gate (I-SEC) so a stranger can never reach it. Other
+	// commands fall through to normal routing.
+	if c.isStatusCommand(in.Text) {
+		if reply, handled := c.host.HandleCommand(in); handled {
+			var topicID *int64
+			if in.TopicID != nil {
+				topicID = in.TopicID
+			}
+			if _, err := c.SendReply(c3types.ReplyArgs{
+				Channel: c.Name(), ChatID: in.ChatID, TopicID: topicID, Text: reply,
+				Markup: c3types.MarkupMarkdown,
+			}); err != nil {
+				c.host.Logf("telegram: /status reply send failed update=%d chat=%d: %v", updateID, in.ChatID, err)
+			}
+			c.host.Logf("telegram: /status handled update=%d chat=%d thread=%d (not routed)",
+				updateID, msg.Chat.Id, msg.MessageThreadId)
+			// Handled, never persisted — unblock the offset over this update.
+			c.markUpdateDone(updateID)
+			return
+		}
+	}
 	c.host.Logf("telegram: inbound update=%d msg=%d chat=%d thread=%d kind=%s edited=%v",
 		updateID, msg.MessageId, msg.Chat.Id, msg.MessageThreadId, kind, edited)
 	// Record the message_id → update_id seam BEFORE Emit so the broker's persist
@@ -851,5 +864,19 @@ func (c *Channel) dispatchMessage(updateID int64, msg *gotgbot.Message, edited b
 		c.msgToUpdate[in.MessageID] = updateID
 		c.mu.Unlock()
 	}
-	c.host.Emit(in)
+	// I4: Emit reports false when the worker queue is full/stopped and the inbound
+	// is DROPPED (never persisted). The seam above already staged msgToUpdate +
+	// the tracker's in-flight registration for this update, so a drop would strand
+	// the update_id in-flight forever and wedge the contiguous-prefix offset for
+	// ALL inbound on a >64 burst. The message is gone from the pipeline, so the
+	// offset MUST move past it: clear the now-orphaned seam entry and mark the
+	// update done. (Telegram won't redeliver it within this offset, matching the
+	// existing emit-DROP semantics — a queue-full burst is a capacity drop, logged
+	// loudly by Emit, not a silent loss-of-offset wedge.)
+	if !c.host.Emit(in) && c.offTrk != nil {
+		c.mu.Lock()
+		delete(c.msgToUpdate, in.MessageID)
+		c.mu.Unlock()
+		c.markUpdateDone(updateID)
+	}
 }

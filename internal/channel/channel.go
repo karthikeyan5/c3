@@ -42,7 +42,15 @@ type Channel interface {
 // to channel concerns (config + emit + log + done + gate).
 type Host interface {
 	Config(name string, target any) error
-	Emit(in *c3types.Inbound)
+	// Emit submits an inbound to the broker's per-route worker pool. It returns
+	// true when the inbound was accepted onto a worker queue (and will be
+	// persisted there), false when it was DROPPED (worker queue full or stopped).
+	// On a false return the inbound never reaches durable storage, so a caller
+	// that staged any in-flight bookkeeping for it (e.g. the persisted-offset
+	// tracker's msgToUpdate seam) MUST resolve that bookkeeping itself — otherwise
+	// the source update_id stays in-flight forever and wedges the contiguous-prefix
+	// offset for ALL inbound (I4).
+	Emit(in *c3types.Inbound) bool
 	Logf(format string, args ...any)
 	Done() <-chan struct{}
 

@@ -261,6 +261,45 @@ func TestStatusAll_ReportsPendingAndOldest(t *testing.T) {
 	}
 }
 
+// I7: StatusFor reads the in-memory index for ONE route (no file I/O), so a
+// per-topic /status read is race-free against a concurrent worker. It must match
+// by VALUE identity: RouteKey.TopicID is a *int64, so a query RouteKey carrying a
+// DISTINCT pointer to the same topic value must still find the stored entry (a raw
+// map lookup would miss). This also pins the latent pointer-key bug the fix avoids.
+func TestStatusFor_IndexBackedAndPointerSafe(t *testing.T) {
+	s := newStore(t)
+	stored := int64(914)
+	rk := RouteKey{Channel: "telegram", ChatID: -100, TopicID: &stored}
+	_ = s.Append(rk, &c3types.Inbound{Channel: "telegram", ChatID: -100, TopicID: &stored, MessageID: 1, Text: "m", Timestamp: time.Now().Add(-time.Hour)})
+	_ = s.Append(rk, &c3types.Inbound{Channel: "telegram", ChatID: -100, TopicID: &stored, MessageID: 2, Text: "m", Timestamp: time.Now()})
+
+	// Query with a SEPARATE pointer to the same topic id (what the broker builds via
+	// queueRouteKey on each call).
+	queryTopic := int64(914)
+	query := RouteKey{Channel: "telegram", ChatID: -100, TopicID: &queryTopic}
+	st := s.StatusFor(query)
+	if st.Pending != 2 {
+		t.Fatalf("StatusFor.Pending = %d, want 2 (value-identity match across distinct *int64 pointers)", st.Pending)
+	}
+	if st.OldestUnix == 0 {
+		t.Fatalf("StatusFor.OldestUnix = 0, want the oldest pending timestamp")
+	}
+
+	// A route with nothing queued returns the zero Status.
+	none := RouteKey{Channel: "telegram", ChatID: -999}
+	if got := s.StatusFor(none); got.Pending != 0 {
+		t.Fatalf("StatusFor for an empty route = %+v, want zero Status", got)
+	}
+
+	// After draining, StatusFor reflects the index update (no stale count).
+	if _, err := s.Consume(rk, -1); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.StatusFor(query); got.Pending != 0 {
+		t.Fatalf("StatusFor after drain = %+v, want Pending 0", got)
+	}
+}
+
 // -race coverage with a DETERMINISTIC post-condition: a single route worker
 // interleaving appends + consumes must be race-free (all calls funnel through one
 // goroutine, mirroring the worker's single-owner model) AND must never return a
