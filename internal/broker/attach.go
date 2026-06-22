@@ -208,7 +208,7 @@ func (b *Broker) attachDM(conn *ipc.Conn, stub *Stub, chanName string, steal, re
 	if !b.tryClaim(conn, stub, key, "DM", steal, replay) {
 		return
 	}
-	_ = conn.WriteJSON(ipc.AttachedMsg{
+	_ = conn.WriteJSON(b.withBacklog(key, ipc.AttachedMsg{
 		Op:           ipc.OpAttached,
 		OK:           true,
 		Status:       ipc.AttachStatusOK,
@@ -216,7 +216,7 @@ func (b *Broker) attachDM(conn *ipc.Conn, stub *Stub, chanName string, steal, re
 		ChatID:       cc.DMChatID,
 		Name:         "dm",
 		Capabilities: b.capsForChannel(chanName),
-	})
+	}))
 }
 
 // attachByTopicID validates a topic id against the channel (cheap typing
@@ -273,7 +273,7 @@ func (b *Broker) attachByTopicID(conn *ipc.Conn, stub *Stub, chanName string, to
 	tp, _ := b.Mappings().LookupTopicByID(chanName, gCfg.ChatID, topicID)
 	b.persistMapping(stub, chanName, gCfg.ChatID, topicID, tp.Name, gName)
 
-	_ = conn.WriteJSON(ipc.AttachedMsg{
+	_ = conn.WriteJSON(b.withBacklog(key, ipc.AttachedMsg{
 		Op:           ipc.OpAttached,
 		OK:           true,
 		Status:       ipc.AttachStatusOK,
@@ -283,7 +283,7 @@ func (b *Broker) attachByTopicID(conn *ipc.Conn, stub *Stub, chanName string, to
 		Name:         tp.Name,
 		Group:        gName,
 		Capabilities: b.capsForChannel(chanName),
-	})
+	}))
 }
 
 // attachByName runs the full search flow per spec §5.2-§5.4:
@@ -365,13 +365,13 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 					return
 				}
 				b.persistMapping(stub, chanName, m.ChatID, m.TopicID, m.Name, m.Group)
-				_ = conn.WriteJSON(ipc.AttachedMsg{
+				_ = conn.WriteJSON(b.withBacklog(key, ipc.AttachedMsg{
 					Op: ipc.OpAttached, OK: true,
 					Status:  ipc.AttachStatusOK,
 					Channel: chanName, ChatID: m.ChatID, TopicID: tidPtr,
 					Name: m.Name, Group: m.Group,
 					Capabilities: b.capsForChannel(chanName),
-				})
+				}))
 				return
 			}
 		}
@@ -405,13 +405,13 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 			return
 		}
 		b.persistMapping(stub, chanName, tp.ChatID, tp.TopicID, tp.Name, tp.Group)
-		_ = conn.WriteJSON(ipc.AttachedMsg{
+		_ = conn.WriteJSON(b.withBacklog(key, ipc.AttachedMsg{
 			Op: ipc.OpAttached, OK: true,
 			Status:  ipc.AttachStatusOK,
 			Channel: chanName, ChatID: tp.ChatID, TopicID: &tid,
 			Name: tp.Name, Group: tp.Group,
 			Capabilities: b.capsForChannel(chanName),
-		})
+		}))
 		return
 	}
 
@@ -488,13 +488,13 @@ func (b *Broker) createAndClaim(conn *ipc.Conn, stub *Stub, chanName, gName stri
 	}
 	_ = b.SaveMappings()
 
-	_ = conn.WriteJSON(ipc.AttachedMsg{
+	_ = conn.WriteJSON(b.withBacklog(key, ipc.AttachedMsg{
 		Op: ipc.OpAttached, OK: true,
 		Status:  ipc.AttachStatusOK,
 		Channel: chanName, ChatID: chatID, TopicID: &tid,
 		Name: name, Group: gName,
 		Capabilities: b.capsForChannel(chanName),
-	})
+	}))
 }
 
 // heldByDifferentLiveSession reports whether key is currently claimed by a
@@ -782,4 +782,81 @@ func (b *Broker) defaultChannel() string {
 		return name
 	}
 	return ""
+}
+
+// backlogSummaryMax bounds the compact attach-time preview (full content comes
+// via fetch_queue). Three rows keep the on-attach notification short.
+const backlogSummaryMax = 3
+
+// backlogSummary returns the total queued count and a compact preview (oldest up
+// to backlogSummaryMax) for the just-claimed route. Peek only — never consumes;
+// the agent drains via fetch_queue. Empty/zero when nothing is queued or the
+// queue is disabled.
+func (b *Broker) backlogSummary(key RouteKey) (int, []ipc.QueuedItem) {
+	if b.Queue == nil {
+		return 0, nil
+	}
+	qrk := queueRouteKey(key)
+	count, _ := b.Queue.Pending(qrk)
+	if count == 0 {
+		return 0, nil
+	}
+	preview, err := b.Queue.Peek(qrk, backlogSummaryMax)
+	if err != nil {
+		log.Printf("backlog summary peek FAIL %s: %v", routeKeyStr(key), err)
+		return count, nil
+	}
+	items := make([]ipc.QueuedItem, 0, len(preview))
+	for i := range preview {
+		in := &preview[i]
+		items = append(items, ipc.QueuedItem{
+			MessageID: in.MessageID,
+			Sender:    senderLabel(in.Sender),
+			Kind:      inboundKindLabel(in),
+			Unix:      in.Timestamp.Unix(),
+			Preview:   previewText(in, 80),
+		})
+	}
+	return count, items
+}
+
+// senderLabel renders a compact sender label for the backlog preview.
+func senderLabel(s c3types.Sender) string {
+	if s.Username != "" {
+		return "@" + s.Username
+	}
+	if s.UserID != 0 {
+		return fmt.Sprintf("uid=%d", s.UserID)
+	}
+	return ""
+}
+
+// inboundKindLabel returns "text" or the first attachment kind / event kind.
+func inboundKindLabel(in *c3types.Inbound) string {
+	if in.IsEvent() {
+		return string(in.Kind)
+	}
+	if len(in.Attachments) > 0 && in.Attachments[0].Kind != "" {
+		return in.Attachments[0].Kind
+	}
+	return "text"
+}
+
+// previewText returns a rune-safe truncated snippet of an inbound's text.
+func previewText(in *c3types.Inbound, n int) string {
+	r := []rune(in.Text)
+	if len(r) <= n {
+		return in.Text
+	}
+	return string(r[:n]) + "…"
+}
+
+// withBacklog returns msg with the route's queued-count + compact summary
+// stamped in (no-op when nothing is queued). Call it on every OK=true attach
+// response so a session learns of held messages immediately.
+func (b *Broker) withBacklog(key RouteKey, msg ipc.AttachedMsg) ipc.AttachedMsg {
+	count, items := b.backlogSummary(key)
+	msg.QueuedCount = count
+	msg.QueuedSummary = items
+	return msg
 }
