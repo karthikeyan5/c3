@@ -238,6 +238,25 @@ re-running is safe. Tell the user to open a fresh terminal and verify with
 If they don't have Codex installed yet, skip — they can run this later
 after `npm install -g @openai/codex` (or however they get Codex).
 
+## 6.5. (Optional) Supervise the broker with systemd
+
+By default the broker is spawned on demand by the first adapter and stays up as
+a singleton. If you want it auto-restarted even when **no CLI session is open**
+(so a crash can't leave inbound silently dead until your next launch), enable the
+opt-in `systemd --user` unit:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp dist/systemd/c3-broker.service ~/.config/systemd/user/
+# If your GOBIN isn't ~/go/bin, edit ExecStart= first (go env GOBIN GOPATH).
+systemctl --user daemon-reload
+systemctl --user enable --now c3-broker.service
+loginctl enable-linger "$USER"   # keep it running across logout
+```
+
+It coexists with adapter auto-spawn (the broker is a flock singleton). See
+`dist/systemd/README.md` for details and uninstall.
+
 ## 7. Tell the user the install is complete
 
 > "Installation complete.
