@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"runtime"
 	"time"
 
 	"github.com/PaulSonOfLars/gotgbot/v2"
@@ -93,11 +94,12 @@ var allowedUpdates = []string{"message", "edited_message", "callback_query", "me
 // re-introduce the 2026-05-09 bug.
 func (c *Channel) pollLoop() {
 	const (
-		longPoll      = longPollTimeoutSeconds
-		maxRetryAfter = 60 * time.Second
-		trippedSleep  = 5 * time.Minute
-		baseBackoff   = time.Second
-		maxBackoff    = 30 * time.Second
+		longPoll            = longPollTimeoutSeconds
+		maxRetryAfter       = 60 * time.Second
+		trippedSleep        = 5 * time.Minute
+		baseBackoff         = time.Second
+		maxBackoff          = 30 * time.Second
+		offsetSaveFailAlert = 5 // consecutive Save failures before one loud advisory
 	)
 
 	// consecTransient counts consecutive TRANSIENT GetUpdates failures (the
@@ -115,6 +117,12 @@ func (c *Channel) pollLoop() {
 	// second poller). Reset on the first success and on any non-conflict outcome.
 	var consecConflict int
 
+	// consecSaveFail counts consecutive offset-persistence failures so a
+	// sustained failure escalates from a quiet per-line log to ONE loud advisory
+	// (at offsetSaveFailAlert): a silently-failing Save re-floods the CLI with
+	// re-delivered updates on the next restart, which dedup can't cover for long.
+	var consecSaveFail int
+
 	// Effective 409-conflict backoff bounds. Zero fields ⇒ the production
 	// defaults; tests inject millisecond values to exercise the retry path fast.
 	conflictBase := c.conflictBackoffBase
@@ -127,6 +135,10 @@ func (c *Channel) pollLoop() {
 	}
 	conflictBackoff := conflictBase
 
+	// Offset resumes from the PERSISTED store. A supervised panic-restart
+	// re-enters here and re-Loads, so it resumes from the last SAVED offset, not
+	// in-memory progress — if Save was failing (see the offset-save advisory
+	// below) a restart can re-deliver recent updates; the dedup map bounds that.
 	var offset int64
 	if c.offsets != nil {
 		if loaded, err := c.offsets.Load(); err == nil && loaded > 0 {
@@ -170,9 +182,22 @@ func (c *Channel) pollLoop() {
 		}
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
+				// Shutdown. We intentionally do NOT run the conflict-clear below:
+				// the channel is stopping and conflictActive is per-Channel state
+				// that dies with the goroutines, so a stale true is harmless here.
 				return
 			}
 			class, retryAfter := classifyError(err)
+			if class != errClassConflict {
+				// A non-conflict outcome breaks any consecutive-409 streak: reset
+				// the conflict counter/backoff and clear conflictActive so a 409 is
+				// no longer treated as the current inbound blocker (the success path
+				// clears these too). This is also what keeps the consecConflict
+				// comment honest ("reset on any non-conflict outcome").
+				consecConflict = 0
+				conflictBackoff = conflictBase
+				c.conflictActive.Store(false)
+			}
 			switch class {
 			case errClassConflict:
 				// 409 — Telegram reports another getUpdates is active for this
@@ -196,6 +221,7 @@ func (c *Channel) pollLoop() {
 				// never triggers endpoint failover — reset the transient streak.
 				consecTransient = 0
 				consecConflict++
+				c.conflictActive.Store(true)
 				c.reportHealth(c.health.RecordFailure("409 conflict (another getUpdates active)"))
 				c.host.Logf("telegram: 409 CONFLICT (consec=%d) — another getUpdates is active for this bot token; backing off %v and retrying. Self-heals once the other poll ends; no kill/restart needed. Error: %v",
 					consecConflict, conflictBackoff, err)
@@ -308,9 +334,11 @@ func (c *Channel) pollLoop() {
 		backoff = baseBackoff
 		// A success after a 409 means the conflict cleared (the racing poll
 		// ended / the other instance went away) — reset the conflict backoff and
-		// streak so a later, unrelated conflict starts fresh from the base delay.
+		// streak so a later, unrelated conflict starts fresh from the base delay,
+		// and clear conflictActive so the heartbeat may resume clearing DOWN.
 		conflictBackoff = conflictBase
 		consecConflict = 0
+		c.conflictActive.Store(false)
 		// A working endpoint sticks: the first success clears the failover streak
 		// so we don't rotate away from a base that just recovered.
 		consecTransient = 0
@@ -330,7 +358,7 @@ func (c *Channel) pollLoop() {
 			if i < len(probes) {
 				richRaw = richRawFor(probes[i])
 			}
-			c.dispatchUpdate(&u, richRaw)
+			c.dispatchGuarded(&u, richRaw)
 			if u.UpdateId >= offset {
 				offset = u.UpdateId + 1
 				advanced = true
@@ -339,10 +367,36 @@ func (c *Channel) pollLoop() {
 		if advanced && c.offsets != nil {
 			// Best-effort: log the failure but don't stop polling.
 			if err := c.offsets.Save(offset - 1); err != nil {
-				c.host.Logf("telegram: offset Save failed: %v", err)
+				consecSaveFail++
+				c.host.Logf("telegram: offset Save failed (consec=%d): %v", consecSaveFail, err)
+				if consecSaveFail == offsetSaveFailAlert {
+					c.host.Logf("telegram: WARNING offset persistence has failed %d times in a row — a broker restart will RE-DELIVER recent updates (dedup can't cover a long gap) until this clears; check the offset store path is writable.", consecSaveFail)
+				}
+			} else {
+				consecSaveFail = 0
 			}
 		}
 	}
+}
+
+// dispatchGuarded runs dispatchUpdate under a panic recover. A panic while
+// handling ONE update (a malformed payload, a nil deref in a converter, a bug
+// in a plugin) must NOT kill polling: we log the panic + stack and return, and
+// the caller advances the offset past this update so it is SKIPPED rather than
+// re-fetched forever (a poison pill would otherwise wedge inbound permanently,
+// or — under the goroutine supervisor — tight-loop on restart). Losing one bad
+// update is the correct trade against inbound going dead. A dispatch panic is a
+// code bug, not a Telegram-reachability problem, so it does NOT drive
+// fetch-health DOWN (that would be a false outage alarm).
+func (c *Channel) dispatchGuarded(u *gotgbot.Update, richRaw json.RawMessage) {
+	defer func() {
+		if r := recover(); r != nil {
+			buf := make([]byte, 8192)
+			n := runtime.Stack(buf, false)
+			c.host.Logf("telegram: dispatch PANIC recovered (update=%d skipped): %v\n%s", u.UpdateId, r, buf[:n])
+		}
+	}()
+	c.dispatchUpdate(u, richRaw)
 }
 
 // dispatchUpdate converts a single Update into an Inbound (or several) and

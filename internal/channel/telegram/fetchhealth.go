@@ -129,8 +129,16 @@ func (h *fetchHealth) CheckSilence() healthTransition {
 		return healthNoChange
 	}
 	if h.now().Sub(h.lastSuccess) > h.maxSilence {
-		if h.lastReason == "" {
-			h.lastReason = "no successful fetch (silence)"
+		// Silence is its own DOWN cause (a hung getUpdates that neither succeeds
+		// nor errors fast), distinct from a fast-error streak. Stamp a
+		// silence-specific reason UNCONDITIONALLY so a stale earlier fast-error
+		// reason can't mislabel it, and make the reported consec consistent with
+		// the documented threshold so the alert text isn't self-contradictory
+		// (the old behavior could surface "consec=2" against a "down after 3"
+		// threshold because the silence arm never incremented consecFails).
+		h.lastReason = "no successful fetch (silence > max-silence; hung/stalled)"
+		if h.consecFails < h.downAfter {
+			h.consecFails = h.downAfter
 		}
 		return h.goDownLocked()
 	}

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -130,6 +131,16 @@ type Channel struct {
 	// production code — Start leaves them zero so pollLoop uses the defaults.
 	conflictBackoffBase time.Duration
 	conflictBackoffMax  time.Duration
+
+	// conflictActive is true while a getUpdates 409 conflict is the current
+	// reason inbound is down (set on a 409, cleared on the first non-conflict
+	// getUpdates outcome — success OR any other error). It exists because the
+	// poll loop now STAYS ALIVE across a persistent 409 (see poll.go): without
+	// this flag the 5-min getMe heartbeat — which never sees a 409 — would
+	// RecordSuccess and falsely clear the DOWN alert while inbound is still
+	// conflict-dead. recordHeartbeatSuccess consults it. Cross-goroutine
+	// (pollLoop writes, heartbeat reads), hence atomic.
+	conflictActive atomic.Bool
 
 	// health is the single fetch-health state machine. It is the ONLY source
 	// of "is Telegram reachable?" — it replaced the two prior competing
@@ -289,14 +300,65 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 
 	// Start the long-poll loop in a goroutine. Returns immediately after
 	// kicking off — Telegram-side processing is async from the broker's
-	// startup path.
+	// startup path. Each long-lived goroutine runs under superviseLoop so a
+	// panic is recovered + logged + drives health DOWN + the loop restarts,
+	// instead of crashing the whole broker process (the silent-death class the
+	// recovery audit flagged — a panic is even quieter than the old 409-exit).
 	go func() {
 		defer close(c.pollDone)
-		c.pollLoop()
+		c.superviseLoop("pollLoop", superviseRestartBackoff, c.pollLoop)
 	}()
-	go c.silenceWatchdog()
-	go c.heartbeat()
+	go c.superviseLoop("silenceWatchdog", superviseRestartBackoff, c.silenceWatchdog)
+	go c.superviseLoop("heartbeat", superviseRestartBackoff, c.heartbeat)
 	return nil
+}
+
+// superviseRestartBackoff is the pause before a panicked long-lived goroutine
+// is restarted, so a deterministically-panicking loop can't tight-spin.
+const superviseRestartBackoff = 2 * time.Second
+
+// superviseLoop runs body, and if it PANICS, recovers it, logs the panic +
+// stack, drives the fetch-health machine DOWN (so the operator is alerted
+// out-of-band), waits restartBackoff, and re-runs body — a lightweight
+// supervisor. A NORMAL return from body means it observed ctx cancel /
+// shutdown, so the supervisor returns too (no restart). ctx cancellation is
+// honored during the backoff. This converts an unrecovered goroutine panic —
+// which in Go crashes the ENTIRE broker process (and then, with no breadcrumb
+// in broker.log, a silent death) — into a logged, alerted, auto-restarted loop.
+func (c *Channel) superviseLoop(name string, restartBackoff time.Duration, body func()) {
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		default:
+		}
+		if !c.runGuarded(name, body) {
+			return // body returned normally → shutdown; stop supervising.
+		}
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-time.After(restartBackoff):
+		}
+	}
+}
+
+// runGuarded runs body under a panic recover. On panic it returns true after
+// logging the panic + stack and driving health DOWN via RecordFailure; on a
+// normal return it returns false and touches nothing. Separated from
+// superviseLoop so the recover semantics are unit-testable directly.
+func (c *Channel) runGuarded(name string, body func()) (panicked bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			panicked = true
+			buf := make([]byte, 8192)
+			n := runtime.Stack(buf, false)
+			c.host.Logf("telegram: %s PANIC recovered: %v\n%s", name, r, buf[:n])
+			c.reportHealth(c.health.RecordFailure(name + " panic"))
+		}
+	}()
+	body()
+	return false
 }
 
 // reportHealth fires host.NotifyHealth for a transition edge, building the
@@ -404,10 +466,26 @@ func (c *Channel) heartbeat() {
 				c.host.Logf("telegram: heartbeat getMe 429 rate-limited (reachable; not counted as down): %v", err)
 			}
 		} else {
-			c.reportHealth(c.health.RecordSuccess())
+			c.recordHeartbeatSuccess()
 		}
 		timer.Reset(heartbeatInterval)
 	}
+}
+
+// recordHeartbeatSuccess records a getMe success into the health machine —
+// EXCEPT while a getUpdates 409 conflict is active. getMe never returns a 409
+// (conflict is exclusive to getUpdates / setWebhook), so a getMe success proves
+// only "Telegram reachable + token valid", NOT "inbound is flowing". Since the
+// poll loop now stays alive across a persistent 409, clearing DOWN here would
+// falsely signal RECOVERED while inbound is still conflict-dead. So when a
+// conflict is active we log and leave the DOWN alert standing; only a real
+// getUpdates success (which clears conflictActive) recovers it.
+func (c *Channel) recordHeartbeatSuccess() {
+	if c.conflictActive.Load() {
+		c.host.Logf("telegram: heartbeat getMe ok, but a getUpdates 409 conflict is active — NOT clearing DOWN (inbound still conflicted)")
+		return
+	}
+	c.reportHealth(c.health.RecordSuccess())
 }
 
 // Stop halts the polling loop and shuts down the bot.
