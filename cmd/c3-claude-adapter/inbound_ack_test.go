@@ -117,3 +117,54 @@ func TestHandleInbound_EventPushSkipsDeliveredAck(t *testing.T) {
 		t.Fatal("an event push must NOT send a delivered-ack (events are never queued; an ack would over-consume real backlog)")
 	}
 }
+
+// Item E (push-path nudge on the PUSH content): when the broker reports remaining
+// backlog (in.Pending > 0), handleInbound must decorate the PUSHED channel
+// content with the recovery nudge ("(N pending — call fetch_queue)") — not only
+// the delivered-ack. The existing ack tests assert the ack frame; this asserts
+// the nudge text lands on the notify push itself.
+func TestHandleInbound_PendingDecoratesPushWithNudge(t *testing.T) {
+	a := newAdapter()
+
+	// A notifyTx backed by an in-memory buffer we can inspect for the pushed frame.
+	var buf safeBuffer
+	tx := newNotifyTransport(&mcp.IOTransport{
+		Reader: nopCloseReader{strings.NewReader("")},
+		Writer: nopCloseWriter{&buf},
+	})
+	if _, err := tx.Connect(context.Background()); err != nil {
+		t.Fatalf("notifyTx Connect: %v", err)
+	}
+	a.notifyTx = tx
+
+	// Broker socket pair so the post-push delivered-ack write has somewhere to go.
+	peerSide, brokerSide := net.Pipe()
+	t.Cleanup(func() { peerSide.Close(); brokerSide.Close() })
+	a.bmu.Lock()
+	a.conn = ipc.NewConn(brokerSide)
+	a.bmu.Unlock()
+	// Drain the broker side so the ack write doesn't block on the pipe.
+	go func() {
+		c := ipc.NewConn(peerSide)
+		for {
+			if _, err := c.ReadFrame(); err != nil {
+				return
+			}
+		}
+	}()
+
+	msg := ipc.InboundMsg{
+		Op:      ipc.OpInbound,
+		Covered: 1,
+		Pending: 3, // broker reports 3 still queued ⇒ nudge must appear on the push
+		Inbound: c3types.Inbound{Channel: "telegram", ChatID: -100, MessageID: 7, Text: "hi"},
+	}
+	raw, _ := json.Marshal(msg)
+	a.handleInbound(context.Background(), raw)
+
+	// The pushed notification (serialized to buf) must carry the recovery nudge.
+	out := string(buf.Bytes())
+	if !strings.Contains(out, "3 pending") || !strings.Contains(out, "fetch_queue") {
+		t.Fatalf("push content must carry the recovery nudge '(3 pending — call fetch_queue)'; pushed frame was:\n%s", out)
+	}
+}

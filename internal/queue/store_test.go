@@ -468,3 +468,71 @@ func appendRawLine(t *testing.T, dir string, rk RouteKey, raw string) error {
 	_, err = f.WriteString(raw + "\n")
 	return err
 }
+
+// Item E (RefreshText cursor-remap branch): a corrupt line that sits BEFORE the
+// cursor (already consumed past) is stripped by RefreshText's rewrite, so the
+// cursor must be remapped into the corrupt-free coordinate space (store.go
+// ~330-369). After consuming past the corrupt line, refreshing a still-pending
+// line must update exactly that line, keep the other pending line(s) intact, and
+// leave Pending correct (no off-by-one from the dropped corrupt line).
+func TestRefreshText_CursorRemapAfterCorruptBeforeCursor(t *testing.T) {
+	s := newStore(t)
+	rk := RouteKey{Channel: "telegram", ChatID: -100}
+	// Layout: [msg1] [corrupt] [msg2] [msg3]. msg1 is appended first so the file
+	// exists before appendRawLine writes the corrupt placeholder.
+	if err := s.Append(rk, msg(1, "old-1")); err != nil {
+		t.Fatalf("append 1: %v", err)
+	}
+	if err := appendRawLine(t, QueueDir(), rk, "{corrupt"); err != nil {
+		t.Fatal(err)
+	}
+	for i := int64(2); i <= 3; i++ {
+		if err := s.Append(rk, msg(i, "old-"+strconv.FormatInt(i, 10))); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+
+	// Consume 2 REAL messages: msg1 then (stepping over the corrupt line) msg2.
+	// The cursor now sits PAST the corrupt line — corrupt is behind it, msg3 is the
+	// sole still-pending line.
+	got, err := s.Consume(rk, 2)
+	if err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+	if len(got) != 2 || got[0].MessageID != 1 || got[1].MessageID != 2 {
+		t.Fatalf("consume = %+v, want msg1,msg2", got)
+	}
+	if n, _ := s.Pending(rk); n != 1 {
+		t.Fatalf("pending after consume = %d, want 1 (msg3)", n)
+	}
+
+	// Refresh the still-pending msg3. rewrite() drops the corrupt line that sat
+	// BEFORE the cursor, so the cursor must be remapped into the corrupt-free space
+	// (the store.go ~330-369 branch); a desync here would mis-serve or skip msg3.
+	ok, err := s.RefreshText(rk, 3, "fixed transcript")
+	if err != nil {
+		t.Fatalf("RefreshText: %v", err)
+	}
+	if !ok {
+		t.Fatal("RefreshText should hit the still-pending msg3")
+	}
+
+	// msg3 stays the sole pending line, refreshed, served exactly once — proving the
+	// remapped cursor stays aligned with the rewritten file.
+	if n, _ := s.Pending(rk); n != 1 {
+		t.Fatalf("pending after refresh = %d, want 1", n)
+	}
+	drained, err := s.Consume(rk, -1)
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if len(drained) != 1 || drained[0].MessageID != 3 {
+		t.Fatalf("drain after refresh = %+v, want msg3 exactly once", drained)
+	}
+	if drained[0].Text != "fixed transcript" {
+		t.Fatalf("msg3 text = %q, want refreshed 'fixed transcript'", drained[0].Text)
+	}
+	if n, _ := s.Pending(rk); n != 0 {
+		t.Fatalf("pending after drain = %d, want 0", n)
+	}
+}
