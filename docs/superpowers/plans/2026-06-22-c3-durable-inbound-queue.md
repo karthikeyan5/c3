@@ -2622,13 +2622,7 @@ git commit -m "$(printf 'feat(broker): backlog count + compact summary on attach
 
 `fetch_queue` routes through the claimed route's worker (`JobFetch`) so file ops stay single-owner. `retranscribe` re-runs `Plugins.FireOnVoiceReceived` on the `file_id` (downloading via the channel if needed) and returns the fresh transcript.
 
-> **KNOWN DIVERGENCE FROM SPEC — surface to Karthi before shipping (do not ship silently).** Spec Component 5 (line 151) states the optional `message_id`: "if the corresponding message is still queued, its stored `Text` is refreshed in place during a cap-safe rewrite." **This plan does NOT implement that in-place refresh in v1** — `retranscribe` returns the fresh transcript, and `RetranscribeReq.MessageID` is accepted-but-not-yet-acted-on (no error). Consequence: after a successful `retranscribe`, a still-queued message keeps its STT-failure placeholder `Text`, so a later `fetch_queue` returns the failed text, not the fixed transcript — the agent must hold the transcript in its own context rather than re-fetching it.
->
-> This is a deliberate v1 scope cut, not a placeholder, but it is a *behavior* the spec asserts, so it must be a flagged divergence for Karthi (per the review). Two acceptable resolutions, pick one with Karthi:
-> 1. **Implement it** — add a `JobRefreshText{MessageID, NewText}` worker job (single-owner, reusing the store's cap-safe `rewrite` path from Task 2) that reads → rewrites the matching still-queued line's `Text` in place, and call it from `handleRetranscribe` when `req.MessageID != 0` and the message is still queued. Then the spec guarantee holds and this divergence note is removed.
-> 2. **Descope in the spec** — get explicit sign-off to drop the "refreshed in place" guarantee from spec line 151 (e.g. "v1: retranscribe returns the fresh transcript; in-place refresh of a still-queued message_id is deferred to a follow-up"), so plan and spec agree.
->
-> Until Karthi rules, v1 returns the transcript and treats `message_id` as a no-op (pinned by a test in Step 1 below).
+> **SHIPPED (resolution 1 — implemented).** Spec Component 5 (line 151)'s optional `message_id` in-place refresh IS implemented and tested. `handleRetranscribe` submits a `JobRefreshText{MessageID, NewText}` worker job (single-owner, reusing the store's cap-safe `rewrite` path) when `req.MessageID != 0` and the message is still queued: the matching still-queued line's `Text` is rewritten in place, so a later `fetch_queue` returns the corrected transcript rather than the STT-failure placeholder. A `message_id` that is never-queued / already-consumed is a clean no-op and the transcript is still returned. (The earlier "KNOWN DIVERGENCE / v1 no-op / deferred pending Karthi" note is obsolete — this was built, not deferred. See `internal/queue/store.go` `RefreshText` and `internal/broker/queue_dispatch.go` `handleRetranscribe`.)
 
 - [ ] **Step 1: Write the failing test** — create `internal/broker/queue_dispatch_test.go`:
 
@@ -2750,10 +2744,14 @@ func TestHandleRetranscribe_ReRunsSTT(t *testing.T) {
 	}
 }
 
-// message_id is accepted but a no-op in v1 (in-place refresh is a KNOWN
-// DIVERGENCE deferred pending Karthi). Passing it must not error and must still
-// return the fresh transcript. Pins the accepted-but-ignored field so the
-// deferred behavior is explicit, not silently broken.
+// NOTE (post-ship): this sample pinned the ORIGINALLY-PLANNED v1 behavior where
+// message_id was accepted-but-ignored. The in-place refresh WAS subsequently
+// implemented (resolution 1 above), so the shipped suite supersedes this: a
+// still-queued message_id is now refreshed in place (RefreshText), and the
+// shipped tests assert the refresh hit/miss directly. A message_id that is
+// absent / already-consumed remains a clean no-op that still returns the
+// transcript, which this sample's assertion (no error + transcript returned)
+// still illustrates.
 func TestHandleRetranscribe_MessageIDIsNoOp(t *testing.T) {
 	t.Setenv("C3_QUEUE_DIR", t.TempDir())
 	b := brokerWithChannel(t, mfWithTelegram(), &fakeChannel{})
@@ -2913,10 +2911,12 @@ func (b *Broker) handleFetchQueue(conn *ipc.Conn, stub *Stub, raw []byte) {
 // handleRetranscribe re-runs the STT provider chain on a cached voice
 // attachment by file_id and returns the fresh transcript. Downloads via the
 // channel are handled inside the STT plugin chain (it owns DownloadAttachment).
-// v1: retranscribe returns the fresh transcript; in-place refresh of a still-
-// queued message_id is a KNOWN DIVERGENCE from spec Component 5, deferred pending
-// Karthi's resolution (see the divergence note above). MessageID is accepted but
-// currently a no-op (it does not error).
+// SHIPPED: retranscribe returns the fresh transcript AND, when message_id is
+// given and that message is still queued, refreshes its stored Text in place via
+// a JobRefreshText worker job (spec Component 5 — implemented, not deferred). The
+// body below is the originally-planned no-op sample; the shipped handler adds the
+// in-place-refresh block and bounds the STT call with a timeout context. See
+// internal/broker/queue_dispatch.go for the as-shipped code.
 func (b *Broker) handleRetranscribe(conn *ipc.Conn, stub *Stub, raw []byte) {
 	var req ipc.RetranscribeReq
 	if err := json.Unmarshal(raw, &req); err != nil {
@@ -3752,7 +3752,7 @@ git commit -m "$(printf 'docs(c3): document durable inbound queue, /status, fetc
 - Component 2 (persisted-offset tracker: contiguous-prefix advance, gated/dropped immediate-done, crash-before-persist no advance; STT at flush time, per-message storage) → **Task 3** (tracker) + **Task 4** (per-message append at flush) + **Task 5c** (poll-loop wiring, with `offset_wiring_test.go` guarding the crash-before-persist seam — the safety property has a real red→green test, not "mechanical glue, no test").
 - Component 3 (delivery per-adapter: Claude push + OpInboundDelivered consume; Codex pull-only) → **Task 4** (consume job + delivered semantics; `ConsumeJob.Count` so a MERGED push consumes all N covered lines, not 1), **Task 9** (Claude ack echoes `Covered`→`Count`; push-path recovery nudge via `InboundMsg.Pending`), **Task 10** (Codex pull).
 - Component 4 (`fetch_queue`: limit default 3 / "all" / max 50, ack default true, returns content + remaining; drain-all vs batches in tool description) → **Task 1** (IPC), **Task 7** (handler), **Tasks 9/10** (tools).
-- Component 5 (`retranscribe{file_id required, message_id optional}` re-runs FireOnVoiceReceived) → **Task 1**, **Task 7**, **Tasks 9/10**. **KNOWN DIVERGENCE flagged for Karthi:** spec line 151's "refreshed in place" for a still-queued `message_id` is NOT implemented in v1 (transcript returned, `message_id` a no-op pinned by `TestHandleRetranscribe_MessageIDIsNoOp`); resolve by implementing the `JobRefreshText` worker job OR descoping the spec line — see the divergence note in Task 7.
+- Component 5 (`retranscribe{file_id required, message_id optional}` re-runs FireOnVoiceReceived) → **Task 1**, **Task 7**, **Tasks 9/10**. **SHIPPED in full:** spec line 151's "refreshed in place" for a still-queued `message_id` IS implemented — `handleRetranscribe` submits a `JobRefreshText` worker job that rewrites the matching still-queued line's `Text` in place (cap-safe rewrite), tested by the store's `RefreshText` suite + the broker retranscribe-refresh tests. (The earlier "KNOWN DIVERGENCE / no-op / deferred pending Karthi" status is obsolete.)
 - Component 6a (held-reply replacing the drop, running count, 5-min cooldown) → **Task 4**.
 - Component 6b (`/status` in-topic + global, setMyCommands, never queued/routed, marked done) → **Task 5a** (renderer + interface) / **5b** (intercept + setMyCommands + `TestStatusCommand_NotRouted` asserting no Emit) / **5c** (offset wiring marks `/status` done).
 - Component 6c (self-documenting STT-failure text with file_id + download_attachment + retranscribe) → **Task 8**.
@@ -3760,7 +3760,7 @@ git commit -m "$(printf 'docs(c3): document durable inbound queue, /status, fetc
 - Error/edge cases (push-fail stays queued + nudge → Tasks 4/9; crash-mid-STT no advance → Task 3 + Task 5c `offset_wiring_test.go`; crash-mid-consume at-least-once → Task 2 recovery test; **dedupe-by-message_id replay suppression → Task 4 Step 6b + `TestFlushInbounds_DedupesReplayedMessageID`**; cap overflow log+notice → Task 4; /status not queued/routed → Task 5b `TestStatusCommand_NotRouted`; corrupt line skip → Task 2; **disk-full = persist failure → no offset advance + best-effort Telegram notice via `notePersistFailure` → Task 4 append-fail branch**; **merged-push ack consumes all N covered lines → Task 7 `TestHandleInboundDelivered_MergedBatchConsumesAllCovered`**).
 - Caps/cooldown/cursor/paths/defaults all use the spec's verbatim values (1000/14d, 5 min, line-number cursor, `$XDG_STATE_HOME/c3/queue/`, limit 3 / "all" / max 50, ack true).
 
-**2. Placeholder scan** — every code step contains complete Go. The one literal "placeholder" line in Task 9 Step 6 (`renderFetchedMessages ... // placeholder removed below`) is IMMEDIATELY replaced by the real implementation in the same step, with an explicit instruction to replace it — no "TBD"/"handle errors" left dangling. Task 10's adapter code is spelled out explicitly (struct fields, constructor init, registerTools, handlers, dispatchers, renderers) rather than delegated by "same bodies as Task 9" — the only shared-by-copy items are the byte-identical pure renderers (Go has no cross-`main`-package sharing). The retranscribe in-place-refresh of a queued `message_id` is a **KNOWN DIVERGENCE from spec line 151, flagged for Karthi** (Task 7 divergence note: implement `JobRefreshText` or descope the spec) — not silently shipped; v1 treats `message_id` as a no-op, pinned by a test.
+**2. Placeholder scan** — every code step contains complete Go. The one literal "placeholder" line in Task 9 Step 6 (`renderFetchedMessages ... // placeholder removed below`) is IMMEDIATELY replaced by the real implementation in the same step, with an explicit instruction to replace it — no "TBD"/"handle errors" left dangling. Task 10's adapter code is spelled out explicitly (struct fields, constructor init, registerTools, handlers, dispatchers, renderers) rather than delegated by "same bodies as Task 9" — the only shared-by-copy items are the byte-identical pure renderers (Go has no cross-`main`-package sharing). The retranscribe in-place-refresh of a queued `message_id` was implemented (resolution 1): `handleRetranscribe` rewrites the still-queued line's `Text` via a `JobRefreshText` worker job, so the spec-line-151 guarantee holds. (The original "KNOWN DIVERGENCE / v1 no-op" wording elsewhere in this plan predates that and is superseded.)
 
 **3. Type consistency** —
 - `ipc.FetchQueueReq{Limit,All,Ack}` / `FetchQueueResp{Messages []c3types.Inbound, Remaining, Err}` consistent across Task 1 (def), Task 7 (handler), Tasks 9/10 (adapters).
