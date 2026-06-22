@@ -19,10 +19,13 @@ const (
 	OpListClaims      Op = "list_claims"
 	OpListHealth      Op = "list_health"
 	OpToolCall        Op = "tool_call"
-	OpPairModeStart   Op = "pair_mode_start"
-	OpPingThisSession Op = "ping_this_session"
-	OpListSessions    Op = "list_sessions"
-	OpBye             Op = "bye"
+	OpPairModeStart    Op = "pair_mode_start"
+	OpPingThisSession  Op = "ping_this_session"
+	OpListSessions     Op = "list_sessions"
+	OpFetchQueue       Op = "fetch_queue"
+	OpInboundDelivered Op = "inbound_delivered"
+	OpRetranscribe     Op = "retranscribe"
+	OpBye              Op = "bye"
 
 	// broker → adapter
 	OpHelloAck             Op = "hello_ack"
@@ -35,5 +38,7 @@ const (
 	OpPairModeReply        Op = "pair_mode_reply"
 	OpPingThisSessionReply Op = "ping_this_session_reply"
 	OpListSessionsReply    Op = "list_sessions_reply"
+	OpFetchQueueResult     Op = "fetch_queue_result"
+	OpRetranscribeResult   Op = "retranscribe_result"
 	OpError                Op = "error"
 )

@@ -13,6 +13,20 @@ import (
 type InboundMsg struct {
 	Op      Op              `json:"op"` // = OpInbound
 	Inbound c3types.Inbound `json:"inbound"`
+
+	// Pending is the number of messages STILL queued for this route AFTER the
+	// lines this push covered (i.e. backlog the live push did not cover). The
+	// Claude adapter appends a "(N pending — call fetch_queue)" recovery nudge to
+	// the push when Pending > 0, so a stuck backlog item is surfaced on the next
+	// successful push — not only at the next re-attach.
+	Pending int `json:"pending,omitempty"`
+	// Covered is the number of durable queue lines this (possibly MERGED) push
+	// covers. A debounced batch of N stored lines is delivered as ONE merged
+	// notification; the adapter echoes Covered back in InboundDeliveredMsg.Count
+	// so the broker Consumes exactly those N lines on ack (not just 1, which
+	// would orphan N-1 as phantom backlog). Defaults to 1 (single-message push /
+	// older brokers).
+	Covered int `json:"covered,omitempty"`
 }
 
 // ToolCallReq is the adapter → broker forward of an MCP tool call. The broker
@@ -36,6 +50,76 @@ type ToolResultMsg struct {
 type ErrorPayload struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+}
+
+// FetchQueueReq is the adapter → broker pull of held inbound for the stub's
+// claimed route. Limit caps the batch (default applied by the adapter: 3, max
+// 50); All=true overrides Limit and drains everything. Ack=true consumes
+// (advances the cursor, deletes the files when drained); Ack=false peeks.
+type FetchQueueReq struct {
+	Op    Op     `json:"op"` // = OpFetchQueue
+	ID    string `json:"id"`
+	Limit int    `json:"limit,omitempty"`
+	All   bool   `json:"all,omitempty"`
+	Ack   bool   `json:"ack"`
+}
+
+// FetchQueueResp is the broker → adapter response to FetchQueueReq. Messages
+// are the oldest up-to-Limit (or all) held inbound with full content; Remaining
+// is the count still queued after this batch. Err is set (and Messages nil) on
+// failure (e.g. no route claimed).
+type FetchQueueResp struct {
+	Op        Op                `json:"op"` // = OpFetchQueueResult
+	ID        string            `json:"id"`
+	Messages  []c3types.Inbound `json:"messages,omitempty"`
+	Remaining int               `json:"remaining"`
+	Err       string            `json:"err,omitempty"`
+}
+
+// InboundDeliveredMsg is the Claude adapter → broker live-push ack. The broker
+// Consumes the queued line(s) the push covered only after OK=true, so a push the
+// adapter never accepted stays queued (backlog + recovery nudge). OK=false is a
+// reported failure (the broker leaves it queued and may retry). Count is the
+// number of durable queue lines this (possibly merged) push covered — the
+// adapter echoes InboundMsg.Covered back so the broker Consumes exactly that many
+// off the head (a merged batch of N must drop N lines, not 1). Count<=0 is
+// treated as 1.
+type InboundDeliveredMsg struct {
+	Op       Op    `json:"op"` // = OpInboundDelivered
+	UpdateID int64 `json:"update_id"`
+	OK       bool  `json:"ok"`
+	Count    int   `json:"count,omitempty"`
+}
+
+// RetranscribeReq is the adapter → broker request to re-run the STT chain over a
+// cached voice attachment by FileID. MessageID is optional: when the matching
+// message is still queued, its stored Text is refreshed in place.
+type RetranscribeReq struct {
+	Op        Op     `json:"op"` // = OpRetranscribe
+	ID        string `json:"id"`
+	FileID    string `json:"file_id"`
+	MessageID int64  `json:"message_id,omitempty"`
+}
+
+// RetranscribeResp is the broker → adapter response to RetranscribeReq. Text is
+// the fresh transcript; Err is set (Text empty) when the provider chain still
+// fails.
+type RetranscribeResp struct {
+	Op   Op     `json:"op"` // = OpRetranscribeResult
+	ID   string `json:"id"`
+	Text string `json:"text,omitempty"`
+	Err  string `json:"err,omitempty"`
+}
+
+// QueuedItem is one compact backlog-summary row carried in AttachedMsg. Preview
+// is a short, truncated text snippet (never the full body); Unix is the
+// message's timestamp.
+type QueuedItem struct {
+	MessageID int64  `json:"message_id"`
+	Sender    string `json:"sender,omitempty"`
+	Kind      string `json:"kind,omitempty"`
+	Unix      int64  `json:"unix,omitempty"`
+	Preview   string `json:"preview,omitempty"`
 }
 
 // HelloMsg is sent by the adapter on connect.
@@ -319,6 +403,13 @@ type AttachedMsg struct {
 	// at attach-time (the turn-time-refresh seam — spec §L5). Additive +
 	// omitempty: nil on failures and for older brokers.
 	Capabilities *c3types.Capabilities `json:"capabilities,omitempty"`
+
+	// QueuedCount is the number of held inbound waiting on the just-claimed
+	// route at attach time; QueuedSummary is a compact preview of the oldest few
+	// (the adapter renders it and instructs the agent to call fetch_queue).
+	// Additive + omitempty: zero/nil for an empty queue and for older brokers.
+	QueuedCount   int          `json:"queued_count,omitempty"`
+	QueuedSummary []QueuedItem `json:"queued_summary,omitempty"`
 }
 
 // Proposal describes what the broker would do if the agent confirms.

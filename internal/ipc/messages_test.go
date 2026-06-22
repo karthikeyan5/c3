@@ -3,6 +3,8 @@ package ipc
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/karthikeyan5/c3/internal/c3types"
 )
 
 func TestHelloMsg_Roundtrip(t *testing.T) {
@@ -265,5 +267,77 @@ func TestPairModeReplyMsg_Roundtrip(t *testing.T) {
 	}
 	if out.Code != "5829" || out.Target != "dm" || out.TTLSec != 600 || !out.OK {
 		t.Errorf("roundtrip mismatch: %+v", out)
+	}
+}
+
+// ─── durable-inbound-queue wire shape (2026-06-22) ────────────────────────
+
+func TestFetchQueueReqRoundTrip(t *testing.T) {
+	req := FetchQueueReq{Op: OpFetchQueue, ID: "7", Limit: 3, All: false, Ack: true}
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err := PeekOp(data)
+	if err != nil || op != OpFetchQueue {
+		t.Fatalf("PeekOp = %q,%v; want fetch_queue", op, err)
+	}
+	var got FetchQueueReq
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Limit != 3 || got.Ack != true || got.All != false || got.ID != "7" {
+		t.Errorf("round-trip mismatch: %+v", got)
+	}
+}
+
+func TestFetchQueueRespCarriesInbound(t *testing.T) {
+	resp := FetchQueueResp{
+		Op: OpFetchQueueResult, ID: "7", Remaining: 2,
+		Messages: []c3types.Inbound{{Channel: "telegram", ChatID: -100, MessageID: 5, Text: "hi"}},
+	}
+	data, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got FetchQueueResp
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Messages) != 1 || got.Messages[0].Text != "hi" || got.Remaining != 2 {
+		t.Errorf("resp round-trip mismatch: %+v", got)
+	}
+}
+
+func TestInboundDeliveredAndRetranscribeRoundTrip(t *testing.T) {
+	d, _ := json.Marshal(InboundDeliveredMsg{Op: OpInboundDelivered, UpdateID: 42, OK: true})
+	if op, _ := PeekOp(d); op != OpInboundDelivered {
+		t.Fatalf("delivered op = %q", op)
+	}
+	r, _ := json.Marshal(RetranscribeReq{Op: OpRetranscribe, ID: "9", FileID: "vf", MessageID: 5})
+	if op, _ := PeekOp(r); op != OpRetranscribe {
+		t.Fatalf("retranscribe op = %q", op)
+	}
+	var gr RetranscribeReq
+	if err := json.Unmarshal(r, &gr); err != nil {
+		t.Fatal(err)
+	}
+	if gr.FileID != "vf" || gr.MessageID != 5 {
+		t.Errorf("retranscribe req mismatch: %+v", gr)
+	}
+}
+
+func TestAttachedMsgCarriesBacklog(t *testing.T) {
+	m := AttachedMsg{
+		Op: OpAttached, OK: true, QueuedCount: 2,
+		QueuedSummary: []QueuedItem{{MessageID: 5, Sender: "@k", Kind: "text", Unix: 1718722680, Preview: "hi"}},
+	}
+	data, _ := json.Marshal(m)
+	var got AttachedMsg
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.QueuedCount != 2 || len(got.QueuedSummary) != 1 || got.QueuedSummary[0].Preview != "hi" {
+		t.Errorf("backlog round-trip mismatch: %+v", got)
 	}
 }
