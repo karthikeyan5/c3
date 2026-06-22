@@ -578,7 +578,13 @@ func (a *adapter) handleInbound(ctx context.Context, raw []byte) {
 	// adapter plumbing the agent never sees (lifecycle B). On the notify-FAIL
 	// branch above we returned WITHOUT acking — the message stays queued as
 	// backlog, exactly as the recovery-nudge design requires.
-	if conn := a.currentConn(); conn != nil {
+	//
+	// C1: a synthesized EVENT (poll_result / reaction / callback) is NEVER queued,
+	// so it covers zero stored lines — do NOT send a delivered-ack for one. The
+	// broker stamps Covered=1 via covEffective on a push (overridden to 0 for
+	// events broker-side too), and handleConsume would otherwise Consume a real
+	// queued backlog message the event never delivered, silently dropping it.
+	if conn := a.currentConn(); conn != nil && !in.Inbound.IsEvent() {
 		_ = conn.WriteJSON(ipc.InboundDeliveredMsg{Op: ipc.OpInboundDelivered, UpdateID: in.Inbound.MessageID, OK: true, Count: in.Covered})
 	}
 }
