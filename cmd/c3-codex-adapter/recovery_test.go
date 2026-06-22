@@ -214,46 +214,45 @@ func TestInboundContentSummary_CapturesContent(t *testing.T) {
 
 // TestAdviseBrokerDown_OneShotAndRearm guards the D5 (adapter-ipc-5) loud
 // advisory: it surfaces exactly once per outage (no spam across retry cycles)
-// and re-arms after a successful reconnect so a later outage advises again. It
-// also buffers the advisory into the inbox ring so a Codex session that drains
-// `inbox` sees it.
+// and re-arms after a successful reconnect so a later outage advises again.
+//
+// The in-memory inbox ring is RETIRED (the broker's durable queue is the source
+// of truth), and a broker-DOWN advisory can't be durably queued anyway — the
+// broker is exactly what's unreachable — so it rides ONLY the best-effort notify
+// frame. The one-shot/rearm contract is therefore asserted on the
+// brokerDownAdvised flag (the mechanism that suppresses spam), the only
+// observable state. An unconnected logNotify transport returns an error on
+// Notify, which adviseBrokerDown logs and tolerates; the flag bookkeeping still
+// runs, which is what we assert.
 func TestAdviseBrokerDown_OneShotAndRearm(t *testing.T) {
 	a := newAdapter()
-	// A transport is required for the notify leg; an unconnected logNotify
-	// transport returns an error on Notify, which adviseBrokerDown logs and
-	// tolerates — the inbox-buffer leg still runs. That's the behavior we
-	// assert (advisory is durable even if the notify frame can't be sent).
 	a.transport = newLogNotifyTransport(nil)
 
+	if a.brokerDownAdvised.Load() {
+		t.Fatal("brokerDownAdvised must start cleared")
+	}
+
 	a.adviseBrokerDown(6)
-	a.adviseBrokerDown(7) // must be suppressed (one-shot)
+	if !a.brokerDownAdvised.Load() {
+		t.Fatal("adviseBrokerDown must set the one-shot flag on first outage")
+	}
+	// Subsequent calls in the SAME outage must be suppressed (no re-arm, flag
+	// stays set). The CompareAndSwap in adviseBrokerDown is the guard; these
+	// calls must be no-ops that leave the flag set.
+	a.adviseBrokerDown(7)
 	a.adviseBrokerDown(8)
-
-	a.imu.Lock()
-	got := len(a.inbox)
-	var sysCount int
-	for _, in := range a.inbox {
-		if in.Kind == c3types.InboundSystem {
-			sysCount++
-		}
-	}
-	a.imu.Unlock()
-	if sysCount != 1 {
-		t.Fatalf("adviseBrokerDown must buffer exactly one system advisory per outage; got %d (inbox=%d)", sysCount, got)
+	if !a.brokerDownAdvised.Load() {
+		t.Fatal("flag must remain set across repeated outage cycles (one-shot)")
 	}
 
-	// After a reconnect clears the flag, a new outage must advise again.
+	// After a reconnect clears the flag, a new outage must be able to advise
+	// again (re-arm).
 	a.clearBrokerDownAdvisory()
-	a.adviseBrokerDown(6)
-	a.imu.Lock()
-	sysCount = 0
-	for _, in := range a.inbox {
-		if in.Kind == c3types.InboundSystem {
-			sysCount++
-		}
+	if a.brokerDownAdvised.Load() {
+		t.Fatal("clearBrokerDownAdvisory must clear the one-shot flag on reconnect")
 	}
-	a.imu.Unlock()
-	if sysCount != 2 {
-		t.Fatalf("after clearBrokerDownAdvisory a fresh outage must re-advise; got %d system advisories", sysCount)
+	a.adviseBrokerDown(6)
+	if !a.brokerDownAdvised.Load() {
+		t.Fatal("a fresh outage after clear must re-advise (set the flag again)")
 	}
 }

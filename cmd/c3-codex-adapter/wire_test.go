@@ -85,17 +85,18 @@ func TestServerInfoName(t *testing.T) {
 	}
 
 	// Verify tools/list returns the expected Codex tool set
-	// (attach, topics, inbox, reply, react, edit_message,
+	// (attach, topics, fetch_queue, retranscribe, reply, react, edit_message,
 	// poll, download_attachment, codex_forward) — a regression here breaks
 	// every adapter operation for Codex. `send_typing` is deliberately ABSENT
 	// (P5): the typing indicator is relayed programmatically by the broker, not
-	// via an LLM tool.
+	// via an LLM tool. The in-memory `inbox` ring tool is RETIRED in favor of the
+	// broker-backed `fetch_queue` (durable queue is the source of truth).
 	listResult, err := sess.ListTools(ctx, nil)
 	if err != nil {
 		t.Fatalf("ListTools: %v", err)
 	}
 	wantTools := []string{
-		"attach", "topics", "inbox", "reply", "react",
+		"attach", "topics", "fetch_queue", "retranscribe", "reply", "react",
 		"edit_message", "poll", "download_attachment", "codex_forward",
 	}
 	got := map[string]bool{}
@@ -120,6 +121,11 @@ func TestServerInfoName(t *testing.T) {
 	// pulse typing, defeating the deterministic relay.
 	if got["send_typing"] {
 		t.Errorf("send_typing must NOT be registered as an agent tool (P5: broker-relayed); got %v", got)
+	}
+	// The in-memory `inbox` ring tool is RETIRED: a regression that re-registers
+	// it would resurrect a cap-100 lossy buffer alongside the durable queue.
+	if got["inbox"] {
+		t.Errorf("inbox tool must be RETIRED in favor of broker-backed fetch_queue; got %v", got)
 	}
 }
 

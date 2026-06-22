@@ -1,0 +1,78 @@
+package main
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/karthikeyan5/c3/internal/c3types"
+	"github.com/karthikeyan5/c3/internal/ipc"
+)
+
+func TestRenderFetchedMessages_Codex(t *testing.T) {
+	got := renderFetchedMessages([]c3types.Inbound{
+		{Channel: "telegram", ChatID: -100, MessageID: 1, Text: "hi", Sender: c3types.Sender{Username: "k"}},
+	}, 2)
+	if !strings.Contains(got, "hi") || !strings.Contains(got, "fetch_queue") {
+		t.Errorf("rendered = %q, want body + remaining nudge", got)
+	}
+}
+
+// renderFetchedMessages must expose attachment file_id/mime so the agent can
+// recover backlog voice via download_attachment/retranscribe (spec Component 4).
+func TestRenderFetchedMessages_Codex_ExposesAttachmentFileID(t *testing.T) {
+	got := renderFetchedMessages([]c3types.Inbound{{
+		Channel: "telegram", ChatID: -100, MessageID: 7,
+		Attachments: []c3types.Attachment{{Kind: "voice", FileID: "VOICE123", MIME: "audio/ogg", Size: 2048, Name: "note.ogg"}},
+	}}, 0)
+	for _, want := range []string{"VOICE123", "audio/ogg", "message_id=7"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("fetch_queue render missing %q; got %q", want, got)
+		}
+	}
+}
+
+func TestPendingNudge_Codex(t *testing.T) {
+	if got := pendingNudge(2); !strings.Contains(got, "2 pending") {
+		t.Errorf("pendingNudge(2) = %q", got)
+	}
+	if got := pendingNudge(0); got != "" {
+		t.Errorf("pendingNudge(0) = %q, want empty", got)
+	}
+}
+
+// renderFetchedMessages on an empty pull tells the agent the queue is empty
+// rather than returning a misleading blank result.
+func TestRenderFetchedMessages_Codex_Empty(t *testing.T) {
+	if got := renderFetchedMessages(nil, 0); !strings.Contains(got, "empty") {
+		t.Errorf("empty fetch render = %q, want an 'empty' notice", got)
+	}
+}
+
+// renderBacklogSummary must render the count line + fetch_queue hint even when
+// the broker degraded to a count-only summary (QueuedCount>0 with an EMPTY
+// QueuedSummary slice — Peek failed broker-side). Without this the agent would
+// see nothing and never drain its backlog.
+func TestRenderBacklogSummary_Codex_CountOnly(t *testing.T) {
+	got := renderBacklogSummary(3, nil)
+	if !strings.Contains(got, "3") || !strings.Contains(got, "fetch_queue") {
+		t.Errorf("count-only backlog summary = %q, want the count + fetch_queue hint", got)
+	}
+}
+
+func TestRenderBacklogSummary_Codex_Empty(t *testing.T) {
+	if got := renderBacklogSummary(0, nil); got != "" {
+		t.Errorf("empty backlog summary = %q, want empty string", got)
+	}
+}
+
+func TestRenderBacklogSummary_Codex_PerItem(t *testing.T) {
+	got := renderBacklogSummary(2, []ipc.QueuedItem{
+		{MessageID: 5, Sender: "@k", Kind: "text", Preview: "hello"},
+		{MessageID: 6, Sender: "@k", Kind: "voice", Preview: ""},
+	})
+	for _, want := range []string{"fetch_queue", "[5]", "hello", "[6]", "(voice)"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("backlog summary missing %q; got %q", want, got)
+		}
+	}
+}

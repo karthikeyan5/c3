@@ -67,7 +67,6 @@ const (
 	adapterName    = "c3_codex"
 	adapterVersion = "0.1.0"
 
-	inboxCap           = 100              // ring buffer max
 	idleStartupTimeout = 60 * time.Second // mirror cmd/c3-claude-adapter behavior
 )
 
@@ -164,9 +163,13 @@ type adapter struct {
 	pending map[string]chan ipc.ToolResultMsg
 	nextID  atomic.Uint64
 
-	// Inbox ring buffer for the `inbox` tool fallback path.
-	imu   sync.Mutex
-	inbox []c3types.Inbound
+	// fetch_queue / retranscribe have their own pending maps keyed by request
+	// ID so the typed broker responses don't have to share the generic
+	// pending[ToolResultMsg] slot. Mirrors the Claude adapter.
+	fqmu      sync.Mutex
+	fqPending map[string]chan ipc.FetchQueueResp
+	rtmu      sync.Mutex
+	rtPending map[string]chan ipc.RetranscribeResp
 
 	helloAck ipc.HelloAckMsg
 
@@ -190,7 +193,9 @@ type adapter struct {
 
 func newAdapter() *adapter {
 	return &adapter{
-		pending: map[string]chan ipc.ToolResultMsg{},
+		pending:   map[string]chan ipc.ToolResultMsg{},
+		fqPending: map[string]chan ipc.FetchQueueResp{},
+		rtPending: map[string]chan ipc.RetranscribeResp{},
 	}
 }
 
@@ -229,7 +234,7 @@ func (a *adapter) hello() error {
 	}
 	if err := a.conn.WriteJSON(ipc.HelloMsg{
 		Op: ipc.OpHello, CLI: "codex", PID: os.Getpid(), CWD: cwd,
-		Capabilities: []string{"log-notification", "inbox", "ws-forwarder"},
+		Capabilities: []string{"log-notification", "fetch_queue", "ws-forwarder"},
 	}); err != nil {
 		return err
 	}
@@ -324,6 +329,10 @@ func (a *adapter) brokerReader(ctx context.Context) {
 			a.dispatchAttached(raw)
 		case ipc.OpTopicsList:
 			a.dispatchTopicsList(raw)
+		case ipc.OpFetchQueueResult:
+			a.dispatchFetchQueueResult(raw)
+		case ipc.OpRetranscribeResult:
+			a.dispatchRetranscribeResult(raw)
 		case ipc.OpError:
 			var errMsg ipc.ErrorMsg
 			_ = json.Unmarshal(raw, &errMsg)
@@ -421,27 +430,19 @@ func (a *adapter) adviseBrokerDown(attempt int) {
 		Message: fmt.Sprintf("C3 lost its connection to the broker and could not reconnect after %d attempts. Inbound Telegram messages will NOT arrive until this recovers (the adapter is still retrying in the background). Your phone messages won't reach this session meanwhile.", attempt),
 	}
 	body := "⚠️ SYSTEM: " + sysev.Message
+	// The ring is retired; the broker's durable queue is the source of truth.
+	// But a broker-DOWN advisory can't be queued (the broker is exactly what's
+	// unreachable), so it is surfaced ONLY via the best-effort notify frame. If
+	// that notify fails we log the FULL advisory so it is recoverable from
+	// adapter.log — the same "don't lose undelivered content" rule the broker
+	// follows (DEBUGGING.md).
 	if err := a.transport.Notify(context.Background(), "notifications/message", map[string]any{
 		"level":  "warning",
 		"logger": "c3",
 		"data":   body,
 	}); err != nil {
-		log.Printf("broker-down advisory notify failed: %v", err)
+		log.Printf("broker-down advisory notify failed: %v — %s", err, body)
 	}
-	// Also buffer it in the inbox ring so a Codex session that drains `inbox`
-	// (the Codex fallback surface, since Codex doesn't render unsolicited
-	// notifications natively) sees the advisory even if the log frame is
-	// dropped.
-	a.imu.Lock()
-	a.inbox = append(a.inbox, c3types.Inbound{
-		Channel: "c3",
-		Kind:    c3types.InboundSystem,
-		Event:   &c3types.InboundEvent{System: sysev},
-	})
-	if len(a.inbox) > inboxCap {
-		a.inbox = a.inbox[len(a.inbox)-inboxCap:]
-	}
-	a.imu.Unlock()
 	log.Printf("broker-down advisory surfaced (attempt %d)", attempt)
 }
 
@@ -499,42 +500,33 @@ func (a *adapter) wakePendingWithErr(msg string) {
 	}
 }
 
-// handleInbound: buffer in ring + emit log notification + (if remote-bridge) WS-forward.
+// handleInbound: emit a lightweight "new message — call fetch_queue" nudge +
+// (if remote-bridge) WS-forward. The in-memory ring is RETIRED — the broker's
+// durable queue is the single source of truth; Codex polls it via fetch_queue.
 func (a *adapter) handleInbound(raw []byte) {
 	var msg ipc.InboundMsg
 	if err := json.Unmarshal(raw, &msg); err != nil {
 		return
 	}
 
-	// Ring buffer (drop oldest at cap).
-	a.imu.Lock()
-	a.inbox = append(a.inbox, msg.Inbound)
-	if len(a.inbox) > inboxCap {
-		dropped := len(a.inbox) - inboxCap
-		a.inbox = a.inbox[dropped:]
-		fmt.Fprintf(os.Stderr, "c3-codex-adapter: inbox cap exceeded; dropped %d oldest\n", dropped)
-	}
-	a.imu.Unlock()
-
-	// Log notification — cheap; future-proofs for Codex native rendering.
+	// Codex cannot render unsolicited content reliably, so it polls. Replace the
+	// retired in-memory ring with a lightweight "N pending" nudge — the durable
+	// queue in the broker is the source of truth; the agent calls fetch_queue.
 	if a.transport != nil {
 		if err := a.transport.Notify(context.Background(), "notifications/message", map[string]any{
-			"level":  "info",
-			"logger": "c3",
-			"data":   formatLogLine(&msg.Inbound),
+			"data": "c3: new Telegram message — call `fetch_queue` to read it. " + pendingNudge(1),
 		}); err != nil {
-			// D4 (adapter-ipc-4): the broker already counted this inbound as
-			// "delivered" when it wrote it to our IPC socket. The Codex notify
-			// is best-effort (the message is also buffered in the inbox ring
-			// above for the `inbox` tool), but a notify failure was previously
-			// swallowed silently. Log the FULL content so a delivery problem is
-			// visible and recoverable from adapter.log — same "don't lose
-			// undelivered content" rule the broker follows (DEBUGGING.md).
+			// D4 (adapter-ipc-4): the broker already DURABLY QUEUED this inbound
+			// before pushing it to us, so the content is never lost — it stays in
+			// the queue until fetch_queue(ack=true) consumes it. The nudge is
+			// best-effort; a notify failure is logged (with a content summary) so a
+			// delivery problem is visible and recoverable from adapter.log, and the
+			// agent can still call fetch_queue to drain the durable copy.
 			thread := "-"
 			if msg.Inbound.TopicID != nil {
 				thread = strconv.FormatInt(*msg.Inbound.TopicID, 10)
 			}
-			log.Printf("notify FAIL chan=%s chat=%d thread=%s msg=%d: %v — content buffered in inbox; LOST CONTENT: %s",
+			log.Printf("notify FAIL chan=%s chat=%d thread=%s msg=%d: %v — content durably queued; call fetch_queue. %s",
 				msg.Inbound.Channel, msg.Inbound.ChatID, thread, msg.Inbound.MessageID, err,
 				inboundContentSummary(&msg.Inbound))
 		}
@@ -585,60 +577,6 @@ func capRunes(s string, n int) string {
 		return s
 	}
 	return string(r[:n]) + "…"
-}
-
-func formatLogLine(in *c3types.Inbound) string {
-	thread := "0"
-	if in.TopicID != nil {
-		thread = strconv.FormatInt(*in.TopicID, 10)
-	}
-	sender := in.Sender.Username
-	if sender == "" {
-		sender = strconv.FormatInt(in.Sender.UserID, 10)
-	}
-	// P4: a synthesized channel event (poll_result / reaction / callback) renders
-	// from its neutral Event payload rather than message text. String-only — no
-	// structured Telegram types reach the Codex turn.
-	if in.IsEvent() {
-		return fmt.Sprintf("Telegram %s event (chat=%d thread=%s)\n%s",
-			in.Kind, in.ChatID, thread, formatEventBody(in))
-	}
-	return fmt.Sprintf("Telegram message from %s (chat=%d thread=%s)\n%s",
-		sender, in.ChatID, thread, in.Text)
-}
-
-// formatEventBody renders a channel event's neutral payload into a one-line
-// string body for the Codex log/turn forwarder. Mirrors the Claude adapter's
-// buildEventFrame content (kept simple strings).
-func formatEventBody(in *c3types.Inbound) string {
-	ev := in.Event
-	switch {
-	case ev != nil && ev.PollResult != nil:
-		pr := ev.PollResult
-		parts := make([]string, 0, len(pr.Options))
-		for _, o := range pr.Options {
-			parts = append(parts, fmt.Sprintf("%s:%d", o.Text, o.VoterCount))
-		}
-		closed := ""
-		if pr.IsClosed {
-			closed = " (closed)"
-		}
-		return fmt.Sprintf("Poll results: %q — %d votes — %s%s",
-			pr.Question, pr.TotalVoters, strings.Join(parts, " "), closed)
-	case ev != nil && ev.Reaction != nil:
-		r := ev.Reaction
-		return fmt.Sprintf("reaction on message %d — added %s removed %s",
-			r.MessageID, strings.Join(r.Added, " "), strings.Join(r.Removed, " "))
-	case ev != nil && ev.Callback != nil:
-		cb := ev.Callback
-		return fmt.Sprintf("button pressed (data=%q) on message %d", cb.Data, cb.MessageID)
-	case ev != nil && ev.System != nil:
-		// Broker-originated system advisory (e.g. a channel-health alert).
-		// Operational, not user content.
-		return "⚠️ SYSTEM: " + ev.System.Message
-	default:
-		return fmt.Sprintf("(%s event)", in.Kind)
-	}
 }
 
 func codexForwardingAllowed() bool {
@@ -755,9 +693,9 @@ func (a *adapter) buildInstructions() string {
 		if cwd == "" {
 			cwd, _ = os.Getwd()
 		}
-		head = fmt.Sprintf("No C3 mapping for %q. Use the `attach` tool to set one up. Inbound Telegram messages are buffered for the `inbox` tool until your TUI is bound (`--remote`).", cwd)
+		head = fmt.Sprintf("No C3 mapping for %q. Use the `attach` tool to set one up. Inbound Telegram messages are held in C3's durable queue; call `fetch_queue` to read them.", cwd)
 	default:
-		head = "C3 connected. Use `attach` to claim a Telegram topic, `inbox` to drain buffered inbound, `reply` to send. Codex doesn't render unsolicited MCP notifications today; check `inbox` periodically."
+		head = "C3 connected. Use `attach` to claim a Telegram topic, `fetch_queue` to read held/new inbound, `reply` to send. Codex doesn't render unsolicited MCP notifications today; call `fetch_queue` when you see a 'new Telegram message' nudge or periodically."
 	}
 	return head + mode.Combined(a.capsOrDefault())
 }
@@ -812,17 +750,32 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 		},
 		{
 			tool: &mcp.Tool{
-				Name:        "inbox",
-				Description: "Drain buffered inbound Telegram messages. Codex-only fallback path until Codex renders unsolicited MCP notifications natively.",
+				Name:        "fetch_queue",
+				Description: "Retrieve inbound Telegram messages held in the durable queue for the attached topic (messages that arrived while no session was attached, or that a live push didn't confirm). `limit` is how many oldest messages to pull (default 3; or pass the string \"all\" to drain everything). `ack` (default true) consumes them (advances the cursor); ack=false peeks without consuming. Drain all at once for bulk catch-up, or pull in small batches (default 3) to process carefully one group at a time. Returns full content (text/transcript, sender, attachments with file_id) plus how many remain.",
 				InputSchema: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
-						"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+						"limit": map[string]any{"description": "integer (default 3, max 50) or the string \"all\""},
 						"ack":   map[string]any{"type": "boolean", "default": true},
 					},
 				},
 			},
-			handler: a.toolInbox,
+			handler: a.toolFetchQueue,
+		},
+		{
+			tool: &mcp.Tool{
+				Name:        "retranscribe",
+				Description: "Re-run speech-to-text on a voice message by file_id (downloading the audio if not cached) and return the fresh transcript. Use this after a '[voice transcription failed]' message once the STT provider is healthy again — the audio is saved, so the user never has to resend. Optional `message_id` refreshes the stored transcript when that message is still queued.",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"file_id":    map[string]any{"type": "string"},
+						"message_id": map[string]any{"type": "integer"},
+					},
+					"required": []string{"file_id"},
+				},
+			},
+			handler: a.toolRetranscribe,
 		},
 		{
 			tool: &mcp.Tool{
@@ -1016,7 +969,15 @@ func (a *adapter) toolAttach(ctx context.Context, req *mcp.CallToolRequest) (*mc
 			// (tty + C3_NO_TERMINAL_TITLE). See internal/termtitle.
 			termtitle.EmitAttach(&attached)
 		}
-		return toolTextResult(ipc.FormatAttached(&attached)), nil
+		text := ipc.FormatAttached(&attached)
+		// Backlog summary on attach (spec Component 6): if the just-claimed route
+		// has held inbound, tell the agent to call fetch_queue. Handles the
+		// broker's degraded count-only case (QueuedCount>0 with empty
+		// QueuedSummary) gracefully. Parity with the Claude adapter.
+		if summary := renderBacklogSummary(attached.QueuedCount, attached.QueuedSummary); summary != "" {
+			text += "\n\n" + summary
+		}
+		return toolTextResult(text), nil
 	}
 }
 
@@ -1047,46 +1008,226 @@ func (a *adapter) toolTopics(ctx context.Context, _ *mcp.CallToolRequest) (*mcp.
 	}
 }
 
-func (a *adapter) toolInbox(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+// toolFetchQueue forwards a fetch_queue pull to the broker and renders the
+// returned messages. The agent sees full content; the broker advanced the
+// cursor (ack=true) before replying. The in-memory ring is RETIRED — the
+// durable broker queue is the single source of truth (parity with the Claude
+// adapter's toolFetchQueue).
+func (a *adapter) toolFetchQueue(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args, err := decodeArgs(req.Params.Arguments)
 	if err != nil {
 		return nil, fmt.Errorf("invalid params: %w", err)
 	}
-	limit := 10
-	if v, ok := args["limit"]; ok {
-		if f, ok := v.(float64); ok {
-			limit = int(f)
-		}
-	}
-	if limit < 1 {
-		limit = 1
-	}
-	if limit > 50 {
-		limit = 50
-	}
-	ack := true
+	fq := ipc.FetchQueueReq{Op: ipc.OpFetchQueue, ID: strconv.FormatUint(a.nextID.Add(1), 10), Ack: true}
 	if v, ok := args["ack"].(bool); ok {
-		ack = v
+		fq.Ack = v
+	}
+	switch v := args["limit"].(type) {
+	case string:
+		if strings.EqualFold(v, "all") {
+			fq.All = true
+		}
+	case float64:
+		fq.Limit = int(v)
+	}
+	if !fq.All && fq.Limit <= 0 {
+		fq.Limit = 3 // spec default
+	}
+	if fq.Limit > 50 {
+		fq.Limit = 50
 	}
 
-	a.imu.Lock()
-	defer a.imu.Unlock()
+	ch := make(chan ipc.FetchQueueResp, 1)
+	a.fqmu.Lock()
+	a.fqPending[fq.ID] = ch
+	a.fqmu.Unlock()
+	defer func() { a.fqmu.Lock(); delete(a.fqPending, fq.ID); a.fqmu.Unlock() }()
 
-	if len(a.inbox) == 0 {
-		return toolTextResult("c3 inbox is empty"), nil
+	conn := a.currentConn()
+	if conn == nil {
+		return toolErrorResult("broker reconnecting — retry fetch_queue in a moment"), nil
 	}
-	n := limit
-	if n > len(a.inbox) {
-		n = len(a.inbox)
+	if err := conn.WriteJSON(fq); err != nil {
+		return toolErrorResult("broker write: " + err.Error()), nil
 	}
-	chunks := make([]string, 0, n)
-	for i, in := range a.inbox[:n] {
-		chunks = append(chunks, fmt.Sprintf("[%d] %s", i+1, formatLogLine(&in)))
+	select {
+	case <-ctx.Done():
+		return toolErrorResult("canceled"), nil
+	case <-time.After(120 * time.Second):
+		return toolErrorResult("fetch_queue timeout"), nil
+	case resp := <-ch:
+		if resp.Err != "" {
+			return toolErrorResult(resp.Err), nil
+		}
+		return toolTextResult(renderFetchedMessages(resp.Messages, resp.Remaining)), nil
 	}
-	if ack {
-		a.inbox = a.inbox[n:]
+}
+
+// toolRetranscribe forwards a retranscribe request and returns the transcript.
+func (a *adapter) toolRetranscribe(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, err := decodeArgs(req.Params.Arguments)
+	if err != nil {
+		return nil, fmt.Errorf("invalid params: %w", err)
 	}
-	return toolTextResult(strings.Join(chunks, "\n\n")), nil
+	fileID, _ := args["file_id"].(string)
+	if fileID == "" {
+		return toolErrorResult("retranscribe: file_id is required"), nil
+	}
+	rt := ipc.RetranscribeReq{Op: ipc.OpRetranscribe, ID: strconv.FormatUint(a.nextID.Add(1), 10), FileID: fileID}
+	if v, ok := args["message_id"].(float64); ok {
+		rt.MessageID = int64(v)
+	}
+	ch := make(chan ipc.RetranscribeResp, 1)
+	a.rtmu.Lock()
+	a.rtPending[rt.ID] = ch
+	a.rtmu.Unlock()
+	defer func() { a.rtmu.Lock(); delete(a.rtPending, rt.ID); a.rtmu.Unlock() }()
+
+	conn := a.currentConn()
+	if conn == nil {
+		return toolErrorResult("broker reconnecting — retry retranscribe in a moment"), nil
+	}
+	if err := conn.WriteJSON(rt); err != nil {
+		return toolErrorResult("broker write: " + err.Error()), nil
+	}
+	select {
+	case <-ctx.Done():
+		return toolErrorResult("canceled"), nil
+	case <-time.After(120 * time.Second):
+		return toolErrorResult("retranscribe timeout"), nil
+	case resp := <-ch:
+		if resp.Err != "" {
+			return toolErrorResult(resp.Err), nil
+		}
+		return toolTextResult(resp.Text), nil
+	}
+}
+
+// dispatchFetchQueueResult routes a broker FetchQueueResp back to the waiting
+// toolFetchQueue call by request ID.
+func (a *adapter) dispatchFetchQueueResult(raw []byte) {
+	var resp ipc.FetchQueueResp
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return
+	}
+	a.fqmu.Lock()
+	ch, ok := a.fqPending[resp.ID]
+	if ok {
+		delete(a.fqPending, resp.ID)
+	}
+	a.fqmu.Unlock()
+	if ok {
+		ch <- resp
+	}
+}
+
+// dispatchRetranscribeResult routes a broker RetranscribeResp back to the
+// waiting toolRetranscribe call by request ID.
+func (a *adapter) dispatchRetranscribeResult(raw []byte) {
+	var resp ipc.RetranscribeResp
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return
+	}
+	a.rtmu.Lock()
+	ch, ok := a.rtPending[resp.ID]
+	if ok {
+		delete(a.rtPending, resp.ID)
+	}
+	a.rtmu.Unlock()
+	if ok {
+		ch <- resp
+	}
+}
+
+// renderBacklogSummary renders the on-attach backlog notification text. Empty
+// string when nothing is queued. Instructs the agent to call fetch_queue.
+//
+// The broker may report count>0 with an EMPTY items slice (it degrades to
+// count-only when Peek fails) — this still renders the count line + fetch_queue
+// hint so the agent knows to drain, just without per-item previews. Byte-
+// identical to the Claude adapter's renderBacklogSummary (Go has no cross-
+// main-package sharing).
+func renderBacklogSummary(count int, items []ipc.QueuedItem) string {
+	if count <= 0 {
+		return ""
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "📨 %d message(s) were held while no session was attached. Call `fetch_queue` (limit:3 or \"all\") to retrieve them.", count)
+	for _, it := range items {
+		preview := it.Preview
+		if preview == "" {
+			preview = "(" + it.Kind + ")"
+		}
+		fmt.Fprintf(&sb, "\n  • [%d] %s %s: %s", it.MessageID, it.Sender, it.Kind, preview)
+	}
+	if count > len(items) {
+		fmt.Fprintf(&sb, "\n  …and %d more", count-len(items))
+	}
+	return sb.String()
+}
+
+// pendingNudge returns a "(N pending — call fetch_queue)" suffix, or "" when
+// nothing is pending. Byte-identical to the Claude adapter's pendingNudge.
+func pendingNudge(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("(%d pending — call `fetch_queue`)", n)
+}
+
+// renderFetchedMessages turns pulled inbound into agent-readable text, one block
+// per message with full content + each attachment's file_id/mime/size/name so
+// the agent can act on backlog voice/media (download_attachment / retranscribe).
+// Byte-identical to the Claude adapter's renderFetchedMessages.
+func renderFetchedMessages(msgs []c3types.Inbound, remaining int) string {
+	if len(msgs) == 0 {
+		return "c3 queue is empty"
+	}
+	blocks := make([]string, 0, len(msgs))
+	for i := range msgs {
+		blocks = append(blocks, renderQueuedInbound(&msgs[i]))
+	}
+	out := strings.Join(blocks, "\n\n")
+	if remaining > 0 {
+		out += "\n\n" + pendingNudge(remaining)
+	}
+	return out
+}
+
+// renderQueuedInbound renders one queued message for fetch_queue output. Unlike
+// inboundContentSummary (notify-FAIL log line), this exposes the full attachment
+// metadata the agent needs to recover backlog media: file_id, mime, size, name
+// (spec Component 4 — load-bearing for the STT-failure recovery of backlog
+// items, Component 6c). Byte-identical to the Claude adapter's
+// renderQueuedInbound.
+func renderQueuedInbound(in *c3types.Inbound) string {
+	var parts []string
+	switch {
+	case in.Sender.Username != "":
+		parts = append(parts, "from=@"+in.Sender.Username)
+	case in.Sender.UserID != 0:
+		parts = append(parts, fmt.Sprintf("from=uid=%d", in.Sender.UserID))
+	}
+	if in.MessageID != 0 {
+		parts = append(parts, fmt.Sprintf("message_id=%d", in.MessageID))
+	}
+	if in.Text != "" {
+		parts = append(parts, fmt.Sprintf("text=%q", in.Text))
+	}
+	if in.ReplyTo != nil {
+		parts = append(parts, fmt.Sprintf("reply_to=%d", in.ReplyTo.MessageID))
+	}
+	for _, att := range in.Attachments {
+		parts = append(parts, fmt.Sprintf("attachment{kind=%s file_id=%q mime=%s size=%d name=%q}",
+			att.Kind, att.FileID, att.MIME, att.Size, att.Name))
+	}
+	if in.IsEvent() {
+		parts = append(parts, fmt.Sprintf("event=%s", in.Kind))
+	}
+	if len(parts) == 0 {
+		return "(no content)"
+	}
+	return strings.Join(parts, " ")
 }
 
 func (a *adapter) toolCodexForward(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
