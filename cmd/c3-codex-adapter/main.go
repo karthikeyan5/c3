@@ -512,9 +512,19 @@ func (a *adapter) handleInbound(raw []byte) {
 	// Codex cannot render unsolicited content reliably, so it polls. Replace the
 	// retired in-memory ring with a lightweight "N pending" nudge — the durable
 	// queue in the broker is the source of truth; the agent calls fetch_queue.
+	//
+	// I6: the true pending count is msg.Pending + msg.Covered. The broker stamps
+	// Pending = lines queued AFTER the covered ones, and Covered = the lines THIS
+	// push added (still queued — Codex never sends OpInboundDelivered, so the
+	// just-pushed line is NOT consumed). Hardcoding 1 undercounted a debounced
+	// merge / existing backlog. Floor at 1 (this push delivered at least itself).
+	pendingCount := msg.Pending + msg.Covered
+	if pendingCount < 1 {
+		pendingCount = 1
+	}
 	if a.transport != nil {
 		if err := a.transport.Notify(context.Background(), "notifications/message", map[string]any{
-			"data": "c3: new Telegram message — call `fetch_queue` to read it. " + pendingNudge(1),
+			"data": "c3: new Telegram message — call `fetch_queue` to read it. " + pendingNudge(pendingCount),
 		}); err != nil {
 			// D4 (adapter-ipc-4): the broker already DURABLY QUEUED this inbound
 			// before pushing it to us, so the content is never lost — it stays in
