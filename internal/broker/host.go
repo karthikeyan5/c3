@@ -69,6 +69,15 @@ func (h *BrokerHost) Logf(format string, args ...any) {
 	log.Printf(format, args...)
 }
 
+// SetPersistedCallback delegates to the broker so a channel that holds a
+// persisted-offset tracker (telegram) can be notified after each inbound is
+// durably stored. The telegram channel discovers this via an interface
+// type-assertion on its host at Start; it is not part of the channel.Host
+// interface (only the telegram channel needs it).
+func (h *BrokerHost) SetPersistedCallback(fn func(in *c3types.Inbound)) {
+	h.broker.SetPersistedCallback(fn)
+}
+
 // Done returns the broker's shutdown channel.
 func (h *BrokerHost) Done() <-chan struct{} {
 	return h.broker.ctx.Done()

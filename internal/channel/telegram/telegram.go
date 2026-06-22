@@ -14,6 +14,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -165,6 +166,14 @@ type Channel struct {
 	// once polling has cleanly stopped at shutdown.
 	pollDone chan struct{}
 
+	// Persisted-offset wiring (Component 2). offTrk advances the committed
+	// offset only over durably-persisted (or no-op) updates. msgToUpdate maps a
+	// stored inbound's MessageID back to its source update_id so the broker's
+	// persist callback can MarkDone the right update. mu guards msgToUpdate.
+	mu          sync.Mutex
+	offTrk      *offsetTracker
+	msgToUpdate map[int64]int64
+
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -304,6 +313,35 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 	} else {
 		host.Logf("telegram: offset store unavailable (%v); restarts will re-process the last 24h of updates", sErr)
 	}
+
+	// Persisted-offset tracker (Component 2): the committed offset advances only
+	// over updates that are durably persisted (Append+fsync) or no-ops (gated /
+	// dropped / non-message / handled command). Seed it from the persisted store
+	// so a restart resumes from the last SAVED offset. The broker fires
+	// SetPersistedCallback once per stored inbound; we MarkDone the source
+	// update_id, advancing the contiguous prefix.
+	var loaded int64
+	if c.offsets != nil {
+		loaded, _ = c.offsets.Load()
+	}
+	c.offTrk = newOffsetTracker(loaded)
+	c.msgToUpdate = map[int64]int64{}
+	if bh, ok := host.(interface {
+		SetPersistedCallback(func(*c3types.Inbound))
+	}); ok {
+		bh.SetPersistedCallback(func(in *c3types.Inbound) {
+			c.mu.Lock()
+			uid, found := c.msgToUpdate[in.MessageID]
+			if found {
+				delete(c.msgToUpdate, in.MessageID)
+			}
+			c.mu.Unlock()
+			if found {
+				c.offTrk.MarkDone(uid)
+			}
+		})
+	}
+
 	c.ctx, c.cancel = context.WithCancel(ctx)
 
 	// Token check is deferred (offline-safe boot), so bot.Username is "<missing>"

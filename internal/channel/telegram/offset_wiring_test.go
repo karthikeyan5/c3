@@ -1,0 +1,66 @@
+package telegram
+
+import (
+	"testing"
+
+	"github.com/karthikeyan5/c3/internal/c3types"
+)
+
+// The poll loop registers each accepted update as in-flight and only marks it
+// done once the broker's persist callback fires (Append+fsync succeeded). An
+// update whose Append is still in-flight must NOT let the committed offset pass
+// it — otherwise a crash there loses the message (Telegram won't redeliver an
+// already-acked offset). This exercises the exact Register → MarkDone(persist)
+// seam the poll-loop wiring uses.
+func TestPollOffsetWiring_NoAdvancePastUnpersisted(t *testing.T) {
+	c := &Channel{}
+	c.offTrk = newOffsetTracker(100)
+	c.msgToUpdate = map[int64]int64{}
+
+	// Simulate the persist callback the channel registers in Start.
+	persist := func(in *c3types.Inbound) {
+		c.mu.Lock()
+		uid, found := c.msgToUpdate[in.MessageID]
+		if found {
+			delete(c.msgToUpdate, in.MessageID)
+		}
+		c.mu.Unlock()
+		if found {
+			c.offTrk.MarkDone(uid)
+		}
+	}
+
+	// Batch of three accepted updates 101,102,103; record msg→update like
+	// dispatchMessage does before Emit.
+	for _, p := range []struct{ msg, upd int64 }{{1, 101}, {2, 102}, {3, 103}} {
+		c.offTrk.Register(p.upd)
+		c.mu.Lock()
+		c.msgToUpdate[p.msg] = p.upd
+		c.mu.Unlock()
+	}
+	// 101 and 103 persist; 102 is still mid-STT/mid-Append (the "crash" point).
+	persist(&c3types.Inbound{MessageID: 1})
+	persist(&c3types.Inbound{MessageID: 3})
+	if got := c.offTrk.Committed(); got != 101 {
+		t.Fatalf("committed = %d, want 101 (must NOT pass unpersisted 102)", got)
+	}
+	// 102 finally persists → committed jumps to 103.
+	persist(&c3types.Inbound{MessageID: 2})
+	if got := c.offTrk.Committed(); got != 103 {
+		t.Fatalf("committed after 102 persisted = %d, want 103", got)
+	}
+}
+
+// A gated/dropped/non-message/`/status` update is marked done immediately via
+// markUpdateDone and must not block the contiguous prefix.
+func TestPollOffsetWiring_MarkUpdateDoneUnblocks(t *testing.T) {
+	c := &Channel{}
+	c.offTrk = newOffsetTracker(200)
+	c.offTrk.Register(201)
+	c.offTrk.Register(202)
+	c.markUpdateDone(202) // e.g. /status — handled, never persisted
+	c.markUpdateDone(201)
+	if got := c.offTrk.Committed(); got != 202 {
+		t.Fatalf("committed = %d, want 202 (gated 202 must not block once 201 done)", got)
+	}
+}

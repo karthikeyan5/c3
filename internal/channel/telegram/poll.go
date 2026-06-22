@@ -140,10 +140,24 @@ func (c *Channel) pollLoop() {
 	// re-enters here and re-Loads, so it resumes from the last SAVED offset, not
 	// in-memory progress — if Save was failing (see the offset-save advisory
 	// below) a restart can re-deliver recent updates; the dedup map bounds that.
+	//
+	// lastSaved tracks the highest offset we have written to the store, so we
+	// only Save on a real advance. With the persisted-offset tracker (offTrk,
+	// set in Start), the tracker is the source of truth across a supervised
+	// panic-restart (it lives on the Channel, not re-seeded here), so we resume
+	// from its committed prefix; the next fetch is Committed()+1.
 	var offset int64
-	if c.offsets != nil {
+	var lastSaved int64
+	if c.offTrk != nil {
+		lastSaved = c.offTrk.Committed()
+		offset = lastSaved + 1
+		if lastSaved > 0 {
+			c.host.Logf("telegram: resuming from persisted-offset tracker committed=%d (next=%d)", lastSaved, offset)
+		}
+	} else if c.offsets != nil {
 		if loaded, err := c.offsets.Load(); err == nil && loaded > 0 {
 			offset = loaded + 1
+			lastSaved = loaded
 			c.host.Logf("telegram: resuming from persisted offset=%d (next=%d)", loaded, offset)
 		} else if err != nil {
 			c.host.Logf("telegram: offset Load failed (%v); starting from 0", err)
@@ -347,9 +361,25 @@ func (c *Channel) pollLoop() {
 		var advanced bool
 		for i := range updates {
 			u := updates[i]
+			// Register the accepted update as in-flight in the persisted-offset
+			// tracker BEFORE dispatch. The committed offset advances past it only
+			// once its message is durably persisted (the broker's persist callback
+			// MarkDone-s it) or it is a no-op outcome (markUpdateDone below). When
+			// offTrk is nil (conflict/resilience unit tests), we fall back to the
+			// legacy highest-seen in-memory advance.
+			if c.offTrk != nil {
+				c.offTrk.Register(u.UpdateId)
+			}
 			if c.dedup != nil && c.dedup.SeenOrAdd(&u) {
 				c.host.Logf("telegram: dedup skip update=%d (recent duplicate)", u.UpdateId)
-				if u.UpdateId >= offset {
+				// A dedup-skip is NOT a persist. With offTrk, this is either a
+				// genuine Telegram redelivery of an already-committed update (id
+				// <= committed ⇒ Register/MarkDone are no-ops) OR an in-flight
+				// update being re-fetched because the next-fetch offset tracks
+				// Committed()+1 — that one must stay in-flight (the persist
+				// callback owns its MarkDone), so we do NOT markUpdateDone here.
+				// Without offTrk we keep the legacy highest-seen advance.
+				if c.offTrk == nil && u.UpdateId >= offset {
 					offset = u.UpdateId + 1
 					advanced = true
 				}
@@ -360,14 +390,32 @@ func (c *Channel) pollLoop() {
 				richRaw = richRawFor(probes[i])
 			}
 			c.dispatchGuarded(&u, richRaw)
-			if u.UpdateId >= offset {
+			if c.offTrk == nil && u.UpdateId >= offset {
 				offset = u.UpdateId + 1
 				advanced = true
 			}
 		}
-		if advanced && c.offsets != nil {
+		// Persist the offset. With the tracker, save only the highest CONTIGUOUS
+		// durably-persisted (or no-op) update_id — never past an update whose
+		// Append is still in-flight (that is the whole safety property). Without
+		// it (unit tests), fall back to the legacy highest-seen advance.
+		var saveTo int64
+		var doSave bool
+		if c.offTrk != nil {
+			if cur := c.offTrk.Committed(); cur > lastSaved {
+				saveTo, doSave = cur, true
+			}
+			// The next getUpdates resumes from the contiguous-committed prefix so
+			// an in-flight (unpersisted) update is re-fetched after a crash and
+			// never silently acked. Steady-state re-fetches are suppressed by the
+			// dedup map.
+			offset = c.offTrk.Committed() + 1
+		} else if advanced {
+			saveTo, doSave = offset-1, true
+		}
+		if doSave && c.offsets != nil {
 			// Best-effort: log the failure but don't stop polling.
-			if err := c.offsets.Save(offset - 1); err != nil {
+			if err := c.offsets.Save(saveTo); err != nil {
 				consecSaveFail++
 				c.host.Logf("telegram: offset Save failed (consec=%d): %v", consecSaveFail, err)
 				if consecSaveFail == offsetSaveFailAlert {
@@ -375,6 +423,7 @@ func (c *Channel) pollLoop() {
 				}
 			} else {
 				consecSaveFail = 0
+				lastSaved = saveTo
 			}
 		}
 	}
@@ -395,6 +444,10 @@ func (c *Channel) dispatchGuarded(u *gotgbot.Update, richRaw json.RawMessage) {
 			buf := make([]byte, 8192)
 			n := runtime.Stack(buf, false)
 			c.host.Logf("telegram: dispatch PANIC recovered (update=%d skipped): %v\n%s", u.UpdateId, r, buf[:n])
+			// A panicked (poison) update is SKIPPED: mark it done so the
+			// persisted offset advances past it rather than re-fetching it
+			// forever (the contiguous-prefix tracker would otherwise wedge here).
+			c.markUpdateDone(u.UpdateId)
 		}
 	}()
 	c.dispatchUpdate(u, richRaw)
@@ -406,20 +459,31 @@ func (c *Channel) dispatchGuarded(u *gotgbot.Update, richRaw json.RawMessage) {
 func (c *Channel) dispatchUpdate(u *gotgbot.Update, richRaw json.RawMessage) {
 	switch {
 	case u.Message != nil:
+		// The message path owns its own offset marking: markUpdateDone on every
+		// no-op outcome (skip/status/gate-drop/pair-consumed) and the
+		// msgToUpdate seam → persist-callback MarkDone on the routed path.
 		c.dispatchMessage(u.UpdateId, u.Message, false, richRaw)
 	case u.EditedMessage != nil:
 		c.dispatchMessage(u.UpdateId, u.EditedMessage, true, richRaw)
 	case u.Poll != nil:
+		// Events (poll_result / callback / reaction) are NEVER persisted; mark
+		// the update done unconditionally so the offset advances past it,
+		// regardless of whether the inner handler surfaced or dropped it.
 		c.dispatchPollUpdate(u.UpdateId, u.Poll)
+		c.markUpdateDone(u.UpdateId)
 	case u.CallbackQuery != nil:
 		c.dispatchCallback(u.UpdateId, u.CallbackQuery)
+		c.markUpdateDone(u.UpdateId)
 	case u.MessageReaction != nil:
 		c.dispatchReaction(u.UpdateId, u.MessageReaction)
+		c.markUpdateDone(u.UpdateId)
 	default:
 		// Any other subscribed-but-unhandled type. Should not occur given the
 		// allowedUpdates list, but log metadata so a future subscription that
-		// forgets its handler is visible rather than silently dropped.
+		// forgets its handler is visible rather than silently dropped. Never
+		// persisted — mark done so it does not wedge the contiguous prefix.
 		c.host.Logf("telegram: drop update=%d (subscribed type with no dispatch handler)", u.UpdateId)
+		c.markUpdateDone(u.UpdateId)
 	}
 }
 
@@ -563,6 +627,10 @@ func (c *Channel) dispatchReaction(updateID int64, mr *gotgbot.MessageReactionUp
 // is ever logged, strangers see nothing. Mirrors dispatchMessage's gate handling
 // without the message-only STT/kind plumbing.
 func (c *Channel) emitEvent(updateID int64, in *c3types.Inbound, kind string) {
+	// Synthesized events (poll_result / reaction / callback) are NEVER persisted
+	// to the durable queue — they are delivered live or dropped. The offset
+	// marking for the event update_id is owned by dispatchUpdate (which calls
+	// markUpdateDone after every event-dispatch case, covering early returns too).
 	switch c.host.GateInbound(in) {
 	case channel.GateInboundDrop:
 		c.host.Logf("telegram: GATE drop update=%d kind=%s chat=%d msg=%d sender=%d",
@@ -683,6 +751,16 @@ func (c *Channel) isStatusCommand(text string) bool {
 	return strings.EqualFold(t, "/status")
 }
 
+// markUpdateDone marks an update done in the persisted-offset tracker for every
+// NON-persist outcome (gated, dropped, non-message, pair-consumed, dedup-skip,
+// /status). Nil-safe so the early-build paths and tests that leave offTrk unset
+// (the conflict/resilience suites) are no-ops.
+func (c *Channel) markUpdateDone(updateID int64) {
+	if c.offTrk != nil {
+		c.offTrk.MarkDone(updateID)
+	}
+}
+
 // topicPtrFromThread converts a gotgbot message_thread_id (0 = none) into the
 // *int64 TopicID convention (nil = no topic).
 func topicPtrFromThread(threadID int64) *int64 {
@@ -711,6 +789,8 @@ func (c *Channel) dispatchMessage(updateID int64, msg *gotgbot.Message, edited b
 	if in == nil {
 		c.host.Logf("telegram: skip update=%d msg=%d chat=%d thread=%d (unsupported service)",
 			updateID, msg.MessageId, msg.Chat.Id, msg.MessageThreadId)
+		// Unsupported service message — never persisted; unblock the offset.
+		c.markUpdateDone(updateID)
 		return
 	}
 	// Broker-owned command intercept: a "/status" inbound is handled by the
@@ -730,6 +810,8 @@ func (c *Channel) dispatchMessage(updateID int64, msg *gotgbot.Message, edited b
 			}
 			c.host.Logf("telegram: /status handled update=%d chat=%d thread=%d (not routed)",
 				updateID, msg.Chat.Id, msg.MessageThreadId)
+			// Handled, never persisted — unblock the offset over this update.
+			c.markUpdateDone(updateID)
 			return
 		}
 	}
@@ -745,6 +827,8 @@ func (c *Channel) dispatchMessage(updateID int64, msg *gotgbot.Message, edited b
 		// in TODO #1.
 		c.host.Logf("telegram: GATE drop update=%d msg=%d chat=%d thread=%d sender=%d kind=%s",
 			updateID, msg.MessageId, msg.Chat.Id, msg.MessageThreadId, in.Sender.UserID, kind)
+		// Dropped — never persisted; unblock the offset over this update.
+		c.markUpdateDone(updateID)
 		return
 	case channel.GateInboundPairConsumed:
 		// Body matched an active pairing code; allowlist already updated
@@ -752,9 +836,20 @@ func (c *Channel) dispatchMessage(updateID int64, msg *gotgbot.Message, edited b
 		// NOT forward as inbound content.
 		c.host.Logf("telegram: GATE pair-consumed update=%d msg=%d chat=%d thread=%d sender=%d (allowlist updated)",
 			updateID, msg.MessageId, msg.Chat.Id, msg.MessageThreadId, in.Sender.UserID)
+		// Pair-consumed control signal — never persisted; unblock the offset.
+		c.markUpdateDone(updateID)
 		return
 	}
 	c.host.Logf("telegram: inbound update=%d msg=%d chat=%d thread=%d kind=%s edited=%v",
 		updateID, msg.MessageId, msg.Chat.Id, msg.MessageThreadId, kind, edited)
+	// Record the message_id → update_id seam BEFORE Emit so the broker's persist
+	// callback (fired after Append+fsync) can MarkDone the right source update.
+	// Guarded on the tracker being live (Start seeds msgToUpdate alongside it);
+	// unit tests that leave offTrk nil never persist, so the seam is unused.
+	if c.offTrk != nil {
+		c.mu.Lock()
+		c.msgToUpdate[in.MessageID] = updateID
+		c.mu.Unlock()
+	}
 	c.host.Emit(in)
 }
