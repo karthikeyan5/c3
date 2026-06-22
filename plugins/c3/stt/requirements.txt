@@ -1,0 +1,14 @@
+# C3 STT (speech-to-text) Python dependencies.
+#
+# Installed into the dedicated venv at ~/.config/c3/stt-venv by setup-venv.sh.
+# C3's STT plugin auto-detects that venv (~/.config/c3/stt-venv/bin/python) and
+# runs the handler under it, so these deps work even when the system python3 is
+# externally-managed (PEP 668) and cannot pip-install them.
+#
+# SYSTEM dependency (NOT pip): ffprobe, from ffmpeg — install via your OS package
+# manager (e.g. `sudo pacman -S ffmpeg`, `apt install ffmpeg`). Used to detect
+# audio duration; STT degrades gracefully (REST-then-batch) if it is absent.
+
+# Sarvam AI Saaras v3 — required for voice notes longer than ~30s (batch API).
+# Tested with 0.1.28.
+sarvamai>=0.1.28

@@ -42,15 +42,20 @@ def _get_key():
     return _SARVAM_KEY
 
 def _get_duration(audio_path):
-    """Get audio duration in seconds using ffprobe."""
+    """Get audio duration in seconds using ffprobe.
+
+    Returns (duration, known). known=False when ffprobe is unavailable or fails,
+    so the caller can choose a dependency-light path instead of blindly assuming
+    a long note — the old behavior returned 999 and forced EVERY note (even short
+    ones) onto the sarvamai-dependent batch path (stt-pipeline-4)."""
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", audio_path],
             capture_output=True, text=True, timeout=5
         )
-        return float(result.stdout.strip())
-    except:
-        return 999  # Assume long, use batch
+        return float(result.stdout.strip()), True
+    except Exception:
+        return 0.0, False
 
 def _transcribe_rest(audio_path, audio_bytes, key):
     """REST API for audio ≤30s.
@@ -113,7 +118,18 @@ def _transcribe_rest(audio_path, audio_bytes, key):
 
 def _transcribe_batch(audio_path, key):
     """Batch API for audio >30s."""
-    from sarvamai import SarvamAI
+    try:
+        from sarvamai import SarvamAI
+    except ImportError as e:
+        # Surface an ACTIONABLE message instead of a bare ModuleNotFoundError —
+        # this is the 2026-06-22 failure (every >30s note failed silently). The
+        # fix is the dedicated STT venv, which C3 auto-detects.
+        raise RuntimeError(
+            "sarvamai is not installed for this interpreter — long (>30s) voice "
+            "notes need it. Create the C3 STT venv: `bash plugins/c3/stt/setup-venv.sh` "
+            "(or `pip install sarvamai`), then point plugins.stt.python at "
+            "~/.config/c3/stt-venv/bin/python (auto-detected if you use the venv)."
+        ) from e
     client = SarvamAI(api_subscription_key=key)
     job = client.speech_to_text_job.create_job(model="saaras:v3", mode="translate", language_code="unknown")
     job.upload_files(file_paths=[audio_path])
@@ -140,8 +156,16 @@ def transcribe(audio_path: str, audio_bytes: bytes) -> str:
     if not key:
         raise RuntimeError("SARVAM_API_KEY not available")
 
-    duration = _get_duration(audio_path)
-    if duration <= 30:
+    duration, known = _get_duration(audio_path)
+    if known:
+        if duration <= 30:
+            return _transcribe_rest(audio_path, audio_bytes, key)
+        return _transcribe_batch(audio_path, key)
+    # Unknown duration (ffprobe missing/failed): prefer the dependency-light REST
+    # path (no sarvamai); if it fails — e.g. the clip is actually too long for
+    # REST — fall back to the batch path. This avoids forcing short notes onto
+    # the sarvamai-dependent path while still handling long ones.
+    try:
         return _transcribe_rest(audio_path, audio_bytes, key)
-    else:
+    except Exception:
         return _transcribe_batch(audio_path, key)

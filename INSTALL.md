@@ -153,6 +153,26 @@ network failure it refuses to write and surfaces the actual error.
 
 Tell the user to follow the interactive prompts.
 
+### Speech-to-text (voice notes) — Python deps
+
+Voice-note transcription runs a Python handler. Its provider chain needs the
+`sarvamai` package for notes longer than ~30s, and the system `python3` is often
+externally-managed (PEP 668) and can't install it. C3 uses a dedicated venv:
+
+```bash
+bash plugins/c3/stt/setup-venv.sh
+```
+
+This creates `~/.config/c3/stt-venv` and installs `plugins/c3/stt/requirements.txt`.
+C3 **auto-detects** `~/.config/c3/stt-venv/bin/python` (override via `mappings.json`
+`plugins.stt.python`). Also install **ffmpeg** (provides `ffprobe`, for
+audio-duration detection) via your OS package manager — STT still works without it
+(REST-first), just less precisely routed.
+
+If this step is skipped, short voice notes still transcribe, but long ones surface
+`[STT FAILED: …]` to the agent and send the user a "couldn't transcribe — resend"
+Telegram notice.
+
 ## 5. Verify
 
 ```bash

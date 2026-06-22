@@ -115,8 +115,12 @@ def download_file(token, file_id, dest_path):
 
 # ── STT ───────────────────────────────────────────────────────────────────────
 
-def run_stt(audio_path, extra_env):
-    """Dynamically load stt.py and run it. Returns transcript or None."""
+def run_stt(audio_path, extra_env, timeout=270):
+    """Dynamically load stt.py and run it. Returns transcript or None.
+
+    timeout: subprocess budget in seconds. main() passes a value reduced by the
+    time the download already consumed so download + transcribe stays under the
+    broker's 300s SIGKILL (stt-pipeline-5)."""
     spec = importlib.util.spec_from_file_location('stt', STT_PKG)
     # We call the providers directly rather than spawning a subprocess,
     # so we need to inject keys into the environment first.
@@ -126,13 +130,14 @@ def run_stt(audio_path, extra_env):
     # Use stt.py's own chain logic via its main internals
     import subprocess
     env = {**os.environ, **extra_env}
-    # 270s: long voice notes (esp. via the Sarvam batch API) routinely take
-    # >120s; the old 120s cap silently failed them. Ordered under the broker's
-    # Go-side 5m (300s) context with ~30s margin; Sarvam's own wait is set lower
-    # (240s) so it returns gracefully before this kill fires.
+    # Long voice notes (esp. via the Sarvam batch API) routinely take >120s; the
+    # budget is ordered under the broker's Go-side 300s context, and Sarvam's own
+    # wait (240s) returns gracefully before this kill fires. main() shrinks this
+    # by the elapsed download time so a slow download can't push the total past
+    # the broker's hard deadline (which would SIGKILL mid-provider).
     result = subprocess.run(
         [sys.executable, STT_PKG, audio_path],
-        capture_output=True, text=True, env=env, timeout=270
+        capture_output=True, text=True, env=env, timeout=timeout
     )
     transcript = result.stdout.strip()
     if result.returncode != 0 or not transcript:
@@ -206,6 +211,7 @@ def main():
     # Download audio
     audio_path = os.path.join(INBOX_DIR, f'{int(time.time()*1000)}-{file_id}.oga')
     logging.info(f'Processing voice msg_id={msg_id} file_id={file_id}')
+    dl_start = time.time()
     for attempt in range(1, 4):
         try:
             download_file(token, file_id, audio_path)
@@ -229,10 +235,28 @@ def main():
     # Load API keys
     keys = load_env(ENV_FILE)
 
+    # Budget the transcription so download + transcribe stays under the broker's
+    # 300s SIGKILL: 270s total minus the time the download already consumed,
+    # floored at 60s so a slow download doesn't leave an unusably tiny window.
+    dl_elapsed = time.time() - dl_start
+    stt_timeout = max(60, 270 - int(dl_elapsed))
+    logging.info(f'Download took {dl_elapsed:.1f}s; STT subprocess budget={stt_timeout}s')
+
     # Transcribe
-    transcript = run_stt(audio_path, keys)
+    transcript = run_stt(audio_path, keys, timeout=stt_timeout)
     if not transcript:
         logging.error(f'STT returned no transcript for {audio_path}')
+        # Best-effort user-facing notice so the human knows immediately (the Go
+        # shim separately surfaces an [STT FAILED] marker to the agent). Without
+        # this the sender just sees their voice note silently ignored.
+        try:
+            tg(token, 'sendMessage',
+               chat_id=chat_id,
+               text='\U0001f3a4 ⚠️ Could not transcribe that voice note (speech-to-text failed). Please retype or resend.',
+               reply_parameters={'message_id': msg_id},
+               **({'message_thread_id': thread_id} if thread_id else {}))
+        except Exception as e:
+            logging.warning(f'failed to send STT-failure notice to Telegram: {e}')
         sys.exit(1)
     logging.info(f'Transcript ({len(transcript)} chars): {transcript[:80]}...')
 

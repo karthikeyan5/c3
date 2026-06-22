@@ -622,6 +622,16 @@ func promptSTTSetup(r *bufio.Reader) (bool, error) {
 	}
 	fmt.Printf("✓ wrote %s (mode 0600)\n", envPath)
 
+	if sarvam != "" {
+		fmt.Println()
+		fmt.Println("STT Python deps (required for voice notes longer than ~30s):")
+		fmt.Println("  The Sarvam batch path needs the `sarvamai` package in a dedicated venv")
+		fmt.Println("  (the system python is often externally-managed / PEP 668). Run:")
+		fmt.Println("      bash plugins/c3/stt/setup-venv.sh")
+		fmt.Println("  C3 auto-detects ~/.config/c3/stt-venv/bin/python. Also install ffmpeg")
+		fmt.Println("  (provides ffprobe) via your OS package manager.")
+	}
+
 	// Tell the user about the vocabulary override path. This is the
 	// "standing instruction" Karthi asked for — agents should learn the
 	// path during setup so they can prompt users to add words when STT
