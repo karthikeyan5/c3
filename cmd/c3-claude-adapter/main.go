@@ -1472,6 +1472,43 @@ func (a *adapter) toolForward(name string) mcp.ToolHandler {
 	}
 }
 
+// parseFetchLimit normalizes the `limit` tool argument into (limit, all). The
+// agent may pass "all" (drain everything), a JSON number, OR a numeric STRING
+// like "5" (some MCP clients serialize an integer field as a string) — the last
+// case previously matched neither the "all" nor the float64 arm and silently fell
+// back to the default 3. A parseable numeric string is honored and clamped to
+// [1,50]; "all" sets All; anything unparseable (or absent) yields the spec
+// default of 3. Pure + unit-tested.
+func parseFetchLimit(v any) (limit int, all bool) {
+	switch t := v.(type) {
+	case string:
+		if strings.EqualFold(t, "all") {
+			return 0, true
+		}
+		// A parseable numeric string ("5", "0", "999") is honored and clamped to
+		// [1,50]; an unparseable string leaves limit 0 so it falls back to the
+		// default below.
+		if n, err := strconv.Atoi(strings.TrimSpace(t)); err == nil {
+			if n < 1 {
+				n = 1
+			}
+			if n > 50 {
+				n = 50
+			}
+			return n, false
+		}
+	case float64:
+		limit = int(t)
+	}
+	if limit <= 0 {
+		limit = 3 // spec default
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	return limit, false
+}
+
 // toolFetchQueue forwards a fetch_queue pull to the broker and renders the
 // returned messages. The agent sees full content; the broker advanced the
 // cursor (ack=true) before replying.
@@ -1484,20 +1521,7 @@ func (a *adapter) toolFetchQueue(ctx context.Context, req *mcp.CallToolRequest) 
 	if v, ok := args["ack"].(bool); ok {
 		fq.Ack = v
 	}
-	switch v := args["limit"].(type) {
-	case string:
-		if strings.EqualFold(v, "all") {
-			fq.All = true
-		}
-	case float64:
-		fq.Limit = int(v)
-	}
-	if !fq.All && fq.Limit <= 0 {
-		fq.Limit = 3 // spec default
-	}
-	if fq.Limit > 50 {
-		fq.Limit = 50
-	}
+	fq.Limit, fq.All = parseFetchLimit(args["limit"])
 
 	ch := make(chan ipc.FetchQueueResp, 1)
 	a.fqmu.Lock()

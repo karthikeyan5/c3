@@ -7,12 +7,16 @@
 //     tools/call, ping, notifications/initialized).
 //  2. On the broker socket: connect, send hello (with C3_ATTACH_NAME if the
 //     launcher set it), listen for inbound / tool_result / topics_list frames.
-//  3. For tools/call: route adapter-local tools (`attach`, `topics`, `inbox`,
-//     `codex_forward`) directly; forward all other tools to the broker.
+//  3. For tools/call: route adapter-local tools (`attach`, `topics`,
+//     `fetch_queue`, `retranscribe`, `codex_forward`) directly; forward all
+//     other tools to the broker. Backlog is read on demand via `fetch_queue`
+//     (the broker's durable per-route queue is the single source of truth) —
+//     there is no in-memory inbound buffer in the adapter.
 //  4. For broker-side ipc.OpInbound frames:
-//     - Buffer in a ring (cap 100) that `inbox` tool drains.
-//     - Emit `notifications/message` log notification (cheap; future-proofs
-//     for when Codex starts surfacing them — issues #18056/#17543/#15299).
+//     - Emit a `notifications/message` log notification (cheap; future-proofs
+//     for when Codex starts surfacing them — issues #18056/#17543/#15299),
+//     carrying a "N pending — call fetch_queue" nudge when the broker reports
+//     remaining backlog, so a stuck item resurfaces without a re-attach.
 //     - When C3_CODEX_REMOTE_BRIDGE=1 (set by the codex launcher), forward
 //     to the Codex app-server via WebSocket so the inbound becomes a
 //     real Codex turn.
@@ -1023,6 +1027,44 @@ func (a *adapter) toolTopics(ctx context.Context, _ *mcp.CallToolRequest) (*mcp.
 // cursor (ack=true) before replying. The in-memory ring is RETIRED — the
 // durable broker queue is the single source of truth (parity with the Claude
 // adapter's toolFetchQueue).
+//
+// parseFetchLimit normalizes the `limit` tool argument into (limit, all). The
+// agent may pass "all" (drain everything), a JSON number, OR a numeric STRING
+// like "5" (some MCP clients serialize an integer field as a string) — the last
+// case previously matched neither the "all" nor the float64 arm and silently fell
+// back to the default 3. A parseable numeric string is honored and clamped to
+// [1,50]; "all" sets All; anything unparseable (or absent) yields the spec
+// default of 3. Pure + unit-tested.
+func parseFetchLimit(v any) (limit int, all bool) {
+	switch t := v.(type) {
+	case string:
+		if strings.EqualFold(t, "all") {
+			return 0, true
+		}
+		// A parseable numeric string ("5", "0", "999") is honored and clamped to
+		// [1,50]; an unparseable string leaves limit 0 so it falls back to the
+		// default below.
+		if n, err := strconv.Atoi(strings.TrimSpace(t)); err == nil {
+			if n < 1 {
+				n = 1
+			}
+			if n > 50 {
+				n = 50
+			}
+			return n, false
+		}
+	case float64:
+		limit = int(t)
+	}
+	if limit <= 0 {
+		limit = 3 // spec default
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	return limit, false
+}
+
 func (a *adapter) toolFetchQueue(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args, err := decodeArgs(req.Params.Arguments)
 	if err != nil {
@@ -1032,20 +1074,7 @@ func (a *adapter) toolFetchQueue(ctx context.Context, req *mcp.CallToolRequest) 
 	if v, ok := args["ack"].(bool); ok {
 		fq.Ack = v
 	}
-	switch v := args["limit"].(type) {
-	case string:
-		if strings.EqualFold(v, "all") {
-			fq.All = true
-		}
-	case float64:
-		fq.Limit = int(v)
-	}
-	if !fq.All && fq.Limit <= 0 {
-		fq.Limit = 3 // spec default
-	}
-	if fq.Limit > 50 {
-		fq.Limit = 50
-	}
+	fq.Limit, fq.All = parseFetchLimit(args["limit"])
 
 	ch := make(chan ipc.FetchQueueResp, 1)
 	a.fqmu.Lock()

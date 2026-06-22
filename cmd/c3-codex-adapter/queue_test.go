@@ -76,3 +76,29 @@ func TestRenderBacklogSummary_Codex_PerItem(t *testing.T) {
 		}
 	}
 }
+
+// Item C: a numeric-STRING limit ("5") must be parsed and honored, not silently
+// dropped to the default 3 (the old switch matched neither "all" nor float64).
+func TestParseFetchLimit_Codex(t *testing.T) {
+	cases := []struct {
+		name      string
+		in        any
+		wantLimit int
+		wantAll   bool
+	}{
+		{"string-number 5", "5", 5, false},
+		{"all", "all", 0, true},
+		{"json number", float64(4), 4, false},
+		{"string over cap clamps to 50", "999", 50, false},
+		{"unparseable falls back to default 3", "xyz", 3, false},
+		{"absent falls back to default 3", nil, 3, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotLimit, gotAll := parseFetchLimit(tc.in)
+			if gotLimit != tc.wantLimit || gotAll != tc.wantAll {
+				t.Fatalf("parseFetchLimit(%#v) = (%d, %v), want (%d, %v)", tc.in, gotLimit, gotAll, tc.wantLimit, tc.wantAll)
+			}
+		})
+	}
+}

@@ -88,3 +88,34 @@ func TestRenderFetchedMessages_RemainingNudge(t *testing.T) {
 		t.Errorf("fetch render with remaining=4 missing nudge; got %q", got)
 	}
 }
+
+// Item C: a numeric-STRING limit ("5") must be parsed and honored, not silently
+// dropped to the default 3 (the old switch matched neither "all" nor float64).
+// Covers "all", JSON-number, string-number, clamps, and unparseable/absent.
+func TestParseFetchLimit(t *testing.T) {
+	cases := []struct {
+		name      string
+		in        any
+		wantLimit int
+		wantAll   bool
+	}{
+		{"string-number 5", "5", 5, false},
+		{"string-number padded", " 7 ", 7, false},
+		{"all lowercase", "all", 0, true},
+		{"all mixed case", "ALL", 0, true},
+		{"json number", float64(4), 4, false},
+		{"string over cap clamps to 50", "999", 50, false},
+		{"string under 1 clamps to 1", "0", 1, false},
+		{"json number over cap clamps", float64(123), 50, false},
+		{"unparseable falls back to default 3", "abc", 3, false},
+		{"absent falls back to default 3", nil, 3, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotLimit, gotAll := parseFetchLimit(tc.in)
+			if gotLimit != tc.wantLimit || gotAll != tc.wantAll {
+				t.Fatalf("parseFetchLimit(%#v) = (%d, %v), want (%d, %v)", tc.in, gotLimit, gotAll, tc.wantLimit, tc.wantAll)
+			}
+		})
+	}
+}
