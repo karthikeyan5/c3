@@ -1,0 +1,28 @@
+[Unit]
+Description=C3 broker — Telegram multiplexer for Claude Code / Codex CLIs
+Documentation=https://github.com/karthikeyan5/c3
+After=network-online.target
+Wants=network-online.target
+# Never enter a "failed" state from restart bursts — we always want a broker.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Adjust if your GOBIN is not ~/go/bin (check: go env GOBIN GOPATH).
+ExecStart=%h/go/bin/c3-broker
+# Keep a broker alive at all times. The broker is a singleton (flock +
+# listen-socket): if an adapter already spawned one, THIS instance exits 0
+# immediately and systemd restarts it RestartSec later — a benign, self-resolving
+# loop that ends the moment it wins the lock. With this unit enabled, systemd is
+# the authoritative supervisor and adapter spawnBroker calls become harmless
+# no-ops. Restart=always (not on-failure) so a clean lost-flock exit is also
+# retried; a `systemctl --user stop` is a commanded stop and is NOT restarted.
+Restart=always
+RestartSec=3
+# The broker writes its own $XDG_STATE_HOME/c3/broker.log; don't duplicate into
+# the journal.
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=default.target

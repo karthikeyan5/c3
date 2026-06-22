@@ -247,7 +247,7 @@ opt-in `systemd --user` unit:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp dist/systemd/c3-broker.service ~/.config/systemd/user/
+cp docs/systemd/c3-broker.service ~/.config/systemd/user/
 # If your GOBIN isn't ~/go/bin, edit ExecStart= first (go env GOBIN GOPATH).
 systemctl --user daemon-reload
 systemctl --user enable --now c3-broker.service
@@ -255,7 +255,7 @@ loginctl enable-linger "$USER"   # keep it running across logout
 ```
 
 It coexists with adapter auto-spawn (the broker is a flock singleton). See
-`dist/systemd/README.md` for details and uninstall.
+`docs/systemd/README.md` for details and uninstall.
 
 ## 7. Tell the user the install is complete
 
