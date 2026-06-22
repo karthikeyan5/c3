@@ -165,6 +165,27 @@ func (c *Channel) pollLoop() {
 	}
 	backoff := baseBackoff
 
+	// Component 2: persist the offset "periodically AND on shutdown". The loop
+	// already saves per successful batch (the periodic half); this defer covers the
+	// shutdown half — on ANY loop exit (ctx cancelled / return) write the highest
+	// durably-committed offset so a final batch persisted just before shutdown is
+	// not lost to a restart (which would re-deliver it; dedup bounds it but the
+	// save avoids the churn). It is a no-op when nothing advanced since the last
+	// Save (saveTo <= lastSaved) or when there is no offset store, so it never
+	// double-writes the steady-state per-batch save.
+	defer func() {
+		if c.offTrk == nil || c.offsets == nil {
+			return
+		}
+		if saveTo := c.offTrk.Committed(); saveTo > lastSaved {
+			if err := c.offsets.Save(saveTo); err != nil {
+				c.host.Logf("telegram: final offset Save on shutdown failed: %v", err)
+			} else {
+				c.host.Logf("telegram: persisted offset=%d on shutdown", saveTo)
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-c.ctx.Done():
@@ -836,12 +857,8 @@ func (c *Channel) dispatchMessage(updateID int64, msg *gotgbot.Message, edited b
 	// commands fall through to normal routing.
 	if c.isStatusCommand(in.Text) {
 		if reply, handled := c.host.HandleCommand(in); handled {
-			var topicID *int64
-			if in.TopicID != nil {
-				topicID = in.TopicID
-			}
 			if _, err := c.SendReply(c3types.ReplyArgs{
-				Channel: c.Name(), ChatID: in.ChatID, TopicID: topicID, Text: reply,
+				Channel: c.Name(), ChatID: in.ChatID, TopicID: in.TopicID, Text: reply,
 				Markup: c3types.MarkupMarkdown,
 			}); err != nil {
 				c.host.Logf("telegram: /status reply send failed update=%d chat=%d: %v", updateID, in.ChatID, err)
