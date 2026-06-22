@@ -64,6 +64,15 @@ type Host interface {
 	//     already mutated state (allowlist + pairing window).
 	// See internal/broker/pairing.go for the policy.
 	GateInbound(in *c3types.Inbound) GateInboundDecision
+
+	// HandleCommand lets the channel hand a recognized bot command (e.g.
+	// "/status") to the broker for direct handling. Returns the reply text and
+	// handled=true when the broker owns the command — the channel then sends the
+	// reply itself and MUST NOT gate, emit, queue, or route the message. Returns
+	// ("", false) for anything the broker does not handle (the channel proceeds
+	// with normal gating/routing). The command is broker-handled, not agent
+	// input.
+	HandleCommand(in *c3types.Inbound) (reply string, handled bool)
 }
 
 // GateInboundDecision mirrors broker.GateDecision but lives at the channel

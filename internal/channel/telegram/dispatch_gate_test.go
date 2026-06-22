@@ -18,6 +18,11 @@ type fakeHost struct {
 	decision channel.GateInboundDecision
 	logs     []string
 	health   []c3types.HealthEvent
+
+	// cmdHandled lets a test opt this double into claiming "/status" (used by
+	// the not-routed test in 5b); defaults to declining so the channel routes
+	// normally.
+	cmdHandled bool
 }
 
 func (h *fakeHost) Config(name string, target any) error { return nil }
@@ -38,6 +43,16 @@ func (h *fakeHost) Done() <-chan struct{} { return nil }
 
 func (h *fakeHost) GateInbound(in *c3types.Inbound) channel.GateInboundDecision {
 	return h.decision
+}
+
+// HandleCommand satisfies channel.Host. cmdHandled lets a test opt this double
+// into claiming "/status" (used by the not-routed test in 5b); it defaults to
+// declining so the channel routes normally.
+func (h *fakeHost) HandleCommand(in *c3types.Inbound) (string, bool) {
+	if h.cmdHandled && in != nil && in.Text == "/status" {
+		return "📊 ok", true
+	}
+	return "", false
 }
 
 func (h *fakeHost) NotifyHealth(ev c3types.HealthEvent) {
