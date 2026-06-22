@@ -4,10 +4,22 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"time"
 
 	"github.com/karthikeyan5/c3/internal/c3types"
 	"github.com/karthikeyan5/c3/internal/ipc"
 )
+
+// retranscribeTimeout bounds the synchronous STT chain run on the IPC read
+// goroutine in handleRetranscribe, so a slow/hung provider cannot wedge that
+// adapter's single-threaded read loop indefinitely. It sits just ABOVE the STT
+// builtin's own subprocess budget (defaultTimeoutSeconds = 300s) so a healthy
+// long voice note that legitimately runs near 300s still completes (the inner,
+// ctx-derived 300s deadline fires first and returns a real "still failing"
+// error), while a provider that hangs BEFORE its own deadline applies (e.g. a
+// stuck network download) is still cut off in bounded time. It is a var (not a
+// const) only so a test can shorten it; production never reassigns it.
+var retranscribeTimeout = 330 * time.Second
 
 // handleFetchQueue routes a fetch_queue pull through the claimed route's worker
 // (single-owner file access). Limit default + max are clamped by the adapter;
@@ -75,7 +87,16 @@ func (b *Broker) handleRetranscribe(conn *ipc.Conn, stub *Stub, raw []byte) {
 		_ = conn.WriteJSON(ipc.RetranscribeResp{Op: ipc.OpRetranscribeResult, ID: req.ID, Err: "no STT plugin registered"})
 		return
 	}
-	transcript := b.Plugins.FireOnVoiceReceived(context.Background(), c3types.VoicePayload{
+	// Bound the STT chain (network download + provider call) so a slow/hung
+	// provider cannot block this adapter's single-threaded IPC read loop forever.
+	// FireOnVoiceReceived honors ctx (the STT builtin wires its subprocess to a
+	// ctx-derived deadline), so a timeout here unblocks the read loop even if a
+	// provider ignores its own budget. The cap sits just above the STT
+	// subprocess default (300s) so a healthy long voice note still completes,
+	// while a truly stuck call still returns an error in bounded time.
+	ctx, cancel := context.WithTimeout(context.Background(), retranscribeTimeout)
+	defer cancel()
+	transcript := b.Plugins.FireOnVoiceReceived(ctx, c3types.VoicePayload{
 		Channel:   chanName,
 		ChatID:    chatID,
 		TopicID:   topicID,

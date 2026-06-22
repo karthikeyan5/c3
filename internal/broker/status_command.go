@@ -74,9 +74,7 @@ func (b *Broker) statusGlobal() string {
 		}
 		rows := make([]row, 0, len(all))
 		for k, st := range all {
-			rk := MakeRouteKey(k.Channel, k.ChatID, k.TopicID)
 			rows = append(rows, row{b.topicDisplayName(k.Channel, k.ChatID, k.TopicID), st.Pending, st.OldestUnix})
-			_ = rk
 		}
 		sort.Slice(rows, func(i, j int) bool { return rows[i].name < rows[j].name })
 		for _, r := range rows {

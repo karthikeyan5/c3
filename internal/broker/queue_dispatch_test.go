@@ -199,6 +199,63 @@ func TestHandleRetranscribe_RefreshesQueuedMessageInPlace(t *testing.T) {
 	}
 }
 
+// Item B (retranscribe timeout): a slow/hung STT provider must NOT block the IPC
+// read goroutine forever. handleRetranscribe bounds FireOnVoiceReceived with
+// retranscribeTimeout; an OnVoiceReceived callback that respects ctx (returns ""
+// once the bounded ctx fires) lets the handler return a "still failing" error
+// within the cap rather than wedging. We shorten retranscribeTimeout so the test
+// is fast, and assert the handler returns well inside a generous outer deadline.
+func TestHandleRetranscribe_BoundsHungProvider(t *testing.T) {
+	t.Setenv("C3_QUEUE_DIR", t.TempDir())
+	b := brokerWithChannel(t, mfWithTelegram(), &fakeChannel{})
+	defer b.Shutdown()
+
+	prev := retranscribeTimeout
+	retranscribeTimeout = 50 * time.Millisecond
+	defer func() { retranscribeTimeout = prev }()
+
+	// A provider that hangs until the (bounded) ctx is cancelled, then returns no
+	// transcript — exactly how a respectful-but-stuck provider behaves under a
+	// deadline.
+	started := make(chan struct{}, 1)
+	b.Plugins.OnVoiceReceived(func(ctx context.Context, _ c3types.VoicePayload) (string, error) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-ctx.Done() // block until handleRetranscribe's timeout fires
+		return "", ctx.Err()
+	})
+	stub := &Stub{CLI: "claude"}
+	stub.SetRoute(&RouteKey{Channel: "telegram", ChatID: -100, HasTopic: true, TopicID: 914})
+
+	agentSide, brokerSide := newConnPair(t)
+	raw, _ := json.Marshal(ipc.RetranscribeReq{Op: ipc.OpRetranscribe, ID: "9", FileID: "vf"})
+
+	respCh := make(chan ipc.RetranscribeResp, 1)
+	go func() {
+		b.handleRetranscribe(brokerSide, stub, raw)
+	}()
+	go func() { respCh <- readRetranscribeResp(t, agentSide) }()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnVoiceReceived callback was never invoked")
+	}
+
+	select {
+	case resp := <-respCh:
+		// The bounded ctx fired, the provider returned "", and the handler reported
+		// the still-failing error rather than blocking indefinitely.
+		if resp.Err == "" {
+			t.Fatalf("expected a 'still failing' error after the bounded timeout; got Text=%q", resp.Text)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleRetranscribe did not return after the bounded timeout — a hung provider can wedge the IPC read loop")
+	}
+}
+
 func TestHandleInboundDelivered_MergedBatchConsumesAllCovered(t *testing.T) {
 	t.Setenv("C3_QUEUE_DIR", t.TempDir())
 	b := brokerWithChannel(t, mfWithTelegram(), &fakeChannel{})
