@@ -338,13 +338,11 @@ func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inboun
 			case transcript != "":
 				in.Text = w.sttPrefix(in.Channel) + transcript
 			case in.Text == "":
-				// Defense-in-depth: no plugin produced a transcript AND the
-				// message has no caption. Without this, the adapter falls
-				// back to a silent "(voice message)" placeholder. Marker
-				// shape matches sttFailureMarker() in plugins/builtins/stt.
-				// 2026-05-18 (#13): append broker log path so a fresh
-				// install user knows where the actual traceback lives.
-				in.Text = w.sttPrefix(in.Channel) + "[STT FAILED: no_transcript_plugin — see " + LogPath() + "]"
+				// Self-documenting failure: the text the AGENT sees becomes a
+				// recovery instruction (it names the file_id + how to fetch /
+				// retry), not a dead end. The audio is durably queued and
+				// recoverable; the user never re-forwards.
+				in.Text = sttFailureText(in, "no_transcript")
 			}
 		}
 	}
@@ -392,6 +390,25 @@ func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inboun
 	}
 
 	w.forwardOrFallback(ctx, merged, len(batch))
+}
+
+// sttFailureText renders the agent-facing STT-failure recovery message. It is
+// self-documenting: the agent learns the audio exists, exactly how to fetch it
+// (download_attachment), that it can retry transcription (retranscribe), and
+// that the user does NOT need to resend. Includes file_id, mime, and duration
+// when known. See broker.log (LogPath) for the provider traceback.
+func sttFailureText(in *c3types.Inbound, reason string) string {
+	fileID, mime, dur := "", "", ""
+	if len(in.Attachments) > 0 {
+		fileID = in.Attachments[0].FileID
+		mime = in.Attachments[0].MIME
+	}
+	if mime == "" {
+		mime = "audio"
+	}
+	dur = "duration unknown"
+	return fmt.Sprintf("⚠️ [voice transcription failed: %s] The audio is saved and recoverable — the user does not need to resend. Call download_attachment with file_id=%q (%s, %s) to retrieve it, or retranscribe with the same file_id to re-run transcription. Provider traceback: %s",
+		reason, fileID, mime, dur, LogPath())
 }
 
 // flushEvent forwards a single synthesized channel EVENT (poll_result /

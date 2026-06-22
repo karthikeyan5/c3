@@ -70,9 +70,11 @@ func TestWorker_SubmitAfterStopReturnsFalse(t *testing.T) {
 // Regression test for 2026-05-14: when the STT handler script went missing,
 // the plugin silently disabled itself at startup and voice messages reached
 // the agent as a bare "(voice message)" with no indication anything was
-// wrong. Broker-side defense-in-depth: if a voice attachment arrives and no
-// plugin produced a transcript AND no caption exists, surface a marker.
-func TestFlushInbounds_VoiceWithoutSTTPluginGetsMarker(t *testing.T) {
+// wrong. The broker now surfaces a self-documenting recovery message: the
+// agent learns the audio exists, the exact file_id, and that it can fetch
+// (download_attachment) or retry (retranscribe) without the user resending.
+func TestFlushInbounds_VoiceWithoutSTTPluginGetsSelfDocumentingFailure(t *testing.T) {
+	t.Setenv("C3_QUEUE_DIR", t.TempDir())
 	b := New(&mappings.MappingsFile{SchemaVersion: 1})
 	defer b.Shutdown()
 
@@ -80,15 +82,15 @@ func TestFlushInbounds_VoiceWithoutSTTPluginGetsMarker(t *testing.T) {
 	defer w.Stop()
 
 	in := &c3types.Inbound{
-		Channel:     "telegram",
-		ChatID:      -100,
-		MessageID:   42,
-		Attachments: []c3types.Attachment{{Kind: "voice", FileID: "v1", Size: 1000}},
+		Channel: "telegram", ChatID: -100, MessageID: 42,
+		Attachments: []c3types.Attachment{{Kind: "voice", FileID: "VFILE", MIME: "audio/ogg", Size: 1000}},
 	}
 	w.flushInbounds(context.Background(), []*c3types.Inbound{in})
 
-	if !strings.Contains(in.Text, "[STT FAILED:") || !strings.Contains(in.Text, "no_transcript_plugin") {
-		t.Errorf("voice with no STT plugin: in.Text=%q, want marker with no_transcript_plugin reason", in.Text)
+	for _, want := range []string{"transcription failed", "VFILE", "download_attachment", "retranscribe", "does not need to resend"} {
+		if !strings.Contains(in.Text, want) {
+			t.Errorf("STT failure text missing %q; got %q", want, in.Text)
+		}
 	}
 }
 
