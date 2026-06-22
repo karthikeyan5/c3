@@ -10,6 +10,7 @@ import (
 
 	"github.com/karthikeyan5/c3/internal/c3types"
 	"github.com/karthikeyan5/c3/internal/ipc"
+	"github.com/karthikeyan5/c3/internal/queue"
 )
 
 // JobKind tags route-worker jobs.
@@ -19,6 +20,8 @@ const (
 	JobInbound JobKind = iota
 	JobOutbound
 	JobRelease
+	JobFetch
+	JobConsume
 )
 
 // Job is one unit of work for a route worker. Exactly one of the payload
@@ -27,6 +30,38 @@ type Job struct {
 	Kind     JobKind
 	Inbound  *c3types.Inbound
 	Outbound *OutboundJob
+	Fetch    *FetchJob
+	Consume  *ConsumeJob
+}
+
+// FetchJob asks the worker to Peek/Consume the route's durable queue. Limit<0
+// (or All) means everything. Ack=true consumes; false peeks. The result returns
+// via ResultCh.
+type FetchJob struct {
+	Limit    int
+	All      bool
+	Ack      bool
+	ResultCh chan<- FetchResult
+}
+
+// FetchResult carries the pulled messages + remaining count back to the handler.
+type FetchResult struct {
+	Messages  []c3types.Inbound
+	Remaining int
+	Err       error
+}
+
+// ConsumeJob consumes the queued lines a Claude live push covered, off the front
+// (Claude live-ack path). A single push may MERGE a debounced batch of N stored
+// lines into one notification (mergeBatch), so the ack must consume ALL N lines
+// the push covered, not just one — otherwise N-1 stored lines are orphaned as
+// phantom backlog. Count is the number of stored lines the acked push covered
+// (>=1); MessageID is the merged push's id (the last in the batch), logged for
+// audit. Consumption is strictly oldest-first (live delivery is in arrival
+// order), so consuming Count off the head matches exactly the covered lines.
+type ConsumeJob struct {
+	MessageID int64
+	Count     int
 }
 
 // OutboundJob is a queued tool-call dispatched to a channel.
@@ -77,6 +112,11 @@ type RouteWorker struct {
 	// maxTypingPulses the relay self-disarms even if (for any reason) the idle
 	// timeout never trips. See pulseTyping.
 	typingPulses int
+
+	// dedup suppresses the at-least-once REPLAY a crash-mid-consume cursor rewind
+	// can produce (spec: "dedupe by message_id"). Bounded FIFO; touched only from
+	// the worker's single run goroutine (flushInbounds), so it needs no lock.
+	dedup *deliveredDedup
 }
 
 // debounceWindow / debounceMax defaults from spec §7.3 + §6.
@@ -111,6 +151,9 @@ func newRouteWorker(parent context.Context, key RouteKey, idle time.Duration, br
 		cancel:    cancel,
 		done:      make(chan struct{}),
 		typingIvl: typingInterval,
+		// 2048 is comfortably larger than the 1000-message per-route cap, so a
+		// full-queue recovery replay is fully covered by the dedup window.
+		dedup: newDeliveredDedup(2048),
 	}
 	go w.run(ctx)
 	return w
@@ -217,6 +260,10 @@ func (w *RouteWorker) run(ctx context.Context) {
 				}
 			case JobOutbound:
 				w.dispatchOutbound(ctx, job.Outbound)
+			case JobFetch:
+				w.handleFetch(ctx, job.Fetch)
+			case JobConsume:
+				w.handleConsume(ctx, job.Consume)
 			case JobRelease:
 				flushDeb()
 				return
@@ -281,7 +328,37 @@ func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inboun
 		}
 	}
 
-	// Merge.
+	// Durable storage: persist EACH message (one queue line) AFTER STT
+	// substitution so the stored line already carries the transcript. Storage is
+	// per-message; the merge below is a delivery-presentation concern only and
+	// does not merge stored lines. Append failure = persist failure: do NOT mark
+	// the update_id done (markPersisted is only called on success), so the
+	// Telegram offset can't pass it and the message is redelivered (loss-free).
+	if w.broker != nil && w.broker.Queue != nil {
+		qrk := queueRouteKey(w.key)
+		for _, in := range batch {
+			// Dedup the at-least-once REPLAY a crash-mid-consume can produce
+			// (spec: "dedupe by message_id"). See newDeliveredDedup below.
+			if w.dedup != nil && w.dedup.seenBefore(in.MessageID) {
+				log.Printf("dedup chan=%s chat=%d topic=%s msg=%d: already delivered, suppressing replay",
+					w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID)
+				continue
+			}
+			if err := w.broker.Queue.Append(qrk, in); err != nil {
+				log.Printf("queue append FAIL chan=%s chat=%d topic=%s msg=%d: %v — offset will NOT advance; Telegram redelivers — %s",
+					w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, err, fallbackSummary(in))
+				// Best-effort Telegram notice (spec Error-handling: disk-full =
+				// persist failure → log + best-effort Telegram notice). Cooldown'd
+				// via the existing fallback tracker so a stuck disk doesn't spam.
+				w.notePersistFailure(in)
+				continue
+			}
+			w.markPersisted(in)
+			w.evictIfOverCap(qrk)
+		}
+	}
+
+	// Merge (delivery presentation only).
 	merged := mergeBatch(batch)
 
 	// OnInbound chain on the merged inbound.
@@ -293,7 +370,7 @@ func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inboun
 		merged = next
 	}
 
-	w.forwardOrFallback(ctx, merged)
+	w.forwardOrFallback(ctx, merged, len(batch))
 }
 
 // flushEvent forwards a single synthesized channel EVENT (poll_result /
@@ -315,7 +392,7 @@ func (w *RouteWorker) flushEvent(ctx context.Context, ev *c3types.Inbound) {
 		}
 		ev = next
 	}
-	w.forwardOrFallback(ctx, ev)
+	w.forwardOrFallback(ctx, ev, 0)
 }
 
 // mergeBatch collapses a batch of inbounds into one. See flushInbounds for
@@ -375,7 +452,7 @@ func mergeBatch(batch []*c3types.Inbound) *c3types.Inbound {
 // holder-conn-bad, write-error, fallback-cooldown-drop, fallback-send-fail,
 // AND fallback-sent (the user's message was bounced back to Telegram with a
 // boilerplate; no CLI processed it).
-func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound) {
+func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound, covered int) {
 	holder, claimed := w.broker.Routes.Holder(w.key)
 
 	// Liveness sweep: if the holder's PID is dead (e.g. Claude Code killed
@@ -421,12 +498,28 @@ func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound) 
 
 	if claimed {
 		conn := holderConn
-		if err := conn.WriteJSON(ipc.InboundMsg{Op: ipc.OpInbound, Inbound: *in}); err != nil {
+		// Stamp the covered-line count + remaining backlog onto the live push so
+		// (a) the OpInboundDelivered ack can Consume exactly the lines this push
+		// covered (a merged batch covers N stored lines, not 1) and (b) the Claude
+		// adapter can append the recovery nudge. The covered lines are STILL queued
+		// at push time (only Consumed on the ack), so subtract covered from the
+		// route's pending count → a fully-caught-up live session shows Pending:0.
+		covered := covEffective(covered) // >=1
+		pending := 0
+		if w.broker != nil && w.broker.Queue != nil {
+			if n, _ := w.broker.Queue.Pending(queueRouteKey(w.key)); n > covered {
+				pending = n - covered // covered lines are still queued until acked
+			}
+		}
+		if err := conn.WriteJSON(ipc.InboundMsg{Op: ipc.OpInbound, Inbound: *in, Covered: covered, Pending: pending}); err != nil {
 			log.Printf("deliver FAIL chan=%s chat=%d topic=%s msg=%d to cli=%s pid=%d: %v — %s",
 				w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID,
 				holder.CLI, holder.PID, err, fallbackSummary(in))
 			return
 		}
+		// Live delivery: the message stays queued until the adapter sends
+		// OpInboundDelivered{ok:true}, which Consumes it (queue dispatch task).
+		// This keeps an un-acked push recoverable as backlog (recovery nudge).
 		log.Printf("delivered chan=%s chat=%d topic=%s msg=%d to cli=%s pid=%d conn=%d",
 			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID,
 			holder.CLI, holder.PID, holder.ConnID)
@@ -449,34 +542,47 @@ func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound) 
 			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, in.Kind)
 		return
 	}
+	// Append-if-absent: the normal path already appended this message (and its
+	// MessageID is recorded in w.dedup) in flushInbounds. A direct-call/test path
+	// (or any future caller that reaches forwardOrFallback without flushInbounds)
+	// has NOT — so append it here, gated by the SAME dedup set so the normal path
+	// does not double-store (flushInbounds already recorded the id, so seenBefore
+	// returns true here and we skip). This keeps the running count below accurate
+	// for the message the user just sent. Events are never queued.
+	if w.broker.Queue != nil {
+		if w.dedup == nil || !w.dedup.seenBefore(in.MessageID) {
+			_ = w.broker.Queue.Append(queueRouteKey(w.key), in)
+		}
+	}
+	// No live claim: the message is already durably queued (flushInbounds — or
+	// the append-if-absent above — stored it). Replace the old drop with a
+	// "held, nothing lost" auto-reply, cooldown'd to once per window, carrying
+	// the RUNNING queued count.
 	if !w.broker.Fallbacks.ShouldSend(w.key) {
-		log.Printf("drop chan=%s chat=%d topic=%s msg=%d: no claim, fallback in cooldown — %s",
-			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID,
-			fallbackSummary(in))
+		log.Printf("hold chan=%s chat=%d topic=%s msg=%d: no claim, queued; held-reply in cooldown — %s",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, fallbackSummary(in))
 		return
 	}
 	ch, err := w.broker.Channel(in.Channel)
 	if err != nil {
-		log.Printf("fallback FAIL chan=%s chat=%d topic=%s msg=%d: channel lookup: %v — %s",
-			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, err,
-			fallbackSummary(in))
+		log.Printf("hold FAIL chan=%s chat=%d topic=%s msg=%d: channel lookup: %v — %s",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, err, fallbackSummary(in))
 		return
 	}
-	args := c3types.ReplyArgs{
-		Channel: in.Channel,
-		ChatID:  in.ChatID,
-		TopicID: in.TopicID,
-		Text:    fallbackText,
+	count := 1
+	if w.broker.Queue != nil {
+		if n, _ := w.broker.Queue.Pending(queueRouteKey(w.key)); n > 0 {
+			count = n
+		}
 	}
+	args := c3types.ReplyArgs{Channel: in.Channel, ChatID: in.ChatID, TopicID: in.TopicID, Text: heldReplyText(count)}
 	if _, err := ch.SendReply(args); err != nil {
-		log.Printf("fallback FAIL chan=%s chat=%d topic=%s msg=%d: send: %v — %s",
-			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, err,
-			fallbackSummary(in))
+		log.Printf("hold FAIL chan=%s chat=%d topic=%s msg=%d: send held-reply: %v — %s",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, err, fallbackSummary(in))
 		return
 	}
-	log.Printf("fallback chan=%s chat=%d topic=%s msg=%d: no claim, sent fallback reply — %s",
-		w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID,
-		fallbackSummary(in))
+	log.Printf("hold chan=%s chat=%d topic=%s msg=%d: no claim, queued + held-reply (count=%d) — %s",
+		w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, count, fallbackSummary(in))
 }
 
 // fallbackSummary returns a one-liner of message content for use in
@@ -511,6 +617,179 @@ func fallbackSummary(in *c3types.Inbound) string {
 		return "(no content)"
 	}
 	return strings.Join(parts, " ")
+}
+
+// covEffective normalizes a covered-line count to >=1 (a live push always covers
+// at least the one merged message; 0/negative comes from the event path or a
+// direct test call and is treated as a single line).
+func covEffective(n int) int {
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
+// markPersisted notifies the broker that an inbound's source update_id is now
+// durably stored, so the persisted-offset tracker may advance over it. The
+// broker holds the channel-side tracker via a registered callback (set when the
+// telegram channel starts); a nil callback (unit tests, non-telegram) is a no-op.
+func (w *RouteWorker) markPersisted(in *c3types.Inbound) {
+	if w.broker == nil {
+		return
+	}
+	w.broker.notifyPersisted(in)
+}
+
+// notePersistFailure sends ONE best-effort, cooldown'd Telegram notice when a
+// durable Append fails (spec Error-handling: "Disk full on append: treat as
+// persist failure → do not advance offset → Telegram retains → log + (best-
+// effort) Telegram notice"). The offset non-advance + Telegram retention is the
+// real safety net; this notice just tells the human why a message seems stuck.
+// Reuses the existing fallback cooldown so a stuck disk does not spam the topic.
+func (w *RouteWorker) notePersistFailure(in *c3types.Inbound) {
+	if w.broker == nil || w.broker.Fallbacks == nil || !w.broker.Fallbacks.ShouldSend(w.key) {
+		return
+	}
+	ch, err := w.broker.Channel(w.key.Channel)
+	if err != nil {
+		return
+	}
+	var topicID *int64
+	if w.key.HasTopic {
+		t := w.key.TopicID
+		topicID = &t
+	}
+	// in's content is intentionally NOT echoed back to the chat (it failed to
+	// persist, but we don't surface user content in an error notice). The caller
+	// already logged the metadata via fallbackSummary(in) on the append-fail line.
+	_, _ = ch.SendReply(c3types.ReplyArgs{
+		Channel: w.key.Channel, ChatID: w.key.ChatID, TopicID: topicID,
+		Text: "⚠️ Could not persist a received message (storage error) — it was NOT lost; Telegram will redeliver it. Check the broker host's disk.",
+	})
+}
+
+// evictIfOverCap enforces the per-route cap. On a drop it logs + sends ONE
+// Telegram notice (never silent). Errors are logged, not fatal.
+func (w *RouteWorker) evictIfOverCap(qrk queue.RouteKey) {
+	dropped, err := w.broker.Queue.EvictOverCap(qrk)
+	if err != nil {
+		log.Printf("queue evict FAIL chan=%s chat=%d topic=%s: %v", w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), err)
+		return
+	}
+	if dropped == 0 {
+		return
+	}
+	log.Printf("queue CAP chan=%s chat=%d topic=%s: dropped %d oldest held message(s) over cap", w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), dropped)
+	if ch, cerr := w.broker.Channel(w.key.Channel); cerr == nil {
+		var topicID *int64
+		if w.key.HasTopic {
+			t := w.key.TopicID
+			topicID = &t
+		}
+		_, _ = ch.SendReply(c3types.ReplyArgs{
+			Channel: w.key.Channel, ChatID: w.key.ChatID, TopicID: topicID,
+			Text: fmt.Sprintf("⚠️ queue full — dropped %d oldest held message(s); attach a session soon.", dropped),
+		})
+	}
+}
+
+// handleFetch peeks or consumes the route's durable queue and returns the batch.
+func (w *RouteWorker) handleFetch(_ context.Context, job *FetchJob) {
+	if job == nil || job.ResultCh == nil {
+		return
+	}
+	defer recoverGoroutineThen("worker.handleFetch", func() {
+		select {
+		case job.ResultCh <- FetchResult{Err: fmt.Errorf("internal panic in fetch_queue")}:
+		default:
+		}
+	})
+	if w.broker == nil || w.broker.Queue == nil {
+		job.ResultCh <- FetchResult{Err: errOutboundNotImpl}
+		return
+	}
+	qrk := queueRouteKey(w.key)
+	n := job.Limit
+	if job.All {
+		n = -1
+	}
+	var msgs []c3types.Inbound
+	var err error
+	if job.Ack {
+		msgs, err = w.broker.Queue.Consume(qrk, n)
+	} else {
+		msgs, err = w.broker.Queue.Peek(qrk, n)
+	}
+	if err != nil {
+		job.ResultCh <- FetchResult{Err: err}
+		return
+	}
+	remaining, _ := w.broker.Queue.Pending(qrk)
+	if !job.Ack {
+		remaining -= len(msgs) // peek doesn't advance; "remaining after this batch"
+		if remaining < 0 {
+			remaining = 0
+		}
+	}
+	log.Printf("fetch_queue chan=%s chat=%d topic=%s ack=%v returned=%d remaining=%d",
+		w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), job.Ack, len(msgs), remaining)
+	job.ResultCh <- FetchResult{Messages: msgs, Remaining: remaining}
+}
+
+// handleConsume drops the oldest Count queued messages (Claude live-ack: a
+// pushed notification the adapter accepted, which may have MERGED a debounced
+// batch of Count stored lines). Consuming Count off the head matches exactly the
+// lines the push covered — otherwise a merged push of N would orphan N-1 stored
+// lines as phantom backlog. Count defaults to 1 (defensive: an older adapter or
+// a single-message push). MessageID is logged for audit; consumption is strictly
+// oldest-first (live delivery is in arrival order).
+func (w *RouteWorker) handleConsume(_ context.Context, job *ConsumeJob) {
+	if job == nil || w.broker == nil || w.broker.Queue == nil {
+		return
+	}
+	defer recoverGoroutine("worker.handleConsume")
+	n := job.Count
+	if n < 1 {
+		n = 1
+	}
+	qrk := queueRouteKey(w.key)
+	if _, err := w.broker.Queue.Consume(qrk, n); err != nil {
+		log.Printf("queue consume(live-ack) FAIL chan=%s chat=%d topic=%s msg=%d count=%d: %v",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), job.MessageID, n, err)
+	}
+}
+
+// deliveredDedup is a bounded FIFO set of recently-delivered MessageIDs for this
+// route. It suppresses the at-least-once REPLAY that a crash-mid-consume cursor
+// rewind can produce (spec: "dedupe by message_id"). Bounded so it never grows
+// without limit; the window only needs to cover a recovery replay, not history.
+type deliveredDedup struct {
+	seen  map[int64]struct{}
+	order []int64
+	cap   int
+}
+
+func newDeliveredDedup(capN int) *deliveredDedup {
+	return &deliveredDedup{seen: make(map[int64]struct{}, capN), cap: capN}
+}
+
+// seenBefore reports whether id was already delivered; otherwise records it
+// (dropping the oldest when over cap) and returns false.
+func (d *deliveredDedup) seenBefore(id int64) bool {
+	if id == 0 {
+		return false // unidentifiable; never dedup
+	}
+	if _, ok := d.seen[id]; ok {
+		return true
+	}
+	d.seen[id] = struct{}{}
+	d.order = append(d.order, id)
+	if len(d.order) > d.cap {
+		old := d.order[0]
+		d.order = d.order[1:]
+		delete(d.seen, old)
+	}
+	return false
 }
 
 // dispatchOutbound translates an OutboundJob into a channel call, returning

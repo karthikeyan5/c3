@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -45,3 +46,14 @@ const defaultFallbackCooldown = 300 * time.Second
 
 // fallbackText is the boilerplate reply sent on a no-claim inbound.
 const fallbackText = "No CLI is currently attached to this topic. Run `c3-broker status` to see attached terminals, or open a CLI in the project directory and `attach`."
+
+// heldReplyText is the "held, nothing lost" auto-reply sent when an inbound is
+// queued because no session is attached. It reassures and carries the running
+// count of queued messages. Cadence is the existing 5-min fallback cooldown.
+func heldReplyText(n int) string {
+	plural := "messages"
+	if n == 1 {
+		plural = "message"
+	}
+	return fmt.Sprintf("📨 Held — nothing lost. No CLI is attached to this topic right now. %d %s queued — they'll be delivered when you attach a session here. Send /status to check.", n, plural)
+}

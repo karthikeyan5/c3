@@ -3,6 +3,7 @@ package broker
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/karthikeyan5/c3/internal/mappings"
 	"github.com/karthikeyan5/c3/internal/plugin"
 	"github.com/karthikeyan5/c3/internal/proctree"
+	"github.com/karthikeyan5/c3/internal/queue"
 )
 
 // Broker holds the in-memory state shared by all connections: stubs registry,
@@ -39,8 +41,21 @@ type Broker struct {
 	Plugins   *PluginHost
 	Pairing   *pairingState
 
+	// Queue is the durable per-route inbound hold buffer. All file ops for a
+	// route are funneled through that route's RouteWorker goroutine (single
+	// owner ⇒ no file locks). May be nil if queue init failed at New (durable
+	// hold disabled for the run, logged loudly) — callers must nil-check.
+	Queue *queue.Store
+
 	mappings   atomic.Pointer[mappings.MappingsFile]
 	mutationMu sync.Mutex
+
+	// persistedCB is invoked (best-effort, off the hot path is fine) when an
+	// inbound's source update_id has been durably appended to the queue. The
+	// telegram channel registers this to advance its persisted-offset tracker.
+	// nil ⇒ no-op (non-telegram / unit tests).
+	persistedMu sync.RWMutex
+	persistedCB func(in *c3types.Inbound)
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -88,6 +103,18 @@ func New(mf *mappings.MappingsFile) *Broker {
 		sessionPIDResolver: proctree.CLISessionPID,
 	}
 	b.mappings.Store(mf)
+	// Durable inbound queue. A queue init failure must NOT stop the broker (it
+	// degrades to the old in-memory-only path), but log loudly so the operator
+	// knows durable hold is disabled for this run.
+	if q, err := queue.NewStore(queue.QueueDir()); err != nil {
+		log.Printf("queue: init failed (%v) — durable inbound hold DISABLED for this run", err)
+		b.Queue = nil
+	} else {
+		if rerr := q.RecoverOnStartup(); rerr != nil {
+			log.Printf("queue: recovery scan failed: %v", rerr)
+		}
+		b.Queue = q
+	}
 	b.Workers = NewWorkerPool(ctx, defaultWorkerIdle, b)
 	b.Plugins = newPluginHost(b)
 	return b
@@ -267,4 +294,33 @@ func (b *Broker) SetMappings(mf *mappings.MappingsFile) {
 	b.mutationMu.Lock()
 	defer b.mutationMu.Unlock()
 	b.mappings.Store(mf)
+}
+
+// SetPersistedCallback registers the durable-persist notifier (the telegram
+// channel sets this to advance its persisted-offset tracker). Safe to call once
+// at channel start.
+func (b *Broker) SetPersistedCallback(fn func(in *c3types.Inbound)) {
+	b.persistedMu.Lock()
+	defer b.persistedMu.Unlock()
+	b.persistedCB = fn
+}
+
+// notifyPersisted invokes the registered persist callback, if any.
+func (b *Broker) notifyPersisted(in *c3types.Inbound) {
+	b.persistedMu.RLock()
+	fn := b.persistedCB
+	b.persistedMu.RUnlock()
+	if fn != nil {
+		fn(in)
+	}
+}
+
+// queueRouteKey converts a broker RouteKey into the queue package's RouteKey.
+func queueRouteKey(k RouteKey) queue.RouteKey {
+	rk := queue.RouteKey{Channel: k.Channel, ChatID: k.ChatID}
+	if k.HasTopic {
+		t := k.TopicID
+		rk.TopicID = &t
+	}
+	return rk
 }

@@ -12,6 +12,22 @@ import (
 	"github.com/karthikeyan5/c3/internal/mappings"
 )
 
+// TestMain isolates the durable queue to a throwaway dir for the whole broker
+// test package, so any test that drives a message through the delivery pipeline
+// (flushInbounds/Emit/forwardOrFallback now persist to disk) never writes to the
+// user's real ~/.local/state/c3/queue. Individual tests may still override with
+// t.Setenv("C3_QUEUE_DIR", t.TempDir()) for a fresh per-test dir.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "c3-broker-queue-test")
+	if err != nil {
+		panic(err)
+	}
+	_ = os.Setenv("C3_QUEUE_DIR", dir)
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
+
 func TestWorker_IdleShutdown(t *testing.T) {
 	w := newRouteWorker(context.Background(), RouteKey{Channel: "x"}, 50*time.Millisecond, nil)
 	select {
@@ -128,6 +144,7 @@ func TestFlushInbounds_VoiceWithSTTPluginUsesTranscript(t *testing.T) {
 // either (the stale claim made `claimed=true`). Fix: liveness check at
 // dispatch time, release-and-fall-through when holder PID is dead.
 func TestForwardOrFallback_StaleClaim_ReleasesAndFallsThrough(t *testing.T) {
+	t.Setenv("C3_QUEUE_DIR", t.TempDir())
 	mf := mfWithTelegram()
 	fc := &fakeChannel{}
 	b := brokerWithChannel(t, mf, fc)
@@ -159,7 +176,7 @@ func TestForwardOrFallback_StaleClaim_ReleasesAndFallsThrough(t *testing.T) {
 		MessageID: 1133,
 		Text:      "Hi",
 	}
-	w.forwardOrFallback(context.Background(), in)
+	w.forwardOrFallback(context.Background(), in, 1)
 
 	// Stale claim must be released.
 	if _, held := b.Routes.Holder(key); held {
@@ -178,6 +195,7 @@ func TestForwardOrFallback_StaleClaim_ReleasesAndFallsThrough(t *testing.T) {
 // lost forever with nothing to replay it. Instead it bounces to the SAME
 // Telegram fallback the STALE branch uses, so the user is told to resend.
 func TestForwardOrFallback_AliveButDisconnectedHolder_BouncesToFallback(t *testing.T) {
+	t.Setenv("C3_QUEUE_DIR", t.TempDir())
 	mf := mfWithTelegram()
 	fc := &fakeChannel{}
 	b := brokerWithChannel(t, mf, fc)
@@ -200,7 +218,7 @@ func TestForwardOrFallback_AliveButDisconnectedHolder_BouncesToFallback(t *testi
 		Channel: "telegram", ChatID: -1001234567890, TopicID: &tid,
 		MessageID: 1134, Text: "Hi",
 	}
-	w.forwardOrFallback(context.Background(), in)
+	w.forwardOrFallback(context.Background(), in, 1)
 
 	// The claim is preserved: the holder is alive and will rebind on reconnect.
 	if _, held := b.Routes.Holder(key); !held {
@@ -239,7 +257,7 @@ func TestForwardOrFallback_AliveButDisconnectedHolder_EventNotBounced(t *testing
 		MessageID: 2201, Kind: c3types.InboundPollResult,
 		Event: &c3types.InboundEvent{PollResult: &c3types.PollResult{PollID: "p-late", IsClosed: true}},
 	}
-	w.forwardOrFallback(context.Background(), event)
+	w.forwardOrFallback(context.Background(), event, 0)
 
 	if _, held := b.Routes.Holder(key); !held {
 		t.Error("alive-but-disconnected claim must be preserved for an event too")
@@ -278,7 +296,7 @@ func TestForwardOrFallback_UnclaimedEvent_DoesNotBounceFallback(t *testing.T) {
 			PollID: "p-late", IsClosed: true,
 		}},
 	}
-	w.forwardOrFallback(context.Background(), event)
+	w.forwardOrFallback(context.Background(), event, 0)
 
 	// The event must be dropped — no fallback boilerplate sent to the chat.
 	if got := len(fc.sendRepliesSnapshot()); got != 0 {
@@ -320,7 +338,11 @@ func TestTypingRelay_ArmsOnlyWhenHolderRepliedAndTypingCap(t *testing.T) {
 		defer b.Shutdown()
 		holder := claimedHolder(t, b, key)
 		w := newRouteWorker(context.Background(), key, time.Hour, b)
-		defer w.Stop()
+		// Stop the run goroutine before driving the relay calls directly: armTyping
+		// and the run loop's `case <-w.typingC` both touch worker-goroutine-owned
+		// state (typingC/typingTicker) with no lock, so a direct call from the test
+		// goroutine while run is live races the select. Stop cancels run first.
+		w.Stop()
 
 		w.armTyping(holder) // holder.HasReplied() == false
 		if w.typingTicker != nil || w.typingC != nil {
@@ -335,7 +357,9 @@ func TestTypingRelay_ArmsOnlyWhenHolderRepliedAndTypingCap(t *testing.T) {
 		holder := claimedHolder(t, b, key)
 		holder.MarkReplied()
 		w := newRouteWorker(context.Background(), key, time.Hour, b)
-		defer w.Stop()
+		// Stop run before driving the relay directly (see the first subtest's note):
+		// armTyping/pulseTyping are worker-goroutine semantics being driven manually.
+		w.Stop()
 
 		w.armTyping(holder)
 		if w.typingTicker == nil || w.typingC == nil {
@@ -356,7 +380,8 @@ func TestTypingRelay_ArmsOnlyWhenHolderRepliedAndTypingCap(t *testing.T) {
 		holder := claimedHolder(t, b, key)
 		holder.MarkReplied()
 		w := newRouteWorker(context.Background(), key, time.Hour, b)
-		defer w.Stop()
+		// Stop run before driving the relay directly (see the first subtest's note).
+		w.Stop()
 
 		w.armTyping(holder)
 		if w.typingTicker != nil {
@@ -376,7 +401,10 @@ func TestTypingRelay_DisarmIsIdempotentAndStopsTicker(t *testing.T) {
 	holder := claimedHolder(t, b, key)
 	holder.MarkReplied()
 	w := newRouteWorker(context.Background(), key, time.Hour, b)
-	defer w.Stop()
+	// Stop run before driving the relay directly: arm/disarm and the run loop's
+	// `case <-w.typingC` both touch unlocked worker-goroutine state, so a direct
+	// call while run is live races the select. Stop cancels run first.
+	w.Stop()
 
 	w.armTyping(holder)
 	if w.typingTicker == nil {
@@ -401,7 +429,8 @@ func TestTypingRelay_ReArmKeepsCadence(t *testing.T) {
 	holder := claimedHolder(t, b, key)
 	holder.MarkReplied()
 	w := newRouteWorker(context.Background(), key, time.Hour, b)
-	defer w.Stop()
+	// Stop run before driving the relay directly (see DisarmIsIdempotent's note).
+	w.Stop()
 
 	w.armTyping(holder)
 	first := w.typingTicker
