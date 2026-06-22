@@ -131,7 +131,13 @@ func (b *Broker) StartHealthRefresh() {
 			case <-b.ctx.Done():
 				return
 			case <-t.C:
-				b.WriteHealthFile()
+				// Guard so a panic in WriteHealthFile (negligible surface, but
+				// symmetry with the other supervised broker goroutines) can't
+				// crash the process or kill the ticker.
+				func() {
+					defer recoverGoroutine("healthRefresh")
+					b.WriteHealthFile()
+				}()
 			}
 		}
 	}()

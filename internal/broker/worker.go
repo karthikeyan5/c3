@@ -118,6 +118,13 @@ func newRouteWorker(parent context.Context, key RouteKey, idle time.Duration, br
 
 func (w *RouteWorker) run(ctx context.Context) {
 	defer close(w.done)
+	// Backstop: a panic in the run-loop machinery (outside the per-method guards
+	// below) is recovered + logged instead of crashing the whole broker. The
+	// worker then exits cleanly (done closes); WorkerPool.Submit respawns a fresh
+	// worker on the next job for this route. The per-method guards on the
+	// panic-prone work (flushInbounds/flushEvent/dispatchOutbound/pulseTyping)
+	// keep THIS worker alive for the common case; this only catches the rest.
+	defer recoverGoroutine("worker.run")
 	idleTimer := time.NewTimer(w.idle)
 	defer idleTimer.Stop()
 	// Ensure the typing ticker is stopped on any exit (ctx cancel, idle,
@@ -234,6 +241,7 @@ func (w *RouteWorker) run(ctx context.Context) {
 //   - Attachments: concatenated in order — agent sees all media.
 //   - OnInbound chain runs ONCE on the merged Inbound, not per-message.
 func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inbound) {
+	defer recoverGoroutine(fmt.Sprintf("worker.flushInbounds chan=%s chat=%d", w.key.Channel, w.key.ChatID))
 	if w.broker == nil || len(batch) == 0 {
 		return
 	}
@@ -296,6 +304,7 @@ func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inboun
 // flushInbounds is skipped entirely. An event whose chain returns nil is
 // dropped, matching the message path.
 func (w *RouteWorker) flushEvent(ctx context.Context, ev *c3types.Inbound) {
+	defer recoverGoroutine(fmt.Sprintf("worker.flushEvent chan=%s chat=%d", w.key.Channel, w.key.ChatID))
 	if w.broker == nil || ev == nil {
 		return
 	}
@@ -510,6 +519,16 @@ func (w *RouteWorker) dispatchOutbound(_ context.Context, job *OutboundJob) {
 	if job == nil || job.ResultCh == nil {
 		return
 	}
+	// A panic in the channel send (dispatchTool) must NOT crash the broker AND
+	// must NOT leave the waiting tool-call blocked on ResultCh forever — recover,
+	// log, and best-effort deliver a failure result (non-blocking, in case the
+	// result was already sent).
+	defer recoverGoroutineThen("worker.dispatchOutbound tool="+job.Tool, func() {
+		select {
+		case job.ResultCh <- OutboundResult{Err: fmt.Errorf("internal panic dispatching tool %q", job.Tool)}:
+		default:
+		}
+	})
 	if w.broker == nil {
 		job.ResultCh <- OutboundResult{Err: errOutboundNotImpl}
 		return
@@ -596,6 +615,7 @@ func (w *RouteWorker) disarmTyping() {
 // On error it logs and disarms — a persistently failing channel should not keep
 // the ticker spinning. Runs in the worker goroutine (the run loop's <-typingC).
 func (w *RouteWorker) pulseTyping(_ context.Context) {
+	defer recoverGoroutine(fmt.Sprintf("worker.pulseTyping chan=%s chat=%d", w.key.Channel, w.key.ChatID))
 	if w.broker == nil {
 		w.disarmTyping()
 		return

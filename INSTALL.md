@@ -257,6 +257,11 @@ loginctl enable-linger "$USER"   # keep it running across logout
 It coexists with adapter auto-spawn (the broker is a flock singleton). See
 `docs/systemd/README.md` for details and uninstall.
 
+**STT caveat:** a systemd-supervised broker has no `$CLAUDE_PLUGIN_ROOT`, so set
+`plugins.stt.handler_path` in `~/.config/c3/mappings.json` to your cloned repo's
+`plugins/c3/stt/stt-handler.py` or voice transcription silently turns off (the
+venv still auto-detects). Details in `docs/systemd/README.md`.
+
 ## 7. Tell the user the install is complete
 
 > "Installation complete.

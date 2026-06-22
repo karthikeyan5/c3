@@ -25,6 +25,30 @@ loginctl enable-linger "$USER"
 
 Verify: `systemctl --user status c3-broker` and `c3-broker status`.
 
+## IMPORTANT: STT (voice notes) needs `plugins.stt.handler_path` under systemd
+
+A broker spawned by an adapter inherits `$CLAUDE_PLUGIN_ROOT` (set by Claude
+Code), which is how it locates the STT handler. A **systemd-supervised broker has
+no `$CLAUDE_PLUGIN_ROOT`**, so unless you tell it where the handler is, voice
+transcription silently turns off (broker.log shows `stt: handler ... missing`).
+
+Set the handler path explicitly in `~/.config/c3/mappings.json`, pointing at your
+**cloned repo** (the stable location from INSTALL step 2 — NOT the marketplace
+cache):
+
+```json
+{
+  "plugins": {
+    "stt": { "handler_path": "/home/YOU/src/c3/plugins/c3/stt/stt-handler.py" }
+  }
+}
+```
+
+The STT **venv** still auto-detects (`~/.config/c3/stt-venv`, independent of
+`$CLAUDE_PLUGIN_ROOT`), so only `handler_path` must be set. Then
+`systemctl --user restart c3-broker` and confirm `broker.log` shows
+`stt: registered with handler=...`.
+
 ## How it coexists with adapter auto-spawn
 
 The broker is a singleton (flock + listen-socket). With this unit enabled,

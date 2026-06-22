@@ -21,6 +21,9 @@ import (
 func (b *Broker) HandleConn(nc net.Conn) {
 	conn := ipc.NewConn(nc)
 	defer conn.Close()
+	// A panic on a crafted/garbage frame must drop only THIS connection, not
+	// crash the whole broker (one connection-handler goroutine per adapter).
+	defer recoverGoroutine("HandleConn")
 
 	// Stage 1: hello.
 	raw, err := conn.ReadFrame()
