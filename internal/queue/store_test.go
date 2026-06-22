@@ -3,6 +3,7 @@ package queue
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -316,6 +317,105 @@ func TestStore_SingleOwnerSerializedConsumeIsExactlyOnce(t *testing.T) {
 	}
 	if n, _ := s.Pending(rk); n != appended-consumed {
 		t.Errorf("final pending = %d, want appended(%d) - consumed(%d) = %d", n, appended, consumed, appended-consumed)
+	}
+}
+
+// TestRefreshText_UpdatesPendingLineInPlace asserts RefreshText rewrites exactly
+// the still-pending line whose MessageID matches, leaving the others untouched,
+// and that a later Peek returns the refreshed Text.
+func TestRefreshText_UpdatesPendingLineInPlace(t *testing.T) {
+	s := newStore(t)
+	rk := RouteKey{Channel: "telegram", ChatID: -100}
+	for i := int64(1); i <= 3; i++ {
+		if err := s.Append(rk, msg(i, "old-"+strconv.FormatInt(i, 10))); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	ok, err := s.RefreshText(rk, 2, "fixed transcript")
+	if err != nil {
+		t.Fatalf("RefreshText: %v", err)
+	}
+	if !ok {
+		t.Fatal("RefreshText should report a hit for a pending message_id")
+	}
+	got, err := s.Peek(rk, 3)
+	if err != nil {
+		t.Fatalf("Peek: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("peek len = %d, want 3", len(got))
+	}
+	for _, in := range got {
+		switch in.MessageID {
+		case 2:
+			if in.Text != "fixed transcript" {
+				t.Fatalf("msg 2 text = %q, want refreshed", in.Text)
+			}
+		default:
+			if in.Text != "old-"+strconv.FormatInt(in.MessageID, 10) {
+				t.Fatalf("msg %d text = %q, want untouched", in.MessageID, in.Text)
+			}
+		}
+	}
+	// Pending count is unchanged by an in-place refresh.
+	if n, _ := s.Pending(rk); n != 3 {
+		t.Fatalf("pending after refresh = %d, want 3", n)
+	}
+}
+
+// TestRefreshText_NoOpWhenNotQueued asserts RefreshText returns (false, nil) and
+// rewrites nothing when the message_id is absent (never queued) or already
+// consumed (behind the cursor).
+func TestRefreshText_NoOpWhenNotQueued(t *testing.T) {
+	s := newStore(t)
+	rk := RouteKey{Channel: "telegram", ChatID: -100}
+	for i := int64(1); i <= 3; i++ {
+		if err := s.Append(rk, msg(i, "old-"+strconv.FormatInt(i, 10))); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+
+	// Absent message_id: no-op.
+	ok, err := s.RefreshText(rk, 999, "irrelevant")
+	if err != nil {
+		t.Fatalf("RefreshText(absent): %v", err)
+	}
+	if ok {
+		t.Fatal("RefreshText for an absent message_id must report no hit")
+	}
+
+	// Consume the first two; message_id 1 is now behind the cursor.
+	if _, err := s.Consume(rk, 2); err != nil {
+		t.Fatalf("Consume: %v", err)
+	}
+	ok, err = s.RefreshText(rk, 1, "too late")
+	if err != nil {
+		t.Fatalf("RefreshText(consumed): %v", err)
+	}
+	if ok {
+		t.Fatal("RefreshText for an already-consumed message_id must report no hit")
+	}
+	// The still-pending line (msg 3) keeps its original text.
+	got, err := s.Peek(rk, 3)
+	if err != nil {
+		t.Fatalf("Peek: %v", err)
+	}
+	if len(got) != 1 || got[0].MessageID != 3 || got[0].Text != "old-3" {
+		t.Fatalf("after no-op refresh, head = %+v, want msg 3 unchanged", got)
+	}
+}
+
+// TestRefreshText_MissingFileNoOp asserts RefreshText on a route with no queue
+// file is a clean (false, nil) no-op.
+func TestRefreshText_MissingFileNoOp(t *testing.T) {
+	s := newStore(t)
+	rk := RouteKey{Channel: "telegram", ChatID: -777}
+	ok, err := s.RefreshText(rk, 5, "x")
+	if err != nil {
+		t.Fatalf("RefreshText(missing): %v", err)
+	}
+	if ok {
+		t.Fatal("RefreshText on an empty/missing queue must report no hit")
 	}
 }
 

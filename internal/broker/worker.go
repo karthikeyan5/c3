@@ -22,6 +22,7 @@ const (
 	JobRelease
 	JobFetch
 	JobConsume
+	JobRefreshText
 )
 
 // Job is one unit of work for a route worker. Exactly one of the payload
@@ -32,6 +33,7 @@ type Job struct {
 	Outbound *OutboundJob
 	Fetch    *FetchJob
 	Consume  *ConsumeJob
+	Refresh  *RefreshTextJob
 }
 
 // FetchJob asks the worker to Peek/Consume the route's durable queue. Limit<0
@@ -62,6 +64,23 @@ type FetchResult struct {
 type ConsumeJob struct {
 	MessageID int64
 	Count     int
+}
+
+// RefreshTextJob asks the worker to refresh, in place, the stored Text of the
+// still-queued line whose MessageID matches (retranscribe in-place refresh, spec
+// Component 5). Routed through the single-owner worker so the cap-safe rewrite
+// never touches the route's files off the worker goroutine. The result (whether a
+// line was refreshed) returns via ResultCh.
+type RefreshTextJob struct {
+	MessageID int64
+	NewText   string
+	ResultCh  chan<- RefreshResult
+}
+
+// RefreshResult carries whether a queued line was refreshed back to the handler.
+type RefreshResult struct {
+	Refreshed bool
+	Err       error
 }
 
 // OutboundJob is a queued tool-call dispatched to a channel.
@@ -264,6 +283,8 @@ func (w *RouteWorker) run(ctx context.Context) {
 				w.handleFetch(ctx, job.Fetch)
 			case JobConsume:
 				w.handleConsume(ctx, job.Consume)
+			case JobRefreshText:
+				w.handleRefreshText(ctx, job.Refresh)
 			case JobRelease:
 				flushDeb()
 				return
@@ -757,6 +778,38 @@ func (w *RouteWorker) handleConsume(_ context.Context, job *ConsumeJob) {
 		log.Printf("queue consume(live-ack) FAIL chan=%s chat=%d topic=%s msg=%d count=%d: %v",
 			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), job.MessageID, n, err)
 	}
+}
+
+// handleRefreshText rewrites, in place, the stored Text of the still-queued line
+// whose MessageID matches (retranscribe in-place refresh, spec Component 5). Runs
+// on the route's single-owner worker so the cap-safe rewrite never races other
+// file ops for this route. A miss (message not queued / already consumed) is a
+// clean no-op reported as Refreshed=false.
+func (w *RouteWorker) handleRefreshText(_ context.Context, job *RefreshTextJob) {
+	if job == nil || job.ResultCh == nil {
+		return
+	}
+	defer recoverGoroutineThen("worker.handleRefreshText", func() {
+		select {
+		case job.ResultCh <- RefreshResult{Err: fmt.Errorf("internal panic in refresh_text")}:
+		default:
+		}
+	})
+	if w.broker == nil || w.broker.Queue == nil {
+		job.ResultCh <- RefreshResult{Err: errOutboundNotImpl}
+		return
+	}
+	qrk := queueRouteKey(w.key)
+	refreshed, err := w.broker.Queue.RefreshText(qrk, job.MessageID, job.NewText)
+	if err != nil {
+		log.Printf("retranscribe refresh FAIL chan=%s chat=%d topic=%s msg=%d: %v",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), job.MessageID, err)
+		job.ResultCh <- RefreshResult{Err: err}
+		return
+	}
+	log.Printf("retranscribe refresh chan=%s chat=%d topic=%s msg=%d refreshed=%v",
+		w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), job.MessageID, refreshed)
+	job.ResultCh <- RefreshResult{Refreshed: refreshed}
 }
 
 // deliveredDedup is a bounded FIFO set of recently-delivered MessageIDs for this

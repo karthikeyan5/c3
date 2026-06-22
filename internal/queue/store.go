@@ -308,6 +308,69 @@ func (s *Store) EvictOverCap(rk RouteKey) (int, error) {
 	return drop, nil
 }
 
+// RefreshText rewrites, in place, the Text of the still-pending queued line whose
+// Inbound.MessageID == messageID. Used by retranscribe to replace a stored STT-
+// failure placeholder with a corrected transcript so a later fetch_queue returns
+// the fixed text. Only lines AT/AFTER the cursor (not yet consumed) are eligible —
+// an already-consumed or never-queued message_id is a clean no-op. Returns whether
+// a line was refreshed.
+//
+// It reuses the same cap-safe atomic rewrite path as EvictOverCap (temp file →
+// fsync → rename → dir-fsync), so the on-disk update is crash-safe. Like that
+// path, rewrite() strips corrupt placeholder lines, so the cursor is remapped into
+// the corrupt-free coordinate space to stay aligned with the rewritten file.
+func (s *Store) RefreshText(rk RouteKey, messageID int64, newText string) (bool, error) {
+	if messageID == 0 {
+		return false, nil // unidentifiable; never refresh
+	}
+	lines, cursor, err := s.readLines(rk)
+	if err != nil || len(lines) == 0 {
+		return false, err
+	}
+	// Project lines→real (corrupt-free) and map the cursor into that index space,
+	// mirroring EvictOverCap so a rewrite that drops corrupt lines doesn't desync
+	// the cursor from the rewritten file.
+	real := make([]c3types.Inbound, 0, len(lines))
+	cursorReal := 0
+	for i, in := range lines {
+		if in.Channel == corruptSentinel {
+			continue
+		}
+		if i < cursor {
+			cursorReal++
+		}
+		real = append(real, in)
+	}
+	// Find the matching message among the still-pending (cursor-onward) real lines.
+	found := false
+	for idx := cursorReal; idx < len(real); idx++ {
+		if real[idx].MessageID == messageID {
+			real[idx].Text = newText
+			found = true
+			break
+		}
+	}
+	if !found {
+		return false, nil
+	}
+	if err := s.rewrite(rk, real); err != nil {
+		return false, err
+	}
+	// rewrite() may have dropped corrupt lines that sat before the cursor; persist
+	// the remapped cursor so consumed lines stay consumed.
+	if cursorReal != cursor {
+		if cursorReal >= len(real) {
+			if err := s.deletePair(rk); err != nil {
+				return false, err
+			}
+		} else if err := s.writeCursor(rk, cursorReal); err != nil {
+			return false, err
+		}
+	}
+	s.refreshIndex(rk)
+	return true, nil
+}
+
 // RecoverOnStartup scans the queue dir and rebuilds the status index. A route
 // whose cursor is at/after its line count has its pair deleted; otherwise the
 // index records the derived pending count.

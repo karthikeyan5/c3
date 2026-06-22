@@ -136,6 +136,12 @@ func (b *Broker) HandleConn(nc net.Conn) {
 			stub.SetRoute(nil)
 		case ipc.OpToolCall:
 			b.handleToolCall(conn, stub, raw)
+		case ipc.OpFetchQueue:
+			b.handleFetchQueue(conn, stub, raw)
+		case ipc.OpRetranscribe:
+			b.handleRetranscribe(conn, stub, raw)
+		case ipc.OpInboundDelivered:
+			b.handleInboundDelivered(stub, raw)
 		case ipc.OpPairModeStart:
 			b.handlePairModeStart(conn, raw)
 		case ipc.OpPingThisSession:

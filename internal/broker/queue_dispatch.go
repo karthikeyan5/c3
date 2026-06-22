@@ -1,0 +1,142 @@
+package broker
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+
+	"github.com/karthikeyan5/c3/internal/c3types"
+	"github.com/karthikeyan5/c3/internal/ipc"
+)
+
+// handleFetchQueue routes a fetch_queue pull through the claimed route's worker
+// (single-owner file access). Limit default + max are clamped by the adapter;
+// the broker honors All (drain everything) and Ack (consume vs peek).
+func (b *Broker) handleFetchQueue(conn *ipc.Conn, stub *Stub, raw []byte) {
+	var req ipc.FetchQueueReq
+	if err := json.Unmarshal(raw, &req); err != nil {
+		_ = conn.WriteJSON(ipc.FetchQueueResp{Op: ipc.OpFetchQueueResult, Err: "malformed fetch_queue: " + err.Error()})
+		return
+	}
+	route := stub.CurrentRoute()
+	if route == nil {
+		_ = conn.WriteJSON(ipc.FetchQueueResp{Op: ipc.OpFetchQueueResult, ID: req.ID, Err: "fetch_queue before attach: no route claimed"})
+		return
+	}
+	resultCh := make(chan FetchResult, 1)
+	job := Job{Kind: JobFetch, Fetch: &FetchJob{Limit: req.Limit, All: req.All, Ack: req.Ack, ResultCh: resultCh}}
+	if !b.Workers.Submit(*route, job) {
+		_ = conn.WriteJSON(ipc.FetchQueueResp{Op: ipc.OpFetchQueueResult, ID: req.ID, Err: "worker queue full or stopped"})
+		return
+	}
+	res := <-resultCh
+	resp := ipc.FetchQueueResp{Op: ipc.OpFetchQueueResult, ID: req.ID, Remaining: res.Remaining}
+	if res.Err != nil {
+		resp.Err = res.Err.Error()
+	} else {
+		resp.Messages = res.Messages
+	}
+	_ = conn.WriteJSON(resp)
+}
+
+// handleRetranscribe re-runs the STT provider chain on a cached voice attachment
+// by file_id and returns the fresh transcript. Downloads via the channel are
+// handled inside the STT plugin chain (it owns DownloadAttachment).
+//
+// In-place refresh (spec Component 5): when message_id is given AND that message
+// is still queued for the claimed route, the fresh transcript replaces the stored
+// Text in place (a cap-safe rewrite routed through the route's single-owner
+// worker), so a later fetch_queue returns the corrected transcript rather than the
+// old STT-failure placeholder. A message_id that isn't queued (never seen /
+// already consumed) is a clean no-op — the transcript is still returned.
+func (b *Broker) handleRetranscribe(conn *ipc.Conn, stub *Stub, raw []byte) {
+	var req ipc.RetranscribeReq
+	if err := json.Unmarshal(raw, &req); err != nil {
+		_ = conn.WriteJSON(ipc.RetranscribeResp{Op: ipc.OpRetranscribeResult, Err: "malformed retranscribe: " + err.Error()})
+		return
+	}
+	if req.FileID == "" {
+		_ = conn.WriteJSON(ipc.RetranscribeResp{Op: ipc.OpRetranscribeResult, ID: req.ID, Err: "retranscribe: file_id required"})
+		return
+	}
+	route := stub.CurrentRoute()
+	chanName := "telegram"
+	var chatID int64
+	var topicID *int64
+	if route != nil {
+		chanName = route.Channel
+		chatID = route.ChatID
+		if route.HasTopic {
+			t := route.TopicID
+			topicID = &t
+		}
+	}
+	if b.Plugins == nil {
+		_ = conn.WriteJSON(ipc.RetranscribeResp{Op: ipc.OpRetranscribeResult, ID: req.ID, Err: "no STT plugin registered"})
+		return
+	}
+	transcript := b.Plugins.FireOnVoiceReceived(context.Background(), c3types.VoicePayload{
+		Channel:   chanName,
+		ChatID:    chatID,
+		TopicID:   topicID,
+		MessageID: req.MessageID,
+		FileID:    req.FileID,
+	})
+	resp := ipc.RetranscribeResp{Op: ipc.OpRetranscribeResult, ID: req.ID}
+	if transcript == "" {
+		resp.Err = "retranscribe: STT provider still failing (no transcript)"
+		log.Printf("retranscribe chan=%s file_id=%s msg=%d ok=false", chanName, req.FileID, req.MessageID)
+		_ = conn.WriteJSON(resp)
+		return
+	}
+	resp.Text = transcript
+
+	// In-place refresh of the still-queued line for this message_id (spec
+	// Component 5). Routed through the route's single-owner worker so the cap-safe
+	// rewrite never touches the route's files off the worker goroutine. Best-effort:
+	// a refresh miss/failure does not change the returned transcript (the agent
+	// already has it), so we log on error but still return Text.
+	refreshed := false
+	if req.MessageID != 0 && route != nil && b.Workers != nil && b.Queue != nil {
+		resultCh := make(chan RefreshResult, 1)
+		job := Job{Kind: JobRefreshText, Refresh: &RefreshTextJob{MessageID: req.MessageID, NewText: transcript, ResultCh: resultCh}}
+		if b.Workers.Submit(*route, job) {
+			res := <-resultCh
+			if res.Err != nil {
+				log.Printf("retranscribe refresh chan=%s file_id=%s msg=%d: refresh error: %v", chanName, req.FileID, req.MessageID, res.Err)
+			}
+			refreshed = res.Refreshed
+		} else {
+			log.Printf("retranscribe refresh chan=%s file_id=%s msg=%d: worker queue full or stopped", chanName, req.FileID, req.MessageID)
+		}
+	}
+	log.Printf("retranscribe chan=%s file_id=%s msg=%d ok=true refreshed=%v", chanName, req.FileID, req.MessageID, refreshed)
+	_ = conn.WriteJSON(resp)
+}
+
+// handleInboundDelivered consumes the oldest queued message(s) for the stub's
+// route after the Claude adapter acks a successful live push (OK=true). A merged
+// push covers Count stored lines and is acked once, so Count lines are consumed
+// off the head (not 1, which would orphan Count-1 as phantom backlog). OK=false
+// leaves it queued (backlog + recovery nudge). No response is sent — it is a
+// one-way ack.
+func (b *Broker) handleInboundDelivered(stub *Stub, raw []byte) {
+	var msg ipc.InboundDeliveredMsg
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		log.Printf("inbound_delivered: malformed: %v", err)
+		return
+	}
+	if !msg.OK {
+		log.Printf("inbound_delivered NACK update=%d — leaving queued (backlog)", msg.UpdateID)
+		return
+	}
+	route := stub.CurrentRoute()
+	if route == nil {
+		return
+	}
+	count := msg.Count
+	if count < 1 {
+		count = 1 // older adapter / single-message push
+	}
+	b.Workers.Submit(*route, Job{Kind: JobConsume, Consume: &ConsumeJob{MessageID: msg.UpdateID, Count: count}})
+}
