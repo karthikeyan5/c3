@@ -114,7 +114,7 @@ stderr is the trace.
 - **Gemini provider:** OPENROUTER_API_KEY (env or `~/.claude/stt.env`)
 - **Sarvam provider:** SARVAM_API_KEY (env or `~/.claude/stt.env`)
 - **ElevenLabs provider:** ELEVENLABS_API_KEY (env or `~/.claude/stt.env`)
-- **Sarvam >30s audio:** `pip install sarvamai` + `ffprobe`
+- **Sarvam >30s audio:** `ffprobe` (batch path is native urllib — no extra PyPI deps)
 
 ## Why This Exists
 

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Create / refresh the dedicated C3 STT virtualenv and install its Python deps.
 #
-# WHY: the STT provider chain needs the `sarvamai` package for voice notes longer
-# than ~30s, but the system python3 is frequently externally-managed (PEP 668)
-# and cannot pip-install it. C3's STT plugin auto-detects this venv
-# (~/.config/c3/stt-venv/bin/python) and runs the handler under it.
+# WHY: C3's STT plugin auto-detects this venv (~/.config/c3/stt-venv/bin/python)
+# and runs the handler under it. As of 2026-06-22 the STT chain has NO required
+# PyPI packages (the Sarvam >30s batch path is native stdlib urllib), so the venv
+# is OPTIONAL — system python3 works fine. Kept as a stable, isolated interpreter
+# target and to install any optional deps listed in requirements.txt.
 #
 # Idempotent — safe to re-run.
 #
@@ -39,7 +40,7 @@ echo "setup-venv: venv: $VENV"
 "$PY" -m venv "$VENV"
 "$VENV/bin/python" -m pip install --quiet --upgrade pip
 "$VENV/bin/python" -m pip install --quiet -r "$REQ"
-echo "setup-venv: installed $("$VENV/bin/python" -m pip show sarvamai 2>/dev/null | awk -F': ' '/^Version/{print "sarvamai "$2}')"
+echo "setup-venv: requirements installed from $REQ (STT currently needs no PyPI deps)."
 echo "setup-venv: done — C3 auto-detects $VENV/bin/python (or set mappings.json plugins.stt.python)."
 
 if ! command -v ffprobe >/dev/null 2>&1; then

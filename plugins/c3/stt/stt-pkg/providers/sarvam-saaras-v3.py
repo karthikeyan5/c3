@@ -1,9 +1,17 @@
 """Sarvam AI Saaras v3 STT provider.
 
 Requires: SARVAM_API_KEY env var (or in ~/.claude/stt.env)
-For audio >30s: requires sarvamai Python package (pip install sarvamai)
+For audio >30s: uses Sarvam's batch (bulk-job) API over native HTTP (stdlib
+urllib only — no third-party deps). The batch flow (init job -> presigned
+upload -> start -> poll status -> presigned download of outputs) was ported
+1:1 from the `sarvamai` SDK (v0.1.28) so the `sarvamai` PyPI dependency could
+be dropped. Endpoint/field fidelity matters: a wrong URL or field name
+silently breaks long-voice transcription.
 """
-import os, json, time, subprocess, tempfile, urllib.request, urllib.error
+import os, json, time, subprocess, mimetypes, urllib.request, urllib.error
+
+# Sarvam API base (sarvamai/environment.py: SarvamAIEnvironment.PRODUCTION.base)
+_SARVAM_BASE = "https://api.sarvam.ai"
 
 # Dynamic vocabulary (set by main stt.py via set_vocabulary)
 _VOCAB = {"terms": [], "context": ""}
@@ -116,27 +124,118 @@ def _transcribe_rest(audio_path, audio_bytes, key):
         data = json.loads(resp.read())
         return data.get("transcript", "")
 
+# --- Batch (bulk-job) API over native urllib ---
+# Ported from the sarvamai SDK (v0.1.28). Step → SDK source mapping:
+#   init job        POST speech-to-text/job/v1
+#                     -> speech_to_text_job/raw_client.py:60-77 (initialise)
+#   upload links    POST speech-to-text/job/v1/upload-files
+#                     -> raw_client.py:402-415 (get_upload_links)
+#   upload bytes    PUT  <presigned upload_url> (Azure blob)
+#                     -> speech_to_text_job/job.py:361-385 (upload_files, sync)
+#   start           POST speech-to-text/job/v1/{job_id}/start
+#                     -> raw_client.py:292-300 (start)
+#   poll status     GET  speech-to-text/job/v1/{job_id}/status
+#                     -> raw_client.py:180-185 (get_status)
+#   download links  POST speech-to-text/job/v1/download-files
+#                     -> raw_client.py:517-530 (get_download_links)
+#   download bytes  GET  <presigned download_url>
+#                     -> job.py:510-531 (download_outputs, sync)
+# Auth header on every api.sarvam.ai call: "api-subscription-key: <key>"
+#   (core/client_wrapper.py:38 — get_headers()["api-subscription-key"]).
+
+
+def _sarvam_api(path, key, method="GET", body=None, timeout=30):
+    """Call an api.sarvam.ai bulk-job endpoint and return the parsed JSON dict.
+
+    `path` is relative (e.g. "speech-to-text/job/v1"); joined to the base the
+    same way the SDK does (core/http_client.py:_build_url —
+    base.rstrip('/') + '/' + path.lstrip('/')). JSON body is sent with
+    content-type application/json; auth via the api-subscription-key header.
+    """
+    url = _SARVAM_BASE.rstrip("/") + "/" + path.lstrip("/")
+    headers = {"api-subscription-key": key}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+        return json.loads(raw) if raw else {}
+
+
+def _http_put_file(url, file_path, timeout=60):
+    """PUT a local file to a presigned Azure-blob URL (SDK job.py upload_files).
+
+    Mirrors the SDK's headers exactly: x-ms-blob-type: BlockBlob plus a guessed
+    Content-Type (defaulting to audio/wav when unknown — matches the sync SDK)."""
+    content_type, _ = mimetypes.guess_type(file_path)
+    if content_type is None:
+        content_type = "audio/wav"
+    with open(file_path, "rb") as f:
+        data = f.read()
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"x-ms-blob-type": "BlockBlob", "Content-Type": content_type},
+        method="PUT",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        # 2xx == success. urlopen raises HTTPError for >=400 already.
+        return 200 <= resp.status <= 226
+
+
+def _http_get_bytes(url, timeout=60):
+    """GET a presigned download URL and return the raw bytes."""
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
 def _transcribe_batch(audio_path, key):
-    """Batch API for audio >30s."""
-    try:
-        from sarvamai import SarvamAI
-    except ImportError as e:
-        # Surface an ACTIONABLE message instead of a bare ModuleNotFoundError —
-        # this is the 2026-06-22 failure (every >30s note failed silently). The
-        # fix is the dedicated STT venv, which C3 auto-detects.
-        raise RuntimeError(
-            "sarvamai is not installed for this interpreter — long (>30s) voice "
-            "notes need it. Create the C3 STT venv: `bash plugins/c3/stt/setup-venv.sh` "
-            "(or `pip install sarvamai`), then point plugins.stt.python at "
-            "~/.config/c3/stt-venv/bin/python (auto-detected if you use the venv)."
-        ) from e
-    client = SarvamAI(api_subscription_key=key)
-    job = client.speech_to_text_job.create_job(model="saaras:v3", mode="translate", language_code="unknown")
-    job.upload_files(file_paths=[audio_path])
-    job.start()
+    """Batch (bulk-job) API for audio >30s — native urllib, no sarvamai dep."""
+    file_name = os.path.basename(audio_path)
+
+    # 1) Init job. Body is exactly what the SDK serializes for
+    #    create_job(model="saaras:v3", mode="translate", language_code="unknown")
+    #    (verified against sarvamai serialization: callback OMITted, num_speakers
+    #    null, booleans default False). Returns {"job_id": ...} (BulkJobInitResponse).
+    init = _sarvam_api(
+        "speech-to-text/job/v1",
+        key,
+        method="POST",
+        body={
+            "job_parameters": {
+                "language_code": "unknown",
+                "model": "saaras:v3",
+                "mode": "translate",
+                "num_speakers": None,
+                "with_diarization": False,
+                "with_timestamps": False,
+            }
+        },
+    )
+    job_id = init["job_id"]
+
+    # 2) Get a presigned upload URL for our file, then PUT the bytes.
+    #    FilesUploadResponse.upload_urls: {file_name: {"file_url": ...}}.
+    up = _sarvam_api(
+        "speech-to-text/job/v1/upload-files",
+        key,
+        method="POST",
+        body={"job_id": job_id, "files": [file_name]},
+    )
+    upload_url = up["upload_urls"][file_name]["file_url"]
+    _http_put_file(upload_url, audio_path)
+
+    # 3) Start processing. ptu_id is optional/None in the SDK; we omit it.
+    _sarvam_api(
+        f"speech-to-text/job/v1/{job_id}/start", key, method="POST"
+    )
+
     # Wait budget derived from the handler's remaining subprocess budget
     # (C3_STT_BUDGET_SECONDS, set by stt-handler.py = 270s minus elapsed download
-    # time). We keep the wait ~15s UNDER that budget so the job returns/raises
+    # time). We keep the wait ~15s UNDER that budget so the poll loop returns/raises
     # here gracefully BEFORE the handler's subprocess.run hard-kills us. Capped at
     # 240s (long notes need it), floored at 30s. The Go-side 300s context is the
     # true backstop. Default 270 when the env isn't set (direct invocation).
@@ -145,16 +244,61 @@ def _transcribe_batch(audio_path, key):
     except ValueError:
         _budget = 270
     _wait = max(30, min(240, _budget - 15))
-    job.wait_until_complete(timeout=_wait)
 
-    if job.is_successful():
-        with tempfile.TemporaryDirectory() as td:
-            job.download_outputs(output_dir=td)
-            for f in os.listdir(td):
-                with open(os.path.join(td, f)) as fh:
-                    data = json.load(fh)
-                    return data.get("transcript", "")
+    # 4) Poll status every 5s (SDK wait_until_complete poll_interval default)
+    #    until job_state is "completed"/"failed", or the budget elapses.
+    #    JobStatusResponse.job_state is the completion signal (SDK job.py:415).
+    status = _poll_until_complete(job_id, key, poll_interval=5, timeout=_wait)
+    state = (status.get("job_state") or "").lower()
+    if state != "completed":
+        return None
+
+    # 5) For each successfully-processed file, resolve its output file name
+    #    from job_details, get a presigned download URL, fetch the output JSON,
+    #    and return its "transcript". Output JSON shape mirrors the REST one
+    #    (the SDK download_outputs writes this raw body to {input}.json).
+    for detail in (status.get("job_details") or []):
+        if (detail.get("state") != "Success"):
+            continue
+        outputs = detail.get("outputs") or []
+        if not outputs:
+            continue
+        output_file = outputs[0].get("file_name")
+        if not output_file:
+            continue
+        dl = _sarvam_api(
+            "speech-to-text/job/v1/download-files",
+            key,
+            method="POST",
+            body={"job_id": job_id, "files": [output_file]},
+        )
+        download_url = dl["download_urls"][output_file]["file_url"]
+        raw = _http_get_bytes(download_url)
+        data = json.loads(raw) if raw else {}
+        return data.get("transcript", "")
     return None
+
+
+def _poll_until_complete(job_id, key, poll_interval=5, timeout=600):
+    """Poll GET .../status until job_state is completed/failed, mirroring the
+    SDK's sync wait_until_complete (job.py:411-421): poll, check terminal
+    state, sleep, give up after `timeout` seconds.
+
+    Returns the final status dict. Raises TimeoutError if the job has not
+    reached a terminal state within `timeout` (same contract as the SDK)."""
+    start = time.monotonic()
+    while True:
+        status = _sarvam_api(
+            f"speech-to-text/job/v1/{job_id}/status", key, method="GET"
+        )
+        state = (status.get("job_state") or "").lower()
+        if state in {"completed", "failed"}:
+            return status
+        if time.monotonic() - start > timeout:
+            raise TimeoutError(
+                f"Job {job_id} did not complete within {timeout} seconds."
+            )
+        time.sleep(poll_interval)
 
 def transcribe(audio_path: str, audio_bytes: bytes) -> str:
     """Transcribe audio using Sarvam v3.

@@ -9,6 +9,10 @@
 # manager (e.g. `sudo pacman -S ffmpeg`, `apt install ffmpeg`). Used to detect
 # audio duration; STT degrades gracefully (REST-then-batch) if it is absent.
 
-# Sarvam AI Saaras v3 — required for voice notes longer than ~30s (batch API).
-# Tested with 0.1.28.
-sarvamai>=0.1.28
+# NO Python PyPI dependencies. Both the REST (≤30s) and batch (>30s) Sarvam
+# flows now use only the stdlib (urllib/json/os/time). The `sarvamai` library
+# was removed (2026-06-22) — its sole use was the >30s batch path, since
+# reimplemented over native HTTP in providers/sarvam-saaras-v3.py.
+#
+# This file is intentionally dependency-free; it is kept so setup-venv.sh and
+# the docs have a stable target and future deps have a home.
