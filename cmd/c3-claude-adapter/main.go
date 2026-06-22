@@ -212,6 +212,13 @@ type adapter struct {
 	pending map[string]chan ipc.ToolResultMsg
 	nextID  atomic.Uint64
 
+	// fetch_queue / retranscribe have their own pending maps keyed by request
+	// id so their typed responses don't overload the ToolResultMsg pending map.
+	fqmu      sync.Mutex
+	fqPending map[string]chan ipc.FetchQueueResp
+	rtmu      sync.Mutex
+	rtPending map[string]chan ipc.RetranscribeResp
+
 	// Hello-ack response state, captured on connect.
 	helloAck ipc.HelloAckMsg
 
@@ -240,7 +247,9 @@ type adapter struct {
 
 func newAdapter() *adapter {
 	return &adapter{
-		pending: map[string]chan ipc.ToolResultMsg{},
+		pending:   map[string]chan ipc.ToolResultMsg{},
+		fqPending: map[string]chan ipc.FetchQueueResp{},
+		rtPending: map[string]chan ipc.RetranscribeResp{},
 	}
 }
 
@@ -329,6 +338,10 @@ func (a *adapter) brokerReader(ctx context.Context) {
 			a.dispatchAttached(raw)
 		case ipc.OpTopicsList:
 			a.dispatchTopicsList(raw)
+		case ipc.OpFetchQueueResult:
+			a.dispatchFetchQueueResult(raw)
+		case ipc.OpRetranscribeResult:
+			a.dispatchRetranscribeResult(raw)
 		case ipc.OpError:
 			var errMsg ipc.ErrorMsg
 			_ = json.Unmarshal(raw, &errMsg)
@@ -521,6 +534,14 @@ func (a *adapter) handleInbound(ctx context.Context, raw []byte) {
 	}
 	frame := buildClaudeChannelFrame(&in.Inbound)
 
+	// Push-path recovery nudge (spec Component 3 — the push half of the recovery
+	// net). When the broker reports remaining backlog (in.Pending > 0), append a
+	// "(N pending — call fetch_queue)" suffix so a stuck backlog item surfaces on
+	// THIS successful push, not only at the next re-attach.
+	if s, ok := frame["content"].(string); ok {
+		frame["content"] = decoratePushContent(s, in.Pending)
+	}
+
 	// One-shot wire dump for diagnosing "broker delivers but CLI silent" —
 	// captures the exact bytes we send so we can prove the shape from outside
 	// the adapter. Logged on FIRST inbound only to avoid noise.
@@ -550,6 +571,16 @@ func (a *adapter) handleInbound(ctx context.Context, raw []byte) {
 	}
 	log.Printf("notified chan=%s chat=%d topic=%s msg=%d kind=%s",
 		in.Inbound.Channel, in.Inbound.ChatID, topic, in.Inbound.MessageID, kind)
+
+	// Tell the broker we accepted this push so it Consumes the queued copy/copies.
+	// Echo Covered back as Count so a MERGED push of N stored lines consumes all N
+	// (not just 1, which would orphan N-1 as phantom backlog). This is broker↔
+	// adapter plumbing the agent never sees (lifecycle B). On the notify-FAIL
+	// branch above we returned WITHOUT acking — the message stays queued as
+	// backlog, exactly as the recovery-nudge design requires.
+	if conn := a.currentConn(); conn != nil {
+		_ = conn.WriteJSON(ipc.InboundDeliveredMsg{Op: ipc.OpInboundDelivered, UpdateID: in.Inbound.MessageID, OK: true, Count: in.Covered})
+	}
 }
 
 // inboundContentSummary renders a one-line, content-bearing summary of an
@@ -573,6 +604,106 @@ func inboundContentSummary(in *c3types.Inbound) string {
 	}
 	for _, att := range in.Attachments {
 		parts = append(parts, fmt.Sprintf("attach=%s/%d", att.Kind, att.Size))
+	}
+	if in.IsEvent() {
+		parts = append(parts, fmt.Sprintf("event=%s", in.Kind))
+	}
+	if len(parts) == 0 {
+		return "(no content)"
+	}
+	return strings.Join(parts, " ")
+}
+
+// renderBacklogSummary renders the on-attach backlog notification text. Empty
+// string when nothing is queued. Instructs the agent to call fetch_queue.
+//
+// The broker may report count>0 with an EMPTY items slice (it degrades to
+// count-only when Peek fails) — this still renders the count line + fetch_queue
+// hint so the agent knows to drain, just without per-item previews.
+func renderBacklogSummary(count int, items []ipc.QueuedItem) string {
+	if count <= 0 {
+		return ""
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "📨 %d message(s) were held while no session was attached. Call `fetch_queue` (limit:3 or \"all\") to retrieve them.", count)
+	for _, it := range items {
+		preview := it.Preview
+		if preview == "" {
+			preview = "(" + it.Kind + ")"
+		}
+		fmt.Fprintf(&sb, "\n  • [%d] %s %s: %s", it.MessageID, it.Sender, it.Kind, preview)
+	}
+	if count > len(items) {
+		fmt.Fprintf(&sb, "\n  …and %d more", count-len(items))
+	}
+	return sb.String()
+}
+
+// pendingNudge returns a "(N pending — call fetch_queue)" suffix, or "" when
+// nothing is pending. Appended to pushes + the attach summary so Claude can
+// always recover even after a failed push.
+func pendingNudge(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("(%d pending — call `fetch_queue`)", n)
+}
+
+// decoratePushContent appends the recovery nudge to a push's content string when
+// the broker reports remaining backlog. Pure + unit-testable. (spec Component 3
+// — the push half of the recovery net: a stuck backlog item surfaces on the next
+// successful push, not only at the next re-attach.)
+func decoratePushContent(content string, pending int) string {
+	if nudge := pendingNudge(pending); nudge != "" {
+		return content + "\n\n" + nudge
+	}
+	return content
+}
+
+// renderFetchedMessages turns pulled inbound into agent-readable text, one block
+// per message with full content + each attachment's file_id/mime/size/name so
+// the agent can act on backlog voice/media (download_attachment / retranscribe).
+func renderFetchedMessages(msgs []c3types.Inbound, remaining int) string {
+	if len(msgs) == 0 {
+		return "c3 queue is empty"
+	}
+	blocks := make([]string, 0, len(msgs))
+	for i := range msgs {
+		blocks = append(blocks, renderQueuedInbound(&msgs[i]))
+	}
+	out := strings.Join(blocks, "\n\n")
+	if remaining > 0 {
+		out += "\n\n" + pendingNudge(remaining)
+	}
+	return out
+}
+
+// renderQueuedInbound renders one queued message for fetch_queue output. Unlike
+// inboundContentSummary (notify-FAIL log line), this exposes the full attachment
+// metadata the agent needs to recover backlog media: file_id, mime, size, name
+// (spec Component 4 — load-bearing for the STT-failure recovery of backlog items,
+// Component 6c: the agent must be able to call download_attachment/retranscribe
+// on a queued voice/media message).
+func renderQueuedInbound(in *c3types.Inbound) string {
+	var parts []string
+	switch {
+	case in.Sender.Username != "":
+		parts = append(parts, "from=@"+in.Sender.Username)
+	case in.Sender.UserID != 0:
+		parts = append(parts, fmt.Sprintf("from=uid=%d", in.Sender.UserID))
+	}
+	if in.MessageID != 0 {
+		parts = append(parts, fmt.Sprintf("message_id=%d", in.MessageID))
+	}
+	if in.Text != "" {
+		parts = append(parts, fmt.Sprintf("text=%q", in.Text))
+	}
+	if in.ReplyTo != nil {
+		parts = append(parts, fmt.Sprintf("reply_to=%d", in.ReplyTo.MessageID))
+	}
+	for _, att := range in.Attachments {
+		parts = append(parts, fmt.Sprintf("attachment{kind=%s file_id=%q mime=%s size=%d name=%q}",
+			att.Kind, att.FileID, att.MIME, att.Size, att.Name))
 	}
 	if in.IsEvent() {
 		parts = append(parts, fmt.Sprintf("event=%s", in.Kind))
@@ -1100,6 +1231,35 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 			},
 			handler: a.toolForward("download_attachment"),
 		},
+		{
+			tool: &mcp.Tool{
+				Name:        "fetch_queue",
+				Description: "Retrieve inbound Telegram messages held in the durable queue for the attached topic (messages that arrived while no session was attached, or that a live push didn't confirm). `limit` is how many oldest messages to pull (default 3; or pass the string \"all\" to drain everything). `ack` (default true) consumes them (advances the cursor); ack=false peeks without consuming. Drain all at once for bulk catch-up, or pull in small batches (default 3) to process carefully one group at a time. Returns full content (text/transcript, sender, attachments with file_id) plus how many remain.",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"limit": map[string]any{"description": "integer (default 3, max 50) or the string \"all\""},
+						"ack":   map[string]any{"type": "boolean", "default": true},
+					},
+				},
+			},
+			handler: a.toolFetchQueue,
+		},
+		{
+			tool: &mcp.Tool{
+				Name:        "retranscribe",
+				Description: "Re-run speech-to-text on a voice message by file_id (downloading the audio if not cached) and return the fresh transcript. Use this after a '[voice transcription failed]' message once the STT provider is healthy again — the audio is saved, so the user never has to resend. Optional `message_id` refreshes the stored transcript when that message is still queued.",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"file_id":    map[string]any{"type": "string"},
+						"message_id": map[string]any{"type": "integer"},
+					},
+					"required": []string{"file_id"},
+				},
+			},
+			handler: a.toolRetranscribe,
+		},
 	}
 	for _, t := range tools {
 		srv.AddTool(t.tool, t.handler)
@@ -1195,7 +1355,16 @@ func (a *adapter) toolAttach(ctx context.Context, req *mcp.CallToolRequest) (*mc
 			// branch because they leave OK=false.
 			termtitle.EmitAttach(&attached)
 		}
-		return toolTextResult(ipc.FormatAttached(&attached)), nil
+		text := ipc.FormatAttached(&attached)
+		// Backlog-on-attach: surface any inbound held while no session was
+		// attached (spec backlog-on-attach). renderBacklogSummary degrades
+		// gracefully when the broker reports QueuedCount>0 with an EMPTY
+		// QueuedSummary (count-only fallback when Peek failed): the agent still
+		// gets the count + a fetch_queue hint.
+		if summary := renderBacklogSummary(attached.QueuedCount, attached.QueuedSummary); summary != "" {
+			text += "\n\n" + summary
+		}
+		return toolTextResult(text), nil
 	}
 }
 
@@ -1294,6 +1463,135 @@ func (a *adapter) toolForward(name string) mcp.ToolHandler {
 			}
 			return toolResultFromMap(res.Result), nil
 		}
+	}
+}
+
+// toolFetchQueue forwards a fetch_queue pull to the broker and renders the
+// returned messages. The agent sees full content; the broker advanced the
+// cursor (ack=true) before replying.
+func (a *adapter) toolFetchQueue(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, err := decodeArgs(req.Params.Arguments)
+	if err != nil {
+		return nil, fmt.Errorf("invalid params: %w", err)
+	}
+	fq := ipc.FetchQueueReq{Op: ipc.OpFetchQueue, ID: strconv.FormatUint(a.nextID.Add(1), 10), Ack: true}
+	if v, ok := args["ack"].(bool); ok {
+		fq.Ack = v
+	}
+	switch v := args["limit"].(type) {
+	case string:
+		if strings.EqualFold(v, "all") {
+			fq.All = true
+		}
+	case float64:
+		fq.Limit = int(v)
+	}
+	if !fq.All && fq.Limit <= 0 {
+		fq.Limit = 3 // spec default
+	}
+	if fq.Limit > 50 {
+		fq.Limit = 50
+	}
+
+	ch := make(chan ipc.FetchQueueResp, 1)
+	a.fqmu.Lock()
+	a.fqPending[fq.ID] = ch
+	a.fqmu.Unlock()
+	defer func() { a.fqmu.Lock(); delete(a.fqPending, fq.ID); a.fqmu.Unlock() }()
+
+	conn := a.currentConn()
+	if conn == nil {
+		return toolErrorResult("broker reconnecting — retry fetch_queue in a moment"), nil
+	}
+	if err := conn.WriteJSON(fq); err != nil {
+		return toolErrorResult("broker write: " + err.Error()), nil
+	}
+	select {
+	case <-ctx.Done():
+		return toolErrorResult("canceled"), nil
+	case <-time.After(120 * time.Second):
+		return toolErrorResult("fetch_queue timeout"), nil
+	case resp := <-ch:
+		if resp.Err != "" {
+			return toolErrorResult(resp.Err), nil
+		}
+		return toolTextResult(renderFetchedMessages(resp.Messages, resp.Remaining)), nil
+	}
+}
+
+// toolRetranscribe forwards a retranscribe request and returns the transcript.
+func (a *adapter) toolRetranscribe(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, err := decodeArgs(req.Params.Arguments)
+	if err != nil {
+		return nil, fmt.Errorf("invalid params: %w", err)
+	}
+	fileID, _ := args["file_id"].(string)
+	if fileID == "" {
+		return toolErrorResult("retranscribe: file_id is required"), nil
+	}
+	rt := ipc.RetranscribeReq{Op: ipc.OpRetranscribe, ID: strconv.FormatUint(a.nextID.Add(1), 10), FileID: fileID}
+	if v, ok := args["message_id"].(float64); ok {
+		rt.MessageID = int64(v)
+	}
+	ch := make(chan ipc.RetranscribeResp, 1)
+	a.rtmu.Lock()
+	a.rtPending[rt.ID] = ch
+	a.rtmu.Unlock()
+	defer func() { a.rtmu.Lock(); delete(a.rtPending, rt.ID); a.rtmu.Unlock() }()
+
+	conn := a.currentConn()
+	if conn == nil {
+		return toolErrorResult("broker reconnecting — retry retranscribe in a moment"), nil
+	}
+	if err := conn.WriteJSON(rt); err != nil {
+		return toolErrorResult("broker write: " + err.Error()), nil
+	}
+	select {
+	case <-ctx.Done():
+		return toolErrorResult("canceled"), nil
+	case <-time.After(120 * time.Second):
+		return toolErrorResult("retranscribe timeout"), nil
+	case resp := <-ch:
+		if resp.Err != "" {
+			return toolErrorResult(resp.Err), nil
+		}
+		return toolTextResult(resp.Text), nil
+	}
+}
+
+// dispatchFetchQueueResult routes an OpFetchQueueResult frame to the waiting
+// toolFetchQueue caller, keyed by the request ID.
+func (a *adapter) dispatchFetchQueueResult(raw []byte) {
+	var resp ipc.FetchQueueResp
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return
+	}
+	a.fqmu.Lock()
+	ch, ok := a.fqPending[resp.ID]
+	if ok {
+		delete(a.fqPending, resp.ID)
+	}
+	a.fqmu.Unlock()
+	if ok {
+		ch <- resp
+	}
+}
+
+// dispatchRetranscribeResult routes an OpRetranscribeResult frame to the waiting
+// toolRetranscribe caller, keyed by the request ID.
+func (a *adapter) dispatchRetranscribeResult(raw []byte) {
+	var resp ipc.RetranscribeResp
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return
+	}
+	a.rtmu.Lock()
+	ch, ok := a.rtPending[resp.ID]
+	if ok {
+		delete(a.rtPending, resp.ID)
+	}
+	a.rtmu.Unlock()
+	if ok {
+		ch <- resp
 	}
 }
 
