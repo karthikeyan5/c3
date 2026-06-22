@@ -243,30 +243,57 @@ func (s *Store) EvictOverCap(rk RouteKey) (int, error) {
 	if err != nil || len(lines) == 0 {
 		return 0, err
 	}
+	// rewrite() strips corrupt placeholders from the file, so the cap/age/cursor
+	// math must run on the corrupt-free real-line view — otherwise corrupt lines
+	// inflate the count (over-evicting) and desync the rewritten file's length
+	// from newCursor (risking double-serve or skip). Project lines→real and map
+	// the cursor into the same corrupt-free coordinate space.
+	real := make([]c3types.Inbound, 0, len(lines))
+	cursorReal := 0 // cursor mapped into the corrupt-free index space
+	for i, in := range lines {
+		if i < cursor && in.Channel != corruptSentinel {
+			cursorReal++
+		}
+		if in.Channel == corruptSentinel {
+			continue
+		}
+		real = append(real, in)
+	}
+	if len(real) == 0 {
+		// Only corrupt lines remained; rewrite drops them all (deletes the pair).
+		if err := s.rewrite(rk, real); err != nil {
+			return 0, err
+		}
+		if err := s.deletePair(rk); err != nil {
+			return 0, err
+		}
+		s.refreshIndex(rk)
+		return 0, nil
+	}
 	cutoff := time.Now().Add(-MaxAge)
-	// Find how many leading lines to drop: by age first, then by count.
+	// Find how many leading real lines to drop: by age first, then by count.
 	drop := 0
-	for _, in := range lines {
-		if in.Channel != corruptSentinel && !in.Timestamp.IsZero() && in.Timestamp.Before(cutoff) {
+	for _, in := range real {
+		if !in.Timestamp.IsZero() && in.Timestamp.Before(cutoff) {
 			drop++
 			continue
 		}
 		break
 	}
-	if len(lines)-drop > MaxMessages {
-		drop += (len(lines) - drop) - MaxMessages
+	if len(real)-drop > MaxMessages {
+		drop += (len(real) - drop) - MaxMessages
 	}
 	if drop == 0 {
 		return 0, nil
 	}
-	if drop > len(lines) {
-		drop = len(lines)
+	if drop > len(real) {
+		drop = len(real)
 	}
-	kept := lines[drop:]
+	kept := real[drop:]
 	if err := s.rewrite(rk, kept); err != nil {
 		return 0, err
 	}
-	newCursor := cursor - drop
+	newCursor := cursorReal - drop
 	if newCursor < 0 {
 		newCursor = 0
 	}

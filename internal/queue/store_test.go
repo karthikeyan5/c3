@@ -156,6 +156,79 @@ func TestEvictOverCap_DropsByAge(t *testing.T) {
 	}
 }
 
+// FIX 1: Consume(rk, -1) is the "consume all" sentinel. A negative n must not
+// reach make() as a capacity (which panics "makeslice: cap out of range"); it
+// must drain every pending message and then honor the delete-on-empty contract.
+func TestConsumeAll_NegativeN(t *testing.T) {
+	s := newStore(t)
+	rk := RouteKey{Channel: "telegram", ChatID: -100}
+	for i := int64(1); i <= 3; i++ {
+		if err := s.Append(rk, msg(i, "m")); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	got, err := s.Consume(rk, -1) // must not panic on the make() cap hint
+	if err != nil {
+		t.Fatalf("consume-all: %v", err)
+	}
+	if len(got) != 3 || got[0].MessageID != 1 || got[2].MessageID != 3 {
+		t.Fatalf("consume-all = %+v, want msgs 1,2,3", got)
+	}
+	if n, _ := s.Pending(rk); n != 0 {
+		t.Fatalf("pending after consume-all = %d, want 0", n)
+	}
+	// delete-on-empty contract: both files gone once the cursor hits EOF.
+	if _, err := os.Stat(filepath.Join(QueueDir(), rk.File()+".jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("jsonl should be deleted on empty, stat err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(QueueDir(), rk.File()+".cur")); !os.IsNotExist(err) {
+		t.Fatalf("cur should be deleted on empty, stat err = %v", err)
+	}
+}
+
+// FIX 3: EvictOverCap must run its cap/age/cursor math on the corrupt-free real
+// lines (rewrite() strips corrupt placeholders from the file). With a corrupt
+// line present, the rewritten file's length must stay consistent with newCursor
+// so the surviving messages are served exactly once — no double-serve, no skip.
+func TestEvictOverCap_CorruptLineCursorConsistent(t *testing.T) {
+	s := newStore(t)
+	rk := RouteKey{Channel: "telegram", ChatID: -100}
+	// Line layout: [old(age-evict)] [corrupt] [fresh msg2] [fresh msg3]
+	old := &c3types.Inbound{Channel: "telegram", ChatID: -100, MessageID: 1, Text: "old", Timestamp: time.Now().Add(-MaxAge - time.Hour)}
+	_ = s.Append(rk, old)
+	if err := appendRawLine(t, QueueDir(), rk, "{corrupt"); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Append(rk, msg(2, "fresh"))
+	_ = s.Append(rk, msg(3, "fresh"))
+
+	dropped, err := s.EvictOverCap(rk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only the one old REAL line is dropped; the corrupt line is not counted as a
+	// dropped message (it's stripped by rewrite, not "evicted").
+	if dropped != 1 {
+		t.Fatalf("dropped = %d, want 1 (old real line only)", dropped)
+	}
+	// After evict the corrupt placeholder is gone and msgs 2,3 remain pending.
+	if n, _ := s.Pending(rk); n != 2 {
+		t.Fatalf("pending after evict = %d, want 2 (msgs 2,3)", n)
+	}
+	// Draining must return EXACTLY msgs 2 and 3, in order, once each — proving the
+	// rewritten-file length and the cursor agree (the bug double-served or skipped).
+	got, err := s.Consume(rk, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].MessageID != 2 || got[1].MessageID != 3 {
+		t.Fatalf("drain after corrupt-evict = %+v, want msgs 2,3 exactly once", got)
+	}
+	if n, _ := s.Pending(rk); n != 0 {
+		t.Fatalf("pending after drain = %d, want 0", n)
+	}
+}
+
 func TestRecoverOnStartup_SkipsCorruptLine(t *testing.T) {
 	s := newStore(t)
 	rk := RouteKey{Channel: "telegram", ChatID: -100}
