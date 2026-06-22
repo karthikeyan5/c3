@@ -72,8 +72,13 @@ var allowedUpdates = []string{"message", "edited_message", "callback_query", "me
 // Inbound and emitting via host.Emit. Honors c.ctx cancellation.
 //
 // Error handling (per prior-art parity, see DEBUGGING.md):
-//   - 409 Conflict: another poller holds this token. Log loud and EXIT —
-//     retrying would just thrash; the human needs to kill the other poller.
+//   - 409 Conflict: another getUpdates is active for this token. Drive
+//     fetch-health (so a PERSISTENT conflict still raises the out-of-band DOWN
+//     alert), back off with an escalating delay, and RETRY — do NOT exit. A 409
+//     is usually transient (a client-side long-poll timeout racing the server's
+//     still-open prior poll) and self-heals on the next success; the broker
+//     singleton already prevents a second LOCAL broker. Exiting would turn a
+//     few-second blip into a dead bot needing a manual kill+restart.
 //   - 401/403 Permanent: increment authBreaker. After auth401Threshold
 //     consecutive 401s, the breaker trips: sleep long (5min) between
 //     attempts so a revoked-token retry-storm can't get the bot deleted.
@@ -104,6 +109,23 @@ func (c *Channel) pollLoop() {
 	// everywhere) or 409 (conflict). This composes with the Phase-1 fetch-health
 	// machine: the health edge still fires; failover just also rotates the base.
 	var consecTransient int
+
+	// consecConflict counts consecutive 409 conflicts (diagnostic, surfaced in
+	// the log so a one-off transient 409 is distinguishable from a persistent
+	// second poller). Reset on the first success and on any non-conflict outcome.
+	var consecConflict int
+
+	// Effective 409-conflict backoff bounds. Zero fields ⇒ the production
+	// defaults; tests inject millisecond values to exercise the retry path fast.
+	conflictBase := c.conflictBackoffBase
+	if conflictBase <= 0 {
+		conflictBase = defaultConflictBackoffBase
+	}
+	conflictMax := c.conflictBackoffMax
+	if conflictMax <= 0 {
+		conflictMax = defaultConflictBackoffMax
+	}
+	conflictBackoff := conflictBase
 
 	var offset int64
 	if c.offsets != nil {
@@ -153,16 +175,40 @@ func (c *Channel) pollLoop() {
 			class, retryAfter := classifyError(err)
 			switch class {
 			case errClassConflict:
-				// 409 — another poller has this token. Stop. The other process
-				// (often the Python POC, sometimes a leaked broker) needs to
-				// be killed before we can safely poll again. Logging loud so
-				// the user sees it in DEBUGGING.md flow. A conflict also means
-				// inbound is effectively dead (we can't poll), so it drives the
-				// health machine DOWN before we exit — the out-of-band alert is
-				// the only way the user learns the bot stopped fetching.
-				c.host.Logf("telegram: 409 CONFLICT — another poller holds this bot token; pollLoop exiting. Kill the other process and restart c3-broker. Error: %v", err)
-				c.reportHealth(c.health.RecordFailure("409 conflict (another poller)"))
-				return
+				// 409 — Telegram reports another getUpdates is active for this
+				// token. This is USUALLY transient and self-healing, NOT a reason
+				// to give up: after a client-side long-poll timeout (flaky
+				// network/proxy), our next getUpdates races the server's
+				// still-open prior long-poll and draws a 409 that clears within
+				// seconds. The broker singleton (flock + listen socket) already
+				// prevents a second LOCAL broker, so the old behavior — exit
+				// pollLoop and demand a manual kill+restart — turned a few-second
+				// blip into a dead bot only a human could revive (the 2026-06-22
+				// fresh-laptop incident). Instead: drive fetch-health (so a
+				// PERSISTENT conflict still raises the out-of-band DOWN alert once
+				// consecFails crosses downAfterFails), back off with an escalating
+				// delay, and RETRY. The first success auto-recovers and resets —
+				// no restart, no debugging. A genuine second poller elsewhere just
+				// keeps us in slow-retry + DOWN-alerting until it goes away, at
+				// which point the next poll succeeds on its own.
+				//
+				// A 409 follows the token to every endpoint (like 401/403), so it
+				// never triggers endpoint failover — reset the transient streak.
+				consecTransient = 0
+				consecConflict++
+				c.reportHealth(c.health.RecordFailure("409 conflict (another getUpdates active)"))
+				c.host.Logf("telegram: 409 CONFLICT (consec=%d) — another getUpdates is active for this bot token; backing off %v and retrying. Self-heals once the other poll ends; no kill/restart needed. Error: %v",
+					consecConflict, conflictBackoff, err)
+				select {
+				case <-c.ctx.Done():
+					return
+				case <-time.After(conflictBackoff):
+				}
+				conflictBackoff *= 2
+				if conflictBackoff > conflictMax {
+					conflictBackoff = conflictMax
+				}
+				continue
 			case errClassPermanent:
 				// 401/403 — token issue. Trip-on-N pattern. Only a TRIPPED
 				// breaker (token revoked / persistently rejected) drives the
@@ -260,6 +306,11 @@ func (c *Channel) pollLoop() {
 		c.authBrk.RecordSuccess()
 		c.reportHealth(c.health.RecordSuccess())
 		backoff = baseBackoff
+		// A success after a 409 means the conflict cleared (the racing poll
+		// ended / the other instance went away) — reset the conflict backoff and
+		// streak so a later, unrelated conflict starts fresh from the base delay.
+		conflictBackoff = conflictBase
+		consecConflict = 0
 		// A working endpoint sticks: the first success clears the failover streak
 		// so we don't rotate away from a base that just recovered.
 		consecTransient = 0

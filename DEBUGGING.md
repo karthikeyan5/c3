@@ -144,17 +144,32 @@ Common causes: stale pid file with a live foreign process at that pid
 (unlikely but possible after reboots reusing pid numbers); mappings.json
 parse error (`c3-broker validate`); socket dir not writable.
 
-### "Two brokers fighting"
+### "Two brokers fighting" (409 Conflict)
 
-Telegram gives `409 Conflict` when two pollers hit the same bot token.
-Check:
+Telegram gives `409 Conflict` when two `getUpdates` calls hit the same bot
+token. **The poll loop now self-heals from this** — it no longer exits. On a
+409 it logs `409 CONFLICT (consec=N) … backing off … retrying`, backs off with
+an escalating delay (5s → 60s), and keeps retrying; the first successful poll
+recovers automatically with no kill/restart.
+
+Most 409s are transient: after a client-side long-poll timeout (flaky network/
+proxy, e.g. a laptop waking up) the next `getUpdates` races Telegram's still-open
+prior poll. These clear within seconds on their own — `consec` stays low and no
+`FETCH DOWN` alert fires.
+
+A *persistent* 409 (rising `consec`, a `FETCH DOWN` alert) means a genuine
+second poller is really holding the token — another machine, or a leftover
+Python POC broker. The Go broker keeps retrying + alerting until it goes away.
+To end it now, find and kill the other poller:
 
 ```bash
 pgrep -af 'c3-broker|broker.py'
 ```
 
-If the Python POC broker is still running, kill it before the Go broker.
-See `INSTALL.md` step 2.
+If the Python POC broker is still running, kill it. The Go broker will resume
+on its next poll automatically — you do NOT need to restart `c3-broker`.
+See `INSTALL.md` step 2. (The broker singleton flock prevents a second *local*
+`c3-broker`, so a persistent conflict is almost always an off-box poller.)
 
 ## Conventions for future log lines
 

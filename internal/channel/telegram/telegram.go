@@ -40,6 +40,20 @@ const auth401Threshold = 10
 // consulted when len(endpoints) > 1 (a single-endpoint setup never fails over).
 const endpointFailoverThreshold = 5
 
+// defaultConflictBackoffBase / defaultConflictBackoffMax bound the escalating
+// backoff the poll loop applies on a 409 conflict ("another getUpdates is
+// active for this token"). A 409 is USUALLY transient and self-healing: after a
+// client-side long-poll timeout (flaky network/proxy), the next getUpdates can
+// race Telegram's still-open prior long-poll and draw a 409 that clears within
+// a few seconds. So pollLoop retries with backoff instead of exiting. The base
+// is long enough for the stale long-poll to drain server-side; the cap keeps a
+// GENUINE second poller (e.g. another machine) from becoming a tight retry-storm
+// that Telegram could read as abuse. See pollLoop's errClassConflict case.
+const (
+	defaultConflictBackoffBase = 5 * time.Second
+	defaultConflictBackoffMax  = 60 * time.Second
+)
+
 // telegramAPIURLEnv is the env override for the primary Bot-API base URL. It
 // wins over APIBaseURL in mappings.json, matching the C3_LOG_FILE precedent
 // (env beats file). Empty/unset leaves the config field untouched.
@@ -109,6 +123,14 @@ type Channel struct {
 	// site reads it via requestOptsFor, so the swap is picked up on the next call.
 	activeEndpoint atomic.Int32
 
+	// conflictBackoffBase / conflictBackoffMax bound the poll loop's escalating
+	// 409-conflict backoff. Zero ⇒ the default consts (defaultConflictBackoff*).
+	// A test seam: the conflict-retry path can be exercised with millisecond
+	// backoffs instead of the multi-second production values. Never set in
+	// production code — Start leaves them zero so pollLoop uses the defaults.
+	conflictBackoffBase time.Duration
+	conflictBackoffMax  time.Duration
+
 	// health is the single fetch-health state machine. It is the ONLY source
 	// of "is Telegram reachable?" — it replaced the two prior competing
 	// false-positive watchdogs (stallWatchdog + heartbeat's HEARTBEAT-FAILED
@@ -120,11 +142,10 @@ type Channel struct {
 	// lock — see reportHealth.
 	health *fetchHealth
 
-	// pollDone is closed when pollLoop returns (cleanly via 409 conflict
-	// or ctx-cancel). The stall watchdog watches this so it stops emitting
-	// "STALL DETECTED" once polling has cleanly stopped — the actual
-	// problem at that point is upstream (broker should exit / supervisor
-	// should restart it), not a stalled call.
+	// pollDone is closed when pollLoop returns. pollLoop now exits ONLY on
+	// ctx-cancel (shutdown) — a 409 conflict no longer terminates it (it backs
+	// off and retries). The silence watchdog watches this so it stops checking
+	// once polling has cleanly stopped at shutdown.
 	pollDone chan struct{}
 
 	ctx    context.Context
@@ -330,9 +351,8 @@ func (c *Channel) silenceWatchdog() {
 		case <-c.ctx.Done():
 			return
 		case <-c.pollDone:
-			// pollLoop exited (e.g., 409 conflict, ctx cancel). The silence
-			// concept doesn't apply anymore; stop checking. The broker
-			// supervisor (or operator) should restart at this point.
+			// pollLoop exited (ctx cancel / shutdown — a 409 conflict no longer
+			// ends it). The silence concept doesn't apply anymore; stop checking.
 			return
 		case <-ticker.C:
 			c.reportHealth(c.health.CheckSilence())
