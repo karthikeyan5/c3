@@ -85,12 +85,12 @@ func assertHealthFileState(t *testing.T, path, want string) {
 	if err != nil {
 		t.Fatalf("read health file: %v", err)
 	}
-	var got map[string]healthFileEntry
+	var got healthFile
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("health file invalid JSON: %v (%s)", err, data)
 	}
-	if got["telegram"].State != want {
-		t.Errorf("health file telegram.state = %q, want %q", got["telegram"].State, want)
+	if got.Channels["telegram"].State != want {
+		t.Errorf("health file channels.telegram.state = %q, want %q", got.Channels["telegram"].State, want)
 	}
 }
 

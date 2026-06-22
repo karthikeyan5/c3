@@ -95,8 +95,16 @@ func Register(host plugin.Host) error {
 	// Log which interpreter we'll run the handler under. If we fell back to bare
 	// python3 (no venv, no override), warn with the exact fix — long (>30s) notes
 	// need the sarvamai package, which a PEP 668 system python can't have.
-	pyExe := pythonExe(cfg)
-	if cfg.Python == "" && defaultVenvPython() == "" {
+	venv := defaultVenvPython()
+	pyExe := cfg.Python
+	if pyExe == "" {
+		if venv != "" {
+			pyExe = venv
+		} else {
+			pyExe = "python3"
+		}
+	}
+	if cfg.Python == "" && venv == "" {
 		host.Logf("stt: WARNING no STT venv found and plugins.stt.python unset — using bare %q; long voice notes need sarvamai. Create the venv: bash %s",
 			pyExe, venvSetupHint(cfg.HandlerPath))
 	} else {

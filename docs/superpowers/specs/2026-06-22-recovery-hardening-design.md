@@ -145,6 +145,20 @@ Important = needs manual restart but is visible/alerted. Minor = ungraceful but 
   `c3_tg_proxy_gcp_project`); configure `api_base_urls` in `~/.config/c3/mappings.json` (NOT the
   repo). Confirm region/provider/budget with Karthi before deploying. Likely its own focused effort.
 
+## Batch C review follow-ups (QUEUED — apply after Batch E commits, in stt files)
+From the Batch C adversarial review (verdict READY):
+- **C-fix-1 (Important):** the dynamic STT budget (`stt-handler.py`: `stt_timeout = max(60, 270-dl_elapsed)`)
+  can drop below the Sarvam provider's hard-coded `job.wait_until_complete(timeout=240)`
+  (`sarvam-saaras-v3.py`), so a >30s download can SIGKILL the batch path before its graceful
+  wait — the documented 240<270 ordering inverts. Fix: thread the budget to the provider
+  (e.g. `stt-handler.py` exports `C3_STT_BUDGET_SECONDS=stt_timeout`; the Sarvam provider caps
+  `wait_until_complete(timeout=min(240, budget-15))` with a floor) and correct the comments
+  (the Go-side 300s ctx is the true backstop). Net user impact today is benign.
+- **C-fix-2 (Minor):** unknown-duration REST-then-batch fallback (`sarvam-saaras-v3.py` transcribe)
+  only falls through on a RAISED exception; a 200-with-empty-transcript REST response won't fall
+  through to batch. Fix: `t = _transcribe_rest(...); return t if (t and t.strip()) else _transcribe_batch(...)`.
+- **C-fix-3 (Minor):** `defaultVenvPython()` is evaluated twice in `stt.go` Register — compute once.
+
 ## Deferred / not-fixing (with reason)
 - **adapter-ipc-6** worker-exit race — verifier judged the proposed fix UNSOUND (the
   stopped-worker false-return is unreachable in production); leave as-is.

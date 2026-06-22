@@ -257,6 +257,14 @@ func runDaemon() (err error) {
 	// a detection-driven write.
 	br.WriteHealthFile()
 
+	// Slow refresh ticker: re-write health.json every healthRefreshInterval
+	// regardless of health edges, so written_unix stays current while the
+	// broker is alive. A reader treats a stale written_unix (or a dead pid) as
+	// broker-down — closing the silent-death gap where a crashed broker froze
+	// health.json at its last "up" value (audit health-observability-2). The
+	// goroutine exits on br.Shutdown() (ctx cancel), so it never leaks.
+	br.StartHealthRefresh()
+
 	if cc, ok := mf.Channels["telegram"]; ok && cc.BotToken != "" {
 		if err := br.RegisterChannel(telegram.New()); err != nil {
 			return fmt.Errorf("register telegram channel: %w", err)

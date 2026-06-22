@@ -130,11 +130,12 @@ def run_stt(audio_path, extra_env, timeout=270):
     # Use stt.py's own chain logic via its main internals
     import subprocess
     env = {**os.environ, **extra_env}
-    # Long voice notes (esp. via the Sarvam batch API) routinely take >120s; the
-    # budget is ordered under the broker's Go-side 300s context, and Sarvam's own
-    # wait (240s) returns gracefully before this kill fires. main() shrinks this
-    # by the elapsed download time so a slow download can't push the total past
-    # the broker's hard deadline (which would SIGKILL mid-provider).
+    # Tell the provider chain how much wall-clock it has so the Sarvam batch wait
+    # can size itself to return gracefully BEFORE this subprocess.run timeout
+    # SIGKILLs it (the provider caps wait at min(240, budget-15)). main() shrinks
+    # `timeout` by the elapsed download time so a slow download can't push the
+    # total past the broker's Go-side 300s context (the true backstop).
+    env["C3_STT_BUDGET_SECONDS"] = str(timeout)
     result = subprocess.run(
         [sys.executable, STT_PKG, audio_path],
         capture_output=True, text=True, env=env, timeout=timeout

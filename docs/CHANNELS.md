@@ -135,6 +135,32 @@ A top-level `notifications` block (sibling of `channels`, not per-channel) gover
 - `false` silences the desktop popup **and** the CLI turn-injection, but **keeps** the always-on ambient status-line indicator (`health.json`).
 - It is SIGHUP-reloadable, like other mappings changes (`/c3:reload-config`).
 
+#### `health.json` shape (the ambient status-line read source)
+
+The broker writes the ambient connectivity state to `$XDG_STATE_HOME/c3/health.json` (fallback `$HOME/.local/state/c3/health.json`), resolved by `broker.HealthFilePath()`. It is written atomically (temp-in-same-dir + rename, no fsync — best-effort). The top level is a **wrapper that carries broker liveness**, with the per-channel snapshot nested under `channels`:
+
+```json
+{
+  "broker_pid": 12345,
+  "written_unix": 1718722725,
+  "channels": {
+    "telegram": {
+      "state": "down",
+      "since_unix": 1718722680,
+      "since_hhmm": "14:38",
+      "reason": "dial failures",
+      "consec": 3
+    }
+  }
+}
+```
+
+- `broker_pid` — `os.Getpid()` of the writing broker.
+- `written_unix` — unix seconds, **refreshed on every write**: edge-driven writes (UP↔DOWN) *and* a slow 45-second refresh ticker that runs regardless of edges. So while the broker is alive, `written_unix` stays current.
+- `channels` — map of channel name → per-channel entry (`state` is `"up"`/`"down"`; `since_unix`/`since_hhmm`/`reason`/`consec` describe the current state). At boot it is `{}` (no outage asserted), so a crash never leaves a stale per-channel `down`.
+
+**Why the wrapper exists (broker-dead detection):** previously the top level was a flat `{"<channel>": {...}}` map written only on health edges + startup. When the **broker process** died, the file froze at its last value (usually `up`), so a status line showed green while C3 was completely dead. A reader now treats **`broker_pid` not alive** (e.g. `kill(pid, 0)` fails) **OR** `now - written_unix > 90s` (2× the 45s refresh interval) as **broker-down/unknown**, regardless of the per-channel `state`. The bash status-line reader reads `.channels.telegram.state` and `.channels.telegram.since_hhmm`, and additionally checks `broker_pid`/`written_unix` for liveness.
+
 ## Channel lifecycle
 
 ```

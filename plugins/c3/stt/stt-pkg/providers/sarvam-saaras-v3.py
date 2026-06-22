@@ -134,10 +134,18 @@ def _transcribe_batch(audio_path, key):
     job = client.speech_to_text_job.create_job(model="saaras:v3", mode="translate", language_code="unknown")
     job.upload_files(file_paths=[audio_path])
     job.start()
-    # 240s: long notes need more than the old 120s; kept under stt-handler.py's
-    # 270s subprocess cap so the job returns/raises here before the handler
-    # hard-kills the process.
-    job.wait_until_complete(timeout=240)
+    # Wait budget derived from the handler's remaining subprocess budget
+    # (C3_STT_BUDGET_SECONDS, set by stt-handler.py = 270s minus elapsed download
+    # time). We keep the wait ~15s UNDER that budget so the job returns/raises
+    # here gracefully BEFORE the handler's subprocess.run hard-kills us. Capped at
+    # 240s (long notes need it), floored at 30s. The Go-side 300s context is the
+    # true backstop. Default 270 when the env isn't set (direct invocation).
+    try:
+        _budget = int(os.environ.get("C3_STT_BUDGET_SECONDS", "270"))
+    except ValueError:
+        _budget = 270
+    _wait = max(30, min(240, _budget - 15))
+    job.wait_until_complete(timeout=_wait)
 
     if job.is_successful():
         with tempfile.TemporaryDirectory() as td:
@@ -162,10 +170,14 @@ def transcribe(audio_path: str, audio_bytes: bytes) -> str:
             return _transcribe_rest(audio_path, audio_bytes, key)
         return _transcribe_batch(audio_path, key)
     # Unknown duration (ffprobe missing/failed): prefer the dependency-light REST
-    # path (no sarvamai); if it fails — e.g. the clip is actually too long for
-    # REST — fall back to the batch path. This avoids forcing short notes onto
-    # the sarvamai-dependent path while still handling long ones.
+    # path (no sarvamai); fall back to the batch path if REST fails — either by
+    # raising OR by returning an empty transcript (a 200-with-empty response,
+    # e.g. the clip was actually too long for REST). This avoids forcing short
+    # notes onto the sarvamai-dependent path while still handling long ones.
     try:
-        return _transcribe_rest(audio_path, audio_bytes, key)
+        t = _transcribe_rest(audio_path, audio_bytes, key)
+        if t and t.strip():
+            return t
+        return _transcribe_batch(audio_path, key)
     except Exception:
         return _transcribe_batch(audio_path, key)
