@@ -197,7 +197,7 @@ So the agent natively knows the audio exists, exactly how to fetch it, that it c
 
 ## Interfaces (for the implementation plan)
 
-**New package `internal/queue`** — `Store` with worker-invoked methods: `Append(routeKey, *Inbound) error`, `Peek(routeKey, n) ([]Inbound, error)`, `Consume(routeKey, n) ([]Inbound, error)`, `Pending(routeKey) (int, time.Time)`, `StatusAll() map[routeKey]Status`, `EvictOverCap(routeKey) (dropped int)`, `RecoverOnStartup() error`.
+**New package `internal/queue`** — `Store` with worker-invoked methods: `Append(routeKey, *Inbound) error`, `Peek(routeKey, n) ([]Inbound, error)`, `Consume(routeKey, n) ([]Inbound, error)`, `Pending(routeKey) (int, time.Time)`, `StatusAll() map[routeKey]Status`, `EvictOverCap(routeKey) (dropped int, err error)`, `RecoverOnStartup() error`. (EvictOverCap does file I/O — atomic rewrite — so it returns an error; the implementation plan uses this `(int, error)` form.)
 
 **New IPC ops (`internal/ipc`)**
 - `OpFetchQueue` — `FetchQueueReq{Limit int, All bool, Ack bool}` → `FetchQueueResp{Messages []c3types.Inbound, Remaining int}`.
