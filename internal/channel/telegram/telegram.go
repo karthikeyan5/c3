@@ -311,6 +311,18 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 	// on its first successful getMe.
 	host.Logf("telegram: started (token-check deferred; identity confirmed on first successful call)")
 
+	// Register the /status bot command so it autocompletes in Telegram's "/"
+	// menu. Best-effort: a failure here never blocks Start (the command still
+	// works when typed; only the menu hint is missing).
+	go func() {
+		if _, err := c.bot.SetMyCommands(
+			[]gotgbot.BotCommand{{Command: "status", Description: "Show C3 broker + queue status"}},
+			&gotgbot.SetMyCommandsOpts{},
+		); err != nil {
+			c.host.Logf("telegram: setMyCommands(/status) failed (non-fatal): %v", err)
+		}
+	}()
+
 	// The fetch-health machine seeds its lastSuccess to now on construction
 	// (see newFetchHealth), so the first ~90s after start don't spuriously
 	// trip the silence arm before any GetUpdates has returned.

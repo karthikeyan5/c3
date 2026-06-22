@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/PaulSonOfLars/gotgbot/v2"
@@ -671,6 +672,17 @@ func reactionTypeString(r gotgbot.ReactionType) string {
 	}
 }
 
+// isStatusCommand reports whether text is the "/status" bot command (optionally
+// "/status@<botname>"), case-insensitive, after trimming. It must be an exact
+// command token — "/statusly" and "please /status" are NOT matched.
+func (c *Channel) isStatusCommand(text string) bool {
+	t := strings.TrimSpace(text)
+	if i := strings.IndexByte(t, '@'); i >= 0 {
+		t = t[:i]
+	}
+	return strings.EqualFold(t, "/status")
+}
+
 // topicPtrFromThread converts a gotgbot message_thread_id (0 = none) into the
 // *int64 TopicID convention (nil = no topic).
 func topicPtrFromThread(threadID int64) *int64 {
@@ -700,6 +712,26 @@ func (c *Channel) dispatchMessage(updateID int64, msg *gotgbot.Message, edited b
 		c.host.Logf("telegram: skip update=%d msg=%d chat=%d thread=%d (unsupported service)",
 			updateID, msg.MessageId, msg.Chat.Id, msg.MessageThreadId)
 		return
+	}
+	// Broker-owned command intercept: a "/status" inbound is handled by the
+	// broker directly (it answers + is NEVER gated, queued, or routed to an
+	// agent). Other commands fall through to normal gating.
+	if c.isStatusCommand(in.Text) {
+		if reply, handled := c.host.HandleCommand(in); handled {
+			var topicID *int64
+			if in.TopicID != nil {
+				topicID = in.TopicID
+			}
+			if _, err := c.SendReply(c3types.ReplyArgs{
+				Channel: c.Name(), ChatID: in.ChatID, TopicID: topicID, Text: reply,
+				Markup: c3types.MarkupMarkdown,
+			}); err != nil {
+				c.host.Logf("telegram: /status reply send failed update=%d chat=%d: %v", updateID, in.ChatID, err)
+			}
+			c.host.Logf("telegram: /status handled update=%d chat=%d thread=%d (not routed)",
+				updateID, msg.Chat.Id, msg.MessageThreadId)
+			return
+		}
 	}
 	kind := "text"
 	if len(in.Attachments) > 0 && in.Attachments[0].Kind != "" {
