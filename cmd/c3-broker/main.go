@@ -23,6 +23,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/karthikeyan5/c3/internal/broker"
 	"github.com/karthikeyan5/c3/internal/channel/telegram"
@@ -41,12 +42,12 @@ var builtinPlugins = []broker.BuiltinPlugin{
 // Exit codes follow BSD sysexits(3) where applicable so shell scripts can
 // branch on the cause. Generic runtime failures still use 1 (EX_GENERIC).
 const (
-	exitOK       = 0  // success
-	exitFailure  = 1  // generic runtime error
-	exitUsage    = 2  // unknown subcommand / malformed args
-	exitDataErr  = 65 // EX_DATAERR — mappings.json invalid
-	exitNoInput  = 66 // EX_NOINPUT — mappings.json missing/unreadable
-	exitConfig   = 78 // EX_CONFIG — config-time failure (setup, install-codex-shim)
+	exitOK      = 0  // success
+	exitFailure = 1  // generic runtime error
+	exitUsage   = 2  // unknown subcommand / malformed args
+	exitDataErr = 65 // EX_DATAERR — mappings.json invalid
+	exitNoInput = 66 // EX_NOINPUT — mappings.json missing/unreadable
+	exitConfig  = 78 // EX_CONFIG — config-time failure (setup, install-codex-shim)
 )
 
 func main() {
@@ -239,6 +240,16 @@ func runDaemon() (err error) {
 	}
 	if err := mf.Validate(); err != nil {
 		return fmt.Errorf("validate mappings: %w", err)
+	}
+
+	// Prune expired auto-attach-on-resume entries so session_attachments doesn't
+	// grow unbounded. Best-effort: a write failure is non-fatal (the in-memory
+	// pruned state is still used this run).
+	if n := mf.PruneSessionAttachments(time.Now().UTC(), broker.SessionAttachmentTTL); n > 0 {
+		log.Printf("c3-broker: pruned %d expired session attachment(s)", n)
+		if wErr := mappings.Write(mfPath, mf); wErr != nil {
+			log.Printf("c3-broker: WARNING failed to persist session-attachment prune: %v", wErr)
+		}
 	}
 
 	br := broker.New(mf)

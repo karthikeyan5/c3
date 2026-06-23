@@ -688,9 +688,10 @@ func welcomeText(stub *Stub, label, resolvedCWD string) string {
 // To actually change the default, the user edits
 // `~/.config/c3/mappings.json` directly. Loud log line so the rejection
 // is visible.
-// sessionAttachmentTTL bounds how long a recorded session→route mapping stays
-// eligible for auto-attach-on-resume.
-const sessionAttachmentTTL = 30 * 24 * time.Hour
+// SessionAttachmentTTL bounds how long a recorded session→route mapping stays
+// eligible for auto-attach-on-resume. Exported so the broker entrypoint can
+// prune expired entries on start.
+const SessionAttachmentTTL = 30 * 24 * time.Hour
 
 // routeKeyFromSessionAttachment builds the route key for a recovered session.
 func routeKeyFromSessionAttachment(sa mappings.SessionAttachment) RouteKey {

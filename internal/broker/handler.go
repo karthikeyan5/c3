@@ -156,7 +156,7 @@ func (b *Broker) buildHelloAck(hello ipc.HelloMsg, stub *Stub) ipc.HelloAckMsg {
 	if len(b.Mappings().Channels) == 0 {
 		ack.NoConfig = true
 	} else {
-		if sa, ok := b.Mappings().LookupSessionAttachment(hello.SessionID); ok && sa.Recoverable(time.Now(), sessionAttachmentTTL) {
+		if sa, ok := b.Mappings().LookupSessionAttachment(hello.SessionID); ok && sa.Recoverable(time.Now(), SessionAttachmentTTL) {
 			key := routeKeyFromSessionAttachment(sa)
 			if _, held := b.heldByDifferentLiveSession(key, stub); held {
 				log.Printf("hello: session-id recovery SKIPPED session=%s topic=%q (held by another live session); falling through",
