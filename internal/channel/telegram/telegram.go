@@ -353,9 +353,14 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 	// menu. Best-effort: a failure here never blocks Start (the command still
 	// works when typed; only the menu hint is missing).
 	go func() {
+		// Pass nil opts, NOT &SetMyCommandsOpts{}. gotgbot's SetMyCommands does
+		// `v["scope"] = opts.Scope` unconditionally whenever opts != nil, so an
+		// empty opts sends scope=null — which Telegram rejects with "can't parse
+		// BotCommandScope: BotCommandScope must be an Object". nil opts omits the
+		// scope param entirely, so Telegram applies the default scope (what we want).
 		if _, err := c.bot.SetMyCommands(
 			[]gotgbot.BotCommand{{Command: "status", Description: "Show C3 broker + queue status"}},
-			&gotgbot.SetMyCommandsOpts{},
+			nil,
 		); err != nil {
 			c.host.Logf("telegram: setMyCommands(/status) failed (non-fatal): %v", err)
 		}

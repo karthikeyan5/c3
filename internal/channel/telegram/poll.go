@@ -862,6 +862,8 @@ func (c *Channel) dispatchMessage(updateID int64, msg *gotgbot.Message, edited b
 				Markup: c3types.MarkupMarkdown,
 			}); err != nil {
 				c.host.Logf("telegram: /status reply send failed update=%d chat=%d: %v", updateID, in.ChatID, err)
+			} else {
+				c.host.Logf("telegram: /status reply sent update=%d chat=%d thread=%d", updateID, in.ChatID, msg.MessageThreadId)
 			}
 			c.host.Logf("telegram: /status handled update=%d chat=%d thread=%d (not routed)",
 				updateID, msg.Chat.Id, msg.MessageThreadId)

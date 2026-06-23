@@ -55,5 +55,5 @@ func heldReplyText(n int) string {
 	if n == 1 {
 		plural = "message"
 	}
-	return fmt.Sprintf("📨 Held — nothing lost. No CLI is attached to this topic right now. %d %s queued — they'll be delivered when you attach a session here. Send /status to check.", n, plural)
+	return fmt.Sprintf("📨 Held — nothing lost.\n%d %s queued.\n\n\nSend /status to check.", n, plural)
 }
