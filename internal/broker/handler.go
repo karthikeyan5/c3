@@ -14,6 +14,7 @@ import (
 
 	"github.com/karthikeyan5/c3/internal/c3types"
 	"github.com/karthikeyan5/c3/internal/ipc"
+	"github.com/karthikeyan5/c3/internal/mappings"
 )
 
 // HandleConn drives one adapter connection through its lifecycle. Owns the
@@ -86,24 +87,7 @@ func (b *Broker) HandleConn(nc net.Conn) {
 	}()
 	defer b.Stubs.Unregister(stub.ConnID)
 
-	ack := ipc.HelloAckMsg{Op: ipc.OpHelloAck, ConnID: stub.ConnID}
-	if len(b.Mappings().Channels) == 0 {
-		ack.NoConfig = true
-	} else if _, ok := b.Mappings().LookupByCwd(hello.CWD); !ok {
-		ack.NoMapping = true
-	}
-	// Attach the resolvable channel's capability manifest so the adapter can
-	// fold GuidanceFor(caps) into the agent's MCP-initialize instructions
-	// (Claude) / AGENTS.md surface (Codex). Prefer the cwd-mapped channel;
-	// fall back to the default channel. nil (no channel resolvable) is a
-	// valid wire value — the adapter falls back to a default Capabilities.
-	chanName := ""
-	if m, ok := b.Mappings().LookupByCwd(hello.CWD); ok && m.Channel != "" {
-		chanName = m.Channel
-	} else {
-		chanName = b.defaultChannel()
-	}
-	ack.Capabilities = b.capsForChannel(chanName)
+	ack := b.buildHelloAck(hello, stub)
 	if err := conn.WriteJSON(ack); err != nil {
 		return
 	}
@@ -154,6 +138,69 @@ func (b *Broker) HandleConn(nc net.Conn) {
 			_ = conn.WriteJSON(ipc.ErrorMsg{Op: ipc.OpError, Err: "op not implemented yet: " + string(op)})
 		}
 	}
+}
+
+// buildHelloAck constructs the hello ack for a freshly-registered stub and, as
+// a side effect, performs auto-attach-on-resume: if hello.SessionID resolves to
+// a valid (non-tombstoned, within-TTL) recorded attachment whose route is NOT
+// held by another live session, it CLAIMS that route for the stub and reports
+// it (AutoAttached + Mapping + QueuedCount). Session-id recovery takes
+// precedence over the cwd mapping, so a resume from any directory — including
+// the shared root, which itself has a cwd mapping — returns to the session's own
+// last topic. With no recoverable attachment it falls back to the prior
+// NoConfig / NoMapping behavior. Claiming uses low-level Routes.Claim (not
+// tryClaim, which would write an AttachedMsg the just-handshaked conn isn't
+// expecting); C3's backlog is pull-not-push, so the claim never floods the conn.
+func (b *Broker) buildHelloAck(hello ipc.HelloMsg, stub *Stub) ipc.HelloAckMsg {
+	ack := ipc.HelloAckMsg{Op: ipc.OpHelloAck, ConnID: stub.ConnID}
+	recovered := false
+	if len(b.Mappings().Channels) == 0 {
+		ack.NoConfig = true
+	} else {
+		if sa, ok := b.Mappings().LookupSessionAttachment(hello.SessionID); ok && sa.Recoverable(time.Now(), sessionAttachmentTTL) {
+			key := routeKeyFromSessionAttachment(sa)
+			if _, held := b.heldByDifferentLiveSession(key, stub); held {
+				log.Printf("hello: session-id recovery SKIPPED session=%s topic=%q (held by another live session); falling through",
+					hello.SessionID, sa.Name)
+			} else if _, claimed := b.Routes.Claim(key, stub); claimed {
+				stub.SetRoute(&key)
+				cnt, _ := b.backlogSummary(key)
+				ack.AutoAttached = true
+				ack.Mapping = wireMappingFromSessionAttachment(sa)
+				ack.QueuedCount = cnt
+				recovered = true
+				// Refresh LastAttachedAt so an actively-resumed session doesn't
+				// TTL-expire, then persist.
+				b.mutateMappings(func(mf *mappings.MappingsFile) {
+					if cur, ok := mf.LookupSessionAttachment(hello.SessionID); ok {
+						cur.LastAttachedAt = time.Now().UTC()
+						mf.UpsertSessionAttachment(hello.SessionID, cur)
+					}
+				})
+				_ = b.SaveMappings()
+				log.Printf("hello: session-id recovery cli=%s pid=%d session=%s → %q (queued=%d)",
+					hello.CLI, hello.PID, hello.SessionID, sa.Name, cnt)
+			}
+		}
+		if !recovered {
+			if _, ok := b.Mappings().LookupByCwd(hello.CWD); !ok {
+				ack.NoMapping = true
+			}
+		}
+	}
+	// Capability manifest: prefer the recovered route's channel, then the
+	// cwd-mapped channel, then the default. nil is a valid wire value — the
+	// adapter falls back to a default Capabilities.
+	chanName := ""
+	if ack.Mapping != nil && ack.Mapping.Channel != "" {
+		chanName = ack.Mapping.Channel
+	} else if m, ok := b.Mappings().LookupByCwd(hello.CWD); ok && m.Channel != "" {
+		chanName = m.Channel
+	} else {
+		chanName = b.defaultChannel()
+	}
+	ack.Capabilities = b.capsForChannel(chanName)
+	return ack
 }
 
 // handleToolCall dispatches a tool-call to the worker for the stub's

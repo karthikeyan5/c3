@@ -688,6 +688,24 @@ func welcomeText(stub *Stub, label, resolvedCWD string) string {
 // To actually change the default, the user edits
 // `~/.config/c3/mappings.json` directly. Loud log line so the rejection
 // is visible.
+// sessionAttachmentTTL bounds how long a recorded session→route mapping stays
+// eligible for auto-attach-on-resume.
+const sessionAttachmentTTL = 30 * 24 * time.Hour
+
+// routeKeyFromSessionAttachment builds the route key for a recovered session.
+func routeKeyFromSessionAttachment(sa mappings.SessionAttachment) RouteKey {
+	return MakeRouteKey(sa.Channel, sa.ChatID, sa.TopicID)
+}
+
+// wireMappingFromSessionAttachment converts a stored attachment to the hello-ack
+// wire Mapping so the adapter can render "Auto-attached to <name>".
+func wireMappingFromSessionAttachment(sa mappings.SessionAttachment) *ipc.Mapping {
+	return &ipc.Mapping{
+		Channel: sa.Channel, ChatID: sa.ChatID,
+		TopicID: sa.TopicID, Name: sa.Name, Group: sa.Group,
+	}
+}
+
 func (b *Broker) persistMapping(stub *Stub, chanName string, chatID, topicID int64, name, group string) {
 	now := time.Now().UTC()
 	cwd := resolveAttachCWD(stub.CWD, name)

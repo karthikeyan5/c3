@@ -1,0 +1,132 @@
+package broker
+
+import (
+	"testing"
+	"time"
+
+	"github.com/karthikeyan5/c3/internal/ipc"
+	"github.com/karthikeyan5/c3/internal/mappings"
+)
+
+// seedSessionAttachment adds a recoverable c3/topic-281 attachment for id.
+func seedSessionAttachment(mf *mappings.MappingsFile, id string, lastAttached time.Time, detached bool) {
+	tid := int64(281)
+	mf.UpsertSessionAttachment(id, mappings.SessionAttachment{
+		Channel: "telegram", ChatID: -100, TopicID: &tid, Name: "c3", Group: "main",
+		LastAttachedAt: lastAttached, Detached: detached,
+	})
+}
+
+func TestBuildHelloAck_SessionRecoveryHit(t *testing.T) {
+	mf := mfWithTelegram()
+	seedSessionAttachment(mf, "sess-1", time.Now().UTC(), false)
+	b := brokerWithChannel(t, mf, &fakeChannel{})
+	defer b.Shutdown()
+
+	stub := b.Stubs.RegisterWithSession("claude", 4242, "/anywhere", "sess-1", nil)
+	ack := b.buildHelloAck(ipc.HelloMsg{CLI: "claude", PID: 4242, CWD: "/anywhere", SessionID: "sess-1"}, stub)
+
+	if !ack.AutoAttached || ack.Mapping == nil || ack.Mapping.Name != "c3" {
+		t.Fatalf("expected AutoAttached to c3, got AutoAttached=%v mapping=%+v", ack.AutoAttached, ack.Mapping)
+	}
+	if ack.NoMapping {
+		t.Fatal("NoMapping must not be set when recovered")
+	}
+	rk := stub.CurrentRoute()
+	if rk == nil || !rk.HasTopic || rk.TopicID != 281 {
+		t.Fatalf("stub route not claimed to topic 281: %+v", rk)
+	}
+}
+
+func TestBuildHelloAck_SessionRecoveryBeatsCwdMapping(t *testing.T) {
+	mf := mfWithTelegram()
+	// cwd /proj maps to a DIFFERENT topic (412 / feature-x).
+	mf.UpsertMapping("/proj", mappings.Mapping{Channel: "telegram", ChatID: -200, TopicID: 412, Name: "feature-x", Group: "work"})
+	seedSessionAttachment(mf, "sess-1", time.Now().UTC(), false) // → c3 / 281
+	b := brokerWithChannel(t, mf, &fakeChannel{})
+	defer b.Shutdown()
+
+	stub := b.Stubs.RegisterWithSession("claude", 4242, "/proj", "sess-1", nil)
+	ack := b.buildHelloAck(ipc.HelloMsg{CLI: "claude", PID: 4242, CWD: "/proj", SessionID: "sess-1"}, stub)
+
+	if !ack.AutoAttached || ack.Mapping == nil || ack.Mapping.Name != "c3" {
+		t.Fatalf("session-id recovery must beat the cwd mapping; got mapping=%+v", ack.Mapping)
+	}
+	if rk := stub.CurrentRoute(); rk == nil || rk.TopicID != 281 {
+		t.Fatalf("expected claim to the session's topic 281, got %+v", rk)
+	}
+}
+
+func TestBuildHelloAck_TombstonedNoRecovery(t *testing.T) {
+	mf := mfWithTelegram()
+	seedSessionAttachment(mf, "sess-1", time.Now().UTC(), true) // tombstoned
+	b := brokerWithChannel(t, mf, &fakeChannel{})
+	defer b.Shutdown()
+
+	stub := b.Stubs.RegisterWithSession("claude", 1, "/x", "sess-1", nil)
+	ack := b.buildHelloAck(ipc.HelloMsg{CLI: "claude", PID: 1, CWD: "/x", SessionID: "sess-1"}, stub)
+	if ack.AutoAttached {
+		t.Fatal("tombstoned attachment must not auto-recover")
+	}
+	if stub.CurrentRoute() != nil {
+		t.Fatal("no route should be claimed for a tombstoned attachment")
+	}
+}
+
+func TestBuildHelloAck_ExpiredNoRecovery(t *testing.T) {
+	mf := mfWithTelegram()
+	seedSessionAttachment(mf, "sess-1", time.Now().UTC().Add(-40*24*time.Hour), false)
+	b := brokerWithChannel(t, mf, &fakeChannel{})
+	defer b.Shutdown()
+
+	stub := b.Stubs.RegisterWithSession("claude", 1, "/x", "sess-1", nil)
+	ack := b.buildHelloAck(ipc.HelloMsg{CLI: "claude", PID: 1, CWD: "/x", SessionID: "sess-1"}, stub)
+	if ack.AutoAttached {
+		t.Fatal("expired attachment must not auto-recover")
+	}
+}
+
+func TestBuildHelloAck_EmptySessionIDNoRecovery(t *testing.T) {
+	mf := mfWithTelegram()
+	seedSessionAttachment(mf, "sess-1", time.Now().UTC(), false)
+	b := brokerWithChannel(t, mf, &fakeChannel{})
+	defer b.Shutdown()
+
+	// No SessionID on hello and an unmapped cwd → NoMapping, no recovery.
+	stub := b.Stubs.RegisterWithSession("claude", 1, "/x", "", nil)
+	ack := b.buildHelloAck(ipc.HelloMsg{CLI: "claude", PID: 1, CWD: "/x", SessionID: ""}, stub)
+	if ack.AutoAttached {
+		t.Fatal("no recovery without a session id")
+	}
+	if !ack.NoMapping {
+		t.Fatal("expected NoMapping for an unmapped cwd with no recovery")
+	}
+}
+
+func TestBuildHelloAck_CollisionSkipsRecovery(t *testing.T) {
+	mf := mfWithTelegram()
+	seedSessionAttachment(mf, "sess-1", time.Now().UTC(), false) // → c3 / 281
+	b := brokerWithChannel(t, mf, &fakeChannel{})
+	defer b.Shutdown()
+
+	// Another LIVE session already holds c3 (topic 281). conn non-nil → IsConnected → alive.
+	tid := int64(281)
+	key := MakeRouteKey("telegram", -100, &tid)
+	holder := b.Stubs.Register("claude", 9999, "/other", struct{}{})
+	if _, ok := b.Routes.Claim(key, holder); !ok {
+		t.Fatal("precondition: holder should claim the route")
+	}
+
+	stub := b.Stubs.RegisterWithSession("claude", 4242, "/anywhere", "sess-1", nil)
+	ack := b.buildHelloAck(ipc.HelloMsg{CLI: "claude", PID: 4242, CWD: "/anywhere", SessionID: "sess-1"}, stub)
+
+	if ack.AutoAttached {
+		t.Fatal("recovery must be skipped when the topic is held by another live session")
+	}
+	if stub.CurrentRoute() != nil {
+		t.Fatal("no route should be claimed on collision")
+	}
+	if h, ok := b.Routes.Holder(key); !ok || h.ConnID != holder.ConnID {
+		t.Fatal("the original live holder must keep the claim")
+	}
+}
