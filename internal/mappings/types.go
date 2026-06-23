@@ -13,6 +13,10 @@ type MappingsFile struct {
 	Plugins       map[string]map[string]any `json:"plugins,omitempty"`
 	Allowlist     *Allowlist                `json:"allowlist,omitempty"`
 	Notifications *NotificationsConfig      `json:"notifications,omitempty"`
+	// SessionAttachments maps a host CLI's stable session id → the route it
+	// was last attached to, powering auto-attach-on-resume. omitempty keeps
+	// pre-feature config files byte-identical until the first session attaches.
+	SessionAttachments map[string]SessionAttachment `json:"session_attachments,omitempty"`
 }
 
 // NotificationsConfig governs the "invasive" health-notification surfaces
@@ -105,4 +109,27 @@ type Mapping struct {
 	Group          string    `json:"group,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
 	LastAttachedAt time.Time `json:"last_attached_at,omitempty"`
+}
+
+// SessionAttachment records the last topic a CLI session was attached to,
+// keyed by the host CLI's stable session id (Claude: CLAUDE_CODE_SESSION_ID),
+// so a resumed session re-attaches automatically regardless of its launch dir.
+// TopicID is a pointer so a DM route (no topic) is representable as nil.
+// Detached is a tombstone: a deliberate `detach` sets it so the resumed session
+// stays unattached until it attaches again (which clears it).
+type SessionAttachment struct {
+	Channel        string    `json:"channel"`
+	ChatID         int64     `json:"chat_id"`
+	TopicID        *int64    `json:"topic_id,omitempty"`
+	Name           string    `json:"name,omitempty"`
+	Group          string    `json:"group,omitempty"`
+	CWD            string    `json:"cwd,omitempty"`
+	LastAttachedAt time.Time `json:"last_attached_at"`
+	Detached       bool      `json:"detached,omitempty"`
+}
+
+// Recoverable reports whether this attachment may be auto-restored on resume:
+// not tombstoned and within ttl of its last attach.
+func (sa SessionAttachment) Recoverable(now time.Time, ttl time.Duration) bool {
+	return !sa.Detached && now.Sub(sa.LastAttachedAt) < ttl
 }

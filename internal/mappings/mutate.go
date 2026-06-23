@@ -1,5 +1,7 @@
 package mappings
 
+import "time"
+
 // UpsertTopic inserts a new topic or updates an existing one (matched by
 // channel + chat_id + topic_id). Creates the channel entry if missing.
 func (mf *MappingsFile) UpsertTopic(channel string, t Topic) {
@@ -31,4 +33,55 @@ func (mf *MappingsFile) UpsertMapping(cwd string, m Mapping) {
 		}
 	}
 	mf.Mappings[cwd] = m
+}
+
+// UpsertSessionAttachment records (or replaces) the last-attached route for a
+// session id. The new value's Detached defaults false, so re-attaching after a
+// detach clears the tombstone. No-op on an empty id.
+func (mf *MappingsFile) UpsertSessionAttachment(id string, sa SessionAttachment) {
+	if id == "" {
+		return
+	}
+	if mf.SessionAttachments == nil {
+		mf.SessionAttachments = map[string]SessionAttachment{}
+	}
+	mf.SessionAttachments[id] = sa
+}
+
+// LookupSessionAttachment returns the raw entry for a session id, if present.
+// The caller applies the Recoverable policy (tombstone + TTL).
+func (mf *MappingsFile) LookupSessionAttachment(id string) (SessionAttachment, bool) {
+	if mf == nil || mf.SessionAttachments == nil || id == "" {
+		return SessionAttachment{}, false
+	}
+	sa, ok := mf.SessionAttachments[id]
+	return sa, ok
+}
+
+// TombstoneSessionAttachment marks a session's attachment as deliberately
+// detached, so a later resume does NOT auto-recover it. No-op if absent.
+func (mf *MappingsFile) TombstoneSessionAttachment(id string) {
+	if mf == nil || mf.SessionAttachments == nil {
+		return
+	}
+	if sa, ok := mf.SessionAttachments[id]; ok {
+		sa.Detached = true
+		mf.SessionAttachments[id] = sa
+	}
+}
+
+// PruneSessionAttachments deletes entries older than ttl (since LastAttachedAt).
+// Returns the count removed. Bounds growth of the store.
+func (mf *MappingsFile) PruneSessionAttachments(now time.Time, ttl time.Duration) int {
+	if mf == nil || mf.SessionAttachments == nil {
+		return 0
+	}
+	n := 0
+	for id, sa := range mf.SessionAttachments {
+		if now.Sub(sa.LastAttachedAt) >= ttl {
+			delete(mf.SessionAttachments, id)
+			n++
+		}
+	}
+	return n
 }
