@@ -22,10 +22,14 @@ import (
 // confirmed-dead holder, Routes.Claim will release the stale claim and
 // grant the new one.
 type Stub struct {
-	CLI    string
-	PID    int
-	CWD    string
-	ConnID uint64
+	CLI string
+	PID int
+	CWD string
+	// SessionID is the host CLI's stable per-session id (from HelloMsg), used
+	// for auto-attach-on-resume. Empty for hosts that don't expose one. Set at
+	// construction (Register*); never mutated, so it's race-free to read.
+	SessionID string
+	ConnID    uint64
 
 	// Conn is opaque from the registry's POV — broker package wires it after
 	// constructing, used by route workers to write inbound to the right
@@ -175,10 +179,18 @@ func NewStubRegistry() *StubRegistry {
 	return &StubRegistry{byConn: map[uint64]*Stub{}}
 }
 
-// Register creates a new Stub with a monotonic ConnID and returns it.
+// Register creates a new Stub with a monotonic ConnID and returns it. Thin
+// wrapper over RegisterWithSession for callers that have no session id.
 func (r *StubRegistry) Register(cli string, pid int, cwd string, conn any) *Stub {
+	return r.RegisterWithSession(cli, pid, cwd, "", conn)
+}
+
+// RegisterWithSession is Register plus the host CLI's stable session id (set at
+// construction so reads are race-free). Empty sessionID behaves exactly like
+// Register.
+func (r *StubRegistry) RegisterWithSession(cli string, pid int, cwd, sessionID string, conn any) *Stub {
 	id := r.next.Add(1)
-	s := &Stub{CLI: cli, PID: pid, CWD: cwd, ConnID: id, Conn: conn}
+	s := &Stub{CLI: cli, PID: pid, CWD: cwd, SessionID: sessionID, ConnID: id, Conn: conn}
 	r.mu.Lock()
 	r.byConn[id] = s
 	r.mu.Unlock()

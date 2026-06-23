@@ -13,6 +13,18 @@ func TestStubRegistry_AssignsMonotonicConnID(t *testing.T) {
 	}
 }
 
+func TestStubRegistry_RegisterWithSession(t *testing.T) {
+	r := NewStubRegistry()
+	s := r.RegisterWithSession("claude", 42, "/x", "sess-1", nil)
+	if s.SessionID != "sess-1" {
+		t.Fatalf("SessionID = %q, want sess-1", s.SessionID)
+	}
+	// Plain Register leaves it empty (no behavior change for old callers).
+	if r.Register("claude", 7, "/y", nil).SessionID != "" {
+		t.Fatal("Register must leave SessionID empty")
+	}
+}
+
 func TestStubRegistry_GetByConnID(t *testing.T) {
 	r := NewStubRegistry()
 	s := r.Register("claude", 1, "/x", nil)

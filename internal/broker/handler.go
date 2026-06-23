@@ -48,7 +48,7 @@ func (b *Broker) HandleConn(nc net.Conn) {
 	// authority" principle, claims survive conn drops as long as PID lives.
 	var stub *Stub
 	if existing := b.Routes.FindByLogicalSession(hello.CLI, hello.PID, hello.CWD); existing != nil {
-		stub = b.Stubs.Register(hello.CLI, hello.PID, hello.CWD, conn)
+		stub = b.Stubs.RegisterWithSession(hello.CLI, hello.PID, hello.CWD, hello.SessionID, conn)
 		oldConnID := existing.ConnID
 		// Unregister the OLD stub (now superseded) and transfer its claims.
 		b.Stubs.Unregister(oldConnID)
@@ -56,7 +56,7 @@ func (b *Broker) HandleConn(nc net.Conn) {
 		log.Printf("hello: RECONNECT cli=%s pid=%d cwd=%q old-conn=%d new-conn=%d (claims transferred)",
 			hello.CLI, hello.PID, hello.CWD, oldConnID, stub.ConnID)
 	} else {
-		stub = b.Stubs.Register(hello.CLI, hello.PID, hello.CWD, conn)
+		stub = b.Stubs.RegisterWithSession(hello.CLI, hello.PID, hello.CWD, hello.SessionID, conn)
 		log.Printf("hello: NEW cli=%s pid=%d cwd=%q conn=%d",
 			hello.CLI, hello.PID, hello.CWD, stub.ConnID)
 	}
