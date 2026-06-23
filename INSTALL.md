@@ -155,23 +155,16 @@ Tell the user to follow the interactive prompts.
 
 ### Speech-to-text (voice notes) — Python deps
 
-Voice-note transcription runs a Python handler. Its provider chain needs the
-`sarvamai` package for notes longer than ~30s, and the system `python3` is often
-externally-managed (PEP 668) and can't install it. C3 uses a dedicated venv:
+Voice-note transcription runs a Python handler. **STT needs only system
+`python3` + ffmpeg (`ffprobe`); no Python packages, no venv.** The provider
+chain uses only the standard library (the Sarvam long-audio path is native
+`urllib`), so a plain system `python3` works — even an externally-managed
+(PEP 668) one. Override the interpreter via `mappings.json`
+`plugins.stt.python` if you need a specific one.
 
-```bash
-bash plugins/c3/stt/setup-venv.sh
-```
-
-This creates `~/.config/c3/stt-venv` and installs `plugins/c3/stt/requirements.txt`.
-C3 **auto-detects** `~/.config/c3/stt-venv/bin/python` (override via `mappings.json`
-`plugins.stt.python`). Also install **ffmpeg** (provides `ffprobe`, for
-audio-duration detection) via your OS package manager — STT still works without it
-(REST-first), just less precisely routed.
-
-If this step is skipped, short voice notes still transcribe, but long ones surface
-`[STT FAILED: …]` to the agent and send the user a "couldn't transcribe — resend"
-Telegram notice.
+Install **ffmpeg** (provides `ffprobe`, for audio-duration detection) via your
+OS package manager. STT still works without it (REST-first), just less
+precisely routed for long notes.
 
 ## 5. Verify
 
@@ -259,8 +252,9 @@ It coexists with adapter auto-spawn (the broker is a flock singleton). See
 
 **STT caveat:** a systemd-supervised broker has no `$CLAUDE_PLUGIN_ROOT`, so set
 `plugins.stt.handler_path` in `~/.config/c3/mappings.json` to your cloned repo's
-`plugins/c3/stt/stt-handler.py` or voice transcription silently turns off (the
-venv still auto-detects). Details in `docs/systemd/README.md`.
+`plugins/c3/stt/stt-handler.py` or voice transcription silently turns off. (STT
+needs only system `python3` + ffmpeg (`ffprobe`); no Python packages, no venv.)
+Details in `docs/systemd/README.md`.
 
 ## 7. Tell the user the install is complete
 

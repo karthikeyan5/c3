@@ -44,8 +44,8 @@ cache):
 }
 ```
 
-The STT **venv** still auto-detects (`~/.config/c3/stt-venv`, independent of
-`$CLAUDE_PLUGIN_ROOT`), so only `handler_path` must be set. Then
+STT needs only system `python3` + ffmpeg (`ffprobe`); no Python packages, no
+venv. So only `handler_path` must be set. Then
 `systemctl --user restart c3-broker` and confirm `broker.log` shows
 `stt: registered with handler=...`.
 
