@@ -148,10 +148,13 @@ re-verifies each.
    it should drain.
 
 7. **Record on attach** — in `persistMapping`
-   (`internal/broker/attach.go:691-721`, where it already
-   `UpsertMapping + SaveMappings`), also `UpsertSessionAttachment(stub.SessionID,
-   …)` when `stub.SessionID != ""`. Every attach path funnels its persist
-   through here, so one write point covers all of them.
+   (`internal/broker/attach.go`, where it already `UpsertMapping +
+   SaveMappings`), also `UpsertSessionAttachment(stub.SessionID, …)` when
+   `stub.SessionID != ""`. The **topic** attach paths (attachByTopicID,
+   attachByName, createAndClaim) funnel their persist through `persistMapping`.
+   The **DM** path (`attachDM`) must NOT write a cwd default, so it records the
+   session attachment via a sibling helper `recordSessionAttachment`
+   (session entry only, nil TopicID → DM route key). Both paths are covered.
 
 8. **Tombstone on explicit detach** — in `OpRelease`
    (`internal/broker/handler.go:134-136`), mark
@@ -219,8 +222,12 @@ session-id story is confirmed.
 - **adapter unit:** hello includes `SessionID` from env; `buildInstructions`
   renders the "Auto-attached … N held — call fetch_queue" line when the ack
   has `AutoAttached + Mapping (+ QueuedCount)`.
-- **persist:** every attach path records the session attachment via
-  `persistMapping`.
+- **persist:** topic attaches record the session attachment via
+  `persistMapping`; the DM attach records via `recordSessionAttachment` (its
+  own path, tested through `attachDM`).
+- **churn:** a reconnect within `sessionRefreshInterval` (1h) of the last
+  attach does NOT rewrite `mappings.json`; a stale one does (TTL stays
+  reliable).
 - **race:** `go test -race ./...` green.
 - **live:** attach this session to a topic; quit; `claude --resume` from
   `~/arogara` root → it re-attaches to the same topic with no manual `cd` +
