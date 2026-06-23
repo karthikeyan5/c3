@@ -45,11 +45,9 @@ type Config struct {
 	HandlerPath string `json:"handler_path"`    // path to Python script
 	Timeout     int    `json:"timeout_seconds"` // subprocess budget (default 300s — long voice notes
 	//                                              need download + Gemini + Sarvam fallback time)
-	// Python is the interpreter the handler runs under. Empty ⇒ auto-detect the
-	// dedicated STT venv (~/.config/c3/stt-venv/bin/python), else bare "python3".
-	// The venv decouples STT's pip deps (sarvamai) from a system python that may
-	// be externally-managed (PEP 668) and lack them — the 2026-06-22 failure
-	// where every >30s note failed with ModuleNotFoundError: sarvamai.
+	// Python is the interpreter the handler runs under. Empty ⇒ bare "python3"
+	// (PATH). STT needs only the standard library now (the Sarvam batch path was
+	// ported to native urllib), so no venv is required — system python3 works.
 	Python string `json:"python"`
 }
 
@@ -92,24 +90,9 @@ func Register(host plugin.Host) error {
 		host.Logf("stt: registered with handler=%s timeout=%ds", cfg.HandlerPath, cfg.Timeout)
 	}
 
-	// Log which interpreter we'll run the handler under. If we fell back to bare
-	// python3 (no venv, no override), warn with the exact fix — long (>30s) notes
-	// need the sarvamai package, which a PEP 668 system python can't have.
-	venv := defaultVenvPython()
-	pyExe := cfg.Python
-	if pyExe == "" {
-		if venv != "" {
-			pyExe = venv
-		} else {
-			pyExe = "python3"
-		}
-	}
-	if cfg.Python == "" && venv == "" {
-		host.Logf("stt: WARNING no STT venv found and plugins.stt.python unset — using bare %q; long voice notes need sarvamai. Create the venv: bash %s",
-			pyExe, venvSetupHint(cfg.HandlerPath))
-	} else {
-		host.Logf("stt: python=%s", pyExe)
-	}
+	// Log which interpreter we'll run the handler under. STT needs only the
+	// standard library + ffmpeg/ffprobe — no Python packages, no venv.
+	host.Logf("stt: python=%s", pythonExe(cfg))
 
 	// TODO #12 (2026-05-16): belt-and-suspenders for the fresh-install STT
 	// crash. The Python handler also mkdir's these on its own at import
@@ -245,48 +228,15 @@ func runHandler(ctx context.Context, host plugin.Host, cfg Config, token, apiBas
 
 // pythonExe resolves the interpreter the STT handler runs under:
 //  1. cfg.Python (mappings.json:plugins.stt.python), if set;
-//  2. the auto-detected dedicated venv (~/.config/c3/stt-venv/bin/python);
-//  3. bare "python3" (PATH).
-// The handler's inner subprocess uses sys.executable, so whatever we pick here
-// cascades to the provider chain — picking the venv is what makes sarvamai
-// importable for long-note transcription regardless of the system python.
+//  2. bare "python3" (PATH).
+//
+// STT needs only the standard library now (the Sarvam batch path was ported to
+// native urllib), so the system python3 is sufficient — no venv required.
 func pythonExe(cfg Config) string {
 	if cfg.Python != "" {
 		return cfg.Python
 	}
-	if p := defaultVenvPython(); p != "" {
-		return p
-	}
 	return "python3"
-}
-
-// defaultVenvPython returns ~/.config/c3/stt-venv/bin/python if it exists as a
-// file, else "". Mirrors the mappings.json config-dir convention (XDG_CONFIG_HOME
-// or ~/.config), which is where `setup-venv.sh` creates the venv.
-func defaultVenvPython() string {
-	base := os.Getenv("XDG_CONFIG_HOME")
-	if base == "" {
-		home, err := os.UserHomeDir()
-		if err != nil || home == "" {
-			return ""
-		}
-		base = filepath.Join(home, ".config")
-	}
-	p := filepath.Join(base, "c3", "stt-venv", "bin", "python")
-	if st, err := os.Stat(p); err == nil && !st.IsDir() {
-		return p
-	}
-	return ""
-}
-
-// venvSetupHint points the operator at the bundled venv installer next to the
-// handler (plugins/c3/stt/setup-venv.sh). Falls back to the relative path if the
-// handler dir isn't known.
-func venvSetupHint(handlerPath string) string {
-	if handlerPath != "" {
-		return filepath.Join(filepath.Dir(handlerPath), "setup-venv.sh")
-	}
-	return "plugins/c3/stt/setup-venv.sh"
 }
 
 // readTelegramConn pulls the bot token and the optional Bot-API base URL from

@@ -624,12 +624,9 @@ func promptSTTSetup(r *bufio.Reader) (bool, error) {
 
 	if sarvam != "" {
 		fmt.Println()
-		fmt.Println("STT Python deps (required for voice notes longer than ~30s):")
-		fmt.Println("  The Sarvam batch path needs the `sarvamai` package in a dedicated venv")
-		fmt.Println("  (the system python is often externally-managed / PEP 668). Run:")
-		fmt.Println("      bash plugins/c3/stt/setup-venv.sh")
-		fmt.Println("  C3 auto-detects ~/.config/c3/stt-venv/bin/python. Also install ffmpeg")
-		fmt.Println("  (provides ffprobe) via your OS package manager.")
+		fmt.Println("STT deps: STT needs only system python3 + ffmpeg (ffprobe);")
+		fmt.Println("  no Python packages, no venv. Install ffmpeg (provides ffprobe)")
+		fmt.Println("  via your OS package manager for long-audio (>30s) routing.")
 	}
 
 	// Tell the user about the vocabulary override path. This is the
