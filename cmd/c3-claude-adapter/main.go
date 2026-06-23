@@ -281,11 +281,18 @@ func spawnBroker() error {
 }
 
 // hello sends the hello frame and reads hello_ack.
+// sessionIDFromEnv returns Claude Code's stable per-session id, which it
+// exports to stdio MCP servers as CLAUDE_CODE_SESSION_ID (stable across
+// `claude --resume <id>`). Empty when unset. Sent on hello to power
+// auto-attach-on-resume.
+func sessionIDFromEnv() string { return os.Getenv("CLAUDE_CODE_SESSION_ID") }
+
 func (a *adapter) hello() error {
 	cwd, _ := os.Getwd()
 	if err := a.conn.WriteJSON(ipc.HelloMsg{
 		Op: ipc.OpHello, CLI: "claude", PID: os.Getpid(), CWD: cwd,
 		Capabilities: []string{"claude/channel"},
+		SessionID:    sessionIDFromEnv(),
 	}); err != nil {
 		return err
 	}
@@ -1088,7 +1095,14 @@ func (a *adapter) buildInstructions() string {
 		head = fmt.Sprintf("No C3 mapping for %q. Use the `attach` tool to set one up — the broker proposes a topic named %q in the default group; confirm to create.", cwd, filepath.Base(cwd))
 	case a.helloAck.AutoAttached && a.helloAck.Mapping != nil:
 		m := a.helloAck.Mapping
-		head = fmt.Sprintf("Auto-attached to %q (%s). Inbound messages render here as `<channel>` blocks.", m.Name, m.Channel)
+		head = fmt.Sprintf("Auto-attached to %q (%s) — resumed session. Inbound messages render here as `<channel>` blocks.", m.Name, m.Channel)
+		if a.helloAck.QueuedCount > 0 {
+			noun := "message"
+			if a.helloAck.QueuedCount > 1 {
+				noun = "messages"
+			}
+			head += fmt.Sprintf(" %d %s held while detached — call `fetch_queue` to retrieve.", a.helloAck.QueuedCount, noun)
+		}
 	default:
 		head = "C3 connected. Use the `attach` tool to claim a Telegram topic for this session."
 	}
