@@ -116,8 +116,7 @@ func (b *Broker) HandleConn(nc net.Conn) {
 		case ipc.OpListHealth:
 			b.handleHealth(conn)
 		case ipc.OpRelease:
-			b.Routes.ReleaseAllByConnID(stub.ConnID)
-			stub.SetRoute(nil)
+			b.handleRelease(stub)
 		case ipc.OpToolCall:
 			b.handleToolCall(conn, stub, raw)
 		case ipc.OpFetchQueue:
@@ -201,6 +200,23 @@ func (b *Broker) buildHelloAck(hello ipc.HelloMsg, stub *Stub) ipc.HelloAckMsg {
 	}
 	ack.Capabilities = b.capsForChannel(chanName)
 	return ack
+}
+
+// handleRelease drops the stub's claim on an explicit detach (OpRelease) and
+// tombstones its session attachment so a later resume of the SAME session stays
+// unattached — a deliberate detach is remembered. The dead-PID conn-drop path in
+// HandleConn must NOT call this: that's a process exit, not a user detach, and
+// tombstoning there would wipe recovery on every quit-without-detach (defeating
+// the feature). Conn-drop releases claims directly via Routes.ReleaseAllByConnID.
+func (b *Broker) handleRelease(stub *Stub) {
+	b.Routes.ReleaseAllByConnID(stub.ConnID)
+	stub.SetRoute(nil)
+	if stub.SessionID != "" {
+		b.mutateMappings(func(mf *mappings.MappingsFile) {
+			mf.TombstoneSessionAttachment(stub.SessionID)
+		})
+		_ = b.SaveMappings()
+	}
 }
 
 // handleToolCall dispatches a tool-call to the worker for the stub's

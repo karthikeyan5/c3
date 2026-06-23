@@ -103,6 +103,54 @@ func TestBuildHelloAck_EmptySessionIDNoRecovery(t *testing.T) {
 	}
 }
 
+func TestHandleRelease_TombstonesSessionAttachment(t *testing.T) {
+	mf := mfWithTelegram()
+	seedSessionAttachment(mf, "sess-1", time.Now().UTC(), false)
+	b := brokerWithChannel(t, mf, &fakeChannel{})
+	defer b.Shutdown()
+
+	stub := b.Stubs.RegisterWithSession("claude", 1, "/x", "sess-1", nil)
+	tid := int64(281)
+	b.Routes.Claim(MakeRouteKey("telegram", -100, &tid), stub)
+	stub.SetRoute(func() *RouteKey { k := MakeRouteKey("telegram", -100, &tid); return &k }())
+
+	b.handleRelease(stub)
+
+	if stub.CurrentRoute() != nil {
+		t.Fatal("release should clear the stub's route")
+	}
+	sa, ok := b.Mappings().LookupSessionAttachment("sess-1")
+	if !ok || !sa.Detached {
+		t.Fatalf("explicit detach must tombstone the session attachment; got %+v ok=%v", sa, ok)
+	}
+}
+
+func TestHandleRelease_EmptySessionIDNoOp(t *testing.T) {
+	mf := mfWithTelegram()
+	b := brokerWithChannel(t, mf, &fakeChannel{})
+	defer b.Shutdown()
+	stub := b.Stubs.RegisterWithSession("claude", 1, "/x", "", nil)
+	b.handleRelease(stub) // must not panic; nothing to tombstone
+}
+
+func TestConnDrop_DoesNotTombstone(t *testing.T) {
+	// The HandleConn conn-drop defer releases claims via ReleaseAllByConnID
+	// directly (NOT handleRelease), so a quit-without-detach must leave the
+	// session attachment recoverable.
+	mf := mfWithTelegram()
+	seedSessionAttachment(mf, "sess-1", time.Now().UTC(), false)
+	b := brokerWithChannel(t, mf, &fakeChannel{})
+	defer b.Shutdown()
+
+	stub := b.Stubs.RegisterWithSession("claude", 1, "/x", "sess-1", nil)
+	b.Routes.ReleaseAllByConnID(stub.ConnID) // the conn-drop path
+
+	sa, ok := b.Mappings().LookupSessionAttachment("sess-1")
+	if !ok || sa.Detached {
+		t.Fatalf("conn-drop must NOT tombstone; got %+v ok=%v", sa, ok)
+	}
+}
+
 func TestBuildHelloAck_CollisionSkipsRecovery(t *testing.T) {
 	mf := mfWithTelegram()
 	seedSessionAttachment(mf, "sess-1", time.Now().UTC(), false) // → c3 / 281
