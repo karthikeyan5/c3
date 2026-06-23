@@ -63,6 +63,16 @@ func (mf *MappingsFile) Clone() *MappingsFile {
 		}
 		out.Notifications = &nc
 	}
+	if mf.SessionAttachments != nil {
+		out.SessionAttachments = make(map[string]SessionAttachment, len(mf.SessionAttachments))
+		for k, v := range mf.SessionAttachments {
+			if v.TopicID != nil { // deep-copy the pointer per the Clone contract
+				t := *v.TopicID
+				v.TopicID = &t
+			}
+			out.SessionAttachments[k] = v
+		}
+	}
 	return out
 }
 

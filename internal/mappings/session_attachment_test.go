@@ -85,6 +85,22 @@ func TestSessionAttachment_Prune(t *testing.T) {
 	}
 }
 
+func TestSessionAttachment_CloneDeepCopies(t *testing.T) {
+	tid := int64(914)
+	mf := &MappingsFile{}
+	mf.UpsertSessionAttachment("s", SessionAttachment{Name: "c3", TopicID: &tid, LastAttachedAt: time.Now().UTC()})
+	cl := mf.Clone()
+	sa, ok := cl.LookupSessionAttachment("s")
+	if !ok || sa.Name != "c3" || sa.TopicID == nil || *sa.TopicID != 914 {
+		t.Fatalf("Clone dropped/garbled session attachment: %+v ok=%v", sa, ok)
+	}
+	// Deep copy: mutating the clone's TopicID must not leak into the original.
+	*sa.TopicID = 1
+	if got := mf.SessionAttachments["s"]; got.TopicID == nil || *got.TopicID != 914 {
+		t.Fatalf("Clone must deep-copy TopicID; original mutated to %v", got.TopicID)
+	}
+}
+
 func TestSessionAttachment_OmitemptyAndRoundTrip(t *testing.T) {
 	// Empty store stays off the wire (old config files unchanged).
 	b, _ := json.Marshal(&MappingsFile{SchemaVersion: 1})
