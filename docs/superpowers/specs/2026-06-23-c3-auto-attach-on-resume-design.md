@@ -55,16 +55,23 @@ once its MCP server + broker-reader are up, auto-issues a claim for that route
 through the **existing** attach machinery (collision-safe, backlog-replay,
 welcome). The existing cwd path is left untouched as a fallback.
 
-### Why adapter-issued (not broker-at-hello) claim
+### Claim realized broker-side at hello (pull-model backlog)
 
-The Claude adapter's `run()` is `connectBroker → hello → buildMCPServer →
-brokerReader → server.Run` (`cmd/c3-claude-adapter/main.go:109-125`), with no
-`autoAttach` (unlike Codex, which has one at `cmd/c3-codex-adapter/main.go:100`).
-If the broker claimed during hello, backlog delivery could fire **before**
-`brokerReader` is up and be missed. So the claim must be issued by the adapter
-*after* the reader is running — mirroring Codex's proven `autoAttach`, but
-gated on the recovery signal. The claim still executes server-side through
-`tryClaim`.
+The broker performs the recovery claim during the hello handshake
+(`internal/broker/handler.go` HandleConn), using the low-level
+`b.Routes.Claim` — NOT `tryClaim`, which writes an AttachedMsg to the conn the
+adapter isn't yet expecting. This is safe because C3's backlog is **pull, not
+push**: claiming a route does NOT flush its queued backlog (the normal attach
+path only *reports* a count via `withBacklog`; the agent pulls with
+`fetch_queue`). So there is no flood-before-`brokerReader`-is-up race. Only NEW
+messages push after the claim, by which point `run()` has started `brokerReader`
+(and the OS socket buffer covers the brief gap regardless). The held-backlog
+count travels in the hello ack (`QueuedCount`, new field) so the boot
+instructions can tell the agent to call `fetch_queue`. A topic held by another
+live session is detected first (`heldByDifferentLiveSession`) and recovery is
+skipped (falls through to the normal cwd / NoMapping flow) — never a silent
+steal. A resumed session's own prior claim, if still lingering, is held by a
+dead PID, so `Routes.Claim` releases it and grants the new one.
 
 ## Data model
 
@@ -115,27 +122,30 @@ re-verifies each.
    (`internal/broker/stubs.go`); extend `Stubs.Register(...)` to take it; pass
    `hello.SessionID` at both call sites (`internal/broker/handler.go:51,59`).
 
-4. **Hello recovery decision** — in the hello handler
-   (`internal/broker/handler.go:89-106`), the precedence (see below). When
-   recovery applies, set the (currently vestigial) ack fields so the adapter
-   knows to claim and the boot text reads correctly:
+4. **Hello recovery (broker, the core)** — in the hello handler
+   (`internal/broker/handler.go:89-106`), BEFORE the cwd/NoMapping logic
+   (session-id precedence): if `hello.SessionID` resolves to a valid (non-
+   tombstoned, within-TTL) session attachment whose route is NOT
+   `heldByDifferentLiveSession`, claim it via `b.Routes.Claim(key, stub)` +
+   `stub.SetRoute(&key)`, refresh the attachment's `LastAttachedAt`, and set:
    ```go
    ack.AutoAttached = true
-   ack.Mapping = wireMapping(sa)   // ipc.HelloAckMsg.Mapping (messages.go:138-139)
+   ack.Mapping = wireMapping(sa)               // ipc.HelloAckMsg.Mapping (messages.go:139)
+   ack.QueuedCount, _ = b.backlogSummary(key)  // ipc.HelloAckMsg.QueuedCount (NEW)
    ```
+   On collision, or no/expired/tombstoned attachment, skip recovery and fall
+   through to the existing cwd-mapping / NoMapping logic.
 
-5. **Adapter auto-claim** — in Claude `run()` after `brokerReader` starts
-   (`cmd/c3-claude-adapter/main.go:109-125`), if
-   `helloAck.AutoAttached && helloAck.Mapping != nil`, issue an `AttachReq`
-   for that route (by name/key, carrying `SessionID`). This flows through
-   `attachByName → tryClaim`. On a `force_steal` collision proposal: **do not
-   steal** — surface it (render in boot instructions / let the agent decide).
+5. **New ack field** — add `QueuedCount int \`json:"queued_count,omitempty"\``
+   to `ipc.HelloAckMsg` (additive-omitempty).
 
 6. **Boot instructions** — `buildInstructions()`
-   (`cmd/c3-claude-adapter/main.go:1081-1095`) already has an
-   `AutoAttached && Mapping != nil` branch that renders "Auto-attached to
-   …" — it just was never reached before. Recovery now triggers it, so the
-   agent sees it's attached and won't reflexively re-call `attach`.
+   (`cmd/c3-claude-adapter/main.go:1089-1091`) already has the
+   `AutoAttached && Mapping != nil` branch rendering "Auto-attached to …";
+   recovery now triggers it. Extend that branch so that when `QueuedCount > 0`
+   it appends "N message(s) held — call `fetch_queue` to retrieve." The agent
+   thus knows both that it is attached (won't reflexively re-`attach`) and that
+   it should drain.
 
 7. **Record on attach** — in `persistMapping`
    (`internal/broker/attach.go:691-721`, where it already
@@ -150,11 +160,15 @@ re-verifies each.
    process exit, not a user detach; clearing there would wipe recovery on
    every quit-without-detach and defeat the feature.
 
-9. **Claim safety** — the recovery claim routes through `tryClaim`
-   (`internal/broker/attach.go:364,538-…`). A topic held by another **live**
-   session yields the `force_steal` proposal, never a silent steal. A resumed
-   session's *old* PID is dead, so its prior claim is auto-released on
-   conn-drop (`handler.go:76-86`) and self-recovery never collides with itself.
+9. **Claim safety** — recovery uses `b.heldByDifferentLiveSession(key, stub)`
+   (`internal/broker/attach.go:510`) FIRST: if a different **live** session
+   holds the route, recovery is **skipped** (no claim, no steal) and the flow
+   falls through to the normal cwd / NoMapping path so the agent can attach
+   explicitly (and get the usual `force_steal` prompt if it wants the topic).
+   When not held by a live other session, `b.Routes.Claim(key, stub)` grants
+   it; a resumed session's *old* PID is dead, so any lingering self-claim is
+   released by `Claim` and re-granted. Recovery never calls `tryClaim` (which
+   would write an unexpected AttachedMsg to the just-handshaked conn).
 
 ## Precedence order (on hello, Claude)
 
@@ -174,7 +188,7 @@ claim with the user's argument).
 
 | # | Case | Decision (default) |
 |---|------|--------------------|
-| 1 | Topic held by another live session on resume | Surface the `force_steal` collision prompt; never auto-steal. |
+| 1 | Topic held by another live session on resume | Skip recovery (no claim, no steal); fall through to normal flow so the agent can attach explicitly. Never auto-steal. |
 | 2 | User did an explicit `detach` earlier | Tombstone (`Detached=true`) → resumed session stays unattached until it attaches again. |
 | 3 | Session quit without detach (conn-drop) | Entry kept → next resume recovers. (This is the core feature.) |
 | 4 | Project dir moved/renamed | Still recovers (session-id is dir-independent); stored `cwd` is informational only. |
@@ -197,13 +211,14 @@ session-id story is confirmed.
 - **mappings unit:** Upsert/Lookup/Delete/TTL-sweep of `SessionAttachments`;
   round-trip JSON; `omitempty` keeps old files byte-identical.
 - **broker unit:** hello with a known `SessionID` + a stored attachment →
-  ack carries `AutoAttached + Mapping`; precedence (session-id beats cwd
-  mapping incl. the root-has-a-mapping case); `OpRelease` tombstones;
-  conn-drop does **not** clear; collision → `force_steal` proposal (reuse the
-  existing `heldByDifferentLiveSession` / `tryClaim` tests as the pattern).
-- **adapter unit:** hello includes `SessionID` from env; `run()` issues the
-  auto-claim only when `AutoAttached && Mapping != nil`; collision proposal is
-  surfaced, not auto-stolen.
+  ack carries `AutoAttached + Mapping + QueuedCount` and the route is claimed
+  (`stub.CurrentRoute()` set); precedence (session-id beats cwd mapping incl.
+  the root-has-a-mapping case); `OpRelease` tombstones; conn-drop does **not**
+  clear; held-by-another-live-session → recovery skipped, no claim, falls
+  through (reuse the existing `heldByDifferentLiveSession` tests as the pattern).
+- **adapter unit:** hello includes `SessionID` from env; `buildInstructions`
+  renders the "Auto-attached … N held — call fetch_queue" line when the ack
+  has `AutoAttached + Mapping (+ QueuedCount)`.
 - **persist:** every attach path records the session attachment via
   `persistMapping`.
 - **race:** `go test -race ./...` green.
