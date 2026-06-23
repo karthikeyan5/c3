@@ -709,13 +709,72 @@ func routeKeyFromSessionAttachment(sa mappings.SessionAttachment) RouteKey {
 	return MakeRouteKey(sa.Channel, sa.ChatID, sa.TopicID)
 }
 
-// wireMappingFromSessionAttachment converts a stored attachment to the hello-ack
-// wire Mapping so the adapter can render "Auto-attached to <name>".
-func wireMappingFromSessionAttachment(sa mappings.SessionAttachment) *ipc.Mapping {
-	return &ipc.Mapping{
-		Channel: sa.Channel, ChatID: sa.ChatID,
-		TopicID: sa.TopicID, Name: sa.Name, Group: sa.Group,
+// recoverSession attempts to re-claim the route the stub's STABLE session was
+// last attached to. Returns the claimed key, the held-backlog count, and ok.
+// No-op (ok=false) when: no stable id, no/expired/tombstoned attachment, the
+// route is held by another live session, or the claim fails.
+//
+// Caller MUST hold no lock AND must have already confirmed stub.CurrentRoute()
+// is nil (handleRecoverSession does — the already-attached case takes the
+// record-only branch instead). Uses low-level Routes.Claim (NOT tryClaim, which
+// would write an AttachedMsg the conn isn't expecting and could send a welcome);
+// C3's backlog is pull-not-push, so the claim never floods the conn. Refreshes
+// LastAttachedAt only when staler than sessionRefreshInterval, so a burst of
+// broker-bounce / reconnect-driven recover ops doesn't rewrite mappings.json
+// (with its .bak + fsyncs) every time.
+func (b *Broker) recoverSession(stub *Stub) (RouteKey, int, bool) {
+	sid := stub.StableSessionIDValue()
+	if sid == "" {
+		return RouteKey{}, 0, false
 	}
+	sa, ok := b.Mappings().LookupSessionAttachment(sid)
+	if !ok || !sa.Recoverable(time.Now(), SessionAttachmentTTL) {
+		return RouteKey{}, 0, false
+	}
+	key := routeKeyFromSessionAttachment(sa)
+	if _, held := b.heldByDifferentLiveSession(key, stub); held {
+		log.Printf("recover: SKIPPED session=%s topic=%q (held by another live session)", sid, sa.Name)
+		return RouteKey{}, 0, false
+	}
+	if _, claimed := b.Routes.Claim(key, stub); !claimed {
+		log.Printf("recover: claim FAILED session=%s topic=%q", sid, sa.Name)
+		return RouteKey{}, 0, false
+	}
+	stub.SetRoute(&key)
+	cnt, _ := b.backlogSummary(key)
+	if time.Since(sa.LastAttachedAt) > sessionRefreshInterval {
+		b.mutateMappings(func(mf *mappings.MappingsFile) {
+			if cur, ok := mf.LookupSessionAttachment(sid); ok {
+				cur.LastAttachedAt = time.Now().UTC()
+				mf.UpsertSessionAttachment(sid, cur)
+			}
+		})
+		_ = b.SaveMappings()
+	}
+	log.Printf("recover: session=%s cli=%s pid=%d → %q (queued=%d)", sid, stub.CLI, stub.PID, sa.Name, cnt)
+	return key, cnt, true
+}
+
+// recordCurrentRouteForStable saves the stub's CURRENT route under its stable
+// session id (the dual-path "attach BEFORE recover" arm). Derives channel /
+// chatID / topicID from the RouteKey, resolves Name/Group from the topic
+// registry (DM = no topic → name "dm"), and records via the session-attachment
+// recorder keyed on stub.StableSessionIDValue(). No-op when the stable id is
+// empty (recordSessionAttachment guards that).
+func (b *Broker) recordCurrentRouteForStable(stub *Stub, key RouteKey) {
+	var topicID *int64
+	name, group := "dm", ""
+	if key.HasTopic {
+		t := key.TopicID
+		topicID = &t
+		if tp, ok := b.Mappings().LookupTopicByID(key.Channel, key.ChatID, key.TopicID); ok {
+			name = tp.Name
+			group = tp.Group
+		} else {
+			name = fmt.Sprintf("topic-%d", key.TopicID)
+		}
+	}
+	b.recordSessionAttachment(stub, key.Channel, key.ChatID, topicID, name, group)
 }
 
 func (b *Broker) persistMapping(stub *Stub, chanName string, chatID, topicID int64, name, group string) {
@@ -730,14 +789,18 @@ func (b *Broker) persistMapping(stub *Stub, chanName string, chatID, topicID int
 	// lock — otherwise a concurrent persistMapping for the same cwd could
 	// race past the refusal check.
 	var persisted bool
+	stableID := stub.StableSessionIDValue()
 	b.mutateMappings(func(mf *mappings.MappingsFile) {
-		// Session-id recovery store — keyed on the session id, recorded
+		// Session-id recovery store — keyed on the STABLE session id, recorded
 		// INDEPENDENTLY of the cwd rebind guard below (so a refused rebind, or
 		// an empty cwd, still records the recovery entry). Clears any prior
-		// tombstone. (The DM route records via recordSessionAttachment instead,
-		// since it must not also write a cwd default.)
-		if stub.SessionID != "" {
-			mf.UpsertSessionAttachment(stub.SessionID, mappings.SessionAttachment{
+		// tombstone. This is the dual-path "attach AFTER recover" arm: when a
+		// RecoverSessionReq already set the stable id, an attach that lands later
+		// records under it. Empty (non-hook session / recover hasn't arrived) →
+		// no recording (fail-closed). The DM route records via
+		// recordSessionAttachment instead (it must not also write a cwd default).
+		if stableID != "" {
+			mf.UpsertSessionAttachment(stableID, mappings.SessionAttachment{
 				Channel: chanName, ChatID: chatID, TopicID: tidPtr,
 				Name: name, Group: group, CWD: cwd, LastAttachedAt: now,
 			})
@@ -774,11 +837,12 @@ func (b *Broker) persistMapping(stub *Stub, chanName string, chatID, topicID int
 // the host exposes no session id. Topic attaches record via persistMapping
 // instead (which records the session attachment AND the cwd default together).
 func (b *Broker) recordSessionAttachment(stub *Stub, chanName string, chatID int64, topicID *int64, name, group string) {
-	if stub.SessionID == "" {
+	sid := stub.StableSessionIDValue()
+	if sid == "" {
 		return
 	}
 	b.mutateMappings(func(mf *mappings.MappingsFile) {
-		mf.UpsertSessionAttachment(stub.SessionID, mappings.SessionAttachment{
+		mf.UpsertSessionAttachment(sid, mappings.SessionAttachment{
 			Channel: chanName, ChatID: chatID, TopicID: topicID,
 			Name: name, Group: group, CWD: stub.CWD, LastAttachedAt: time.Now().UTC(),
 		})

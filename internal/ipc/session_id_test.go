@@ -6,32 +6,42 @@ import (
 	"testing"
 )
 
-func TestHelloMsg_SessionIDRoundTrip(t *testing.T) {
-	b, _ := json.Marshal(HelloMsg{Op: OpHello, CLI: "claude", PID: 1, CWD: "/x", SessionID: "sess-1"})
-	if !strings.Contains(string(b), `"session_id":"sess-1"`) {
-		t.Fatalf("missing session_id on wire: %s", b)
+func TestRecoverSessionReq_RoundTrip(t *testing.T) {
+	b, _ := json.Marshal(RecoverSessionReq{Op: OpRecoverSession, StableSessionID: "sess-1", CWD: "/x"})
+	if !strings.Contains(string(b), `"stable_session_id":"sess-1"`) {
+		t.Fatalf("missing stable_session_id on wire: %s", b)
 	}
-	var m HelloMsg
+	var m RecoverSessionReq
 	if err := json.Unmarshal(b, &m); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if m.SessionID != "sess-1" {
-		t.Fatalf("round-trip session_id = %q", m.SessionID)
+	if m.StableSessionID != "sess-1" || m.CWD != "/x" || m.Op != OpRecoverSession {
+		t.Fatalf("round-trip mismatch: %+v", m)
 	}
-	// omitempty: empty id absent from the wire (older brokers unaffected).
-	b2, _ := json.Marshal(HelloMsg{Op: OpHello})
-	if strings.Contains(string(b2), "session_id") {
-		t.Fatalf("empty session_id must be omitted: %s", b2)
+	// omitempty: empty cwd absent from the wire.
+	b2, _ := json.Marshal(RecoverSessionReq{Op: OpRecoverSession, StableSessionID: "sess-1"})
+	if strings.Contains(string(b2), `"cwd"`) {
+		t.Fatalf("empty cwd must be omitted: %s", b2)
 	}
 }
 
-func TestHelloAckMsg_QueuedCount(t *testing.T) {
-	b, _ := json.Marshal(HelloAckMsg{Op: OpHelloAck, QueuedCount: 3})
-	if !strings.Contains(string(b), `"queued_count":3`) {
-		t.Fatalf("missing queued_count: %s", b)
+func TestRecoverSessionResp_RoundTrip(t *testing.T) {
+	tid := int64(281)
+	b, _ := json.Marshal(RecoverSessionResp{
+		Op: OpRecoverSessionResult, Recovered: true,
+		Channel: "telegram", ChatID: -100, TopicID: &tid,
+		Name: "c3", Group: "main", QueuedCount: 3,
+	})
+	var m RecoverSessionResp
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
 	}
-	b2, _ := json.Marshal(HelloAckMsg{Op: OpHelloAck})
-	if strings.Contains(string(b2), "queued_count") {
-		t.Fatalf("zero queued_count must be omitted: %s", b2)
+	if !m.Recovered || m.Name != "c3" || m.TopicID == nil || *m.TopicID != 281 || m.QueuedCount != 3 {
+		t.Fatalf("round-trip mismatch: %+v", m)
+	}
+	// A not-recovered response stays compact (no topic / count).
+	b2, _ := json.Marshal(RecoverSessionResp{Op: OpRecoverSessionResult})
+	if strings.Contains(string(b2), `"queued_count"`) || strings.Contains(string(b2), `"topic_id"`) {
+		t.Fatalf("empty fields must be omitted: %s", b2)
 	}
 }

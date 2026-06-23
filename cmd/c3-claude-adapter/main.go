@@ -58,6 +58,7 @@ import (
 	"github.com/karthikeyan5/c3/internal/ipc"
 	"github.com/karthikeyan5/c3/internal/mcptools"
 	"github.com/karthikeyan5/c3/internal/mode"
+	"github.com/karthikeyan5/c3/internal/sessionhandoff"
 	"github.com/karthikeyan5/c3/internal/spawn"
 	"github.com/karthikeyan5/c3/internal/termtitle"
 )
@@ -120,6 +121,7 @@ func run() error {
 	a.notifyTx = newNotifyTransport(&mcp.StdioTransport{})
 
 	go a.brokerReader(ctx)
+	go a.recoverSessionOnResume(ctx)
 	go a.idleStartupWatchdog(ctx, cancel)
 
 	err := server.Run(ctx, a.notifyTx)
@@ -219,6 +221,13 @@ type adapter struct {
 	rtmu      sync.Mutex
 	rtPending map[string]chan ipc.RetranscribeResp
 
+	// recover-session is one-shot per session (a session resumes at most once),
+	// so a single buffered channel suffices instead of a pending map. Set by
+	// recoverSessionOnResume before it writes RecoverSessionReq; resolved by
+	// dispatchRecoverSessionResult. Guarded by rsmu.
+	rsmu      sync.Mutex
+	rsPending chan ipc.RecoverSessionResp
+
 	// Hello-ack response state, captured on connect.
 	helloAck ipc.HelloAckMsg
 
@@ -280,19 +289,19 @@ func spawnBroker() error {
 	return spawn.Detached(exec.Command("c3-broker"))
 }
 
-// hello sends the hello frame and reads hello_ack.
-// sessionIDFromEnv returns Claude Code's stable per-session id, which it
-// exports to stdio MCP servers as CLAUDE_CODE_SESSION_ID (stable across
-// `claude --resume <id>`). Empty when unset. Sent on hello to power
-// auto-attach-on-resume.
-func sessionIDFromEnv() string { return os.Getenv("CLAUDE_CODE_SESSION_ID") }
+// instanceIDFromEnv returns Claude Code's EPHEMERAL per-MCP-spawn id, exported
+// to stdio MCP servers as CLAUDE_CODE_SESSION_ID. Despite the name, this is NOT
+// the stable --resume id — it equals the UUID directory in the SessionStart
+// hook's $CLAUDE_ENV_FILE path, so the adapter uses it to look up its own
+// SessionStart-hook handoff (which carries the real stable id). Empty when unset
+// (non-Claude-Code host / no hook) → recovery is skipped (fail-closed).
+func instanceIDFromEnv() string { return os.Getenv("CLAUDE_CODE_SESSION_ID") }
 
 func (a *adapter) hello() error {
 	cwd, _ := os.Getwd()
 	if err := a.conn.WriteJSON(ipc.HelloMsg{
 		Op: ipc.OpHello, CLI: "claude", PID: os.Getpid(), CWD: cwd,
 		Capabilities: []string{"claude/channel"},
-		SessionID:    sessionIDFromEnv(),
 	}); err != nil {
 		return err
 	}
@@ -349,6 +358,8 @@ func (a *adapter) brokerReader(ctx context.Context) {
 			a.dispatchFetchQueueResult(raw)
 		case ipc.OpRetranscribeResult:
 			a.dispatchRetranscribeResult(raw)
+		case ipc.OpRecoverSessionResult:
+			a.dispatchRecoverSessionResult(raw)
 		case ipc.OpError:
 			var errMsg ipc.ErrorMsg
 			_ = json.Unmarshal(raw, &errMsg)
@@ -1094,15 +1105,11 @@ func (a *adapter) buildInstructions() string {
 		cwd, _ := os.Getwd()
 		head = fmt.Sprintf("No C3 mapping for %q. Use the `attach` tool to set one up — the broker proposes a topic named %q in the default group; confirm to create.", cwd, filepath.Base(cwd))
 	case a.helloAck.AutoAttached && a.helloAck.Mapping != nil:
+		// Vestigial: the broker no longer auto-attaches at hello (recovery moved
+		// to the post-hello RecoverSessionReq path, surfaced via a notification).
+		// Kept harmless in case a future hello-time auto-attach is reintroduced.
 		m := a.helloAck.Mapping
 		head = fmt.Sprintf("Auto-attached to %q (%s) — resumed session. Inbound messages render here as `<channel>` blocks.", m.Name, m.Channel)
-		if a.helloAck.QueuedCount > 0 {
-			noun := "message"
-			if a.helloAck.QueuedCount > 1 {
-				noun = "messages"
-			}
-			head += fmt.Sprintf(" %d %s held while detached — call `fetch_queue` to retrieve.", a.helloAck.QueuedCount, noun)
-		}
 	default:
 		head = "C3 connected. Use the `attach` tool to claim a Telegram topic for this session."
 	}
@@ -1636,6 +1643,155 @@ func (a *adapter) dispatchRetranscribeResult(raw []byte) {
 	a.rtmu.Unlock()
 	if ok {
 		ch <- resp
+	}
+}
+
+// recoverSessionParams tunes the post-hello handoff poll. The SessionStart hook
+// fires ~2s AFTER the adapter spawns, so we poll the handoff file a few times
+// over ~3s rather than reading once. All values are bounded — the poll runs in
+// its own goroutine and never blocks hello / server start.
+const (
+	recoverPollAttempts = 6
+	recoverPollInterval = 500 * time.Millisecond
+	recoverRespTimeout  = 10 * time.Second
+)
+
+// recoverSessionOnResume runs in a goroutine after hello. It looks up this
+// adapter's SessionStart-hook handoff (keyed on the ephemeral instance id), and
+// if found, asks the broker to re-attach the resumed session to its last topic
+// (keyed on the STABLE session id from the handoff). On a Recovered response
+// with held backlog, it emits ONE notification telling the agent it was
+// auto-attached and to call fetch_queue.
+//
+// Fail-closed throughout: no instance id (non-Claude-Code host), no handoff
+// (non-c3 / fresh non-resumed session), broker write/timeout — all return
+// silently → today's no-recovery behavior, zero regression. The bounded poll
+// lives entirely in this goroutine; it never delays hello or the MCP server.
+func (a *adapter) recoverSessionOnResume(ctx context.Context) {
+	inst := instanceIDFromEnv()
+	if inst == "" {
+		return
+	}
+	var entry sessionhandoff.Entry
+	found := false
+	for i := 0; i < recoverPollAttempts; i++ {
+		if e, ok := sessionhandoff.Read(inst); ok {
+			entry, found = e, true
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(recoverPollInterval):
+		}
+	}
+	if !found {
+		return // non-hook / non-c3 / non-resumed session — nothing to recover.
+	}
+
+	respCh := make(chan ipc.RecoverSessionResp, 1)
+	a.rsmu.Lock()
+	a.rsPending = respCh
+	a.rsmu.Unlock()
+	defer func() {
+		a.rsmu.Lock()
+		if a.rsPending == respCh {
+			a.rsPending = nil
+		}
+		a.rsmu.Unlock()
+	}()
+
+	conn := a.currentConn()
+	if conn == nil {
+		return
+	}
+	if err := conn.WriteJSON(ipc.RecoverSessionReq{
+		Op: ipc.OpRecoverSession, StableSessionID: entry.StableSessionID, CWD: entry.CWD,
+	}); err != nil {
+		log.Printf("recover-session: write failed: %v", err)
+		return
+	}
+
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(recoverRespTimeout):
+		log.Printf("recover-session: no response within %v", recoverRespTimeout)
+		return
+	case resp := <-respCh:
+		if resp.Err != "" {
+			log.Printf("recover-session: broker err: %s", resp.Err)
+			return
+		}
+		if !resp.Recovered {
+			return // already attached, or nothing recoverable — stay quiet.
+		}
+		// Remember the recovered attach so a later broker reconnect replays it.
+		a.rememberAttach(ipc.AttachReq{
+			Op: ipc.OpAttach, CWD: entry.CWD, Name: resp.Name, Group: resp.Group,
+		})
+		log.Printf("recover-session: auto-attached to %q (queued=%d)", resp.Name, resp.QueuedCount)
+		if text := renderRecoverNotice(resp); text != "" {
+			a.emitRecoverNotice(text)
+		}
+	}
+}
+
+// dispatchRecoverSessionResult resolves the one-shot recover-session pending
+// channel. Safe to call when no recover is in flight (the channel is nil).
+func (a *adapter) dispatchRecoverSessionResult(raw []byte) {
+	var resp ipc.RecoverSessionResp
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return
+	}
+	a.rsmu.Lock()
+	ch := a.rsPending
+	a.rsPending = nil
+	a.rsmu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- resp:
+		default:
+		}
+	}
+}
+
+// renderRecoverNotice builds the one-shot auto-attach notice. With held backlog
+// it nudges fetch_queue; with none it's a minimal "auto-attached" line. Returns
+// "" only when nothing useful can be said (no name).
+func renderRecoverNotice(resp ipc.RecoverSessionResp) string {
+	name := resp.Name
+	if name == "" {
+		return ""
+	}
+	if resp.QueuedCount > 0 {
+		noun := "message"
+		if resp.QueuedCount > 1 {
+			noun = "messages"
+		}
+		return fmt.Sprintf("📨 Auto-attached to %q (resumed session). %d %s held — call `fetch_queue` to retrieve.",
+			name, resp.QueuedCount, noun)
+	}
+	return fmt.Sprintf("📨 Auto-attached to %q (resumed session). Inbound messages render here as `<channel>` blocks.", name)
+}
+
+// emitRecoverNotice surfaces the auto-attach notice to the Claude session via
+// the same broker-originated system-event path the broker-down advisory uses
+// (the proven-visible channel frame). No-op when the notify transport isn't up.
+func (a *adapter) emitRecoverNotice(text string) {
+	if a.notifyTx == nil {
+		return
+	}
+	in := &c3types.Inbound{
+		Channel: "c3",
+		Kind:    c3types.InboundSystem,
+		Event: &c3types.InboundEvent{System: &c3types.SystemEvent{
+			Source: "c3", Level: "info", Title: "C3 auto-attached", Message: text,
+		}},
+	}
+	frame := buildClaudeChannelFrame(in)
+	if err := a.notifyTx.Notify(context.Background(), "notifications/claude/channel", frame); err != nil {
+		log.Printf("recover-session: notify failed: %v", err)
 	}
 }
 

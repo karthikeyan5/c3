@@ -13,15 +13,21 @@ func TestStubRegistry_AssignsMonotonicConnID(t *testing.T) {
 	}
 }
 
-func TestStubRegistry_RegisterWithSession(t *testing.T) {
+func TestStub_StableSessionID(t *testing.T) {
 	r := NewStubRegistry()
-	s := r.RegisterWithSession("claude", 42, "/x", "sess-1", nil)
-	if s.SessionID != "sess-1" {
-		t.Fatalf("SessionID = %q, want sess-1", s.SessionID)
+	s := r.Register("claude", 42, "/x", nil)
+	// Register leaves the stable id empty (it arrives later via RecoverSessionReq).
+	if s.StableSessionIDValue() != "" {
+		t.Fatalf("fresh stub stable id = %q, want empty", s.StableSessionIDValue())
 	}
-	// Plain Register leaves it empty (no behavior change for old callers).
-	if r.Register("claude", 7, "/y", nil).SessionID != "" {
-		t.Fatal("Register must leave SessionID empty")
+	s.SetStableSessionID("sess-1")
+	if s.StableSessionIDValue() != "sess-1" {
+		t.Fatalf("StableSessionIDValue = %q, want sess-1", s.StableSessionIDValue())
+	}
+	// Last write wins (idempotent re-key).
+	s.SetStableSessionID("sess-2")
+	if s.StableSessionIDValue() != "sess-2" {
+		t.Fatalf("StableSessionIDValue = %q, want sess-2 after re-set", s.StableSessionIDValue())
 	}
 }
 

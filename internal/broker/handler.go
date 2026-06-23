@@ -49,15 +49,22 @@ func (b *Broker) HandleConn(nc net.Conn) {
 	// authority" principle, claims survive conn drops as long as PID lives.
 	var stub *Stub
 	if existing := b.Routes.FindByLogicalSession(hello.CLI, hello.PID, hello.CWD); existing != nil {
-		stub = b.Stubs.RegisterWithSession(hello.CLI, hello.PID, hello.CWD, hello.SessionID, conn)
+		stub = b.Stubs.Register(hello.CLI, hello.PID, hello.CWD, conn)
 		oldConnID := existing.ConnID
+		// Carry the stable session id across a reconnect so a post-reconnect
+		// recover op isn't needed to re-key recording — the same logical session
+		// keeps its recovery identity. (No-op when the prior stub never received
+		// one; non-hook sessions stay empty.)
+		if sid := existing.StableSessionIDValue(); sid != "" {
+			stub.SetStableSessionID(sid)
+		}
 		// Unregister the OLD stub (now superseded) and transfer its claims.
 		b.Stubs.Unregister(oldConnID)
 		b.Routes.TransferAllByConnID(oldConnID, stub)
 		log.Printf("hello: RECONNECT cli=%s pid=%d cwd=%q old-conn=%d new-conn=%d (claims transferred)",
 			hello.CLI, hello.PID, hello.CWD, oldConnID, stub.ConnID)
 	} else {
-		stub = b.Stubs.RegisterWithSession(hello.CLI, hello.PID, hello.CWD, hello.SessionID, conn)
+		stub = b.Stubs.Register(hello.CLI, hello.PID, hello.CWD, conn)
 		log.Printf("hello: NEW cli=%s pid=%d cwd=%q conn=%d",
 			hello.CLI, hello.PID, hello.CWD, stub.ConnID)
 	}
@@ -123,6 +130,8 @@ func (b *Broker) HandleConn(nc net.Conn) {
 			b.handleFetchQueue(conn, stub, raw)
 		case ipc.OpRetranscribe:
 			b.handleRetranscribe(conn, stub, raw)
+		case ipc.OpRecoverSession:
+			b.handleRecoverSession(conn, stub, raw)
 		case ipc.OpInboundDelivered:
 			b.handleInboundDelivered(stub, raw)
 		case ipc.OpPairModeStart:
@@ -139,66 +148,25 @@ func (b *Broker) HandleConn(nc net.Conn) {
 	}
 }
 
-// buildHelloAck constructs the hello ack for a freshly-registered stub and, as
-// a side effect, performs auto-attach-on-resume: if hello.SessionID resolves to
-// a valid (non-tombstoned, within-TTL) recorded attachment whose route is NOT
-// held by another live session, it CLAIMS that route for the stub and reports
-// it (AutoAttached + Mapping + QueuedCount). Session-id recovery takes
-// precedence over the cwd mapping, so a resume from any directory — including
-// the shared root, which itself has a cwd mapping — returns to the session's own
-// last topic. With no recoverable attachment it falls back to the prior
-// NoConfig / NoMapping behavior. Claiming uses low-level Routes.Claim (not
-// tryClaim, which would write an AttachedMsg the just-handshaked conn isn't
-// expecting); C3's backlog is pull-not-push, so the claim never floods the conn.
+// buildHelloAck constructs the hello ack for a freshly-registered stub: the
+// NoConfig / NoMapping signals and the resolvable channel's capability manifest.
+//
+// Auto-attach-on-resume is NOT done here. The STABLE, --resume-able session id
+// is delivered only by a SessionStart hook that fires ~2s AFTER the adapter
+// spawns, so recovery can't happen during the hello handshake — it runs later
+// via RecoverSessionReq (handleRecoverSession). buildHelloAck therefore keeps
+// only its pre-recovery behavior.
 func (b *Broker) buildHelloAck(hello ipc.HelloMsg, stub *Stub) ipc.HelloAckMsg {
 	ack := ipc.HelloAckMsg{Op: ipc.OpHelloAck, ConnID: stub.ConnID}
-	recovered := false
 	if len(b.Mappings().Channels) == 0 {
 		ack.NoConfig = true
-	} else {
-		if sa, ok := b.Mappings().LookupSessionAttachment(hello.SessionID); ok && sa.Recoverable(time.Now(), SessionAttachmentTTL) {
-			key := routeKeyFromSessionAttachment(sa)
-			if _, held := b.heldByDifferentLiveSession(key, stub); held {
-				log.Printf("hello: session-id recovery SKIPPED session=%s topic=%q (held by another live session); falling through",
-					hello.SessionID, sa.Name)
-			} else if _, claimed := b.Routes.Claim(key, stub); claimed {
-				stub.SetRoute(&key)
-				cnt, _ := b.backlogSummary(key)
-				ack.AutoAttached = true
-				ack.Mapping = wireMappingFromSessionAttachment(sa)
-				ack.QueuedCount = cnt
-				recovered = true
-				// Refresh LastAttachedAt so an actively-resumed session doesn't
-				// TTL-expire — but only when it's stale enough to matter, so a
-				// burst of broker-bounce / network-blip reconnects (which all
-				// re-run hello) doesn't rewrite mappings.json (with its .bak +
-				// fsyncs) on every reconnect.
-				if time.Since(sa.LastAttachedAt) > sessionRefreshInterval {
-					b.mutateMappings(func(mf *mappings.MappingsFile) {
-						if cur, ok := mf.LookupSessionAttachment(hello.SessionID); ok {
-							cur.LastAttachedAt = time.Now().UTC()
-							mf.UpsertSessionAttachment(hello.SessionID, cur)
-						}
-					})
-					_ = b.SaveMappings()
-				}
-				log.Printf("hello: session-id recovery cli=%s pid=%d session=%s → %q (queued=%d)",
-					hello.CLI, hello.PID, hello.SessionID, sa.Name, cnt)
-			}
-		}
-		if !recovered {
-			if _, ok := b.Mappings().LookupByCwd(hello.CWD); !ok {
-				ack.NoMapping = true
-			}
-		}
+	} else if _, ok := b.Mappings().LookupByCwd(hello.CWD); !ok {
+		ack.NoMapping = true
 	}
-	// Capability manifest: prefer the recovered route's channel, then the
-	// cwd-mapped channel, then the default. nil is a valid wire value — the
-	// adapter falls back to a default Capabilities.
+	// Capability manifest: prefer the cwd-mapped channel, then the default. nil
+	// is a valid wire value — the adapter falls back to a default Capabilities.
 	chanName := ""
-	if ack.Mapping != nil && ack.Mapping.Channel != "" {
-		chanName = ack.Mapping.Channel
-	} else if m, ok := b.Mappings().LookupByCwd(hello.CWD); ok && m.Channel != "" {
+	if m, ok := b.Mappings().LookupByCwd(hello.CWD); ok && m.Channel != "" {
 		chanName = m.Channel
 	} else {
 		chanName = b.defaultChannel()
@@ -216,12 +184,69 @@ func (b *Broker) buildHelloAck(hello ipc.HelloMsg, stub *Stub) ipc.HelloAckMsg {
 func (b *Broker) handleRelease(stub *Stub) {
 	b.Routes.ReleaseAllByConnID(stub.ConnID)
 	stub.SetRoute(nil)
-	if stub.SessionID != "" {
+	if sid := stub.StableSessionIDValue(); sid != "" {
 		b.mutateMappings(func(mf *mappings.MappingsFile) {
-			mf.TombstoneSessionAttachment(stub.SessionID)
+			mf.TombstoneSessionAttachment(sid)
 		})
 		_ = b.SaveMappings()
 	}
+}
+
+// handleRecoverSession is the adapter → broker recover op: the resumed session's
+// STABLE id (learned from the SessionStart-hook handoff) arrives here on the
+// stub's own connection, so the broker maps stub→stable-id directly. It then
+// takes ONE of two dual-path-recording branches:
+//
+//   - Stub ALREADY attached (a fresh session bound by cwd before this arrived):
+//     RECORD the current route under the stable id (so a FUTURE resume can
+//     recover it) — do NOT re-claim or steal. resp.Recovered stays false.
+//   - Stub NOT attached: attempt recoverSession — re-claim the route the stable
+//     id was last attached to, when recoverable and not held by another live
+//     session. On success, report it + the held backlog count so the adapter
+//     can surface a one-shot auto-attach notification.
+//
+// Fail-closed: a malformed request or an empty stable id records nothing and
+// recovers nothing.
+func (b *Broker) handleRecoverSession(conn *ipc.Conn, stub *Stub, raw []byte) {
+	var req ipc.RecoverSessionReq
+	if err := json.Unmarshal(raw, &req); err != nil || req.StableSessionID == "" {
+		_ = conn.WriteJSON(ipc.RecoverSessionResp{Op: ipc.OpRecoverSessionResult, Err: "bad recover_session"})
+		return
+	}
+	stub.SetStableSessionID(req.StableSessionID)
+	resp := ipc.RecoverSessionResp{Op: ipc.OpRecoverSessionResult}
+	if cur := stub.CurrentRoute(); cur != nil {
+		// Attach-first: a fresh session already claimed a route (by cwd) before
+		// this recover op arrived. Record that route under the stable id so a
+		// future resume recovers it. No re-claim.
+		b.recordCurrentRouteForStable(stub, *cur)
+	} else if key, cnt, ok := b.recoverSession(stub); ok {
+		resp.Recovered = true
+		resp.Channel = key.Channel
+		resp.ChatID = key.ChatID
+		if key.HasTopic {
+			t := key.TopicID
+			resp.TopicID = &t
+		}
+		resp.QueuedCount = cnt
+		// Name/Group: prefer the recorded attachment, fall back to the topic
+		// registry. DM (no topic) reports name "dm".
+		if sa, ok := b.Mappings().LookupSessionAttachment(req.StableSessionID); ok {
+			resp.Name = sa.Name
+			resp.Group = sa.Group
+		}
+		if resp.Name == "" {
+			if key.HasTopic {
+				if tp, ok := b.Mappings().LookupTopicByID(key.Channel, key.ChatID, key.TopicID); ok {
+					resp.Name = tp.Name
+					resp.Group = tp.Group
+				}
+			} else {
+				resp.Name = "dm"
+			}
+		}
+	}
+	_ = conn.WriteJSON(resp)
 }
 
 // handleToolCall dispatches a tool-call to the worker for the stub's

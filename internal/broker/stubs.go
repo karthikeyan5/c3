@@ -22,14 +22,10 @@ import (
 // confirmed-dead holder, Routes.Claim will release the stale claim and
 // grant the new one.
 type Stub struct {
-	CLI string
-	PID int
-	CWD string
-	// SessionID is the host CLI's stable per-session id (from HelloMsg), used
-	// for auto-attach-on-resume. Empty for hosts that don't expose one. Set at
-	// construction (Register*); never mutated, so it's race-free to read.
-	SessionID string
-	ConnID    uint64
+	CLI    string
+	PID    int
+	CWD    string
+	ConnID uint64
 
 	// Conn is opaque from the registry's POV — broker package wires it after
 	// constructing, used by route workers to write inbound to the right
@@ -56,9 +52,17 @@ type Stub struct {
 	// to Telegram. It lives on the per-connection Stub (NOT the per-RouteKey
 	// RouteWorker, which outlives sessions) so it resets naturally when a new
 	// adapter connects. Guarded by stubMu.
-	stubMu     sync.Mutex
-	Route      *RouteKey
-	hasReplied bool
+	stubMu sync.Mutex
+	Route  *RouteKey
+	// stableSessionID is the host CLI's STABLE per-session id (Claude: the
+	// transcript / --resume id), learned from the SessionStart-hook handoff and
+	// delivered to the broker via RecoverSessionReq AFTER hello. The broker keys
+	// both recording (persistMapping / recordSessionAttachment) and recovery on
+	// it. Empty until a recover op arrives (or never, for non-hook sessions —
+	// fail-closed → no recording, no recovery). Guarded by stubMu; mutated via
+	// SetStableSessionID.
+	stableSessionID string
+	hasReplied      bool
 }
 
 // MarkDisconnected records that the stub's conn has dropped. The claim
@@ -136,6 +140,23 @@ func (s *Stub) SetRoute(key *RouteKey) {
 	s.Route = &k
 }
 
+// SetStableSessionID records the host CLI's stable per-session id, learned from
+// the SessionStart-hook handoff and delivered via RecoverSessionReq. Idempotent;
+// last write wins. Guarded by stubMu like SetRoute.
+func (s *Stub) SetStableSessionID(id string) {
+	s.stubMu.Lock()
+	defer s.stubMu.Unlock()
+	s.stableSessionID = id
+}
+
+// StableSessionIDValue returns the stub's stable session id (empty until a
+// recover op set it, or for a non-hook session). Guarded by stubMu.
+func (s *Stub) StableSessionIDValue() string {
+	s.stubMu.Lock()
+	defer s.stubMu.Unlock()
+	return s.stableSessionID
+}
+
 // MarkReplied records that this connection has dispatched ≥1 `reply` to its
 // claimed route. Idempotent. Once set it stays set for the life of the
 // connection — a session that has replied once is "in Telegram mode" and stays
@@ -179,18 +200,12 @@ func NewStubRegistry() *StubRegistry {
 	return &StubRegistry{byConn: map[uint64]*Stub{}}
 }
 
-// Register creates a new Stub with a monotonic ConnID and returns it. Thin
-// wrapper over RegisterWithSession for callers that have no session id.
+// Register creates a new Stub with a monotonic ConnID and returns it. The
+// stable session id (used for auto-attach-on-resume) is NOT set here — it
+// arrives later via RecoverSessionReq and is stored with SetStableSessionID.
 func (r *StubRegistry) Register(cli string, pid int, cwd string, conn any) *Stub {
-	return r.RegisterWithSession(cli, pid, cwd, "", conn)
-}
-
-// RegisterWithSession is Register plus the host CLI's stable session id (set at
-// construction so reads are race-free). Empty sessionID behaves exactly like
-// Register.
-func (r *StubRegistry) RegisterWithSession(cli string, pid int, cwd, sessionID string, conn any) *Stub {
 	id := r.next.Add(1)
-	s := &Stub{CLI: cli, PID: pid, CWD: cwd, SessionID: sessionID, ConnID: id, Conn: conn}
+	s := &Stub{CLI: cli, PID: pid, CWD: cwd, ConnID: id, Conn: conn}
 	r.mu.Lock()
 	r.byConn[id] = s
 	r.mu.Unlock()

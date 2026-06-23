@@ -25,6 +25,7 @@ const (
 	OpFetchQueue       Op = "fetch_queue"
 	OpInboundDelivered Op = "inbound_delivered"
 	OpRetranscribe     Op = "retranscribe"
+	OpRecoverSession   Op = "recover_session"
 	OpBye              Op = "bye"
 
 	// broker → adapter
@@ -40,5 +41,6 @@ const (
 	OpListSessionsReply    Op = "list_sessions_reply"
 	OpFetchQueueResult     Op = "fetch_queue_result"
 	OpRetranscribeResult   Op = "retranscribe_result"
+	OpRecoverSessionResult Op = "recover_session_result"
 	OpError                Op = "error"
 )

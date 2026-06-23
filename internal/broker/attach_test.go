@@ -662,7 +662,8 @@ func TestPersistMapping_RecordsSessionAttachment(t *testing.T) {
 	b := brokerWithChannel(t, mf, fc)
 	defer b.Shutdown()
 
-	stub := &Stub{CLI: "claude", PID: 1, CWD: t.TempDir(), SessionID: "sess-xyz"}
+	stub := &Stub{CLI: "claude", PID: 1, CWD: t.TempDir()}
+	stub.SetStableSessionID("sess-xyz")
 	b.persistMapping(stub, "telegram", -100, 914, "c3", "main")
 
 	sa, ok := b.Mappings().LookupSessionAttachment("sess-xyz")
@@ -674,16 +675,16 @@ func TestPersistMapping_RecordsSessionAttachment(t *testing.T) {
 	}
 }
 
-func TestPersistMapping_EmptySessionIDNoOp(t *testing.T) {
+func TestPersistMapping_EmptyStableIDNoOp(t *testing.T) {
 	mf := mfWithTelegram()
 	fc := &fakeChannel{}
 	b := brokerWithChannel(t, mf, fc)
 	defer b.Shutdown()
 
-	stub := &Stub{CLI: "claude", PID: 1, CWD: t.TempDir(), SessionID: ""}
+	stub := &Stub{CLI: "claude", PID: 1, CWD: t.TempDir()} // no stable id set
 	b.persistMapping(stub, "telegram", -100, 914, "c3", "main")
 	if len(b.Mappings().SessionAttachments) != 0 {
-		t.Fatalf("empty SessionID must not record an attachment; got %d", len(b.Mappings().SessionAttachments))
+		t.Fatalf("empty stable id must not record an attachment; got %d", len(b.Mappings().SessionAttachments))
 	}
 }
 
@@ -698,11 +699,13 @@ func TestPersistMapping_RecordsSessionAttachmentEvenOnRebindRefusal(t *testing.T
 
 	root := t.TempDir()
 	name1 := filepath.Base(root)
-	stub := &Stub{CLI: "claude", PID: 1, CWD: root, SessionID: "sess-1"}
+	stub := &Stub{CLI: "claude", PID: 1, CWD: root}
+	stub.SetStableSessionID("sess-1")
 	b.persistMapping(stub, "telegram", -100, 914, name1, "main") // first: cwd→914 persisted
 
 	// Second attach to a DIFFERENT topic from the same cwd → rebind refused.
-	stub2 := &Stub{CLI: "claude", PID: 1, CWD: root, SessionID: "sess-2"}
+	stub2 := &Stub{CLI: "claude", PID: 1, CWD: root}
+	stub2.SetStableSessionID("sess-2")
 	b.persistMapping(stub2, "telegram", -100, 207, name1, "main")
 
 	if got, ok := b.Mappings().LookupByCwd(root); !ok || got.TopicID != 914 {
