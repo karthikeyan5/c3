@@ -656,6 +656,64 @@ func TestPersistMapping_RefinesToProjectSubdirectory(t *testing.T) {
 	}
 }
 
+func TestPersistMapping_RecordsSessionAttachment(t *testing.T) {
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	stub := &Stub{CLI: "claude", PID: 1, CWD: t.TempDir(), SessionID: "sess-xyz"}
+	b.persistMapping(stub, "telegram", -100, 914, "c3", "main")
+
+	sa, ok := b.Mappings().LookupSessionAttachment("sess-xyz")
+	if !ok {
+		t.Fatal("session attachment not recorded")
+	}
+	if sa.Name != "c3" || sa.ChatID != -100 || sa.TopicID == nil || *sa.TopicID != 914 || sa.Group != "main" || sa.Detached {
+		t.Fatalf("session attachment = %+v", sa)
+	}
+}
+
+func TestPersistMapping_EmptySessionIDNoOp(t *testing.T) {
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	stub := &Stub{CLI: "claude", PID: 1, CWD: t.TempDir(), SessionID: ""}
+	b.persistMapping(stub, "telegram", -100, 914, "c3", "main")
+	if len(b.Mappings().SessionAttachments) != 0 {
+		t.Fatalf("empty SessionID must not record an attachment; got %d", len(b.Mappings().SessionAttachments))
+	}
+}
+
+func TestPersistMapping_RecordsSessionAttachmentEvenOnRebindRefusal(t *testing.T) {
+	// Even when the cwd rebind is refused (saved default unchanged), the
+	// session-id recovery entry must still be recorded — it's keyed on the
+	// session, not the cwd.
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	root := t.TempDir()
+	name1 := filepath.Base(root)
+	stub := &Stub{CLI: "claude", PID: 1, CWD: root, SessionID: "sess-1"}
+	b.persistMapping(stub, "telegram", -100, 914, name1, "main") // first: cwd→914 persisted
+
+	// Second attach to a DIFFERENT topic from the same cwd → rebind refused.
+	stub2 := &Stub{CLI: "claude", PID: 1, CWD: root, SessionID: "sess-2"}
+	b.persistMapping(stub2, "telegram", -100, 207, name1, "main")
+
+	if got, ok := b.Mappings().LookupByCwd(root); !ok || got.TopicID != 914 {
+		t.Fatalf("cwd default should stay 914 (rebind refused), got %+v ok=%v", got, ok)
+	}
+	sa, ok := b.Mappings().LookupSessionAttachment("sess-2")
+	if !ok || sa.TopicID == nil || *sa.TopicID != 207 {
+		t.Fatalf("session attachment for sess-2 should record topic 207 despite cwd-rebind refusal, got %+v ok=%v", sa, ok)
+	}
+}
+
 func TestPersistMapping_RebindRefusesToOverwrite(t *testing.T) {
 	// Karthi 2026-05-14: "rebinding should be explicit." persistMapping
 	// must NOT silently change a saved cwd → topic mapping. The live

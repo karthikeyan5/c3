@@ -689,31 +689,47 @@ func welcomeText(stub *Stub, label, resolvedCWD string) string {
 // `~/.config/c3/mappings.json` directly. Loud log line so the rejection
 // is visible.
 func (b *Broker) persistMapping(stub *Stub, chanName string, chatID, topicID int64, name, group string) {
+	now := time.Now().UTC()
 	cwd := resolveAttachCWD(stub.CWD, name)
-	if cwd == "" {
-		return
+	var tidPtr *int64
+	if topicID != 0 {
+		t := topicID
+		tidPtr = &t
 	}
-	// Read existing-mapping check and the Upsert under the same mutation
+	// Read existing-mapping check and the Upsert(s) under the same mutation
 	// lock — otherwise a concurrent persistMapping for the same cwd could
 	// race past the refusal check.
 	var persisted bool
 	b.mutateMappings(func(mf *mappings.MappingsFile) {
-		if existing, ok := mf.LookupByCwd(cwd); ok {
-			if existing.ChatID != chatID || existing.TopicID != topicID {
+		// Session-id recovery store — keyed on the session id, INDEPENDENT of
+		// cwd (so DM / no-launch-dir routes still recover) and of the cwd
+		// rebind guard below. Clears any prior tombstone.
+		if stub.SessionID != "" {
+			mf.UpsertSessionAttachment(stub.SessionID, mappings.SessionAttachment{
+				Channel: chanName, ChatID: chatID, TopicID: tidPtr,
+				Name: name, Group: group, CWD: cwd, LastAttachedAt: now,
+			})
+			persisted = true
+		}
+		// cwd → topic default (existing behavior, incl. the explicit rebind
+		// guard: never silently overwrite a saved cwd→topic with a different
+		// topic; the live claim still proceeds upstream in tryClaim).
+		if cwd != "" {
+			if existing, ok := mf.LookupByCwd(cwd); ok && (existing.ChatID != chatID || existing.TopicID != topicID) {
 				log.Printf("attach: REFUSED to rebind cwd=%q (saved=topic-%d %q → requested=topic-%d %q); live claim proceeds but saved default unchanged. To rebind, edit ~/.config/c3/mappings.json.",
 					cwd, existing.TopicID, existing.Name, topicID, name)
-				return
+			} else {
+				mf.UpsertMapping(cwd, mappings.Mapping{
+					Channel:        chanName,
+					ChatID:         chatID,
+					TopicID:        topicID,
+					Name:           name,
+					Group:          group,
+					LastAttachedAt: now,
+				})
+				persisted = true
 			}
 		}
-		mf.UpsertMapping(cwd, mappings.Mapping{
-			Channel:        chanName,
-			ChatID:         chatID,
-			TopicID:        topicID,
-			Name:           name,
-			Group:          group,
-			LastAttachedAt: time.Now().UTC(),
-		})
-		persisted = true
 	})
 	if persisted {
 		_ = b.SaveMappings()
