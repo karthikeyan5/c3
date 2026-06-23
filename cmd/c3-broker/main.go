@@ -30,6 +30,7 @@ import (
 	"github.com/karthikeyan5/c3/internal/mappings"
 	"github.com/karthikeyan5/c3/internal/plugin"
 	"github.com/karthikeyan5/c3/internal/plugin/builtins/stt"
+	"github.com/karthikeyan5/c3/internal/sessionhandoff"
 )
 
 // builtinPlugins lists the plugins compiled into the broker. Order matters
@@ -122,6 +123,12 @@ func main() {
 				os.Exit(exitConfig)
 			}
 			return
+		case "session-hook":
+			// SessionStart hook (c3 plugin). NEVER connects to the broker and is
+			// designed to exit 0 even on bad input — a hook that errors would
+			// break the user's session. runSessionHook returns nil unconditionally.
+			_ = runSessionHook()
+			return
 		case "--help", "-h", "help":
 			fmt.Print(usage)
 			return
@@ -176,6 +183,13 @@ Usage:
                         broker is currently tracking, with its CWD and
                         attached topic. Marks the calling session if it
                         can be matched via a parent-PID walk.
+  c3-broker session-hook
+                        Internal: the c3 plugin's SessionStart hook. Reads
+                        the hook JSON on stdin, maps the ephemeral MCP
+                        instance id to the stable --resume session id, and
+                        writes a handoff the adapter reads to auto-attach a
+                        resumed session. Never touches the broker socket;
+                        always exits 0.
   c3-broker --help      This text.
 `
 
@@ -250,6 +264,14 @@ func runDaemon() (err error) {
 		if wErr := mappings.Write(mfPath, mf); wErr != nil {
 			log.Printf("c3-broker: WARNING failed to persist session-attachment prune: %v", wErr)
 		}
+	}
+
+	// Bound the SessionStart-hook handoff dir (instance-id → stable-id files
+	// written by `c3-broker session-hook`). Best-effort; a leftover handoff is
+	// harmless (the adapter only reads its own instance id), but stale files
+	// shouldn't accumulate. 24h is well past the seconds-scale read window.
+	if n := sessionhandoff.PruneStale(24*time.Hour, time.Now()); n > 0 {
+		log.Printf("c3-broker: pruned %d stale session-handoff entr(ies)", n)
 	}
 
 	br := broker.New(mf)
