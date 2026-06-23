@@ -169,14 +169,19 @@ func (b *Broker) buildHelloAck(hello ipc.HelloMsg, stub *Stub) ipc.HelloAckMsg {
 				ack.QueuedCount = cnt
 				recovered = true
 				// Refresh LastAttachedAt so an actively-resumed session doesn't
-				// TTL-expire, then persist.
-				b.mutateMappings(func(mf *mappings.MappingsFile) {
-					if cur, ok := mf.LookupSessionAttachment(hello.SessionID); ok {
-						cur.LastAttachedAt = time.Now().UTC()
-						mf.UpsertSessionAttachment(hello.SessionID, cur)
-					}
-				})
-				_ = b.SaveMappings()
+				// TTL-expire — but only when it's stale enough to matter, so a
+				// burst of broker-bounce / network-blip reconnects (which all
+				// re-run hello) doesn't rewrite mappings.json (with its .bak +
+				// fsyncs) on every reconnect.
+				if time.Since(sa.LastAttachedAt) > sessionRefreshInterval {
+					b.mutateMappings(func(mf *mappings.MappingsFile) {
+						if cur, ok := mf.LookupSessionAttachment(hello.SessionID); ok {
+							cur.LastAttachedAt = time.Now().UTC()
+							mf.UpsertSessionAttachment(hello.SessionID, cur)
+						}
+					})
+					_ = b.SaveMappings()
+				}
 				log.Printf("hello: session-id recovery cli=%s pid=%d session=%s → %q (queued=%d)",
 					hello.CLI, hello.PID, hello.SessionID, sa.Name, cnt)
 			}

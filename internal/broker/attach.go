@@ -208,6 +208,11 @@ func (b *Broker) attachDM(conn *ipc.Conn, stub *Stub, chanName string, steal, re
 	if !b.tryClaim(conn, stub, key, "DM", steal, replay) {
 		return
 	}
+	// Record the recovery entry so a resumed DM session re-attaches. The DM
+	// route is universal and deliberately never cwd-mapped, so persistMapping
+	// (which also writes a cwd default) is the wrong tool here — record the
+	// session attachment only, keyed on the session id (nil TopicID = DM).
+	b.recordSessionAttachment(stub, chanName, cc.DMChatID, nil, "dm", "")
 	_ = conn.WriteJSON(b.withBacklog(key, ipc.AttachedMsg{
 		Op:           ipc.OpAttached,
 		OK:           true,
@@ -693,6 +698,12 @@ func welcomeText(stub *Stub, label, resolvedCWD string) string {
 // prune expired entries on start.
 const SessionAttachmentTTL = 30 * 24 * time.Hour
 
+// sessionRefreshInterval is how stale a recovered attachment's LastAttachedAt
+// must be before a resume rewrites it. Bounds mappings.json write churn from
+// reconnect bursts (broker bounces / network blips, which all re-run hello)
+// while keeping the 30-day inactivity TTL reliable.
+const sessionRefreshInterval = time.Hour
+
 // routeKeyFromSessionAttachment builds the route key for a recovered session.
 func routeKeyFromSessionAttachment(sa mappings.SessionAttachment) RouteKey {
 	return MakeRouteKey(sa.Channel, sa.ChatID, sa.TopicID)
@@ -720,9 +731,11 @@ func (b *Broker) persistMapping(stub *Stub, chanName string, chatID, topicID int
 	// race past the refusal check.
 	var persisted bool
 	b.mutateMappings(func(mf *mappings.MappingsFile) {
-		// Session-id recovery store — keyed on the session id, INDEPENDENT of
-		// cwd (so DM / no-launch-dir routes still recover) and of the cwd
-		// rebind guard below. Clears any prior tombstone.
+		// Session-id recovery store — keyed on the session id, recorded
+		// INDEPENDENTLY of the cwd rebind guard below (so a refused rebind, or
+		// an empty cwd, still records the recovery entry). Clears any prior
+		// tombstone. (The DM route records via recordSessionAttachment instead,
+		// since it must not also write a cwd default.)
 		if stub.SessionID != "" {
 			mf.UpsertSessionAttachment(stub.SessionID, mappings.SessionAttachment{
 				Channel: chanName, ChatID: chatID, TopicID: tidPtr,
@@ -753,6 +766,24 @@ func (b *Broker) persistMapping(stub *Stub, chanName string, chatID, topicID int
 	if persisted {
 		_ = b.SaveMappings()
 	}
+}
+
+// recordSessionAttachment writes ONLY the session→route recovery entry (no cwd
+// mapping), for attach paths that must not persist a per-cwd default — namely
+// the DM route, which is universal and deliberately never cwd-mapped. No-op when
+// the host exposes no session id. Topic attaches record via persistMapping
+// instead (which records the session attachment AND the cwd default together).
+func (b *Broker) recordSessionAttachment(stub *Stub, chanName string, chatID int64, topicID *int64, name, group string) {
+	if stub.SessionID == "" {
+		return
+	}
+	b.mutateMappings(func(mf *mappings.MappingsFile) {
+		mf.UpsertSessionAttachment(stub.SessionID, mappings.SessionAttachment{
+			Channel: chanName, ChatID: chatID, TopicID: topicID,
+			Name: name, Group: group, CWD: stub.CWD, LastAttachedAt: time.Now().UTC(),
+		})
+	})
+	_ = b.SaveMappings()
 }
 
 // resolveAttachCWD picks the cwd to persist for a `cwd → topic` mapping.

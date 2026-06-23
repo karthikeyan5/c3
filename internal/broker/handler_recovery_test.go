@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -100,6 +101,102 @@ func TestBuildHelloAck_EmptySessionIDNoRecovery(t *testing.T) {
 	}
 	if !ack.NoMapping {
 		t.Fatal("expected NoMapping for an unmapped cwd with no recovery")
+	}
+}
+
+func TestBuildHelloAck_RecoversDMRoute(t *testing.T) {
+	mf := mfWithTelegram()
+	// DM attachment: nil TopicID.
+	mf.UpsertSessionAttachment("dm-sess", mappings.SessionAttachment{
+		Channel: "telegram", ChatID: 42, TopicID: nil, Name: "dm",
+		LastAttachedAt: time.Now().UTC(),
+	})
+	b := brokerWithChannel(t, mf, &fakeChannel{})
+	defer b.Shutdown()
+
+	stub := b.Stubs.RegisterWithSession("claude", 1, "/anywhere", "dm-sess", nil)
+	ack := b.buildHelloAck(ipc.HelloMsg{CLI: "claude", PID: 1, CWD: "/anywhere", SessionID: "dm-sess"}, stub)
+
+	if !ack.AutoAttached || ack.Mapping == nil || ack.Mapping.Name != "dm" {
+		t.Fatalf("expected DM auto-recovery, got AutoAttached=%v mapping=%+v", ack.AutoAttached, ack.Mapping)
+	}
+	rk := stub.CurrentRoute()
+	if rk == nil || rk.HasTopic {
+		t.Fatalf("DM recovery should claim a no-topic route, got %+v", rk)
+	}
+}
+
+func TestAttachDM_RecordsSessionAttachment(t *testing.T) {
+	mf := mfWithTelegram()
+	b := brokerWithChannel(t, mf, &fakeChannel{})
+	defer b.Shutdown()
+
+	peer, done := peerPair(t, b)
+	defer done()
+	// hello WITH a session id (the helloAck helper omits it).
+	if err := peer.WriteJSON(ipc.HelloMsg{Op: ipc.OpHello, CLI: "claude", PID: 1, CWD: "/x", SessionID: "dm-sess"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := peer.ReadFrame(); err != nil { // hello ack
+		t.Fatal(err)
+	}
+	if err := peer.WriteJSON(ipc.AttachReq{Op: ipc.OpAttach, Target: "dm"}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := peer.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ack ipc.AttachedMsg
+	if err := json.Unmarshal(raw, &ack); err != nil || !ack.OK {
+		t.Fatalf("DM attach failed: ack=%+v err=%v", ack, err)
+	}
+	// recordSessionAttachment runs synchronously before the ack is written.
+	sa, ok := b.Mappings().LookupSessionAttachment("dm-sess")
+	if !ok {
+		t.Fatal("DM attach must record a session attachment")
+	}
+	if sa.Name != "dm" || sa.ChatID != 42 || sa.TopicID != nil {
+		t.Fatalf("DM session attachment = %+v (want name=dm chat=42 topic=nil)", sa)
+	}
+}
+
+func TestBuildHelloAck_SkipsRefreshWhenFresh(t *testing.T) {
+	mf := mfWithTelegram()
+	t0 := time.Now().UTC().Add(-time.Minute) // fresh: < sessionRefreshInterval
+	mf.UpsertSessionAttachment("sess-1", mappings.SessionAttachment{
+		Channel: "telegram", ChatID: -100, TopicID: func() *int64 { t := int64(281); return &t }(),
+		Name: "c3", LastAttachedAt: t0,
+	})
+	b := brokerWithChannel(t, mf, &fakeChannel{})
+	defer b.Shutdown()
+
+	stub := b.Stubs.RegisterWithSession("claude", 1, "/x", "sess-1", nil)
+	ack := b.buildHelloAck(ipc.HelloMsg{CLI: "claude", PID: 1, CWD: "/x", SessionID: "sess-1"}, stub)
+	if !ack.AutoAttached {
+		t.Fatal("fresh attachment should still recover")
+	}
+	sa, _ := b.Mappings().LookupSessionAttachment("sess-1")
+	if !sa.LastAttachedAt.Equal(t0) {
+		t.Fatalf("fresh attachment must NOT be rewritten (churn); LastAttachedAt %v != %v", sa.LastAttachedAt, t0)
+	}
+}
+
+func TestBuildHelloAck_RefreshesWhenStale(t *testing.T) {
+	mf := mfWithTelegram()
+	t0 := time.Now().UTC().Add(-2 * time.Hour) // stale: > sessionRefreshInterval
+	mf.UpsertSessionAttachment("sess-1", mappings.SessionAttachment{
+		Channel: "telegram", ChatID: -100, TopicID: func() *int64 { t := int64(281); return &t }(),
+		Name: "c3", LastAttachedAt: t0,
+	})
+	b := brokerWithChannel(t, mf, &fakeChannel{})
+	defer b.Shutdown()
+
+	stub := b.Stubs.RegisterWithSession("claude", 1, "/x", "sess-1", nil)
+	_ = b.buildHelloAck(ipc.HelloMsg{CLI: "claude", PID: 1, CWD: "/x", SessionID: "sess-1"}, stub)
+	sa, _ := b.Mappings().LookupSessionAttachment("sess-1")
+	if !sa.LastAttachedAt.After(t0) {
+		t.Fatalf("stale attachment must be refreshed; LastAttachedAt %v not after %v", sa.LastAttachedAt, t0)
 	}
 }
 
