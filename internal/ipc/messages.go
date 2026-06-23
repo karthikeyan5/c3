@@ -129,6 +129,10 @@ type HelloMsg struct {
 	PID          int      `json:"pid"`
 	CWD          string   `json:"cwd"`
 	Capabilities []string `json:"capabilities,omitempty"`
+	// SessionID is the host CLI's stable per-session id (Claude:
+	// CLAUDE_CODE_SESSION_ID), used for auto-attach-on-resume. Empty for hosts
+	// that don't expose one; additive-omitempty so older brokers ignore it.
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // HelloAckMsg is the broker's response to HelloMsg.
@@ -140,6 +144,11 @@ type HelloAckMsg struct {
 	ClaimHolder  *Holder  `json:"claim_holder,omitempty"`
 	NoConfig     bool     `json:"no_config,omitempty"`
 	NoMapping    bool     `json:"no_mapping,omitempty"`
+
+	// QueuedCount is the number of inbound held for an auto-recovered route at
+	// hello time, so the boot instructions can nudge fetch_queue. Set only
+	// alongside AutoAttached (auto-attach-on-resume); additive-omitempty.
+	QueuedCount int `json:"queued_count,omitempty"`
 
 	// Capabilities carries the resolvable channel's static capability
 	// manifest so the adapter can fold GuidanceFor(caps) into the agent's
