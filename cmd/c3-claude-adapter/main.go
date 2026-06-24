@@ -1647,11 +1647,17 @@ func (a *adapter) dispatchRetranscribeResult(raw []byte) {
 }
 
 // recoverSessionParams tunes the post-hello handoff poll. The SessionStart hook
-// fires ~2s AFTER the adapter spawns, so we poll the handoff file a few times
-// over ~3s rather than reading once. All values are bounded — the poll runs in
-// its own goroutine and never blocks hello / server start.
+// fires AFTER the adapter spawns, with a VARIABLE delay — observed ~1.7s on one
+// resume and ~2.6s on the next. The original 6×500ms (~2.5s) window raced that:
+// when the hook write landed at ~2.6s the adapter's last read had already passed,
+// so it gave up ~120ms early and auto-attach-on-resume silently no-op'd
+// (2026-06-24). Poll generously — up to ~10s, matching recoverRespTimeout — so a
+// slow hook can't lose the recovery; 10s is ~4× the observed worst case while
+// still bounded. All values stay bounded: the poll runs in its own goroutine and
+// never blocks hello / server start, and a non-c3 / fresh-non-resumed session
+// simply polls the full window (cheap file stats) then returns silently.
 const (
-	recoverPollAttempts = 6
+	recoverPollAttempts = 20
 	recoverPollInterval = 500 * time.Millisecond
 	recoverRespTimeout  = 10 * time.Second
 )
