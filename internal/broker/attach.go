@@ -674,6 +674,54 @@ func welcomeText(stub *Stub, label, resolvedCWD string) string {
 	return fmt.Sprintf("👋 Hi! Attached and listening here.\n📁 `%s`\n🤖 `%s` → **%s**", cwd, cli, label)
 }
 
+// sendRecoverWelcome posts a one-shot Telegram confirmation to the topic when a
+// resumed session auto-re-attaches (handleRecoverSession's recovered branch). It
+// is the GUARANTEED-visible signal that auto-attach-on-resume happened: the
+// adapter's CLI notice can be dropped by Claude Code when it fires in the resume
+// idle gap (2026-06-24), but a Telegram message in the topic always lands.
+// Async (off the IPC thread) so a slow network call never delays the recover
+// response; errors are logged, never surfaced. Distinct wording from sendWelcome
+// so the user can tell a resume re-attach from a fresh attach.
+func (b *Broker) sendRecoverWelcome(stub *Stub, key RouteKey, name string, queued int) {
+	if b == nil {
+		return
+	}
+	ch, err := b.Channel(key.Channel)
+	if err != nil {
+		log.Printf("recover-welcome: channel %s lookup failed: %v", key.Channel, err)
+		return
+	}
+	var topicID *int64
+	if key.HasTopic {
+		t := key.TopicID
+		topicID = &t
+	}
+	text := recoverWelcomeText(name, queued)
+	if _, err := ch.SendReply(c3types.ReplyArgs{
+		Channel: key.Channel,
+		ChatID:  key.ChatID,
+		TopicID: topicID,
+		Text:    text,
+	}); err != nil {
+		log.Printf("recover-welcome: send failed for %s: %v", routeKeyStr(key), err)
+		return
+	}
+	log.Printf("recover-welcome: sent for %s cli=%s queued=%d", routeKeyStr(key), stub.CLI, queued)
+}
+
+// recoverWelcomeText renders the resume re-attach confirmation. Names the held
+// backlog when present so the user knows messages are waiting.
+func recoverWelcomeText(name string, queued int) string {
+	if queued > 0 {
+		noun := "message"
+		if queued > 1 {
+			noun = "messages"
+		}
+		return fmt.Sprintf("🔄 Resumed — re-attached to **%s**. %d held %s waiting.", name, queued, noun)
+	}
+	return fmt.Sprintf("🔄 Resumed — re-attached to **%s**. Listening here again.", name)
+}
+
 // persistMapping upserts the cwd → mapping into the in-memory MappingsFile.
 // SaveMappings is called at the end of any attach that mutates state to flush
 // to disk atomically.

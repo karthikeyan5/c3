@@ -245,6 +245,12 @@ func (b *Broker) handleRecoverSession(conn *ipc.Conn, stub *Stub, raw []byte) {
 				resp.Name = "dm"
 			}
 		}
+		// Guaranteed-visible confirmation: post a one-shot Telegram note to the
+		// recovered topic. The adapter's CLI notice can be dropped by Claude Code
+		// when it fires in the resume idle gap (2026-06-24), so the Telegram
+		// message is the reliable signal that auto-attach-on-resume happened.
+		// Async so a slow send never delays this recover response.
+		go b.sendRecoverWelcome(stub, key, resp.Name, cnt)
 	}
 	_ = conn.WriteJSON(resp)
 }

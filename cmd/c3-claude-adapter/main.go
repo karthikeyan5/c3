@@ -252,6 +252,18 @@ type adapter struct {
 	// Claude Code never drove". The receiving-middleware in buildMCPServer
 	// flips this on first call.
 	dispatched atomic.Bool
+
+	// pendingRecoverNotice holds the auto-attach-on-resume CLI notice until the
+	// session is active. recoverSessionOnResume sets it instead of emitting at
+	// recover time, because a channel frame emitted in the resume idle gap
+	// (right after the handshake, before the first user turn) is dropped by
+	// Claude Code rather than buffered (2026-06-24). The receiving middleware
+	// flushes it on the first tools/call — an active turn, where the frame
+	// renders. The Telegram recover-welcome is the GUARANTEED signal; this is
+	// the best-effort CLI echo. Guarded by pnmu.
+	pnmu                 sync.Mutex
+	pendingRecoverNotice string
+	pendingRecoverAt     time.Time
 }
 
 func newAdapter() *adapter {
@@ -1081,6 +1093,13 @@ func (a *adapter) buildMCPServer() *mcp.Server {
 			if method != "ping" {
 				log.Printf("mcp recv: method=%s", method)
 			}
+			// A tools/call means an active turn — the one moment Claude Code
+			// reliably renders our channel frames (unlike the resume idle gap).
+			// Flush the deferred auto-attach-on-resume CLI notice here; it
+			// self-clears so this only emits once.
+			if method == "tools/call" {
+				a.flushPendingRecoverNotice()
+			}
 			return next(ctx, method, req)
 		}
 	})
@@ -1660,6 +1679,11 @@ const (
 	recoverPollAttempts = 20
 	recoverPollInterval = 500 * time.Millisecond
 	recoverRespTimeout  = 10 * time.Second
+	// pendingRecoverTTL bounds how long the deferred auto-attach CLI notice
+	// waits for the first active turn before being dropped. The Telegram
+	// recover-welcome already informed the user; a minutes-late CLI block would
+	// just confuse.
+	pendingRecoverTTL = 5 * time.Minute
 )
 
 // recoverSessionOnResume runs in a goroutine after hello. It looks up this
@@ -1738,7 +1762,11 @@ func (a *adapter) recoverSessionOnResume(ctx context.Context) {
 		})
 		log.Printf("recover-session: auto-attached to %q (queued=%d)", resp.Name, resp.QueuedCount)
 		if text := renderRecoverNotice(resp); text != "" {
-			a.emitRecoverNotice(text)
+			// Defer rather than emit now: this runs in the resume idle gap,
+			// where Claude Code drops channel frames. The middleware flushes it
+			// on the first tools/call. (The broker's Telegram recover-welcome is
+			// the guaranteed signal; this is the best-effort CLI echo.)
+			a.setPendingRecoverNotice(text)
 		}
 	}
 }
@@ -1798,6 +1826,40 @@ func (a *adapter) emitRecoverNotice(text string) {
 	frame := buildClaudeChannelFrame(in)
 	if err := a.notifyTx.Notify(context.Background(), "notifications/claude/channel", frame); err != nil {
 		log.Printf("recover-session: notify failed: %v", err)
+	}
+}
+
+// setPendingRecoverNotice stores the auto-attach-on-resume CLI notice to be
+// flushed on the first active turn (see the adapter.pendingRecoverNotice doc).
+func (a *adapter) setPendingRecoverNotice(text string) {
+	a.pnmu.Lock()
+	a.pendingRecoverNotice = text
+	a.pendingRecoverAt = time.Now()
+	a.pnmu.Unlock()
+}
+
+// takePendingRecoverNotice atomically clears and returns the pending notice when
+// one is set AND still fresh (within pendingRecoverTTL). A stale or absent
+// notice returns ("", false) and is cleared either way, so it never re-emits.
+// Split out from flush so the once-only + staleness logic is unit-testable
+// without a live notify transport.
+func (a *adapter) takePendingRecoverNotice() (string, bool) {
+	a.pnmu.Lock()
+	defer a.pnmu.Unlock()
+	text, at := a.pendingRecoverNotice, a.pendingRecoverAt
+	a.pendingRecoverNotice = ""
+	if text == "" || time.Since(at) > pendingRecoverTTL {
+		return "", false
+	}
+	return text, true
+}
+
+// flushPendingRecoverNotice emits the deferred auto-attach notice once, if one
+// is pending and fresh. Called from the receiving middleware on the first
+// tools/call.
+func (a *adapter) flushPendingRecoverNotice() {
+	if text, ok := a.takePendingRecoverNotice(); ok {
+		a.emitRecoverNotice(text)
 	}
 }
 
