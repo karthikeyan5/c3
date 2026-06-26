@@ -480,8 +480,20 @@ func (w *RouteWorker) flushEvent(ctx context.Context, ev *c3types.Inbound) {
 	// unknown/already-resolved ask returns false and falls through to the normal
 	// event path; the channel already auto-acked it either way.
 	if ev.Kind == c3types.InboundCallback && ev.Event != nil && ev.Event.Callback != nil {
-		if cb := ev.Event.Callback; strings.HasPrefix(cb.Data, askCallbackPrefix) {
+		cb := ev.Event.Callback
+		if strings.HasPrefix(cb.Data, askCallbackPrefix) {
 			if w.broker.resolveAsk(w.key, cb) {
+				return
+			}
+		}
+		// Permission relay (Phase 1): a "perm:<verb>:<id>" callback resolves a
+		// relayed permission prompt — resolvePerm pushes an OpPermissionVerdict to
+		// the holder and clears the keyboard, gated to the operator. On a match we
+		// SUPPRESS the generic event (the tap was the verdict, not a fresh event); a
+		// non-operator / unknown / already-resolved tap returns false and falls
+		// through (the channel already auto-acked either way).
+		if strings.HasPrefix(cb.Data, permCallbackPrefix) {
+			if w.broker.resolvePerm(w.key, cb) {
 				return
 			}
 		}

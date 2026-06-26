@@ -456,22 +456,34 @@ func (b *Broker) deliverAskResult(route RouteKey, askID string, answer ipc.AskAn
 	}
 }
 
-// editAskMessage edits the ask's Telegram message to text + buttons. Best-effort:
-// a failed edit must not block an answer that was already delivered. A non-nil
-// EMPTY buttons slice clears the inline keyboard (see EditMessage); a non-empty
-// slice re-renders it (multi-select toggle).
-func (b *Broker) editAskMessage(route RouteKey, askID string, messageID int64, text string, buttons [][]c3types.Button) {
-	ch, err := b.Channel(route.Channel)
-	if err != nil {
-		return
+// editKeyboardMessage edits a route's message text + inline keyboard via the
+// channel. A non-nil EMPTY buttons slice clears the keyboard (see EditMessage); a
+// non-empty slice re-renders it. found=false (err set) means the channel could not
+// be resolved at all (the caller stays silent, matching the original
+// editAskMessage behavior); found=true with a non-nil err is a real edit failure
+// the caller should log with its own feature-flavored context. Shared by the ask
+// and permission keyboard flows so the channel-edit plumbing has a single home.
+func (b *Broker) editKeyboardMessage(route RouteKey, messageID int64, text string, buttons [][]c3types.Button) (found bool, err error) {
+	ch, cerr := b.Channel(route.Channel)
+	if cerr != nil {
+		return false, cerr
 	}
-	if _, err := ch.EditMessage(c3types.EditArgs{
+	_, err = ch.EditMessage(c3types.EditArgs{
 		Channel:   route.Channel,
 		ChatID:    route.ChatID,
 		MessageID: messageID,
 		Text:      text,
 		Buttons:   buttons,
-	}); err != nil {
+	})
+	return true, err
+}
+
+// editAskMessage edits the ask's Telegram message to text + buttons. Best-effort:
+// a failed edit must not block an answer that was already delivered. A non-nil
+// EMPTY buttons slice clears the inline keyboard (see EditMessage); a non-empty
+// slice re-renders it (multi-select toggle).
+func (b *Broker) editAskMessage(route RouteKey, askID string, messageID int64, text string, buttons [][]c3types.Button) {
+	if found, err := b.editKeyboardMessage(route, messageID, text, buttons); found && err != nil {
 		log.Printf("ask edit FAIL chan=%s chat=%d topic=%s ask=%s msg=%d: %v",
 			route.Channel, route.ChatID, TopicKeyStr(route), askID, messageID, err)
 	}
@@ -512,8 +524,8 @@ func (b *Broker) sweepExpiredAsks() {
 }
 
 // StartAskReaper launches the background goroutine that periodically expires
-// stale asks (every askSweepInterval) so an untapped / never-Done ask can't leak
-// or leave a live keyboard past the adapter's answer timeout. Mirrors
+// stale asks AND stale permission prompts (every askSweepInterval) so an untapped
+// ask / abandoned permission prompt can't leak or leave a live keyboard. Mirrors
 // StartHealthRefresh: panic-supervised (recover→log→continue) and stops on the
 // broker context cancel (Shutdown), so it never leaks or crashes the process.
 // Call once, after the broker is constructed.
@@ -529,6 +541,7 @@ func (b *Broker) StartAskReaper() {
 				func() {
 					defer recoverGoroutine("askReaper")
 					b.sweepExpiredAsks()
+					b.sweepExpiredPerms()
 				}()
 			}
 		}

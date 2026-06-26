@@ -163,6 +163,32 @@ type AskAnswer struct {
 	TimedOut bool     `json:"timed_out,omitempty"`
 }
 
+// PermissionReq is the adapter → broker relay of a Claude Code tool-use
+// permission prompt. Like AskRegisterReq it carries NO route — the broker derives
+// it from the stub's current claim. RequestID is the harness-minted id (5 letters
+// [a-km-z]) used to correlate the later OpPermissionVerdict back to the prompt.
+// ToolName names the tool awaiting approval; Preview is a short, already-truncated
+// input snippet (input_preview, falling back to the description) — never a secret
+// body. Fire-and-forget: the broker sends no synchronous ack.
+type PermissionReq struct {
+	Op        Op     `json:"op"` // = OpPermissionRequest
+	RequestID string `json:"request_id"`
+	ToolName  string `json:"tool_name,omitempty"`
+	Preview   string `json:"preview,omitempty"`
+}
+
+// PermissionVerdictMsg is the broker → adapter UNSOLICITED push of a human's
+// Allow/Deny verdict for a previously-relayed permission_request. Behavior is the
+// STRING "allow" | "deny" (matching the reference Telegram plugin's contract);
+// the adapter emits it into Claude Code as notifications/claude/channel/permission
+// {request_id, behavior}. Correlated to the prompt by RequestID; delivered to the
+// route holder exactly like OpInbound.
+type PermissionVerdictMsg struct {
+	Op        Op     `json:"op"` // = OpPermissionVerdict
+	RequestID string `json:"request_id"`
+	Behavior  string `json:"behavior"`
+}
+
 // QueuedItem is one compact backlog-summary row carried in AttachedMsg. Preview
 // is a short, truncated text snippet (never the full body); Unix is the
 // message's timestamp.

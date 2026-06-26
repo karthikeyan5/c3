@@ -120,6 +120,10 @@ func run() error {
 
 	server := a.buildMCPServer()
 	a.notifyTx = newNotifyTransport(&mcp.StdioTransport{})
+	// Wire the receive interceptor: a diverted permission_request is relayed to the
+	// broker (Allow/Deny keyboard) instead of being silently dropped by the SDK.
+	// Must be set BEFORE server.Run drives notifyTx.Connect.
+	a.notifyTx.SetPermissionHandler(a.handlePermissionRequest)
 
 	go a.brokerReader(ctx)
 	go a.idleStartupWatchdog(ctx, cancel)
@@ -358,6 +362,8 @@ func (a *adapter) brokerReader(ctx context.Context) {
 			a.dispatchAskRegistered(raw)
 		case ipc.OpAskResult:
 			a.dispatchAskResult(raw)
+		case ipc.OpPermissionVerdict:
+			a.dispatchPermissionVerdict(raw)
 		case ipc.OpError:
 			var errMsg ipc.ErrorMsg
 			_ = json.Unmarshal(raw, &errMsg)
@@ -1061,6 +1067,12 @@ func (a *adapter) buildMCPServer() *mcp.Server {
 			// silently drop our `notifications/claude/channel` frames.
 			Experimental: map[string]any{
 				"claude/channel": map[string]any{},
+				// Declaring claude/channel/permission tells Claude Code this server
+				// relays tool-use permission prompts. Per the reference plugin's
+				// contract, declaring it ASSERTS that the channel authenticates the
+				// replier — C3 sender-gates a verdict to an allowlisted operator
+				// (resolvePerm), and an Allow tap over Telegram AUTHORIZES the tool use.
+				"claude/channel/permission": map[string]any{},
 			},
 		},
 	}
@@ -1108,8 +1120,15 @@ func (a *adapter) buildInstructions() string {
 	default:
 		head = "C3 connected. Use the `attach` tool to claim a Telegram topic for this session."
 	}
-	return head + mode.Combined(a.capsOrDefault())
+	return head + permissionContractNote + mode.Combined(a.capsOrDefault())
 }
+
+// permissionContractNote is the security contract carried in the MCP instructions
+// for the claude/channel/permission capability (mirrors the reference Telegram
+// plugin). Declaring the capability asserts C3 authenticates the replier — C3
+// only honors an Allow/Deny verdict from an allowlisted operator, and tapping
+// Allow over Telegram AUTHORIZES the pending tool use.
+const permissionContractNote = "\n\nPermission relay: C3 declares the claude/channel/permission capability, which asserts the channel authenticates the replier. C3 surfaces a tool-use permission prompt as an Allow/Deny keyboard, honors a verdict only from an allowlisted operator, and an Allow tap over Telegram authorizes the pending tool use."
 
 // capsOrDefault returns the channel capability manifest the broker delivered
 // on hello_ack (or a fresh attach), falling back to a sensible default when
@@ -1775,6 +1794,51 @@ func (a *adapter) dispatchAskRegistered(raw []byte) {
 		case ch <- msg:
 		default:
 		}
+	}
+}
+
+// handlePermissionRequest is the receive interceptor's callback (notify_transport
+// SetPermissionHandler): it relays a diverted Claude Code permission_request to
+// the broker as an OpPermissionRequest so the broker can surface an Allow/Deny
+// keyboard on the claimed route. Fire-and-forget — there is no caller to unblock;
+// a broker write failure (or a reconnecting broker) is logged and CC simply keeps
+// waiting in its TUI. NEVER logs the preview body (it can carry tool input).
+func (a *adapter) handlePermissionRequest(requestID, toolName, preview string) {
+	if requestID == "" {
+		return
+	}
+	conn := a.currentConn()
+	if conn == nil {
+		log.Printf("perm: broker reconnecting — dropping permission_request id=%s tool=%s (CC keeps waiting)", requestID, toolName)
+		return
+	}
+	if err := conn.WriteJSON(ipc.PermissionReq{
+		Op:        ipc.OpPermissionRequest,
+		RequestID: requestID,
+		ToolName:  toolName,
+		Preview:   preview,
+	}); err != nil {
+		log.Printf("perm: broker write failed id=%s tool=%s: %v", requestID, toolName, err)
+	}
+}
+
+// dispatchPermissionVerdict routes a broker OpPermissionVerdict into Claude Code:
+// it emits a notifications/claude/channel/permission frame {request_id, behavior}
+// (fire-and-forget — no pending-tool map, the harness consumes it directly). An
+// unknown/late verdict is harmless: CC silently drops it.
+func (a *adapter) dispatchPermissionVerdict(raw []byte) {
+	var msg ipc.PermissionVerdictMsg
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return
+	}
+	if msg.RequestID == "" || a.notifyTx == nil {
+		return
+	}
+	if err := a.notifyTx.Notify(context.Background(), "notifications/claude/channel/permission", map[string]any{
+		"request_id": msg.RequestID,
+		"behavior":   msg.Behavior,
+	}); err != nil {
+		log.Printf("perm: verdict notify failed id=%s behavior=%s: %v", msg.RequestID, msg.Behavior, err)
 	}
 }
 

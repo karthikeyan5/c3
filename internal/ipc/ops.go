@@ -30,7 +30,14 @@ const (
 	// unsolicited OpAskResult once the human taps a button. Carries NO route —
 	// the broker derives it from the stub's current claim.
 	OpAskRegister Op = "ask_register"
-	OpBye         Op = "bye"
+	// OpPermissionRequest relays a Claude Code tool-use permission prompt
+	// (default / acceptEdits mode) to the broker so it can surface an Allow/Deny
+	// inline keyboard on the stub's claimed route. Carries NO route — the broker
+	// derives it from the stub's current claim. Fire-and-forget: there is no
+	// blocking tool to unblock, so the broker sends no synchronous ack (unlike
+	// OpAskRegister). The verdict comes back later as OpPermissionVerdict.
+	OpPermissionRequest Op = "permission_request"
+	OpBye               Op = "bye"
 
 	// broker → adapter
 	OpHelloAck             Op = "hello_ack"
@@ -55,5 +62,12 @@ const (
 	// a previously-registered ask (delivered to the route holder exactly like
 	// OpInbound). Correlated to the originating tool call by AskID.
 	OpAskResult Op = "ask_result"
-	OpError     Op = "error"
+	// OpPermissionVerdict is the broker's UNSOLICITED push of a human's Allow/Deny
+	// verdict for a previously-relayed permission_request (delivered to the route
+	// holder exactly like OpInbound). Correlated to the originating permission
+	// prompt by RequestID; the adapter emits it into Claude Code as
+	// notifications/claude/channel/permission. Fire-and-forget (no caller blocks
+	// on it — a never-delivered verdict just leaves CC waiting in the TUI).
+	OpPermissionVerdict Op = "permission_verdict"
+	OpError             Op = "error"
 )
