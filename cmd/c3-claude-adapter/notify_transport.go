@@ -99,6 +99,15 @@ func (t *notifyTransport) Connect(ctx context.Context) (mcp.Connection, error) {
 // only Read. CRITICAL: every frame that is not the exact permission_request
 // notification is returned UNCHANGED — this is on the inbound path the whole
 // session depends on.
+//
+// Accepted SDK deviation: embedding the Connection interface means the wrapper
+// fails the SDK's unexported `serverConnection` type assertion, so the server
+// skips one call to the inner conn's `sessionUpdated` (which only records the
+// negotiated protocol version, used solely to reject incoming JSON-RPC batches on
+// protocol >= 2025-06-18). Harmless on the CC stdio path (CC sends no batches;
+// the worst case is leniency, not a crash or a security hole), and the SDK's own
+// shipped loggingConn wrapper skips it identically. `hasSessionID` still passes
+// (SessionID is exported and promoted).
 type interceptConn struct {
 	mcp.Connection
 	owner *notifyTransport
@@ -125,7 +134,13 @@ func (c *interceptConn) Read(ctx context.Context) (jsonrpc.Message, error) {
 		}
 		if h := c.owner.permHandler(); h != nil {
 			if id, tool, preview := parsePermissionRequest(req.Params); id != "" {
-				h(id, tool, preview)
+				// Dispatch ASYNC: the handler writes to the broker (which then does a
+				// blocking Telegram send), and this runs on the SDK's single inbound
+				// read goroutine — calling it synchronously would let a broker/Telegram
+				// stall freeze the whole session's inbound path. Per-request ordering is
+				// irrelevant (each relay is keyed by request_id), so a goroutine is safe
+				// and matches the fire-and-forget contract.
+				go h(id, tool, preview)
 			}
 		}
 		// Diverted — loop to read the next frame so the SDK never sees this one.

@@ -488,14 +488,15 @@ func (w *RouteWorker) flushEvent(ctx context.Context, ev *c3types.Inbound) {
 		}
 		// Permission relay (Phase 1): a "perm:<verb>:<id>" callback resolves a
 		// relayed permission prompt — resolvePerm pushes an OpPermissionVerdict to
-		// the holder and clears the keyboard, gated to the operator. On a match we
-		// SUPPRESS the generic event (the tap was the verdict, not a fresh event); a
-		// non-operator / unknown / already-resolved tap returns false and falls
-		// through (the channel already auto-acked either way).
+		// the holder and clears the keyboard, gated to the operator. A "perm:" tap is
+		// C3-internal — it is NEVER a meaningful generic event (unlike "ask:", whose
+		// prefix an agent-rendered reply button could legitimately reuse). So always
+		// SUPPRESS it, whether or not it resolved: a non-operator / unknown / expired /
+		// route-mismatched tap must not be surfaced as a raw callback event into the
+		// session (it's already auto-acked by the channel regardless).
 		if strings.HasPrefix(cb.Data, permCallbackPrefix) {
-			if w.broker.resolvePerm(w.key, cb) {
-				return
-			}
+			w.broker.resolvePerm(w.key, cb)
+			return
 		}
 	}
 	if w.broker.Plugins != nil {
