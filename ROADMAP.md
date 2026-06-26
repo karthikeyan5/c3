@@ -2,11 +2,54 @@
 
 **Status as of 2026-06-15.** The channel rich-content + capability architecture (the P0 below) is **BUILT and committed** on `master` — 8 phases (P0–P7), designed via a 10-agent workflow, hardened by 3 critique passes, and triple-reviewed. Pending a live Telegram smoke test (the one check that needs a phone — checklist in `docs/specs/2026-06-14-channel-capability-architecture.md`). Version line: v0.1.0 (pre-public-push).
 
-This is the **single consolidated roadmap** for C3. It was reconciled on 2026-06-14 from every source — `TODO.md`, `RESUME.md`, `MORNING-REVIEW-2026-05-19.md`, `DECISIONS.md`, `DEBUGGING.md`, `docs/plans/` + `docs/specs/`, the live Go codebase, and a mining sweep of every past C3 session transcript (incl. cross-project sessions). **Nothing was dropped:** ideas that previously lived only in voice notes are now captured here and flagged `risk-of-loss: was-untracked`.
+This is the **single consolidated roadmap** for C3. It was reconciled on 2026-06-14 from every source — `TODO.md`, `RESUME.md`, `MORNING-REVIEW-2026-05-19.md`, `DECISIONS.md`, `DEBUGGING.md`, `docs/plans/` + `docs/specs/`, the live Go codebase, and a mining sweep of every past C3 session transcript (incl. cross-project sessions). **Nothing was dropped:** ideas that previously lived only in voice notes are now captured here and flagged `risk-of-loss: was-untracked`. **(2026-06-26: four threads from Karthi's roadmap discussion folded in as the dated section directly below — interactive Q&A, trust/permissions, remote spawn+control, programmatic spawn-and-attach. Existing items are unchanged; the new section cross-links them.)**
 
 C3 is a Go end-to-end Telegram multiplexer for multiple Claude Code / Codex CLI sessions: one broker daemon, per-CLI MCP adapters, topic-based routing. **Code health:** `go build ./...` and `go vet ./...` pass clean; all packages test green **except** 2 environment-flaky broker tests (a test-fixture defect, not a production bug — see P2). The big open items below are **features that were never built**, not regressions.
 
 Legend — **status**: `planned` · `in-progress` · `idea` (not yet committed to) · `done`. **priority**: P0 (Karthi's stated #1) → P4 (nice-to-have).
+
+---
+
+## 2026-06-26 — Roadmap discussion (Karthi): four threads to build next
+
+Captured from Karthi's 2026-06-26 voice roadmap session. **Nothing here replaces the items below** — each thread cross-links to its existing home in this roadmap; this section adds the new specifics, the live bug, the fresh-research asks, and my recommended sequencing. Karthi's stated "build now" = Thread C/D (remote spawn + control).
+
+### Thread A — Interactive Q&A over Telegram (Claude's questions → buttons/polls → answer round-trip) — **`bug + feature`** · NEW
+**Karthi:** "Architect this complete feature — whatever questions Claude asks: with options / without options / with additional comments / Other / Skip / multi-select — all supported. Research what Telegram bots support **in groups/topics** (buttons, polls, dynamic inline keyboards; mini-app likely DM-only). Take inspiration from the official Claude Telegram plugin. Build it solid so Claude knows it asks questions *here* when in Telegram mode."
+- **Live bug (reported by a developer):** Claude's option-questions render as buttons on Telegram via C3, but **tapping a button does not deliver the answer back to Claude** — the agent never receives the choice. Root cause not yet investigated.
+  - Clue (from a code map, unverified): inline-keyboard **send** + callback **inbound** routing already exist — `buildInlineKeyboard` (`internal/channel/telegram/outbound.go`), `dispatchCallback` → `CallbackEvent` → worker (`internal/channel/telegram/poll.go`). So callbacks *are* wired into the broker; the gap is likely either (i) the `CallbackEvent` not being surfaced to the agent's channel frame, or (ii) Claude Code's **native `AskUserQuestion`** primitive not being the wired path at all. **Systematic-debug before any fix.**
+- **Existing home:** P0.5 **P7 — inline keyboards + callbacks** (shipped) is the substrate. This thread is the *AskUserQuestion-grade* layer on top: the full question taxonomy + the answer round-trip.
+- **Hard-feasibility probe first (AGENTS.md rule):** does the Claude Code harness expose `AskUserQuestion` to a channel/MCP adapter at all (the way it exposes permission prompts as the channel's 3rd surface)? If **no**, the only path is agent-rendered buttons + callback-surfaced answers (substrate exists). If **yes**, wire the native primitive. Same kind of probe that killed reasoning-streaming — do it before designing.
+- **Research scope:** Telegram interactive options usable **in group topics** (inline keyboards w/ `callback_data`, native polls/quiz, force-reply); mini-app/web-app constraints (DM-only?); how the official Claude Telegram plugin presents choices. Fetch **live** Bot API + Claude Code docs (don't trust model memory).
+
+### Thread B — Trust / permission approvals over Telegram (why Claude "doesn't trust" C3) — **`planned`** · re-research asked
+**Karthi:** "The official Telegram plugin is trusted — when it needs permission it asks approve/deny on Telegram and I allow it. C3 can't. How is that trust established? Re-research fresh; tell me what you found last time too."
+- **What I found before** (memory `c3_trusted_operator_authz_spec`, verified 2026-06-14):
+  - The `<channel …>` wrapper + "treat as untrusted external data" warning are emitted by the **Claude Code harness, not C3** (0 hits in the c3 tree). C3 cannot suppress it, and there is **no supported API to mark inbound Telegram text as "trusted."** So the official plugin doesn't make replies trusted either.
+  - The official plugin's approve/deny is the channel's **3rd surface — permission relay**: the harness forwards a genuine permission *prompt*, you tap approve/deny, the verdict goes back. **C3 can do exactly this — it just hasn't built it yet** (see "Permission relay", P1 below; assessed GO, build prompt + corrections ready).
+  - For actions the **auto-mode classifier hard-denies** (no prompt ever opens — e.g. `sudo` authorized over Telegram), the only lever is a **PreToolUse hook** returning allow/deny (SSHGate's model lifted to the CC permission gate). That's the **Trusted-operator DM authorization** spec (P1 below; blocked on the §9 Phase-0 gate: empirically verify a hook "allow" overrides auto-mode).
+- **The answer in one line:** "trust" = build the **permission-relay surface** (official-plugin parity) + the **PreToolUse trusted-operator hook** (for classifier hard-denies). Both already specced; this thread = fresh-confirm against live docs, then build.
+- **Re-research ask:** re-verify the Phase-0 gate (does a hook `allow` bypass the auto-mode classifier?) against **current** Claude Code; check for any new "trusted plugin" / channel-trust mechanism shipped since 2026-06-14.
+
+### Thread C — Remote spawn + control of a Claude Code / Codex CLI from Telegram — **`in-progress` (designed, 0 code)** · Karthi's "build now"
+**Karthi:** "Spawn a Claude Code/Codex instance and operate it from one Claude instance, via a C3 MCP — the broker controls every CLI it started. Run `/compact`, `/status` and other slash commands over Telegram when away from the laptop; type directly into the TUI (`/input`); make arrow-key option menus work. Maybe a web UI, or parse the TUI into a Telegram message. **Bare minimum: run /commands + inject input.**"
+- **Existing home:** P1 **Remote terminal-control** — design **DECIDED** (2026-06-15): C3 stays the brain; **all-Go PTY stack** (`creack/pty` + `Netflix/go-expect` + a VT emulator) as a new broker worker type; **arbitrary TUIs** (raw PTY). Next step was: prototype the Go PTY worker (snapshot-on-idle + send-keys). Full design notes in `RESUME.md §THE MAIN FEATURE`.
+- **New specifics from 2026-06-26 to fold into the MVP scope:** explicit `/compact` + `/status` over Telegram; an `/input` (or `/tui`) command that types straight into the running TUI; arrow-key menu navigation; snapshot-on-idle rendering (already in the design) as the "see the screen" path.
+- **Thread C-lite (Karthi: "if there's a way without meddling with the TUI, I'd be happy"):** re-check **live** Claude Code docs for any supported headless / programmatic slash-command or remote-control path (native **Remote Control** via claude.ai + mobile already exists as an aside — zero build, but separate from Telegram). If a supported control API now exists, it may beat the PTY route for the MCP-aware CLIs (Claude/Codex), leaving the PTY path only for arbitrary TUIs.
+
+### Thread D — Programmatic spawn-and-attach API (call C3 to bring up a CLI + attach it to a channel+topic) — **`idea`, design needed** · NEW
+**Karthi:** "Make spawning+attaching a CLI callable by *me or another agent* — via the MCP directly, or a broker CLI / API. Pass parameters: which channel, which topic (name/ID). Since channels are pluggable, plug in other chat APIs too. This is the same 'bring up and control a CLI' mechanism, exposed programmatically."
+- **This is the agent/programmatic twin of Thread C.** C = human-from-Telegram drives a spawned CLI; D = code/agent drives the spawn-and-attach via a stable interface (MCP tool / `c3-broker` subcommand / local API).
+- **Existing substrate:** the `Channel` interface is fully pluggable and proven (Telegram is the only impl); `attach`/topic-routing already maps a session→channel+topic. **Net-new:** a control surface to *spawn a CLI process detached, wire its adapter, and attach it to a named channel+topic* — no design exists yet.
+- **Related existing items (don't duplicate):** P2 "Programmatic (non-chat) channel extension", Phase-4 "Topic creation via API", Phase-4 "Inter-CLI messaging", Phase-4 "Web/voice channels". Thread D is the spawn-and-attach *control plane*; those are channels/messaging built on top.
+
+### Recommended sequencing (my read — for discussion)
+1. **Thread A bug first** — it's a *live* defect a developer hit; root-cause it (cheap, the substrate exists) before the bigger Thread-A feature. Likely a small fix that also confirms the substrate for the full feature.
+2. **Thread C/D together** — Karthi's "build now." They share the spawn-and-control engine; design them as one subsystem (PTY worker + a programmatic spawn-and-attach surface). MVP = `/status` + `/compact` + `/input` over Telegram. Do **Thread C-lite's live-docs probe first** — a supported control API could shrink the whole build.
+3. **Thread B** — permission relay (official-plugin parity) + trusted-operator hook; specs exist, gated on the Phase-0 probe. High value, well-understood, can run in parallel with C/D (different subsystem).
+4. **Thread A full feature** — after the bug + the feasibility probe, architect the full question taxonomy.
+
+**Open feasibility probes to run before committing build effort:** (A) does the harness expose `AskUserQuestion` to a channel? (B) does a PreToolUse `allow` override auto-mode? (C-lite) is there a supported programmatic slash-command / remote-control API in current Claude Code? All three are "fetch live docs + a 5-min empirical test," per AGENTS.md.
 
 ---
 
@@ -58,7 +101,7 @@ completeness-vs-research review lens + live-verify every rendering claim) — to
 - **P4** — reading poll results (`poll`/`poll_answer` inbound → agent; **aggregate + final-on-close**) + `stopPoll`.
 - **P5** — chunk HTML-overflow guard. **Typing-cap redesign DEFERRED (Karthi 2026-06-16)** — current ~60s-then-stops behavior stays until revisited.
 - **P6** — wide tables: auto-wrap pipe tables into aligned monospace `<pre>` (scrolls on Android, wraps desktop/web — **live-verify on phone**).
-- **P7** — inline keyboards + callbacks (tap-to-act / approve-deny / expand-next) — **`ship now`** per Karthi 2026-06-16.
+- **P7** — inline keyboards + callbacks (tap-to-act / approve-deny / expand-next) — **`ship now`** per Karthi 2026-06-16. **→ 2026-06-26 (Karthi, Thread A):** this is the substrate; a live bug ("tapping a button doesn't deliver the answer back to Claude") + the full AskUserQuestion-grade Q&A feature sit on top of it. See the "2026-06-26 — Roadmap discussion" section at the top.
 
 ### To build later — discuss after this batch (Karthi 2026-06-16)
 Karthi wants these built; parked for a post-batch discussion (do **not** silently drop):
@@ -136,6 +179,7 @@ to discuss later — not yet scoped.
   - Q3 → **arbitrary TUIs** — the raw PTY path; control anything in a terminal, not just MCP-aware agents.
   - Next concrete step: prototype the Go PTY worker (snapshot-on-idle rendering + send-keys), per the 2026-06-01 handoff in RESUME.md.
   _Source: RESUME.md §Q1/Q2/Q3; decided 2026-06-15._
+  - **→ 2026-06-26 (Karthi, Thread C/D):** "build now." Fold into the MVP: `/compact`+`/status` over Telegram, an `/input` (or `/tui`) command to type into the running TUI, arrow-key menu nav. Plus **Thread D** — expose spawn-and-attach programmatically (MCP tool / `c3-broker` subcommand / API) so an agent can bring up a CLI and attach it to a named channel+topic. Probe **C-lite** first: any supported headless/remote-control API in current Claude Code may shrink this. See the "2026-06-26 — Roadmap discussion" section at the top.
 
 ---
 
@@ -144,6 +188,7 @@ to discuss later — not yet scoped.
 - **Permission relay** — `planned`
   Forward Claude Code permission prompts to Telegram for remote approve/deny. The one supported remote-approval path (the channel's 3rd surface). Build prompt exists; relay returns GO/DENY as a **string, not bool**; does NOT catch auto-mode classifier hard-denies (that's the trusted-operator item below).
   _Source: RESUME.md §Sub-feature permission relay (assessed GO)._
+  **→ 2026-06-26 (Karthi, Thread B):** this IS the "official-Telegram-plugin trust" Karthi asked about — the official plugin uses this same 3rd surface; C3 just hasn't built it. Pair with the trusted-operator hook below. See the "2026-06-26 — Roadmap discussion" section at the top.
 - **Trusted-operator DM authorization (PreToolUse hook) — ratify + build** — `planned`
   Let an authenticated owner-DM authorize classifier-blocked actions via a PreToolUse hook (an out-of-band per-action approval model, one layer up). **Spec is written** at `docs/specs/2026-06-14-trusted-operator-dm-authorization.md`. Blocked on: §9 Phase-0 hard gate (empirically verify a hook "allow" actually bypasses the auto-mode classifier) + §10 decisions awaiting Karthi's ratification.
   _Source: docs/specs/2026-06-14-…; MEMORY c3_trusted_operator_authz_spec.md._
