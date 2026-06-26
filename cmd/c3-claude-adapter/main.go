@@ -1687,7 +1687,31 @@ func (a *adapter) toolAsk(ctx context.Context, req *mcp.CallToolRequest) (*mcp.C
 		return toolErrorResult("ask: at least one option is required (single/multi-select; free-text questions are not yet available)"), nil
 	}
 
+	regCh := make(chan ipc.AskRegisteredMsg, 1)
+	resCh := make(chan ipc.AskResultMsg, 1)
+	a.askmu.Lock()
+	// Pick an askID not already in-flight (FIX-5). crypto/rand collisions are
+	// astronomically unlikely, but reusing a live id would silently clobber
+	// another pending ask's channels — cheap insurance to regenerate on a clash.
 	askID := newAskID()
+	for i := 0; i < 8; i++ {
+		_, regBusy := a.askRegPending[askID]
+		_, resBusy := a.askPending[askID]
+		if !regBusy && !resBusy {
+			break
+		}
+		askID = newAskID()
+	}
+	a.askRegPending[askID] = regCh
+	a.askPending[askID] = resCh
+	a.askmu.Unlock()
+	defer func() {
+		a.askmu.Lock()
+		delete(a.askRegPending, askID)
+		delete(a.askPending, askID)
+		a.askmu.Unlock()
+	}()
+
 	askReq := ipc.AskRegisterReq{
 		Op:       ipc.OpAskRegister,
 		AskID:    askID,
@@ -1698,19 +1722,6 @@ func (a *adapter) toolAsk(ctx context.Context, req *mcp.CallToolRequest) (*mcp.C
 		Multi:     argBoolField(args, "multi"),
 		AllowSkip: argBoolField(args, "allow_skip"),
 	}
-
-	regCh := make(chan ipc.AskRegisteredMsg, 1)
-	resCh := make(chan ipc.AskResultMsg, 1)
-	a.askmu.Lock()
-	a.askRegPending[askID] = regCh
-	a.askPending[askID] = resCh
-	a.askmu.Unlock()
-	defer func() {
-		a.askmu.Lock()
-		delete(a.askRegPending, askID)
-		delete(a.askPending, askID)
-		a.askmu.Unlock()
-	}()
 
 	conn := a.currentConn()
 	if conn == nil {
@@ -1788,23 +1799,31 @@ func (a *adapter) dispatchAskResult(raw []byte) {
 
 // renderAskAnswer renders an AskAnswer into the tool's text result so the agent
 // gets a clean value to branch on:
-//   - single-select  → the chosen option verbatim.
-//   - multi-select   → the selected options comma-joined (e.g. "A, C"); empty when
-//     nothing was selected.
-//   - skip           → a "(skipped)" notice.
-//   - timeout        → a recoverable notice (the agent can re-ask or proceed).
+//   - single-select (exactly one) → the chosen option verbatim.
+//   - multi-select (>1)           → a bulleted list, one option per line, so an
+//     option that itself contains a comma stays unambiguously separable (FIX-2:
+//     a plain ", " join could not be re-split by the agent).
+//   - multi-select (none toggled) → "Selected: (none)".
+//   - skip                        → a "(skipped)" notice.
+//   - timeout                     → a recoverable notice (re-ask or proceed).
 func renderAskAnswer(ans ipc.AskAnswer) string {
 	switch {
 	case ans.TimedOut:
 		return "No answer — the question timed out (no one tapped a button within the time limit). You can ask again or proceed without it."
 	case ans.Skipped:
 		return "(skipped)"
-	case len(ans.Selected) > 0:
-		return strings.Join(ans.Selected, ", ")
+	case len(ans.Selected) == 1:
+		// Single-select: the bare option string (unchanged contract).
+		return ans.Selected[0]
+	case len(ans.Selected) > 1:
+		// Multi-select: bulleted, one per line — unambiguous even if an option
+		// contains a comma.
+		return "Selected:\n• " + strings.Join(ans.Selected, "\n• ")
 	case ans.Text != "":
 		return ans.Text
 	default:
-		return "(no answer)"
+		// Multi-select Done with nothing toggled (empty Selected, no text).
+		return "Selected: (none)"
 	}
 }
 

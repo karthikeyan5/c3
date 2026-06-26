@@ -53,6 +53,35 @@ func resultText(t *testing.T, res *mcp.CallToolResult) string {
 	return tc.Text
 }
 
+// TestRenderAskAnswer covers every branch of the answer renderer (FIX-2). The
+// load-bearing case is multi-select with comma-bearing options: the bulleted,
+// one-per-line rendering keeps them unambiguously separable, where the old
+// ", " join did not.
+func TestRenderAskAnswer(t *testing.T) {
+	cases := []struct {
+		name string
+		ans  ipc.AskAnswer
+		want string
+	}{
+		{"single", ipc.AskAnswer{Selected: []string{"B"}}, "B"},
+		{"single-with-comma", ipc.AskAnswer{Selected: []string{"Red, large"}}, "Red, large"},
+		{"multi", ipc.AskAnswer{Selected: []string{"A", "C"}}, "Selected:\n• A\n• C"},
+		{"multi-comma", ipc.AskAnswer{Selected: []string{"Red, large", "Blue"}}, "Selected:\n• Red, large\n• Blue"},
+		{"multi-empty", ipc.AskAnswer{Selected: nil}, "Selected: (none)"},
+		{"skipped", ipc.AskAnswer{Skipped: true}, "(skipped)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := renderAskAnswer(tc.ans); got != tc.want {
+				t.Fatalf("renderAskAnswer(%+v) = %q, want %q", tc.ans, got, tc.want)
+			}
+		})
+	}
+	if got := renderAskAnswer(ipc.AskAnswer{TimedOut: true}); !strings.Contains(strings.ToLower(got), "timed out") {
+		t.Fatalf("timeout render = %q, want it to report a timeout", got)
+	}
+}
+
 // TestAskTool_ReturnsTappedAnswer drives the full adapter-side blocking flow over
 // a net.Pipe fake broker: toolAsk sends an AskRegisterReq, the broker acks
 // OK, then pushes the tapped answer as an OpAskResult — and the tool returns that
@@ -196,8 +225,9 @@ func TestAskTool_RequiresOptions(t *testing.T) {
 }
 
 // TestAskTool_MultiSelect_ReturnsList: an ask with multi:true forwards the flag to
-// the broker and returns the broker's selected list rendered as a comma-joined
-// string (the agent gets a clean value to branch on).
+// the broker and returns the broker's selected list rendered as an unambiguous
+// bulleted list (FIX-2 — one option per line, so options that contain commas stay
+// separable; a plain ", " join could not be re-split by the agent).
 func TestAskTool_MultiSelect_ReturnsList(t *testing.T) {
 	a, peer := adapterWithConn(t)
 
@@ -233,8 +263,8 @@ func TestAskTool_MultiSelect_ReturnsList(t *testing.T) {
 		if res.IsError {
 			t.Fatalf("unexpected tool error: %q", resultText(t, res))
 		}
-		if got := resultText(t, res); got != "A, C" {
-			t.Fatalf("multi result = %q, want %q", got, "A, C")
+		if got, want := resultText(t, res), "Selected:\n• A\n• C"; got != want {
+			t.Fatalf("multi result = %q, want %q", got, want)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("ask tool did not return after the multi answer was pushed")

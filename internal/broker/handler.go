@@ -253,6 +253,18 @@ func (b *Broker) handleAskRegister(conn *ipc.Conn, stub *Stub, raw []byte) {
 		})
 		return
 	}
+	// Capability gate (FIX-4): `ask` is an inline-keyboard round-trip, so refuse
+	// it on a channel that can't render inline keyboards rather than silently
+	// SendReply-ing buttons it will drop. No behavior change for Telegram
+	// (InlineKeyboards=true); closes the latent gap for future text-only channels.
+	// Checked BEFORE register, so there is no pending entry to clean up.
+	if !ch.Capabilities().InlineKeyboards {
+		_ = conn.WriteJSON(ipc.AskRegisteredMsg{
+			Op: ipc.OpAskRegistered, AskID: req.AskID, OK: false,
+			Err: "channel does not support interactive questions",
+		})
+		return
+	}
 
 	// Register BEFORE the send so a human who taps before the sendMessage
 	// round-trip returns still finds a live ask to resolve. Phase 2 carries the
@@ -262,7 +274,7 @@ func (b *Broker) handleAskRegister(conn *ipc.Conn, stub *Stub, raw []byte) {
 		askID: req.AskID, route: *route, question: req.Question, options: req.Options,
 		multi: req.Multi, allowSkip: req.AllowSkip, selected: make([]bool, len(req.Options)),
 	}
-	if !b.Asks.register(p) {
+	if !b.registerAsk(p) {
 		_ = conn.WriteJSON(ipc.AskRegisteredMsg{
 			Op: ipc.OpAskRegistered, AskID: req.AskID, OK: false,
 			Err: "ask id collision — retry",

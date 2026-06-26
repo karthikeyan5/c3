@@ -124,6 +124,8 @@ func GuidanceFor(c c3types.Capabilities) string {
 		b.WriteString("  you need the human to pick before you continue. Set `multi:true` for multi-select (the human\n")
 		b.WriteString("  toggles options and taps Done; you get the selected list), and `allow_skip:true` to add a Skip\n")
 		b.WriteString("  button. (Free-text / Other questions are not yet supported.)\n")
+		b.WriteString("  Anyone allowlisted who can post in this topic can tap an answer — the question is not\n")
+		b.WriteString("  restricted to a single user, so treat the reply as coming from the group, not one identity.\n")
 	}
 
 	// Reactions (outbound `react` tool).

@@ -2,7 +2,9 @@ package broker
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -100,6 +102,171 @@ func TestResolveAsk_SingleSelect(t *testing.T) {
 	// A second (stale) tap for the same, already-resolved ask must NOT resolve.
 	if b.resolveAsk(key, &c3types.CallbackEvent{Data: "ask:abc12345:0"}) {
 		t.Fatal("a stale tap for an already-resolved ask must return false (generic path proceeds)")
+	}
+}
+
+// TestAskRegistry_ExpiresStale drives FIX-1's reaper: an ask whose createdAt is
+// older than askExpiryTTL is removed by sweepExpiredAsks, which best-effort
+// clears its live keyboard (a timed-out body + empty Buttons), while a fresh ask
+// survives untouched.
+func TestAskRegistry_ExpiresStale(t *testing.T) {
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mfWithTelegram(), fc)
+	defer b.Shutdown()
+
+	key := RouteKey{Channel: "telegram", ChatID: -100, HasTopic: true, TopicID: 5}
+
+	stale := &pendingAsk{
+		askID: "stale123", route: key, question: "Old?", options: []string{"A", "B"},
+		selected: make([]bool, 2), messageID: 55,
+		createdAt: time.Now().Add(-askExpiryTTL - time.Minute),
+	}
+	if !b.registerAsk(stale) {
+		t.Fatal("register stale failed")
+	}
+	fresh := &pendingAsk{
+		askID: "fresh123", route: key, question: "New?", options: []string{"A"},
+		selected: make([]bool, 1), messageID: 66, createdAt: time.Now(),
+	}
+	if !b.registerAsk(fresh) {
+		t.Fatal("register fresh failed")
+	}
+
+	b.sweepExpiredAsks()
+
+	if b.Asks.has("stale123") {
+		t.Fatal("a stale ask must be removed by the sweep")
+	}
+	if !b.Asks.has("fresh123") {
+		t.Fatal("a fresh ask must survive the sweep")
+	}
+	edits := fc.editSnapshot()
+	if len(edits) != 1 {
+		t.Fatalf("sweep must clear exactly the stale ask's keyboard (1 edit); got %d", len(edits))
+	}
+	if edits[0].MessageID != 55 {
+		t.Fatalf("sweep edit targeted msg %d, want 55 (the stale ask)", edits[0].MessageID)
+	}
+	if edits[0].Buttons == nil || len(edits[0].Buttons) != 0 {
+		t.Fatalf("sweep must clear the keyboard via a non-nil empty Buttons; got %+v", edits[0].Buttons)
+	}
+	if !strings.Contains(edits[0].Text, "Timed out") {
+		t.Fatalf("sweep edit body should record a timeout; got %q", edits[0].Text)
+	}
+}
+
+// TestAskRegistry_CapEvictsOldest drives FIX-1's size cap: filling the registry
+// to maxPendingAsks and registering one more evicts the OLDEST entry (smallest
+// createdAt) and best-effort clears its keyboard, while the new ask is retained.
+func TestAskRegistry_CapEvictsOldest(t *testing.T) {
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mfWithTelegram(), fc)
+	defer b.Shutdown()
+
+	key := RouteKey{Channel: "telegram", ChatID: -100, HasTopic: true, TopicID: 5}
+	base := time.Now().Add(-time.Hour)
+
+	// Fill exactly to the cap; the i==0 entry is the oldest (smallest createdAt)
+	// and carries messageID 1 so we can assert the eviction edit targets it.
+	for i := 0; i < maxPendingAsks; i++ {
+		p := &pendingAsk{
+			askID: fmt.Sprintf("cap%05d", i), route: key, question: "Q",
+			options: []string{"A"}, selected: make([]bool, 1), messageID: int64(i + 1),
+			createdAt: base.Add(time.Duration(i) * time.Millisecond),
+		}
+		if !b.registerAsk(p) {
+			t.Fatalf("register %d failed", i)
+		}
+	}
+	if got := fc.editSnapshot(); len(got) != 0 {
+		t.Fatalf("filling to cap must not evict anything; got %d edits", len(got))
+	}
+
+	// One more, over cap → evict the oldest (cap00000, messageID 1).
+	over := &pendingAsk{
+		askID: "capOVER01", route: key, question: "Q2", options: []string{"A"},
+		selected: make([]bool, 1), messageID: 9999, createdAt: time.Now(),
+	}
+	if !b.registerAsk(over) {
+		t.Fatal("over-cap register failed")
+	}
+	if b.Asks.has("cap00000") {
+		t.Fatal("the oldest ask must be evicted when the cap is exceeded")
+	}
+	if !b.Asks.has("capOVER01") {
+		t.Fatal("the new ask must be registered after eviction")
+	}
+	edits := fc.editSnapshot()
+	if len(edits) != 1 {
+		t.Fatalf("eviction must clear exactly one keyboard; got %d edits", len(edits))
+	}
+	if edits[0].MessageID != 1 {
+		t.Fatalf("eviction edit targeted msg %d, want 1 (the oldest)", edits[0].MessageID)
+	}
+	if edits[0].Buttons == nil || len(edits[0].Buttons) != 0 {
+		t.Fatalf("eviction must clear the keyboard via a non-nil empty Buttons; got %+v", edits[0].Buttons)
+	}
+}
+
+// TestHandleAskRegister_RejectsNonKeyboardChannel drives FIX-4's capability gate:
+// handleAskRegister on a channel whose Capabilities report InlineKeyboards=false
+// (the default fakeChannel) replies OK=false with a clear reason and registers no
+// pending ask.
+func TestHandleAskRegister_RejectsNonKeyboardChannel(t *testing.T) {
+	fc := &fakeChannel{} // Capabilities().InlineKeyboards == false
+	b := brokerWithChannel(t, mfWithTelegram(), fc)
+	defer b.Shutdown()
+
+	agentSide, brokerSide := net.Pipe()
+	t.Cleanup(func() { _ = agentSide.Close(); _ = brokerSide.Close() })
+	stub := b.Stubs.Register("claude", 4242, "/work", ipc.NewConn(brokerSide))
+
+	key := RouteKey{Channel: "telegram", ChatID: -100, HasTopic: true, TopicID: 5}
+	if _, ok := b.Routes.Claim(key, stub); !ok {
+		t.Fatal("claim failed")
+	}
+	stub.SetRoute(&key)
+
+	raw, err := json.Marshal(ipc.AskRegisterReq{
+		Op: ipc.OpAskRegister, AskID: "nokbd123", Question: "Pick one", Options: []string{"A", "B"},
+	})
+	if err != nil {
+		t.Fatalf("marshal ask_register: %v", err)
+	}
+
+	// handleAskRegister writes the ack to the broker-side conn; read it from the
+	// agent side. net.Pipe writes block until read, so run the handler in a goroutine.
+	go b.handleAskRegister(ipc.NewConn(brokerSide), stub, raw)
+
+	agentConn := ipc.NewConn(agentSide)
+	done := make(chan ipc.AskRegisteredMsg, 1)
+	go func() {
+		frame, err := agentConn.ReadFrame()
+		if err != nil {
+			close(done)
+			return
+		}
+		var m ipc.AskRegisteredMsg
+		_ = json.Unmarshal(frame, &m)
+		done <- m
+	}()
+
+	select {
+	case m, ok := <-done:
+		if !ok {
+			t.Fatal("no ack frame read from handleAskRegister")
+		}
+		if m.OK {
+			t.Fatalf("a non-keyboard channel must refuse ask register; got OK=true (%+v)", m)
+		}
+		if !strings.Contains(m.Err, "does not support interactive questions") {
+			t.Fatalf("err = %q, want it to name the unsupported-keyboard reason", m.Err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleAskRegister did not reply")
+	}
+	if b.Asks.has("nokbd123") {
+		t.Fatal("a refused ask must not leave a pending entry registered")
 	}
 }
 

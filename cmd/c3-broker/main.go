@@ -41,12 +41,12 @@ var builtinPlugins = []broker.BuiltinPlugin{
 // Exit codes follow BSD sysexits(3) where applicable so shell scripts can
 // branch on the cause. Generic runtime failures still use 1 (EX_GENERIC).
 const (
-	exitOK       = 0  // success
-	exitFailure  = 1  // generic runtime error
-	exitUsage    = 2  // unknown subcommand / malformed args
-	exitDataErr  = 65 // EX_DATAERR — mappings.json invalid
-	exitNoInput  = 66 // EX_NOINPUT — mappings.json missing/unreadable
-	exitConfig   = 78 // EX_CONFIG — config-time failure (setup, install-codex-shim)
+	exitOK      = 0  // success
+	exitFailure = 1  // generic runtime error
+	exitUsage   = 2  // unknown subcommand / malformed args
+	exitDataErr = 65 // EX_DATAERR — mappings.json invalid
+	exitNoInput = 66 // EX_NOINPUT — mappings.json missing/unreadable
+	exitConfig  = 78 // EX_CONFIG — config-time failure (setup, install-codex-shim)
 )
 
 func main() {
@@ -264,6 +264,12 @@ func runDaemon() (err error) {
 	// health.json at its last "up" value (audit health-observability-2). The
 	// goroutine exits on br.Shutdown() (ctx cancel), so it never leaks.
 	br.StartHealthRefresh()
+
+	// Ask reaper: periodically expire stale `ask` round-trips (untapped, or
+	// multi-select toggled-but-never-Done) and best-effort clear their live
+	// keyboards, so an ask can't leak or leave a tappable keyboard past the
+	// adapter's answer timeout (FIX-1). Exits on br.Shutdown() (ctx cancel).
+	br.StartAskReaper()
 
 	if cc, ok := mf.Channels["telegram"]; ok && cc.BotToken != "" {
 		if err := br.RegisterChannel(telegram.New()); err != nil {

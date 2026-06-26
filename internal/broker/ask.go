@@ -5,9 +5,29 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/karthikeyan5/c3/internal/c3types"
 	"github.com/karthikeyan5/c3/internal/ipc"
+)
+
+// Ask-registry lifecycle bounds (FIX-1: no-expiry/no-cap leak + stale live
+// keyboard). An untapped ask (or a multi-select toggled-but-never-Done) used to
+// stay registered forever, leaving its Telegram keyboard live long after the
+// adapter's answer timeout returned — a late tap would then rewrite the message
+// to "✅ <choice>" while the agent already moved on.
+//
+//   - askExpiryTTL: how old an ask may get before the reaper removes it and
+//     best-effort clears its keyboard. MUST exceed the adapter's 600s answer
+//     timeout plus margin so the broker never clears a keyboard the adapter is
+//     still legitimately awaiting (adapter askAnswerTimeout = 600s ⇒ 11 min).
+//   - askSweepInterval: reaper cadence.
+//   - maxPendingAsks: registry size cap; register evicts the oldest entry (and
+//     clears its keyboard) when full, so a flood can't grow the map unbounded.
+const (
+	askExpiryTTL     = 11 * time.Minute
+	askSweepInterval = 1 * time.Minute
+	maxPendingAsks   = 1000
 )
 
 // askCallbackPrefix is the opaque callback_data namespace for `ask` keyboards:
@@ -39,6 +59,12 @@ type pendingAsk struct {
 	allowSkip bool
 	selected  []bool
 	messageID int64
+
+	// createdAt is when the ask was registered, stamped by register (FIX-1). The
+	// reaper expires asks older than askExpiryTTL, and the size cap evicts the
+	// entry with the smallest createdAt. Uses time.Now() — the same clock the rest
+	// of the broker uses (healthfile, pingText).
+	createdAt time.Time
 }
 
 // askRegistry holds the broker's in-flight asks keyed by askID. Mutex-guarded:
@@ -53,17 +79,58 @@ func newAskRegistry() *askRegistry {
 	return &askRegistry{m: map[string]*pendingAsk{}}
 }
 
-// register inserts p. Returns false if askID is already registered (the rare
+// register inserts p, stamping createdAt (if unset) so the reaper / size cap can
+// age it. ok=false (evicted=nil) when askID is already registered (the rare
 // adapter-side collision) so the caller can fail the registration fast rather
-// than clobber a live ask.
-func (r *askRegistry) register(p *pendingAsk) bool {
+// than clobber a live ask. When the registry is at maxPendingAsks it first
+// evicts the OLDEST entry (smallest createdAt) and returns it as `evicted` so the
+// caller can best-effort clear its now-orphaned keyboard (the clear needs a
+// channel edit, which the registry has no handle on — see Broker.registerAsk).
+func (r *askRegistry) register(p *pendingAsk) (evicted *pendingAsk, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, exists := r.m[p.askID]; exists {
-		return false
+		return nil, false
+	}
+	if p.createdAt.IsZero() {
+		p.createdAt = time.Now()
+	}
+	if len(r.m) >= maxPendingAsks {
+		evicted = r.evictOldestLocked()
 	}
 	r.m[p.askID] = p
-	return true
+	return evicted, true
+}
+
+// evictOldestLocked removes and returns the entry with the smallest createdAt.
+// Caller holds r.mu. Returns nil only on an empty map (never the case at the cap).
+func (r *askRegistry) evictOldestLocked() *pendingAsk {
+	var oldest *pendingAsk
+	for _, p := range r.m {
+		if oldest == nil || p.createdAt.Before(oldest.createdAt) {
+			oldest = p
+		}
+	}
+	if oldest != nil {
+		delete(r.m, oldest.askID)
+	}
+	return oldest
+}
+
+// sweepExpired removes and returns every ask older than ttl (createdAt + ttl <=
+// now). Used by the reaper; the caller best-effort clears each returned ask's
+// keyboard.
+func (r *askRegistry) sweepExpired(now time.Time, ttl time.Duration) []*pendingAsk {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var expired []*pendingAsk
+	for id, p := range r.m {
+		if now.Sub(p.createdAt) >= ttl {
+			expired = append(expired, p)
+			delete(r.m, id)
+		}
+	}
+	return expired
 }
 
 // setMessageID records the sent message's id so resolution can edit it.
@@ -408,6 +475,75 @@ func (b *Broker) editAskMessage(route RouteKey, askID string, messageID int64, t
 		log.Printf("ask edit FAIL chan=%s chat=%d topic=%s ask=%s msg=%d: %v",
 			route.Channel, route.ChatID, TopicKeyStr(route), askID, messageID, err)
 	}
+}
+
+// registerAsk registers p in the ask registry and, when the size cap forces an
+// eviction, best-effort clears the evicted (oldest) ask's now-orphaned keyboard
+// (FIX-1). Returns false on an askID collision so the caller fails the
+// registration. The eviction keyboard-clear lives here, not in askRegistry,
+// because clearing requires a channel edit the registry has no handle on.
+func (b *Broker) registerAsk(p *pendingAsk) bool {
+	evicted, ok := b.Asks.register(p)
+	if evicted != nil {
+		log.Printf("ask EVICTED chan=%s chat=%d topic=%s ask=%s reason=cap(max=%d) — clearing keyboard",
+			evicted.route.Channel, evicted.route.ChatID, TopicKeyStr(evicted.route), evicted.askID, maxPendingAsks)
+		b.editAskMessage(evicted.route, evicted.askID, evicted.messageID, askTimedOutText(evicted.question), [][]c3types.Button{})
+	}
+	return ok
+}
+
+// sweepExpiredAsks removes asks older than askExpiryTTL and best-effort clears
+// each one's live keyboard (FIX-1). Called by the reaper (StartAskReaper). Logs
+// the count + per-ask askID/reason, never the question/option text.
+func (b *Broker) sweepExpiredAsks() {
+	if b == nil || b.Asks == nil {
+		return
+	}
+	expired := b.Asks.sweepExpired(time.Now(), askExpiryTTL)
+	if len(expired) == 0 {
+		return
+	}
+	log.Printf("ask sweep: expired %d ask(s) (ttl=%v) — clearing keyboards", len(expired), askExpiryTTL)
+	for _, p := range expired {
+		log.Printf("ask EXPIRED chan=%s chat=%d topic=%s ask=%s reason=ttl",
+			p.route.Channel, p.route.ChatID, TopicKeyStr(p.route), p.askID)
+		b.editAskMessage(p.route, p.askID, p.messageID, askTimedOutText(p.question), [][]c3types.Button{})
+	}
+}
+
+// StartAskReaper launches the background goroutine that periodically expires
+// stale asks (every askSweepInterval) so an untapped / never-Done ask can't leak
+// or leave a live keyboard past the adapter's answer timeout. Mirrors
+// StartHealthRefresh: panic-supervised (recover→log→continue) and stops on the
+// broker context cancel (Shutdown), so it never leaks or crashes the process.
+// Call once, after the broker is constructed.
+func (b *Broker) StartAskReaper() {
+	go func() {
+		t := time.NewTicker(askSweepInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-b.ctx.Done():
+				return
+			case <-t.C:
+				func() {
+					defer recoverGoroutine("askReaper")
+					b.sweepExpiredAsks()
+				}()
+			}
+		}
+	}()
+}
+
+// askTimedOutText renders the post-expiry/eviction body: the original question
+// plus a no-answer notice, so the Telegram view records that nothing was
+// captured after the keyboard clears.
+func askTimedOutText(question string) string {
+	const notice = "⌛ Timed out — no answer recorded"
+	if question == "" {
+		return notice
+	}
+	return question + "\n\n" + notice
 }
 
 // selectedOptions returns the option strings currently toggled on, in option
