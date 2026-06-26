@@ -77,13 +77,13 @@ echo "Building from $SRC_ROOT (1–3 minutes on first run)..."
 cd "$SRC_ROOT" && go install ./cmd/...
 ```
 
-Then verify all five binaries are present:
+Then verify all six binaries are present:
 
 ```bash
 GOBIN_DIR=$(go env GOBIN)
 [ -z "$GOBIN_DIR" ] && GOBIN_DIR=$(go env GOPATH)/bin
 echo "Binaries installed to: $GOBIN_DIR"
-for bin in c3-broker c3-claude-adapter c3-codex-adapter codex migrate-legacy; do
+for bin in c3-broker c3-claude-adapter c3-codex-adapter claude-shim codex migrate-legacy; do
   if [ -x "$GOBIN_DIR/$bin" ]; then
     echo "  ✓ $bin"
   else
