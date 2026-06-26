@@ -159,7 +159,14 @@ type RecoverSessionResp struct {
 	Name        string `json:"name,omitempty"`
 	Group       string `json:"group,omitempty"`
 	QueuedCount int    `json:"queued_count,omitempty"`
-	Err         string `json:"err,omitempty"`
+	// QueuedSummary is a compact preview of the oldest held messages (up to
+	// backlogSummaryMax) on the recovered route — the same shape a normal
+	// attach's AttachedMsg carries. The adapter surfaces these into the resumed
+	// session (sender + kind + preview + total) and instructs the agent to drain
+	// the rest via fetch_queue. Additive + omitempty: nil for an empty queue and
+	// for older brokers.
+	QueuedSummary []QueuedItem `json:"queued_summary,omitempty"`
+	Err           string       `json:"err,omitempty"`
 }
 
 // HelloAckMsg is the broker's response to HelloMsg.

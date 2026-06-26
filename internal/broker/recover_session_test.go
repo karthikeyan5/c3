@@ -5,8 +5,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/karthikeyan5/c3/internal/c3types"
 	"github.com/karthikeyan5/c3/internal/ipc"
 	"github.com/karthikeyan5/c3/internal/mappings"
+	"github.com/karthikeyan5/c3/internal/queue"
 )
 
 // recoverViaPeer runs hello then a RecoverSessionReq over a peer pair and
@@ -54,6 +56,41 @@ func TestHandleRecoverSession_NoRouteRecovers(t *testing.T) {
 	key := MakeRouteKey("telegram", -100, &tid)
 	if _, ok := b.Routes.Holder(key); !ok {
 		t.Fatal("route should be claimed after a successful recover")
+	}
+}
+
+// TestHandleRecoverSession_CarriesBacklogPreview covers BUG #2: a recovered
+// resume must carry a compact backlog PREVIEW (QueuedSummary), not just a count,
+// so the adapter can surface the actual held messages into the resumed session.
+func TestHandleRecoverSession_CarriesBacklogPreview(t *testing.T) {
+	t.Setenv("C3_QUEUE_DIR", t.TempDir())
+	mf := mfWithTelegram()
+	seedSessionAttachment(mf, "sess-1", time.Now().UTC(), false) // → c3 / 281
+	b := brokerWithChannel(t, mf, &fakeChannel{})
+	defer b.Shutdown()
+
+	tid := int64(281)
+	qrk := queue.RouteKey{Channel: "telegram", ChatID: -100, TopicID: &tid}
+	for i := int64(1); i <= 4; i++ {
+		if err := b.Queue.Append(qrk, &c3types.Inbound{
+			Channel: "telegram", ChatID: -100, TopicID: &tid, MessageID: i,
+			Sender: c3types.Sender{Username: "k"}, Text: "held msg", Timestamp: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, done, resp := recoverViaPeer(t, b, "/anywhere", "sess-1")
+	defer done()
+
+	if !resp.Recovered || resp.QueuedCount != 4 {
+		t.Fatalf("expected recovered with 4 queued, got %+v", resp)
+	}
+	if len(resp.QueuedSummary) == 0 {
+		t.Fatal("BUG #2: recover response must carry a backlog preview, not just a count")
+	}
+	if resp.QueuedSummary[0].MessageID != 1 || resp.QueuedSummary[0].Preview == "" {
+		t.Fatalf("first preview item malformed: %+v", resp.QueuedSummary[0])
 	}
 }
 

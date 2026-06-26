@@ -1791,8 +1791,12 @@ func (a *adapter) dispatchRecoverSessionResult(raw []byte) {
 }
 
 // renderRecoverNotice builds the one-shot auto-attach notice. With held backlog
-// it nudges fetch_queue; with none it's a minimal "auto-attached" line. Returns
-// "" only when nothing useful can be said (no name).
+// it ACTIVELY SURFACES the messages — the oldest few (sender + kind + preview)
+// plus the total — and tells the agent to process them, then drain any remainder
+// via fetch_queue (BUG #2: turn the passive "N held, call fetch_queue" count into
+// an actual surfacing so a bare resume with no user turn still gets worked). With
+// no backlog it's a minimal "auto-attached" line. Returns "" only when nothing
+// useful can be said (no name).
 func renderRecoverNotice(resp ipc.RecoverSessionResp) string {
 	name := resp.Name
 	if name == "" {
@@ -1803,8 +1807,20 @@ func renderRecoverNotice(resp ipc.RecoverSessionResp) string {
 		if resp.QueuedCount > 1 {
 			noun = "messages"
 		}
-		return fmt.Sprintf("📨 Auto-attached to %q (resumed session). %d %s held — call `fetch_queue` to retrieve.",
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "📨 Auto-attached to %q (resumed session). %d %s held while no session was attached — process them now, then call `fetch_queue` (limit:\"all\") to drain any remainder:",
 			name, resp.QueuedCount, noun)
+		for _, it := range resp.QueuedSummary {
+			preview := it.Preview
+			if preview == "" {
+				preview = "(" + it.Kind + ")"
+			}
+			fmt.Fprintf(&sb, "\n  • [%d] %s %s: %s", it.MessageID, it.Sender, it.Kind, preview)
+		}
+		if resp.QueuedCount > len(resp.QueuedSummary) {
+			fmt.Fprintf(&sb, "\n  …and %d more", resp.QueuedCount-len(resp.QueuedSummary))
+		}
+		return sb.String()
 	}
 	return fmt.Sprintf("📨 Auto-attached to %q (resumed session). Inbound messages render here as `<channel>` blocks.", name)
 }

@@ -229,6 +229,12 @@ func (b *Broker) handleRecoverSession(conn *ipc.Conn, stub *Stub, raw []byte) {
 			resp.TopicID = &t
 		}
 		resp.QueuedCount = cnt
+		// Carry a compact backlog PREVIEW (not just the count) so the adapter can
+		// SURFACE the held messages into the resumed session — the same data a
+		// normal attach delivers via withBacklog/AttachedMsg (BUG #2). Peek only.
+		if cnt > 0 {
+			_, resp.QueuedSummary = b.backlogSummary(key)
+		}
 		// Name/Group: prefer the recorded attachment, fall back to the topic
 		// registry. DM (no topic) reports name "dm".
 		if sa, ok := b.Mappings().LookupSessionAttachment(req.StableSessionID); ok {
