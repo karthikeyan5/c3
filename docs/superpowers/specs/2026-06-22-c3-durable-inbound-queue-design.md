@@ -161,7 +161,12 @@ When a message is queued because no session is attached, the auto-reply reassure
 
 > 📨 **Held — nothing lost.** No CLI is attached to this topic right now. **{N} message(s) queued** — they'll be delivered when you attach a session here. Send `/status` to check.
 
-Cadence: send on the first queued message, then **at most once per cooldown window** (reuse the existing 5-min `fallbackTracker`) with the *running* count. Messages in between are queued silently — reassure without a reply per voice note.
+Cadence — **two paths, by channel capability** (implemented 2026-06-23, BUG #3 fix; superseded the original cooldown-only rule below):
+
+- **Edit-capable channels (Telegram — the production channel):** the first held inbound **SENDS** the reply and the `fallbackTracker` remembers its `message_id`; every later held inbound for the same route **EDITS that one message in place** to the *running* count (`worker.go` held branch). No cooldown gate, no visible spam, and the count is always live instead of freezing at the first value. The tracked `message_id` is cleared the moment the route goes live again — either a live delivery **or** any session (re)claiming the route via attach/recover (`clearHeldReplyOnClaim`, added 2026-06-25 so the pull-drain resume flow, which never fires a live delivery, still starts the next detach with a fresh held-reply instead of editing a buried one) — so each detach cycle gets its own fresh held-reply.
+- **Channels that cannot edit:** fall back to the original rule — send on the first queued message, then **at most once per cooldown window** (the existing 5-min `fallbackTracker`) with the running count; messages in between are queued silently.
+
+> Original rule (pre-BUG-#3, now applies only to no-edit channels): send on the first queued message, then at most once per cooldown window with the running count. Messages in between are queued silently — reassure without a reply per voice note.
 
 ### 6b. `/status` Telegram command
 A **bot command sent in chat** (distinct from the `/c3:status` CLI slash command — different surface, no conflict). Intercepted in the poll path *before* gating/routing: an inbound whose text is `/status` (or `/status@<botname>`) is handled by the broker directly — it answers and is **never queued or routed to an agent** (its `update_id` is marked *done* in the tracker).
@@ -188,7 +193,7 @@ So the agent natively knows the audio exists, exactly how to fetch it, that it c
 ## Data flow (end to end)
 
 1. **Live (attached, Claude):** update → convert → gate → STT → **append+fsync** → offset eligible → push → adapter Notify → `OpInboundDelivered(ok)` → `Consume` → delete-on-empty.
-2. **No session:** update → … → **append+fsync** → offset eligible → no claim → held-reply (cooldown'd, running count). Message stays in queue.
+2. **No session:** update → … → **append+fsync** → offset eligible → no claim → held-reply (edit-in-place running count on edit-capable channels; cooldown'd running count on no-edit channels — see §6a). Message stays in queue.
 3. **Attach with backlog:** `attach` → claim → attach resp carries `{QueuedCount, QueuedSummary}` → agent sees summary → `fetch_queue(limit:3|all, ack:true)` → worker `Consume`s → cursor advances → delete-on-empty when drained.
 4. **Codex (any):** update → … → append → "N pending" nudge → `fetch_queue` → `Consume`.
 5. **STT failure:** STT chain fails → stored `Text` = self-documenting message → delivered/queued normally → agent may `retranscribe(file_id)` or `download_attachment(file_id)`.
