@@ -21,6 +21,17 @@ func askRequest(t *testing.T, question string, options []string) *mcp.CallToolRe
 	return &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{Arguments: raw}}
 }
 
+// askRequestRaw builds an ask CallToolRequest from an arbitrary args map (so a
+// test can set multi / allow_skip / free_text / allow_other).
+func askRequestRaw(t *testing.T, args map[string]any) *mcp.CallToolRequest {
+	t.Helper()
+	raw, err := json.Marshal(args)
+	if err != nil {
+		t.Fatalf("marshal args: %v", err)
+	}
+	return &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{Arguments: raw}}
+}
+
 func mustMarshal(t *testing.T, v any) []byte {
 	t.Helper()
 	raw, err := json.Marshal(v)
@@ -174,12 +185,124 @@ func TestAskTool_BailsFastOnRegisterFailure(t *testing.T) {
 	}
 }
 
-// TestAskTool_RequiresOptions: Phase 1 is single-select; an ask without options
-// is rejected locally with a clear error (no broker round-trip).
+// TestAskTool_RequiresOptions: an ask without options is rejected locally with a
+// clear error (no broker round-trip) — free-text questions are not yet supported.
 func TestAskTool_RequiresOptions(t *testing.T) {
 	a, _ := adapterWithConn(t)
 	res, _ := a.toolAsk(context.Background(), askRequest(t, "Free text?", nil))
 	if !res.IsError {
-		t.Fatalf("ask without options must be an error in Phase 1; got %q", resultText(t, res))
+		t.Fatalf("ask without options must be an error; got %q", resultText(t, res))
+	}
+}
+
+// TestAskTool_MultiSelect_ReturnsList: an ask with multi:true forwards the flag to
+// the broker and returns the broker's selected list rendered as a comma-joined
+// string (the agent gets a clean value to branch on).
+func TestAskTool_MultiSelect_ReturnsList(t *testing.T) {
+	a, peer := adapterWithConn(t)
+
+	resultCh := make(chan *mcp.CallToolResult, 1)
+	go func() {
+		res, _ := a.toolAsk(context.Background(), askRequestRaw(t, map[string]any{
+			"question": "Pick some", "options": []any{"A", "B", "C"}, "multi": true,
+		}))
+		resultCh <- res
+	}()
+
+	raw, err := peer.ReadFrame()
+	if err != nil {
+		t.Fatalf("read ask_register frame: %v", err)
+	}
+	var reg ipc.AskRegisterReq
+	if err := json.Unmarshal(raw, &reg); err != nil {
+		t.Fatalf("unmarshal ask_register: %v", err)
+	}
+	if !reg.Multi {
+		t.Fatal("multi:true must be forwarded to the broker in AskRegisterReq")
+	}
+
+	a.dispatchAskRegistered(mustMarshal(t, ipc.AskRegisteredMsg{
+		Op: ipc.OpAskRegistered, AskID: reg.AskID, OK: true, MessageID: 5,
+	}))
+	a.dispatchAskResult(mustMarshal(t, ipc.AskResultMsg{
+		Op: ipc.OpAskResult, AskID: reg.AskID, Answer: ipc.AskAnswer{Selected: []string{"A", "C"}},
+	}))
+
+	select {
+	case res := <-resultCh:
+		if res.IsError {
+			t.Fatalf("unexpected tool error: %q", resultText(t, res))
+		}
+		if got := resultText(t, res); got != "A, C" {
+			t.Fatalf("multi result = %q, want %q", got, "A, C")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ask tool did not return after the multi answer was pushed")
+	}
+}
+
+// TestAskTool_Skip_ReturnsSkipped: an ask with allow_skip:true forwards the flag
+// and, when the broker pushes Skipped, the tool reports a skip to the agent.
+func TestAskTool_Skip_ReturnsSkipped(t *testing.T) {
+	a, peer := adapterWithConn(t)
+
+	resultCh := make(chan *mcp.CallToolResult, 1)
+	go func() {
+		res, _ := a.toolAsk(context.Background(), askRequestRaw(t, map[string]any{
+			"question": "Pick or skip", "options": []any{"A", "B"}, "allow_skip": true,
+		}))
+		resultCh <- res
+	}()
+
+	raw, err := peer.ReadFrame()
+	if err != nil {
+		t.Fatalf("read ask_register frame: %v", err)
+	}
+	var reg ipc.AskRegisterReq
+	if err := json.Unmarshal(raw, &reg); err != nil {
+		t.Fatalf("unmarshal ask_register: %v", err)
+	}
+	if !reg.AllowSkip {
+		t.Fatal("allow_skip:true must be forwarded to the broker in AskRegisterReq")
+	}
+
+	a.dispatchAskRegistered(mustMarshal(t, ipc.AskRegisteredMsg{
+		Op: ipc.OpAskRegistered, AskID: reg.AskID, OK: true,
+	}))
+	a.dispatchAskResult(mustMarshal(t, ipc.AskResultMsg{
+		Op: ipc.OpAskResult, AskID: reg.AskID, Answer: ipc.AskAnswer{Skipped: true},
+	}))
+
+	select {
+	case res := <-resultCh:
+		if res.IsError {
+			t.Fatalf("unexpected tool error: %q", resultText(t, res))
+		}
+		if got := strings.ToLower(resultText(t, res)); !strings.Contains(got, "skip") {
+			t.Fatalf("skip result = %q, want it to report a skip", resultText(t, res))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ask tool did not return after the skip was pushed")
+	}
+}
+
+// TestAskTool_RejectsUnsupported: free_text / allow_other are explicitly NOT yet
+// supported; requesting either returns a local tool error without a broker
+// round-trip (so the agent learns it must use single/multi-select).
+func TestAskTool_RejectsUnsupported(t *testing.T) {
+	a, _ := adapterWithConn(t)
+
+	res, _ := a.toolAsk(context.Background(), askRequestRaw(t, map[string]any{
+		"question": "Anything?", "options": []any{"A"}, "free_text": true,
+	}))
+	if !res.IsError {
+		t.Fatalf("free_text must be rejected as not-yet-supported; got %q", resultText(t, res))
+	}
+
+	res2, _ := a.toolAsk(context.Background(), askRequestRaw(t, map[string]any{
+		"question": "Anything?", "options": []any{"A"}, "allow_other": true,
+	}))
+	if !res2.IsError {
+		t.Fatalf("allow_other must be rejected as not-yet-supported; got %q", resultText(t, res2))
 	}
 }

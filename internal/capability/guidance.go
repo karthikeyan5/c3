@@ -121,7 +121,9 @@ func GuidanceFor(c c3types.Capabilities) string {
 		b.WriteString("- Asking a question with choices: use the `ask` tool (question + options). It shows the options\n")
 		b.WriteString("  as buttons and BLOCKS until the human taps one, returning the chosen option as the tool result —\n")
 		b.WriteString("  so use it (NOT the host's AskUserQuestion, NOT a fire-and-forget `reply` with buttons) whenever\n")
-		b.WriteString("  you need the human to pick before you continue.\n")
+		b.WriteString("  you need the human to pick before you continue. Set `multi:true` for multi-select (the human\n")
+		b.WriteString("  toggles options and taps Done; you get the selected list), and `allow_skip:true` to add a Skip\n")
+		b.WriteString("  button. (Free-text / Other questions are not yet supported.)\n")
 	}
 
 	// Reactions (outbound `react` tool).

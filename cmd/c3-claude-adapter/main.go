@@ -1675,9 +1675,16 @@ func (a *adapter) toolAsk(ctx context.Context, req *mcp.CallToolRequest) (*mcp.C
 	if strings.TrimSpace(question) == "" {
 		return toolErrorResult("ask: question is required"), nil
 	}
+	// free_text (no-options questions) and allow_other (an option that opens a
+	// free-text answer) intercept the durable-queue text path and need a product
+	// decision; they are not yet supported. Reject up front (before any broker
+	// round-trip) so the agent learns to use single/multi-select instead.
+	if argBoolField(args, "free_text") || argBoolField(args, "allow_other") {
+		return toolErrorResult("ask: free_text / allow_other are not yet supported (single/multi-select only)"), nil
+	}
 	options := argStringList(args["options"])
 	if len(options) == 0 {
-		return toolErrorResult("ask: at least one option is required (this phase is single-select; free-text / Other / Skip are not yet available)"), nil
+		return toolErrorResult("ask: at least one option is required (single/multi-select; free-text questions are not yet available)"), nil
 	}
 
 	askID := newAskID()
@@ -1686,11 +1693,10 @@ func (a *adapter) toolAsk(ctx context.Context, req *mcp.CallToolRequest) (*mcp.C
 		AskID:    askID,
 		Question: question,
 		Options:  options,
-		// Phase-2-ready: forwarded but currently ignored by the broker.
-		Multi:      argBoolField(args, "multi"),
-		AllowOther: argBoolField(args, "allow_other"),
-		AllowSkip:  argBoolField(args, "allow_skip"),
-		FreeText:   argBoolField(args, "free_text"),
+		// multi / allow_skip are functional (Phase 2); allow_other / free_text are
+		// rejected above and never reach here.
+		Multi:     argBoolField(args, "multi"),
+		AllowSkip: argBoolField(args, "allow_skip"),
 	}
 
 	regCh := make(chan ipc.AskRegisteredMsg, 1)
@@ -1780,9 +1786,13 @@ func (a *adapter) dispatchAskResult(raw []byte) {
 	}
 }
 
-// renderAskAnswer renders an AskAnswer into the tool's text result. Phase 1: a
-// single selected option returns that option verbatim (so the agent gets a clean
-// string to branch on); a timeout returns a recoverable notice.
+// renderAskAnswer renders an AskAnswer into the tool's text result so the agent
+// gets a clean value to branch on:
+//   - single-select  → the chosen option verbatim.
+//   - multi-select   → the selected options comma-joined (e.g. "A, C"); empty when
+//     nothing was selected.
+//   - skip           → a "(skipped)" notice.
+//   - timeout        → a recoverable notice (the agent can re-ask or proceed).
 func renderAskAnswer(ans ipc.AskAnswer) string {
 	switch {
 	case ans.TimedOut:

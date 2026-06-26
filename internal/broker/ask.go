@@ -23,11 +23,21 @@ const askCallbackPrefix = "ask:"
 //
 // options/question are kept so the broker can map the tapped index → option
 // string and re-render the message ("✅ <chosen>") after clearing the keyboard.
+//
+// Phase 2 adds the multi-select / skip taxonomy:
+//   - multi: each option tap TOGGLES selection (selected[idx]) and re-renders the
+//     keyboard in place; a trailing "Done" button resolves with the selected list.
+//   - allowSkip: a trailing "Skip" button resolves with AskAnswer{Skipped:true}.
+//   - selected: per-option selection state, sized to len(options); only meaningful
+//     for a multi ask. Mutated in place (under the registry mutex) on each toggle.
 type pendingAsk struct {
 	askID     string
 	route     RouteKey
 	question  string
 	options   []string
+	multi     bool
+	allowSkip bool
+	selected  []bool
 	messageID int64
 }
 
@@ -92,17 +102,104 @@ func (r *askRegistry) take(askID string) (*pendingAsk, bool) {
 	return p, ok
 }
 
+// askTapResult is the atomic outcome of an option tap ("ask:<id>:<idx>"), decided
+// under the registry mutex by tapIndex.
+//
+//   - match=false              → no live ask on this route with an in-range idx;
+//     the caller falls through to the generic event path.
+//   - match=true, resolved=true  → SINGLE-select ask: REMOVED from the registry.
+//     chosen/question/messageID describe how to deliver + mark-answered the choice.
+//   - match=true, resolved=false → MULTI-select ask: selected[idx] toggled IN PLACE
+//     (the ask stays registered). kb/question/messageID describe the keyboard edit
+//     (text stays the question; kb shows the updated ✓ prefixes + Done/Skip).
+type askTapResult struct {
+	match     bool
+	resolved  bool
+	chosen    string
+	question  string
+	messageID int64
+	kb        [][]c3types.Button
+}
+
+// tapIndex applies an option tap atomically. For a SINGLE-select ask it removes
+// and resolves; for a MULTI-select ask it toggles selected[idx] in place and
+// returns the rebuilt keyboard — WITHOUT removing the ask (so later toggles /
+// Done can still resolve it). All state reads/writes happen under the mutex so a
+// concurrent setMessageID (fast-tap race) cannot data-race the keyboard build.
+func (r *askRegistry) tapIndex(askID string, route RouteKey, idx int) askTapResult {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	p, ok := r.m[askID]
+	if !ok || p.route != route || idx < 0 || idx >= len(p.options) {
+		return askTapResult{}
+	}
+	if p.multi {
+		if idx < len(p.selected) {
+			p.selected[idx] = !p.selected[idx]
+		}
+		return askTapResult{
+			match: true, resolved: false,
+			question: p.question, messageID: p.messageID, kb: askKeyboardFor(p),
+		}
+	}
+	// Single-select: resolve-once — remove it.
+	delete(r.m, askID)
+	return askTapResult{
+		match: true, resolved: true,
+		chosen: p.options[idx], question: p.question, messageID: p.messageID,
+	}
+}
+
+// askDoneSuffix / askSuffixSkip are the reserved non-numeric callback suffixes for
+// the multi-select "Done" and the "Skip" buttons: "ask:<askID>:done" /
+// "ask:<askID>:skip". They can never collide with an option index (which is always
+// a decimal integer), and the askID alphabet (base32) contains no colon, so the
+// LAST colon always separates the suffix.
+const (
+	askDoneSuffix = "done"
+	askSkipSuffix = "skip"
+)
+
 // askKeyboard builds the single-select inline keyboard for an ask: one button
-// per option, each on its own row, callback_data "ask:<askID>:<idx>". The
-// telegram channel enforces the 64-byte callback_data ceiling and the row count;
-// with an 8-char askID the payload is "ask:"+8+":"+digits — comfortably under 64
-// for any deliverable option count.
+// per option, each on its own row, callback_data "ask:<askID>:<idx>". Kept as a
+// thin convenience over askKeyboardFor (single-select = a pendingAsk with no
+// multi/allowSkip) so the format has ONE source of truth.
 func askKeyboard(askID string, options []string) [][]c3types.Button {
-	rows := make([][]c3types.Button, 0, len(options))
-	for i, opt := range options {
+	return askKeyboardFor(&pendingAsk{askID: askID, options: options})
+}
+
+// askKeyboardFor builds the inline keyboard for a pendingAsk, generalizing
+// askKeyboard across the Phase-2 taxonomy:
+//   - one button per option, callback_data "ask:<askID>:<idx>". For a multi ask a
+//     selected option is prefixed with "✓ " so the human sees current selection.
+//   - a trailing "✅ Done" button (callback "ask:<askID>:done") when multi.
+//   - a trailing "⏭ Skip" button (callback "ask:<askID>:skip") when allowSkip.
+//
+// The telegram channel enforces the 64-byte callback_data ceiling and the row
+// count; with an 8-char askID the payload is "ask:"+8+":"+suffix — comfortably
+// under 64 for any deliverable option count.
+func askKeyboardFor(p *pendingAsk) [][]c3types.Button {
+	rows := make([][]c3types.Button, 0, len(p.options)+2)
+	for i, opt := range p.options {
+		label := opt
+		if p.multi && i < len(p.selected) && p.selected[i] {
+			label = "✓ " + opt
+		}
 		rows = append(rows, []c3types.Button{{
-			Text: opt,
-			Data: askCallbackData(askID, i),
+			Text: label,
+			Data: askCallbackData(p.askID, i),
+		}})
+	}
+	if p.multi {
+		rows = append(rows, []c3types.Button{{
+			Text: "✅ Done",
+			Data: askDoneData(p.askID),
+		}})
+	}
+	if p.allowSkip {
+		rows = append(rows, []c3types.Button{{
+			Text: "⏭ Skip",
+			Data: askSkipData(p.askID),
 		}})
 	}
 	return rows
@@ -113,69 +210,171 @@ func askCallbackData(askID string, idx int) string {
 	return askCallbackPrefix + askID + ":" + strconv.Itoa(idx)
 }
 
-// parseAskData parses an "ask:<askID>:<idx>" callback payload. ok=false for any
-// non-ask or malformed payload (so the generic event path proceeds untouched).
-// The Phase-2 "ask:<id>:done" form naturally returns ok=false here (Atoi fails),
-// which is correct for Phase 1 (no Done button exists yet).
-func parseAskData(data string) (askID string, idx int, ok bool) {
+// askDoneData / askSkipData format the multi-select "Done" / "Skip" callbacks.
+func askDoneData(askID string) string { return askCallbackPrefix + askID + ":" + askDoneSuffix }
+func askSkipData(askID string) string { return askCallbackPrefix + askID + ":" + askSkipSuffix }
+
+// askAction is the parsed kind of an "ask:" callback payload.
+type askAction int
+
+const (
+	askActionNone  askAction = iota // not an ask callback (or malformed)
+	askActionIndex                  // "ask:<id>:<idx>" — an option tap
+	askActionDone                   // "ask:<id>:done"  — multi-select resolve
+	askActionSkip                   // "ask:<id>:skip"  — skip resolve
+)
+
+// parseAskCallback parses an "ask:<askID>:<suffix>" callback payload into its
+// (askID, action, idx). The LAST colon separates the suffix (the base32 askID has
+// no colon), so it is robust against any future askID alphabet. action is
+// askActionNone for a non-ask / malformed payload, so the generic event path
+// proceeds untouched. idx is meaningful only for askActionIndex.
+func parseAskCallback(data string) (askID string, action askAction, idx int) {
 	if !strings.HasPrefix(data, askCallbackPrefix) {
-		return "", 0, false
+		return "", askActionNone, 0
 	}
 	rest := data[len(askCallbackPrefix):]
 	sep := strings.LastIndex(rest, ":")
 	if sep <= 0 || sep == len(rest)-1 {
-		return "", 0, false
+		return "", askActionNone, 0
 	}
-	askID = rest[:sep]
-	n, err := strconv.Atoi(rest[sep+1:])
+	id := rest[:sep]
+	suffix := rest[sep+1:]
+	switch suffix {
+	case askDoneSuffix:
+		return id, askActionDone, 0
+	case askSkipSuffix:
+		return id, askActionSkip, 0
+	}
+	n, err := strconv.Atoi(suffix)
 	if err != nil || n < 0 {
-		return "", 0, false
+		return "", askActionNone, 0
 	}
-	return askID, n, true
+	return id, askActionIndex, n
 }
 
-// resolveAsk attempts to resolve a registered ask from an inline-keyboard
-// callback whose Data is "ask:<askID>:<idx>". It returns true when the callback
-// matched a live ask on this route — in which case the caller (flushEvent) must
-// SUPPRESS the generic event (the tap was the answer, not a fresh <channel>
-// event). It returns false for a non-ask payload, an unknown/already-resolved
-// askID, a route mismatch, or an out-of-range index, so the generic path
-// proceeds; the telegram channel has already auto-acked the callback either way,
-// so Telegram stops spinning regardless.
+// parseAskData is the single-select-index view of parseAskCallback, retained for
+// the keyboard round-trip test and any index-only caller. ok=false for a non-ask,
+// malformed, or non-index (done/skip) payload.
+func parseAskData(data string) (askID string, idx int, ok bool) {
+	id, action, n := parseAskCallback(data)
+	if action != askActionIndex {
+		return "", 0, false
+	}
+	return id, n, true
+}
+
+// resolveAsk attempts to resolve (or, for a multi-select toggle, advance) a
+// registered ask from an inline-keyboard callback whose Data is "ask:<askID>:…".
+// It returns true when the callback matched a live ask on this route — in which
+// case the caller (flushEvent) must SUPPRESS the generic event (the tap was the
+// answer/toggle, not a fresh <channel> event). It returns false for a non-ask
+// payload, an unknown/already-resolved askID, a route mismatch, or an out-of-range
+// index, so the generic path proceeds; the telegram channel has already auto-acked
+// the callback either way, so Telegram stops spinning regardless.
 //
-// On a match it (a) pushes an OpAskResult carrying the chosen option to the route
-// holder's conn — the SAME delivery path as OpInbound (survives a same-process
-// broker reconnect via the transferred claim) — and (b) edits the message to mark
-// the choice and CLEAR the keyboard, preventing double answers / stale taps.
+// Three callback forms (parseAskCallback):
+//   - "ask:<id>:<idx>" → single-select resolves immediately; multi-select TOGGLES
+//     selected[idx] and re-renders the keyboard in place (NOT resolved/removed).
+//   - "ask:<id>:done"  → multi-select resolves with the selected option list.
+//   - "ask:<id>:skip"  → resolves with AskAnswer{Skipped:true}.
+//
+// On a resolve it (a) pushes an OpAskResult to the route holder's conn — the SAME
+// delivery path as OpInbound (survives a same-process broker reconnect via the
+// transferred claim) — and (b) edits the message to record the outcome and CLEAR
+// the keyboard, preventing double answers / stale taps.
 func (b *Broker) resolveAsk(route RouteKey, cb *c3types.CallbackEvent) bool {
 	if b == nil || b.Asks == nil || cb == nil {
 		return false
 	}
-	askID, idx, ok := parseAskData(cb.Data)
-	if !ok {
+	askID, action, idx := parseAskCallback(cb.Data)
+	switch action {
+	case askActionIndex:
+		return b.resolveAskIndex(route, askID, idx)
+	case askActionDone:
+		return b.resolveAskDone(route, askID)
+	case askActionSkip:
+		return b.resolveAskSkip(route, askID)
+	default:
 		return false
 	}
+}
+
+// resolveAskIndex handles an option tap. Single-select resolves with the chosen
+// option; multi-select toggles in place and re-renders the keyboard, keeping the
+// ask registered so later toggles / Done can resolve it.
+func (b *Broker) resolveAskIndex(route RouteKey, askID string, idx int) bool {
+	res := b.Asks.tapIndex(askID, route, idx)
+	if !res.match {
+		// Unknown / already-resolved / expired / wrong route / out-of-range.
+		// Already auto-acked by the channel; fall through to the generic path.
+		return false
+	}
+	if !res.resolved {
+		// Multi-select toggle: re-render the keyboard (text stays the question); the
+		// ask stays registered. The keyboard markup changed (✓ toggled) so Telegram
+		// accepts the edit even though the text is unchanged.
+		b.editAskMessage(route, askID, res.messageID, res.question, res.kb)
+		log.Printf("ask TOGGLE chan=%s chat=%d topic=%s ask=%s idx=%d",
+			route.Channel, route.ChatID, TopicKeyStr(route), askID, idx)
+		return true
+	}
+	// Single-select resolve.
+	b.deliverAskResult(route, askID, ipc.AskAnswer{Selected: []string{res.chosen}})
+	b.editAskMessage(route, askID, res.messageID, askAnsweredText(res.question, res.chosen), [][]c3types.Button{})
+	log.Printf("ask RESOLVED chan=%s chat=%d topic=%s ask=%s idx=%d",
+		route.Channel, route.ChatID, TopicKeyStr(route), askID, idx)
+	return true
+}
+
+// resolveAskDone resolves a multi-select ask with the selected option list. (The
+// Done button only renders for a multi ask; for any other ask the selection is
+// empty, which is the correct defensive outcome.)
+func (b *Broker) resolveAskDone(route RouteKey, askID string) bool {
 	p, ok := b.Asks.take(askID)
 	if !ok {
-		// Unknown / already-resolved / expired. Already auto-acked by the channel.
 		return false
 	}
-	// Defense-in-depth: a tap is only honored on the ask's own route, and only for
-	// an in-range option. On either mismatch, re-register so a correct later tap
-	// can still resolve, and fall through to the generic path.
-	if p.route != route || idx < 0 || idx >= len(p.options) {
+	if p.route != route {
 		b.Asks.register(p)
 		return false
 	}
-	chosen := p.options[idx]
+	selected := selectedOptions(p)
+	b.deliverAskResult(route, askID, ipc.AskAnswer{Selected: selected})
+	b.editAskMessage(route, askID, p.messageID, askDoneText(p.question, selected), [][]c3types.Button{})
+	log.Printf("ask RESOLVED(done) chan=%s chat=%d topic=%s ask=%s selected=%d",
+		route.Channel, route.ChatID, TopicKeyStr(route), askID, len(selected))
+	return true
+}
 
-	// Push the answer to the holder adapter (identical to OpInbound delivery).
+// resolveAskSkip resolves an ask with AskAnswer{Skipped:true}.
+func (b *Broker) resolveAskSkip(route RouteKey, askID string) bool {
+	p, ok := b.Asks.take(askID)
+	if !ok {
+		return false
+	}
+	if p.route != route {
+		b.Asks.register(p)
+		return false
+	}
+	b.deliverAskResult(route, askID, ipc.AskAnswer{Skipped: true})
+	b.editAskMessage(route, askID, p.messageID, askSkippedText(p.question), [][]c3types.Button{})
+	log.Printf("ask RESOLVED(skip) chan=%s chat=%d topic=%s ask=%s",
+		route.Channel, route.ChatID, TopicKeyStr(route), askID)
+	return true
+}
+
+// deliverAskResult pushes an OpAskResult to the route holder's conn — identical to
+// OpInbound delivery (survives a same-process broker reconnect via the transferred
+// claim). Best-effort: a disconnected/absent holder is logged, not fatal (the tool
+// call will time out and recover).
+func (b *Broker) deliverAskResult(route RouteKey, askID string, answer ipc.AskAnswer) {
 	if holder, claimed := b.Routes.Holder(route); claimed {
 		if conn, ok := holder.ConnValue().(*ipc.Conn); ok && conn != nil {
 			if err := conn.WriteJSON(ipc.AskResultMsg{
 				Op:     ipc.OpAskResult,
 				AskID:  askID,
-				Answer: ipc.AskAnswer{Selected: []string{chosen}},
+				Answer: answer,
 			}); err != nil {
 				log.Printf("ask deliver FAIL chan=%s chat=%d topic=%s ask=%s: %v",
 					route.Channel, route.ChatID, TopicKeyStr(route), askID, err)
@@ -188,34 +387,69 @@ func (b *Broker) resolveAsk(route RouteKey, cb *c3types.CallbackEvent) bool {
 		log.Printf("ask deliver DROP chan=%s chat=%d topic=%s ask=%s: no live holder — answer not delivered",
 			route.Channel, route.ChatID, TopicKeyStr(route), askID)
 	}
-
-	// Mark the message answered + clear the keyboard (best-effort: a failed edit
-	// must not block the answer that was already delivered). A non-nil EMPTY
-	// Buttons clears the inline keyboard (see EditMessage).
-	if ch, err := b.Channel(route.Channel); err == nil {
-		if _, err := ch.EditMessage(c3types.EditArgs{
-			Channel:   route.Channel,
-			ChatID:    route.ChatID,
-			MessageID: p.messageID,
-			Text:      askAnsweredText(p.question, chosen),
-			Buttons:   [][]c3types.Button{}, // non-nil empty → clears the keyboard
-		}); err != nil {
-			log.Printf("ask edit FAIL chan=%s chat=%d topic=%s ask=%s msg=%d: %v",
-				route.Channel, route.ChatID, TopicKeyStr(route), askID, p.messageID, err)
-		}
-	}
-
-	log.Printf("ask RESOLVED chan=%s chat=%d topic=%s ask=%s idx=%d",
-		route.Channel, route.ChatID, TopicKeyStr(route), askID, idx)
-	return true
 }
 
-// askAnsweredText renders the post-answer message body: the original question
-// followed by a checkmark line naming the chosen option, so the Telegram view
-// records what was picked after the keyboard is cleared.
+// editAskMessage edits the ask's Telegram message to text + buttons. Best-effort:
+// a failed edit must not block an answer that was already delivered. A non-nil
+// EMPTY buttons slice clears the inline keyboard (see EditMessage); a non-empty
+// slice re-renders it (multi-select toggle).
+func (b *Broker) editAskMessage(route RouteKey, askID string, messageID int64, text string, buttons [][]c3types.Button) {
+	ch, err := b.Channel(route.Channel)
+	if err != nil {
+		return
+	}
+	if _, err := ch.EditMessage(c3types.EditArgs{
+		Channel:   route.Channel,
+		ChatID:    route.ChatID,
+		MessageID: messageID,
+		Text:      text,
+		Buttons:   buttons,
+	}); err != nil {
+		log.Printf("ask edit FAIL chan=%s chat=%d topic=%s ask=%s msg=%d: %v",
+			route.Channel, route.ChatID, TopicKeyStr(route), askID, messageID, err)
+	}
+}
+
+// selectedOptions returns the option strings currently toggled on, in option
+// order. Empty (nil) when nothing is selected — a valid multi-select Done result.
+func selectedOptions(p *pendingAsk) []string {
+	var out []string
+	for i, sel := range p.selected {
+		if sel && i < len(p.options) {
+			out = append(out, p.options[i])
+		}
+	}
+	return out
+}
+
+// askAnsweredText renders the post-answer message body for a single-select
+// resolve: the original question followed by a checkmark line naming the chosen
+// option, so the Telegram view records what was picked after the keyboard clears.
 func askAnsweredText(question, chosen string) string {
 	if question == "" {
 		return "✅ " + chosen
 	}
 	return question + "\n\n✅ " + chosen
+}
+
+// askDoneText renders the post-answer body for a multi-select Done resolve: the
+// question followed by a checkmark line listing the selected options (or a
+// "(none selected)" note for an empty selection).
+func askDoneText(question string, selected []string) string {
+	line := "✅ (none selected)"
+	if len(selected) > 0 {
+		line = "✅ " + strings.Join(selected, ", ")
+	}
+	if question == "" {
+		return line
+	}
+	return question + "\n\n" + line
+}
+
+// askSkippedText renders the post-answer body for a Skip resolve.
+func askSkippedText(question string) string {
+	if question == "" {
+		return "⏭ Skipped"
+	}
+	return question + "\n\n⏭ Skipped"
 }

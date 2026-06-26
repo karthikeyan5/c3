@@ -135,13 +135,19 @@ func PollToolSchema() map[string]any {
 	}
 }
 
-// AskToolSchema is the JSON-schema for the blocking `ask` tool (Phase 1:
-// single-select). The agent supplies a `question` and a non-empty `options`
-// array; C3 renders the question on the channel with one inline-keyboard button
-// per option and BLOCKS until the human taps one — the chosen option string is
-// returned as the tool result. The multi / allow_other / allow_skip / free_text
-// flags are accepted but IGNORED in Phase 1 (reserved for the Phase 2 taxonomy)
-// so an agent that sets them does not error. Mirrors PollToolSchema's shape.
+// AskToolSchema is the JSON-schema for the blocking `ask` tool. The agent supplies
+// a `question` and a non-empty `options` array; C3 renders the question on the
+// channel with one inline-keyboard button per option and BLOCKS until the human
+// answers — the answer is returned as the tool result.
+//
+//   - single-select (default): the chosen option string.
+//   - multi (multi-select): each option toggles a ✓; a trailing "Done" button
+//     resolves with the comma-joined list of selected options.
+//   - allow_skip: adds a trailing "Skip" button that resolves with a skip notice.
+//
+// allow_other / free_text are accepted but NOT yet supported — the tool returns an
+// error if either is true (free-text answers intercept the durable-queue text path
+// and need a product decision). Mirrors PollToolSchema's shape.
 func AskToolSchema() map[string]any {
 	return map[string]any{
 		"type": "object",
@@ -153,12 +159,12 @@ func AskToolSchema() map[string]any {
 			"options": map[string]any{
 				"type":        "array",
 				"items":       map[string]any{"type": "string"},
-				"description": "The choices — rendered one inline-keyboard button each. Required and non-empty in Phase 1 (single-select).",
+				"description": "The choices — rendered one inline-keyboard button each. Required and non-empty.",
 			},
-			"multi":       map[string]any{"type": "boolean", "description": "Reserved (Phase 2 multi-select); accepted but ignored for now."},
-			"allow_other": map[string]any{"type": "boolean", "description": "Reserved (Phase 2 free-text 'Other'); accepted but ignored for now."},
-			"allow_skip":  map[string]any{"type": "boolean", "description": "Reserved (Phase 2 'Skip'); accepted but ignored for now."},
-			"free_text":   map[string]any{"type": "boolean", "description": "Reserved (Phase 2 free-text answers); accepted but ignored for now."},
+			"multi":       map[string]any{"type": "boolean", "description": "Multi-select: each option toggles a ✓ and a 'Done' button resolves with the selected list. Default false (single-select)."},
+			"allow_skip":  map[string]any{"type": "boolean", "description": "Add a 'Skip' button that lets the human decline to answer. Default false."},
+			"allow_other": map[string]any{"type": "boolean", "description": "NOT yet supported (free-text 'Other'); setting true returns an error."},
+			"free_text":   map[string]any{"type": "boolean", "description": "NOT yet supported (free-text answers); setting true returns an error."},
 		},
 		"required": []string{"question", "options"},
 	}

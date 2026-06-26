@@ -103,6 +103,242 @@ func TestResolveAsk_SingleSelect(t *testing.T) {
 	}
 }
 
+// askKeyboardHasButton reports whether any button in the keyboard has the exact
+// text. Used by the multi-select / skip keyboard assertions below.
+func askKeyboardHasButton(rows [][]c3types.Button, text string) bool {
+	for _, row := range rows {
+		for _, b := range row {
+			if b.Text == text {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestResolveAsk_MultiSelect_ToggleThenDone drives the multi-select path: each
+// option tap TOGGLES selection (editing the keyboard in place WITHOUT removing
+// the ask), and a trailing "Done" tap resolves with the selected option list.
+// Toggling idx0 on, idx2 on, then idx0 off leaves {C}; Done resolves Selected=[C].
+func TestResolveAsk_MultiSelect_ToggleThenDone(t *testing.T) {
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mfWithTelegram(), fc)
+	defer b.Shutdown()
+
+	agentSide, brokerSide := net.Pipe()
+	t.Cleanup(func() { _ = agentSide.Close(); _ = brokerSide.Close() })
+	agentConn := ipc.NewConn(agentSide)
+	stub := b.Stubs.Register("claude", 4242, "/work", ipc.NewConn(brokerSide))
+
+	key := RouteKey{Channel: "telegram", ChatID: -100, HasTopic: true, TopicID: 5}
+	if _, ok := b.Routes.Claim(key, stub); !ok {
+		t.Fatal("claim failed")
+	}
+	stub.SetRoute(&key)
+
+	options := []string{"A", "B", "C"}
+	b.Asks.register(&pendingAsk{
+		askID: "multi1234", route: key, question: "Pick some", options: options,
+		multi: true, selected: make([]bool, len(options)), messageID: 77,
+	})
+
+	// Toggle idx0 ON — handled (true), keyboard edited, ask still registered, NO answer pushed.
+	if !b.resolveAsk(key, &c3types.CallbackEvent{Data: "ask:multi1234:0", MessageID: 77}) {
+		t.Fatal("a multi-select option tap must be handled (return true) to suppress the generic event")
+	}
+	if !b.Asks.has("multi1234") {
+		t.Fatal("a toggle must NOT remove the ask from the registry")
+	}
+	// Toggle idx2 ON.
+	if !b.resolveAsk(key, &c3types.CallbackEvent{Data: "ask:multi1234:2", MessageID: 77}) {
+		t.Fatal("second toggle must be handled")
+	}
+	// Toggle idx0 OFF.
+	if !b.resolveAsk(key, &c3types.CallbackEvent{Data: "ask:multi1234:0", MessageID: 77}) {
+		t.Fatal("toggle-off must be handled")
+	}
+	if !b.Asks.has("multi1234") {
+		t.Fatal("the ask must remain registered through every toggle, until Done")
+	}
+
+	// One EditMessage per toggle; the latest keyboard reflects {C} and keeps the question.
+	edits := fc.editSnapshot()
+	if len(edits) != 3 {
+		t.Fatalf("expected one EditMessage per toggle (3), got %d", len(edits))
+	}
+	last := edits[len(edits)-1]
+	if last.Text != "Pick some" {
+		t.Fatalf("a toggle edit must keep the question as the message text, got %q", last.Text)
+	}
+	if last.Buttons == nil {
+		t.Fatal("a toggle edit must carry a rebuilt keyboard")
+	}
+	if !askKeyboardHasButton(last.Buttons, "✓ C") {
+		t.Fatalf("selected option C must show a ✓ prefix; keyboard=%+v", last.Buttons)
+	}
+	if !askKeyboardHasButton(last.Buttons, "A") || askKeyboardHasButton(last.Buttons, "✓ A") {
+		t.Fatalf("unselected option A must NOT show a ✓ prefix; keyboard=%+v", last.Buttons)
+	}
+	if !askKeyboardHasButton(last.Buttons, "✅ Done") {
+		t.Fatalf("a multi keyboard must carry a Done button; keyboard=%+v", last.Buttons)
+	}
+
+	// Read the holder push BEFORE Done (net.Pipe write blocks until read).
+	done := make(chan ipc.AskResultMsg, 1)
+	go func() {
+		raw, err := agentConn.ReadFrame()
+		if err != nil {
+			close(done)
+			return
+		}
+		var m ipc.AskResultMsg
+		_ = json.Unmarshal(raw, &m)
+		done <- m
+	}()
+
+	// Done resolves with the selected list and removes the ask.
+	if !b.resolveAsk(key, &c3types.CallbackEvent{Data: "ask:multi1234:done", MessageID: 77}) {
+		t.Fatal("Done must resolve a multi-select ask")
+	}
+	select {
+	case m, ok := <-done:
+		if !ok {
+			t.Fatal("holder conn read failed before an OpAskResult was pushed")
+		}
+		if m.Op != ipc.OpAskResult || m.AskID != "multi1234" {
+			t.Fatalf("pushed msg = %+v, want OpAskResult for multi1234", m)
+		}
+		if len(m.Answer.Selected) != 1 || m.Answer.Selected[0] != "C" {
+			t.Fatalf("resolved answer = %+v, want Selected=[C]", m.Answer)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no OpAskResult pushed on Done")
+	}
+	if b.Asks.has("multi1234") {
+		t.Fatal("Done must remove the ask from the registry")
+	}
+	// Done edits once more, clearing the keyboard (non-nil empty Buttons).
+	edits = fc.editSnapshot()
+	if len(edits) != 4 {
+		t.Fatalf("expected a 4th edit on Done (clear keyboard), got %d", len(edits))
+	}
+	if edits[3].Buttons == nil || len(edits[3].Buttons) != 0 {
+		t.Fatalf("Done must clear the keyboard via a non-nil empty Buttons; got %+v", edits[3].Buttons)
+	}
+}
+
+// TestResolveAsk_Skip drives the Skip path: an "ask:<id>:skip" tap resolves the
+// ask with AskAnswer{Skipped:true}, removes it, and clears the keyboard.
+func TestResolveAsk_Skip(t *testing.T) {
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mfWithTelegram(), fc)
+	defer b.Shutdown()
+
+	agentSide, brokerSide := net.Pipe()
+	t.Cleanup(func() { _ = agentSide.Close(); _ = brokerSide.Close() })
+	agentConn := ipc.NewConn(agentSide)
+	stub := b.Stubs.Register("claude", 4242, "/work", ipc.NewConn(brokerSide))
+
+	key := RouteKey{Channel: "telegram", ChatID: -100, HasTopic: true, TopicID: 5}
+	if _, ok := b.Routes.Claim(key, stub); !ok {
+		t.Fatal("claim failed")
+	}
+	stub.SetRoute(&key)
+
+	b.Asks.register(&pendingAsk{
+		askID: "skip1234", route: key, question: "Pick or skip", options: []string{"A", "B"},
+		allowSkip: true, selected: make([]bool, 2), messageID: 88,
+	})
+
+	done := make(chan ipc.AskResultMsg, 1)
+	go func() {
+		raw, err := agentConn.ReadFrame()
+		if err != nil {
+			close(done)
+			return
+		}
+		var m ipc.AskResultMsg
+		_ = json.Unmarshal(raw, &m)
+		done <- m
+	}()
+
+	if !b.resolveAsk(key, &c3types.CallbackEvent{Data: "ask:skip1234:skip", MessageID: 88}) {
+		t.Fatal("a skip tap must resolve the ask")
+	}
+	select {
+	case m, ok := <-done:
+		if !ok {
+			t.Fatal("holder conn read failed before an OpAskResult was pushed")
+		}
+		if m.Op != ipc.OpAskResult || m.AskID != "skip1234" {
+			t.Fatalf("pushed msg = %+v, want OpAskResult for skip1234", m)
+		}
+		if !m.Answer.Skipped {
+			t.Fatalf("skip answer must set Skipped=true, got %+v", m.Answer)
+		}
+		if len(m.Answer.Selected) != 0 {
+			t.Fatalf("skip answer must carry no selection, got %+v", m.Answer)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no OpAskResult pushed on skip")
+	}
+	if b.Asks.has("skip1234") {
+		t.Fatal("skip must remove the ask from the registry")
+	}
+	edits := fc.editSnapshot()
+	if len(edits) != 1 || edits[0].MessageID != 88 {
+		t.Fatalf("skip must edit the message once (msg 88); got %+v", edits)
+	}
+	if edits[0].Buttons == nil || len(edits[0].Buttons) != 0 {
+		t.Fatalf("skip must clear the keyboard via a non-nil empty Buttons; got %+v", edits[0].Buttons)
+	}
+}
+
+// TestAskKeyboardFor_MultiAndSkip pins the generalized keyboard builder: a multi
+// ask renders ✓ prefixes for selected options plus a Done button, allow_skip adds
+// a Skip button, and every callback_data parses back and stays within the cap.
+func TestAskKeyboardFor_MultiAndSkip(t *testing.T) {
+	p := &pendingAsk{
+		askID: "kbd23456", options: []string{"A", "B", "C"},
+		multi: true, allowSkip: true, selected: []bool{false, true, false},
+	}
+	rows := askKeyboardFor(p)
+	// 3 options + Done + Skip = 5 rows.
+	if len(rows) != 5 {
+		t.Fatalf("expected 5 rows (3 options + Done + Skip), got %d", len(rows))
+	}
+	if !askKeyboardHasButton(rows, "A") || askKeyboardHasButton(rows, "✓ A") {
+		t.Fatalf("unselected A must have no ✓; rows=%+v", rows)
+	}
+	if !askKeyboardHasButton(rows, "✓ B") {
+		t.Fatalf("selected B must show ✓; rows=%+v", rows)
+	}
+	if !askKeyboardHasButton(rows, "✅ Done") {
+		t.Fatalf("multi keyboard must carry a Done button; rows=%+v", rows)
+	}
+	if !askKeyboardHasButton(rows, "⏭ Skip") {
+		t.Fatalf("allow_skip keyboard must carry a Skip button; rows=%+v", rows)
+	}
+	for _, row := range rows {
+		for _, btn := range row {
+			if len(btn.Data) > 64 {
+				t.Fatalf("callback_data %q is %d bytes, over Telegram's 64-byte cap", btn.Data, len(btn.Data))
+			}
+			id, action, _ := parseAskCallback(btn.Data)
+			if id != "kbd23456" || action == askActionNone {
+				t.Fatalf("button data %q did not parse to a valid ask action (got id=%q action=%v)", btn.Data, id, action)
+			}
+		}
+	}
+	// The Done / Skip callbacks parse to their distinct actions.
+	if _, action, _ := parseAskCallback(askDoneData("kbd23456")); action != askActionDone {
+		t.Fatalf("done callback parsed to action %v, want Done", action)
+	}
+	if _, action, _ := parseAskCallback(askSkipData("kbd23456")); action != askActionSkip {
+		t.Fatalf("skip callback parsed to action %v, want Skip", action)
+	}
+}
+
 // TestAskKeyboard_RoundTripsThroughParse pins the broker's keyboard builder
 // against its own parser: every button askKeyboard produces must parse back to
 // the right (askID, idx), and at the max single-select option count each

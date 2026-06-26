@@ -204,7 +204,8 @@ func (b *Broker) handleToolCall(conn *ipc.Conn, stub *Stub, raw []byte) {
 }
 
 // handleAskRegister registers a blocking, correlated `ask`, sends the question to
-// the stub's claimed route with a single-select inline keyboard, and replies with
+// the stub's claimed route with an inline keyboard (single- or multi-select, with
+// an optional Skip button per the req flags), and replies with
 // a SYNCHRONOUS OpAskRegistered ack. The ANSWER is pushed later as an unsolicited
 // OpAskResult when the human taps (resolveAsk, worker.go) — this handler does NOT
 // block on it (mirrors OpInbound delivery, not the inline handleToolCall wait).
@@ -235,11 +236,12 @@ func (b *Broker) handleAskRegister(conn *ipc.Conn, stub *Stub, raw []byte) {
 		})
 		return
 	}
-	// Phase 1 is single-select: options are required and non-empty.
+	// Single- and multi-select both require a non-empty option list (free-text /
+	// Other are not yet supported; the adapter rejects them before this point).
 	if len(req.Options) == 0 {
 		_ = conn.WriteJSON(ipc.AskRegisteredMsg{
 			Op: ipc.OpAskRegistered, AskID: req.AskID, OK: false,
-			Err: "ask: at least one option is required (single-select)",
+			Err: "ask: at least one option is required (single/multi-select)",
 		})
 		return
 	}
@@ -253,8 +255,13 @@ func (b *Broker) handleAskRegister(conn *ipc.Conn, stub *Stub, raw []byte) {
 	}
 
 	// Register BEFORE the send so a human who taps before the sendMessage
-	// round-trip returns still finds a live ask to resolve.
-	p := &pendingAsk{askID: req.AskID, route: *route, question: req.Question, options: req.Options}
+	// round-trip returns still finds a live ask to resolve. Phase 2 carries the
+	// multi / allow_skip flags + per-option selection state (sized to the option
+	// list) so toggles and the Done/Skip buttons resolve correctly.
+	p := &pendingAsk{
+		askID: req.AskID, route: *route, question: req.Question, options: req.Options,
+		multi: req.Multi, allowSkip: req.AllowSkip, selected: make([]bool, len(req.Options)),
+	}
 	if !b.Asks.register(p) {
 		_ = conn.WriteJSON(ipc.AskRegisteredMsg{
 			Op: ipc.OpAskRegistered, AskID: req.AskID, OK: false,
@@ -273,7 +280,7 @@ func (b *Broker) handleAskRegister(conn *ipc.Conn, stub *Stub, raw []byte) {
 		ChatID:  route.ChatID,
 		TopicID: topicID,
 		Text:    req.Question,
-		Buttons: askKeyboard(req.AskID, req.Options),
+		Buttons: askKeyboardFor(p),
 	})
 	if err != nil {
 		// Send failed (oversized keyboard / Telegram error) — drop the pending and
