@@ -24,6 +24,8 @@ type fakeChannel struct {
 	createCalls     []createCall
 	validateCalls   []validateCall
 	replyCalls      []c3types.ReplyArgs
+	editCalls       []c3types.EditArgs
+	sendReplyErr    error
 	createReturnID  int64
 	createReturnErr error
 	validateErr     error
@@ -48,6 +50,9 @@ func (f *fakeChannel) SendReply(args c3types.ReplyArgs) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.replyCalls = append(f.replyCalls, args)
+	if f.sendReplyErr != nil {
+		return 0, f.sendReplyErr
+	}
 	return 0, nil
 }
 func (f *fakeChannel) sendRepliesSnapshot() []c3types.ReplyArgs {
@@ -58,8 +63,18 @@ func (f *fakeChannel) sendRepliesSnapshot() []c3types.ReplyArgs {
 	return out
 }
 func (f *fakeChannel) SendTyping(int64, *int64) error { return nil }
-func (f *fakeChannel) EditMessage(c3types.EditArgs) (*c3types.EditResult, error) {
-	return &c3types.EditResult{}, nil
+func (f *fakeChannel) EditMessage(args c3types.EditArgs) (*c3types.EditResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.editCalls = append(f.editCalls, args)
+	return &c3types.EditResult{MessageID: args.MessageID}, nil
+}
+func (f *fakeChannel) editSnapshot() []c3types.EditArgs {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]c3types.EditArgs, len(f.editCalls))
+	copy(out, f.editCalls)
+	return out
 }
 func (f *fakeChannel) React(c3types.ReactArgs) error             { return nil }
 func (f *fakeChannel) DownloadAttachment(string) (string, error) { return "", nil }

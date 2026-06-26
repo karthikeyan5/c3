@@ -252,6 +252,17 @@ type EditArgs struct {
 	MessageID int64
 	Text      string
 	Markup    Markup
+
+	// Buttons replaces the message's inline keyboard (same rows-of-buttons shape
+	// as Outbound.Buttons). Semantics:
+	//   - nil  → leave the existing keyboard UNTOUCHED (back-compat: edit_progress
+	//     / placeholder edits never carry buttons and must not strip one).
+	//   - non-nil EMPTY (`[][]Button{}`) → CLEAR the keyboard (Telegram removes it
+	//     when sent an empty inline_keyboard). This is how the `ask` round-trip
+	//     drops the buttons once the question is answered.
+	//   - non-empty → set that keyboard.
+	// A channel without inline-keyboard support ignores this field.
+	Buttons [][]Button `json:",omitempty"`
 }
 
 // EditResult is returned from Channel.EditMessage. MessageID echoes

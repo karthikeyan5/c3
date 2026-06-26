@@ -472,6 +472,20 @@ func (w *RouteWorker) flushEvent(ctx context.Context, ev *c3types.Inbound) {
 	if w.broker == nil || ev == nil {
 		return
 	}
+	// Ask round-trip resolution (Phase 1): an inline-keyboard callback whose data
+	// is "ask:<askID>:<idx>" resolves a registered blocking ask — resolveAsk pushes
+	// the chosen option to the holder as an OpAskResult and clears the keyboard. On
+	// a match we SUPPRESS the generic event entirely (the tap was the answer, not a
+	// fresh <channel> event, and plugins should not observe it). A tap for an
+	// unknown/already-resolved ask returns false and falls through to the normal
+	// event path; the channel already auto-acked it either way.
+	if ev.Kind == c3types.InboundCallback && ev.Event != nil && ev.Event.Callback != nil {
+		if cb := ev.Event.Callback; strings.HasPrefix(cb.Data, askCallbackPrefix) {
+			if w.broker.resolveAsk(w.key, cb) {
+				return
+			}
+		}
+	}
 	if w.broker.Plugins != nil {
 		next := w.broker.Plugins.FireOnInbound(ctx, ev)
 		if next == nil {

@@ -135,6 +135,35 @@ func PollToolSchema() map[string]any {
 	}
 }
 
+// AskToolSchema is the JSON-schema for the blocking `ask` tool (Phase 1:
+// single-select). The agent supplies a `question` and a non-empty `options`
+// array; C3 renders the question on the channel with one inline-keyboard button
+// per option and BLOCKS until the human taps one — the chosen option string is
+// returned as the tool result. The multi / allow_other / allow_skip / free_text
+// flags are accepted but IGNORED in Phase 1 (reserved for the Phase 2 taxonomy)
+// so an agent that sets them does not error. Mirrors PollToolSchema's shape.
+func AskToolSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"question": map[string]any{
+				"type":        "string",
+				"description": "The question to ask the human.",
+			},
+			"options": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "string"},
+				"description": "The choices — rendered one inline-keyboard button each. Required and non-empty in Phase 1 (single-select).",
+			},
+			"multi":       map[string]any{"type": "boolean", "description": "Reserved (Phase 2 multi-select); accepted but ignored for now."},
+			"allow_other": map[string]any{"type": "boolean", "description": "Reserved (Phase 2 free-text 'Other'); accepted but ignored for now."},
+			"allow_skip":  map[string]any{"type": "boolean", "description": "Reserved (Phase 2 'Skip'); accepted but ignored for now."},
+			"free_text":   map[string]any{"type": "boolean", "description": "Reserved (Phase 2 free-text answers); accepted but ignored for now."},
+		},
+		"required": []string{"question", "options"},
+	}
+}
+
 // StopPollToolSchema is the JSON-schema for the `stop_poll` tool (P4). It
 // force-closes a bot-sent poll and returns its final aggregate tally — the
 // deterministic read path, since the passive poll-result event only arrives when

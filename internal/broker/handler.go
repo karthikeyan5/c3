@@ -136,6 +136,8 @@ func (b *Broker) HandleConn(nc net.Conn) {
 			stub.SetRoute(nil)
 		case ipc.OpToolCall:
 			b.handleToolCall(conn, stub, raw)
+		case ipc.OpAskRegister:
+			b.handleAskRegister(conn, stub, raw)
 		case ipc.OpFetchQueue:
 			b.handleFetchQueue(conn, stub, raw)
 		case ipc.OpRetranscribe:
@@ -199,6 +201,96 @@ func (b *Broker) handleToolCall(conn *ipc.Conn, stub *Stub, raw []byte) {
 		resp.Result = res.Result
 	}
 	_ = conn.WriteJSON(resp)
+}
+
+// handleAskRegister registers a blocking, correlated `ask`, sends the question to
+// the stub's claimed route with a single-select inline keyboard, and replies with
+// a SYNCHRONOUS OpAskRegistered ack. The ANSWER is pushed later as an unsolicited
+// OpAskResult when the human taps (resolveAsk, worker.go) — this handler does NOT
+// block on it (mirrors OpInbound delivery, not the inline handleToolCall wait).
+//
+// Route resolution mirrors handleToolCall: AskRegisterReq carries no route, so it
+// is derived from stub.CurrentRoute(); a nil route returns OK=false fast. The
+// pendingAsk is registered BEFORE the send (fast-tap race), and removed on a send
+// error so the tool call returns immediately rather than after the answer timeout.
+func (b *Broker) handleAskRegister(conn *ipc.Conn, stub *Stub, raw []byte) {
+	var req ipc.AskRegisterReq
+	if err := json.Unmarshal(raw, &req); err != nil {
+		_ = conn.WriteJSON(ipc.AskRegisteredMsg{
+			Op: ipc.OpAskRegistered, OK: false, Err: "malformed ask_register: " + err.Error(),
+		})
+		return
+	}
+	if req.AskID == "" {
+		_ = conn.WriteJSON(ipc.AskRegisteredMsg{
+			Op: ipc.OpAskRegistered, OK: false, Err: "ask_register: missing ask id",
+		})
+		return
+	}
+	route := stub.CurrentRoute()
+	if route == nil {
+		_ = conn.WriteJSON(ipc.AskRegisteredMsg{
+			Op: ipc.OpAskRegistered, AskID: req.AskID, OK: false,
+			Err: "ask before attach: no route claimed",
+		})
+		return
+	}
+	// Phase 1 is single-select: options are required and non-empty.
+	if len(req.Options) == 0 {
+		_ = conn.WriteJSON(ipc.AskRegisteredMsg{
+			Op: ipc.OpAskRegistered, AskID: req.AskID, OK: false,
+			Err: "ask: at least one option is required (single-select)",
+		})
+		return
+	}
+	ch, err := b.Channel(route.Channel)
+	if err != nil {
+		_ = conn.WriteJSON(ipc.AskRegisteredMsg{
+			Op: ipc.OpAskRegistered, AskID: req.AskID, OK: false,
+			Err: fmt.Sprintf("channel lookup: %v", err),
+		})
+		return
+	}
+
+	// Register BEFORE the send so a human who taps before the sendMessage
+	// round-trip returns still finds a live ask to resolve.
+	p := &pendingAsk{askID: req.AskID, route: *route, question: req.Question, options: req.Options}
+	if !b.Asks.register(p) {
+		_ = conn.WriteJSON(ipc.AskRegisteredMsg{
+			Op: ipc.OpAskRegistered, AskID: req.AskID, OK: false,
+			Err: "ask id collision — retry",
+		})
+		return
+	}
+
+	var topicID *int64
+	if route.HasTopic {
+		t := route.TopicID
+		topicID = &t
+	}
+	msgID, err := ch.SendReply(c3types.ReplyArgs{
+		Channel: route.Channel,
+		ChatID:  route.ChatID,
+		TopicID: topicID,
+		Text:    req.Question,
+		Buttons: askKeyboard(req.AskID, req.Options),
+	})
+	if err != nil {
+		// Send failed (oversized keyboard / Telegram error) — drop the pending and
+		// return fast so the tool errors immediately, not after the answer timeout.
+		b.Asks.delete(req.AskID)
+		_ = conn.WriteJSON(ipc.AskRegisteredMsg{
+			Op: ipc.OpAskRegistered, AskID: req.AskID, OK: false,
+			Err: fmt.Sprintf("ask send failed: %v", err),
+		})
+		return
+	}
+	b.Asks.setMessageID(req.AskID, msgID)
+	log.Printf("ask REGISTERED chan=%s chat=%d topic=%s ask=%s opts=%d msg=%d",
+		route.Channel, route.ChatID, TopicKeyStr(*route), req.AskID, len(req.Options), msgID)
+	_ = conn.WriteJSON(ipc.AskRegisteredMsg{
+		Op: ipc.OpAskRegistered, AskID: req.AskID, OK: true, MessageID: msgID,
+	})
 }
 
 func (b *Broker) handleListTopics(conn *ipc.Conn) {

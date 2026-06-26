@@ -25,7 +25,12 @@ const (
 	OpFetchQueue       Op = "fetch_queue"
 	OpInboundDelivered Op = "inbound_delivered"
 	OpRetranscribe     Op = "retranscribe"
-	OpBye              Op = "bye"
+	// OpAskRegister registers a blocking, correlated `ask` (question + options)
+	// for round-trip resolution. The answer is pushed back later as an
+	// unsolicited OpAskResult once the human taps a button. Carries NO route —
+	// the broker derives it from the stub's current claim.
+	OpAskRegister Op = "ask_register"
+	OpBye         Op = "bye"
 
 	// broker → adapter
 	OpHelloAck             Op = "hello_ack"
@@ -40,5 +45,15 @@ const (
 	OpListSessionsReply    Op = "list_sessions_reply"
 	OpFetchQueueResult     Op = "fetch_queue_result"
 	OpRetranscribeResult   Op = "retranscribe_result"
-	OpError                Op = "error"
+	// OpAskRegistered is the broker's SYNCHRONOUS ack to OpAskRegister: OK=true
+	// once the question + keyboard was sent (with the sent MessageID), or
+	// OK=false + Err on a fast failure (ask before attach, oversized keyboard,
+	// channel/send error) so the tool call returns immediately rather than
+	// blocking the full answer timeout.
+	OpAskRegistered Op = "ask_registered"
+	// OpAskResult is the broker's UNSOLICITED push carrying the human's answer to
+	// a previously-registered ask (delivered to the route holder exactly like
+	// OpInbound). Correlated to the originating tool call by AskID.
+	OpAskResult Op = "ask_result"
+	OpError     Op = "error"
 )
