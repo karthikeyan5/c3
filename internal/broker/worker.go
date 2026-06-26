@@ -619,6 +619,12 @@ func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound, 
 		log.Printf("delivered chan=%s chat=%d topic=%s msg=%d to cli=%s pid=%d conn=%d",
 			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID,
 			holder.CLI, holder.PID, holder.ConnID)
+		// The route is live again, so end any held-reply cycle: clear the tracked
+		// held-reply message id so the NEXT detach starts a FRESH held-reply
+		// instead of editing a now-buried one (BUG #3 fix). Cheap + idempotent.
+		if w.broker != nil && w.broker.Fallbacks != nil {
+			w.broker.Fallbacks.ClearHeldMessageID(w.key)
+		}
 		// Typing relay (P5): an inbound was just delivered to the claimed
 		// holder, so the agent is about to work this turn. Arm the typing
 		// ticker — but ONLY if this holder has already replied at least once
@@ -657,14 +663,17 @@ func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound, 
 		}
 	}
 	// No live claim: the message is already durably queued (flushInbounds — or
-	// the append-if-absent above — stored it). Replace the old drop with a
-	// "held, nothing lost" auto-reply, cooldown'd to once per window, carrying
-	// the RUNNING queued count.
-	if !w.broker.Fallbacks.ShouldSend(w.key) {
-		log.Printf("hold chan=%s chat=%d topic=%s msg=%d: no claim, queued; held-reply in cooldown — %s",
-			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, fallbackSummary(in))
-		return
-	}
+	// the append-if-absent above — stored it). Surface a "held, nothing lost"
+	// auto-reply carrying the RUNNING queued count.
+	//
+	// BUG #3 fix: the old path gated EVERY held-reply behind the 5-min cooldown,
+	// so only the FIRST "Held — N queued" went out; later inbounds enqueued
+	// (count rose) but no updated reply did, and the user saw a frozen count. On
+	// a channel that can EDIT messages we instead keep ONE held-reply per route
+	// and edit it in place to the current count: the first hold SENDS the reply
+	// and remembers its message_id; every later hold EDITS that message to the
+	// true count (no spam, no waiting out the cooldown). A channel that cannot
+	// edit falls back to the original cooldown-gated single reply (no regression).
 	ch, err := w.broker.Channel(in.Channel)
 	if err != nil {
 		log.Printf("hold FAIL chan=%s chat=%d topic=%s msg=%d: channel lookup: %v — %s",
@@ -678,6 +687,47 @@ func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound, 
 		}
 	}
 	args := c3types.ReplyArgs{Channel: in.Channel, ChatID: in.ChatID, TopicID: in.TopicID, Text: heldReplyText(count)}
+
+	if ch.Capabilities().EditMessages {
+		// Edit-in-place: refresh the live held-reply to the true count.
+		if msgID, ok := w.broker.Fallbacks.HeldMessageID(w.key); ok {
+			editArgs := c3types.EditArgs{Channel: in.Channel, ChatID: in.ChatID, MessageID: msgID, Text: heldReplyText(count)}
+			if _, eerr := ch.EditMessage(editArgs); eerr == nil {
+				log.Printf("hold chan=%s chat=%d topic=%s msg=%d: no claim, queued + held-reply EDITED (count=%d, held_msg=%d) — %s",
+					w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, count, msgID, fallbackSummary(in))
+				return
+			} else {
+				// The tracked message is gone/uneditable (deleted, too old): drop the
+				// stale id and SEND a fresh held-reply below.
+				log.Printf("hold chan=%s chat=%d topic=%s msg=%d: held-reply edit failed (held_msg=%d: %v) — resending — %s",
+					w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, msgID, eerr, fallbackSummary(in))
+				w.broker.Fallbacks.ClearHeldMessageID(w.key)
+			}
+		}
+		sentID, serr := ch.SendReply(args)
+		if serr != nil {
+			log.Printf("hold FAIL chan=%s chat=%d topic=%s msg=%d: send held-reply: %v — %s",
+				w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, serr, fallbackSummary(in))
+			return
+		}
+		// Remember the sent message so the next held inbound edits it. A channel
+		// that returns no id (0) leaves nothing to edit, so the next hold simply
+		// sends again — still correct, just no in-place refresh for that channel.
+		if sentID != 0 {
+			w.broker.Fallbacks.SetHeldMessageID(w.key, sentID)
+		}
+		log.Printf("hold chan=%s chat=%d topic=%s msg=%d: no claim, queued + held-reply SENT (count=%d, held_msg=%d) — %s",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, count, sentID, fallbackSummary(in))
+		return
+	}
+
+	// Channel cannot edit messages: preserve the original cooldown-gated single
+	// reply so a no-edit channel still doesn't spam the topic on every hold.
+	if !w.broker.Fallbacks.ShouldSend(w.key) {
+		log.Printf("hold chan=%s chat=%d topic=%s msg=%d: no claim, queued; held-reply in cooldown — %s",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, fallbackSummary(in))
+		return
+	}
 	if _, err := ch.SendReply(args); err != nil {
 		log.Printf("hold FAIL chan=%s chat=%d topic=%s msg=%d: send held-reply: %v — %s",
 			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, err, fallbackSummary(in))

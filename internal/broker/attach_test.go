@@ -24,9 +24,21 @@ type fakeChannel struct {
 	createCalls     []createCall
 	validateCalls   []validateCall
 	replyCalls      []c3types.ReplyArgs
+	editCalls       []c3types.EditArgs
 	createReturnID  int64
 	createReturnErr error
 	validateErr     error
+	// editMessages drives Capabilities().EditMessages so a test can opt into
+	// the edit-in-place held-reply path (BUG #3). Default false preserves the
+	// original cooldown-gated fallback behavior for every existing test.
+	editMessages bool
+	// replyReturnID is the message id SendReply returns (0 by default, matching
+	// the original behavior). A non-zero value lets the held-reply tracker
+	// remember the sent message so later holds EDIT it instead of re-sending.
+	replyReturnID int64
+	// editErr, when set, makes EditMessage fail so a test can exercise the
+	// "tracked message uneditable → resend" fallback.
+	editErr error
 }
 
 type createCall struct {
@@ -42,13 +54,13 @@ func (f *fakeChannel) Name() string                                  { return "t
 func (f *fakeChannel) Start(_ context.Context, _ channel.Host) error { return nil }
 func (f *fakeChannel) Stop() error                                   { return nil }
 func (f *fakeChannel) Capabilities() c3types.Capabilities {
-	return c3types.Capabilities{Channel: "telegram"}
+	return c3types.Capabilities{Channel: "telegram", EditMessages: f.editMessages}
 }
 func (f *fakeChannel) SendReply(args c3types.ReplyArgs) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.replyCalls = append(f.replyCalls, args)
-	return 0, nil
+	return f.replyReturnID, nil
 }
 func (f *fakeChannel) sendRepliesSnapshot() []c3types.ReplyArgs {
 	f.mu.Lock()
@@ -57,9 +69,22 @@ func (f *fakeChannel) sendRepliesSnapshot() []c3types.ReplyArgs {
 	copy(out, f.replyCalls)
 	return out
 }
+func (f *fakeChannel) editCallsSnapshot() []c3types.EditArgs {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]c3types.EditArgs, len(f.editCalls))
+	copy(out, f.editCalls)
+	return out
+}
 func (f *fakeChannel) SendTyping(int64, *int64) error { return nil }
-func (f *fakeChannel) EditMessage(c3types.EditArgs) (*c3types.EditResult, error) {
-	return &c3types.EditResult{}, nil
+func (f *fakeChannel) EditMessage(args c3types.EditArgs) (*c3types.EditResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.editCalls = append(f.editCalls, args)
+	if f.editErr != nil {
+		return nil, f.editErr
+	}
+	return &c3types.EditResult{MessageID: args.MessageID}, nil
 }
 func (f *fakeChannel) React(c3types.ReactArgs) error             { return nil }
 func (f *fakeChannel) DownloadAttachment(string) (string, error) { return "", nil }

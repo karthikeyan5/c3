@@ -17,15 +17,50 @@ import (
 type fallbackTracker struct {
 	mu        sync.Mutex
 	lastByKey map[RouteKey]time.Time
-	cooldown  time.Duration
+	// heldMsgByKey remembers the message_id of the live "held — N queued" reply
+	// per route, on channels that can edit messages. BUG #3 fix: instead of
+	// suppressing every held-reply after the first behind the cooldown (which
+	// froze the visible count while the queue kept growing), the first held
+	// inbound SENDS the reply and records its id here; later held inbounds for
+	// the same route EDIT that message to the true count. Cleared when the route
+	// goes live again so the next detach starts a fresh held-reply message.
+	heldMsgByKey map[RouteKey]int64
+	cooldown     time.Duration
 }
 
 // newFallbackTracker returns a tracker with the given cooldown.
 func newFallbackTracker(cooldown time.Duration) *fallbackTracker {
 	return &fallbackTracker{
-		lastByKey: map[RouteKey]time.Time{},
-		cooldown:  cooldown,
+		lastByKey:    map[RouteKey]time.Time{},
+		heldMsgByKey: map[RouteKey]int64{},
+		cooldown:     cooldown,
 	}
+}
+
+// HeldMessageID returns the message_id of the live held-reply tracked for key,
+// and whether one is currently tracked.
+func (f *fallbackTracker) HeldMessageID(key RouteKey) (int64, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	id, ok := f.heldMsgByKey[key]
+	return id, ok
+}
+
+// SetHeldMessageID records the message_id of the held-reply just sent for key,
+// so subsequent held inbounds edit it in place instead of re-sending.
+func (f *fallbackTracker) SetHeldMessageID(key RouteKey, id int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.heldMsgByKey[key] = id
+}
+
+// ClearHeldMessageID forgets the tracked held-reply for key (the route went
+// live again, or the tracked message became uneditable). The next held inbound
+// will SEND a fresh held-reply rather than editing a stale/buried one.
+func (f *fallbackTracker) ClearHeldMessageID(key RouteKey) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.heldMsgByKey, key)
 }
 
 // ShouldSend returns true and updates the timestamp if cooldown has elapsed
