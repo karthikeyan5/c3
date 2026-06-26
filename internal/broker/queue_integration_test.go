@@ -140,6 +140,56 @@ func TestForwardOrFallback_LiveDelivery_ClearsHeldReplyTracking(t *testing.T) {
 	}
 }
 
+// A resumed session that auto-re-attaches (recoverSession) must end the
+// held-reply cycle: the route is live again, so the tracked held-reply message
+// id is cleared. The resume flow drains the backlog via fetch_queue (a pull,
+// not a live push), so a live delivery — the only OTHER clear path — may never
+// fire. Without this clear, the NEXT detach would EDIT the now-buried
+// pre-resume held-reply far up-thread instead of SENDing a fresh one: the exact
+// "invisible/frozen count" symptom BUG #3 killed, regressing for the new cycle
+// (review finding, 2026-06-25).
+func TestRecoverSession_ClearsHeldReplyTracking(t *testing.T) {
+	mf := mfWithTelegram()
+	seedSessionAttachment(mf, "sess-1", time.Now().UTC(), false) // → c3 / 281
+	b := brokerWithChannel(t, mf, &fakeChannel{editMessages: true})
+	defer b.Shutdown()
+
+	tid := int64(281)
+	key := MakeRouteKey("telegram", -100, &tid)
+	// Simulate a held-reply that was SENT + tracked during the detached window.
+	b.Fallbacks.SetHeldMessageID(key, 7001)
+
+	stub := b.Stubs.Register("claude", 1, "/x", nil)
+	stub.SetStableSessionID("sess-1")
+	if _, _, ok := b.recoverSession(stub); !ok {
+		t.Fatal("expected recoverSession to succeed")
+	}
+	if _, ok := b.Fallbacks.HeldMessageID(key); ok {
+		t.Fatal("recoverSession claim must clear the held-reply tracking (BUG #3 regression)")
+	}
+}
+
+// A normal attach (tryClaim) also ends the held-reply cycle: claiming the route
+// clears the tracked held-reply id so a later detach SENDs a fresh held-reply
+// instead of editing a buried one (review finding, 2026-06-25).
+func TestTryClaim_ClearsHeldReplyTracking(t *testing.T) {
+	mf := mfWithTelegram()
+	b := brokerWithChannel(t, mf, &fakeChannel{editMessages: true})
+	defer b.Shutdown()
+
+	tid := int64(281)
+	key := MakeRouteKey("telegram", -100, &tid)
+	b.Fallbacks.SetHeldMessageID(key, 7001)
+
+	stub := b.Stubs.Register("claude", 1, "/x", nil)
+	if !b.tryClaim(nil, stub, key, "c3", false, false) {
+		t.Fatal("precondition: tryClaim should succeed on a free route")
+	}
+	if _, ok := b.Fallbacks.HeldMessageID(key); ok {
+		t.Fatal("tryClaim must clear the held-reply tracking on a successful claim")
+	}
+}
+
 func TestHeldReplyText_CarriesCount(t *testing.T) {
 	got := heldReplyText(3)
 	// Pin a specific count-bearing phrase, not a stray '3'.

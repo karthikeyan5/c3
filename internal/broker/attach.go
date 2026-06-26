@@ -580,10 +580,28 @@ func (b *Broker) tryClaim(conn *ipc.Conn, stub *Stub, key RouteKey, label string
 		return false
 	}
 	stub.SetRoute(&key)
+	b.clearHeldReplyOnClaim(key)
 	if isFresh {
 		go b.sendWelcome(stub, key, label)
 	}
 	return true
+}
+
+// clearHeldReplyOnClaim ends any in-flight held-reply edit cycle for key once a
+// session (re)claims the route. The hold cycle is logically over the moment
+// anyone attaches: the session drains the backlog via fetch_queue (a PULL, not
+// a live push), so the live-delivery path — the only other place that clears
+// the tracked held-reply id (worker.go:626) — may never fire this cycle.
+// Without this, the NEXT detach would EDIT the now-buried pre-resume held-reply
+// far up-thread instead of SENDing a fresh one — the "invisible/frozen count"
+// symptom BUG #3 set out to kill, regressing for the new cycle (review finding,
+// 2026-06-25). Cheap + idempotent; safe on every claim path (fresh, replay,
+// recover) since a held-reply is only ever tracked while NO session is attached.
+func (b *Broker) clearHeldReplyOnClaim(key RouteKey) {
+	if b == nil || b.Fallbacks == nil {
+		return
+	}
+	b.Fallbacks.ClearHeldMessageID(key)
 }
 
 // sendWelcome posts a one-shot friendly confirmation to the channel after a
@@ -789,6 +807,7 @@ func (b *Broker) recoverSession(stub *Stub) (RouteKey, int, bool) {
 		return RouteKey{}, 0, false
 	}
 	stub.SetRoute(&key)
+	b.clearHeldReplyOnClaim(key)
 	cnt, _ := b.backlogSummary(key)
 	if time.Since(sa.LastAttachedAt) > sessionRefreshInterval {
 		b.mutateMappings(func(mf *mappings.MappingsFile) {

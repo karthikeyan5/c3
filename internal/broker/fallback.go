@@ -23,7 +23,11 @@ type fallbackTracker struct {
 	// froze the visible count while the queue kept growing), the first held
 	// inbound SENDS the reply and records its id here; later held inbounds for
 	// the same route EDIT that message to the true count. Cleared when the route
-	// goes live again so the next detach starts a fresh held-reply message.
+	// goes live again — either a live delivery (worker.go:626) OR any session
+	// (re)claiming the route via attach/recover (clearHeldReplyOnClaim) — so the
+	// next detach starts a fresh held-reply message rather than editing a buried
+	// one. The claim-path clear matters for the pull-drain resume flow, where no
+	// live delivery ever fires (review finding, 2026-06-25).
 	heldMsgByKey map[RouteKey]int64
 	cooldown     time.Duration
 }
