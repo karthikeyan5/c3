@@ -108,6 +108,7 @@ func run() error {
 	installSignalHandlers(cancel)
 
 	a := newAdapter()
+	a.runCtx = ctx
 	if err := a.connectBroker(); err != nil {
 		log.Printf("adapter: exit pid=%d reason=connect-broker err=%v", os.Getpid(), err)
 		return fmt.Errorf("connect broker: %w", err)
@@ -223,10 +224,25 @@ type adapter struct {
 
 	// recover-session is one-shot per session (a session resumes at most once),
 	// so a single buffered channel suffices instead of a pending map. Set by
-	// recoverSessionOnResume before it writes RecoverSessionReq; resolved by
+	// fireRecover before it writes RecoverSessionReq; resolved by
 	// dispatchRecoverSessionResult. Guarded by rsmu.
 	rsmu      sync.Mutex
 	rsPending chan ipc.RecoverSessionResp
+
+	// recoverFired guards the single RecoverSessionReq per session. Both the
+	// background handoff watch (watchForHandoff) and the first-tools/call
+	// belt-and-suspenders recheck call fireRecover; the CompareAndSwap ensures the
+	// broker never sees a duplicate recover for the same session (BUG #1).
+	recoverFired atomic.Bool
+	// recoverRechecked makes the first-tools/call belt-and-suspenders recheck run
+	// at most once, so a non-resume session doesn't re-stat the handoff file on
+	// every subsequent tools/call.
+	recoverRechecked atomic.Bool
+	// runCtx is the process-lifetime context (set in run() before the MCP server
+	// starts). The first-activity recheck fires its recover round-trip against
+	// this rather than the per-request context, which is cancelled when the
+	// triggering tools/call returns.
+	runCtx context.Context
 
 	// Hello-ack response state, captured on connect.
 	helloAck ipc.HelloAckMsg
@@ -1099,6 +1115,10 @@ func (a *adapter) buildMCPServer() *mcp.Server {
 			// self-clears so this only emits once.
 			if method == "tools/call" {
 				a.flushPendingRecoverNotice()
+				// Belt-and-suspenders for BUG #1: if the background watch hasn't
+				// yet fired the recover (the handoff landed between watch polls as
+				// the first turn arrived), re-check the handoff once here and fire.
+				a.recheckRecoverOnFirstActivity()
 			}
 			return next(ctx, method, req)
 		}
@@ -1665,20 +1685,28 @@ func (a *adapter) dispatchRetranscribeResult(raw []byte) {
 	}
 }
 
-// recoverSessionParams tunes the post-hello handoff poll. The SessionStart hook
-// fires AFTER the adapter spawns, with a VARIABLE delay — observed ~1.7s on one
-// resume and ~2.6s on the next. The original 6×500ms (~2.5s) window raced that:
-// when the hook write landed at ~2.6s the adapter's last read had already passed,
-// so it gave up ~120ms early and auto-attach-on-resume silently no-op'd
-// (2026-06-24). Poll generously — up to ~10s, matching recoverRespTimeout — so a
-// slow hook can't lose the recovery; 10s is ~4× the observed worst case while
-// still bounded. All values stay bounded: the poll runs in its own goroutine and
-// never blocks hello / server start, and a non-c3 / fresh-non-resumed session
-// simply polls the full window (cheap file stats) then returns silently.
+// recoverSessionParams tune the post-hello handoff rendezvous. The SessionStart
+// hook fires AFTER the adapter spawns, and its write latency is UNBOUNDED on a
+// busy machine — measured +4.3s on one resume (recovered), but +11.1s and +91s
+// on others, which the old FIXED ~10s blocking window silently missed: it gave
+// up and auto-attach-on-resume no-op'd (BUG #1, 2026-06-24/3e4d45a). A fixed
+// window can never win an unbounded race, so we WATCH IN THE BACKGROUND for a
+// generous budget and fire the instant the handoff appears. All values stay
+// bounded: the watch runs in its own goroutine and never blocks hello / server
+// start, and a non-c3 / fresh-non-resumed session (no handoff ever) just polls
+// cheap file stats to the budget, then expires silently — zero regression.
 const (
-	recoverPollAttempts = 20
-	recoverPollInterval = 500 * time.Millisecond
-	recoverRespTimeout  = 10 * time.Second
+	// recoverWatchBudget bounds the background handoff watch — long enough to
+	// outlast a very slow hook write (5 min ≫ the +91s worst case observed).
+	recoverWatchBudget = 5 * time.Minute
+	// recoverWatchInterval is the background re-check cadence. Generous (the file
+	// stat is cheap, but there's no need to spin) — a ~1s lag on a resume that
+	// hasn't had its first turn yet is invisible.
+	recoverWatchInterval = 1 * time.Second
+	// recoverLateThreshold marks a handoff as "late" for logging — past the old
+	// fixed window that used to silently lose it. Purely diagnostic.
+	recoverLateThreshold = 10 * time.Second
+	recoverRespTimeout   = 10 * time.Second
 	// pendingRecoverTTL bounds how long the deferred auto-attach CLI notice
 	// waits for the first active turn before being dropped. The Telegram
 	// recover-welcome already informed the user; a minutes-late CLI block would
@@ -1686,39 +1714,69 @@ const (
 	pendingRecoverTTL = 5 * time.Minute
 )
 
-// recoverSessionOnResume runs in a goroutine after hello. It looks up this
-// adapter's SessionStart-hook handoff (keyed on the ephemeral instance id), and
-// if found, asks the broker to re-attach the resumed session to its last topic
-// (keyed on the STABLE session id from the handoff). On a Recovered response
-// with held backlog, it emits ONE notification telling the agent it was
-// auto-attached and to call fetch_queue.
+// recoverSessionOnResume runs in a goroutine after hello. It WATCHES (in the
+// background, for recoverWatchBudget) for this adapter's SessionStart-hook
+// handoff (keyed on the ephemeral instance id), and the instant it appears asks
+// the broker to re-attach the resumed session to its last topic (keyed on the
+// STABLE session id from the handoff).
 //
 // Fail-closed throughout: no instance id (non-Claude-Code host), no handoff
 // (non-c3 / fresh non-resumed session), broker write/timeout — all return
-// silently → today's no-recovery behavior, zero regression. The bounded poll
-// lives entirely in this goroutine; it never delays hello or the MCP server.
+// silently → today's no-recovery behavior, zero regression. The watch lives
+// entirely in this goroutine; it never delays hello or the MCP server.
 func (a *adapter) recoverSessionOnResume(ctx context.Context) {
 	inst := instanceIDFromEnv()
 	if inst == "" {
 		return
 	}
-	var entry sessionhandoff.Entry
-	found := false
-	for i := 0; i < recoverPollAttempts; i++ {
-		if e, ok := sessionhandoff.Read(inst); ok {
-			entry, found = e, true
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(recoverPollInterval):
-		}
-	}
+	entry, found := a.watchForHandoff(ctx, inst, recoverWatchInterval, recoverWatchBudget)
 	if !found {
 		return // non-hook / non-c3 / non-resumed session — nothing to recover.
 	}
+	a.fireRecover(ctx, entry)
+}
 
+// watchForHandoff polls for the handoff entry for inst every interval, up to
+// budget, returning it the instant it appears. It returns (zero, false) when the
+// budget expires or ctx is cancelled — the non-resume case, which simply costs a
+// few cheap file stats. Reads the handoff once up front (it may already exist
+// for a fast hook) before the first sleep. Split out so the long-background-watch
+// behavior is unit-testable without a broker.
+func (a *adapter) watchForHandoff(ctx context.Context, inst string, interval, budget time.Duration) (sessionhandoff.Entry, bool) {
+	start := time.Now()
+	deadline := start.Add(budget)
+	for {
+		if e, ok := sessionhandoff.Read(inst); ok {
+			if elapsed := time.Since(start); elapsed > recoverLateThreshold {
+				log.Printf("recover-session: handoff appeared late (+%s after hello, past the old %s window) — recovering now",
+					elapsed.Round(time.Millisecond), recoverLateThreshold)
+			}
+			return e, true
+		}
+		if !time.Now().Before(deadline) {
+			log.Printf("recover-session: no handoff within %s — not a resumed session (or the SessionStart hook never ran)", budget)
+			return sessionhandoff.Entry{}, false
+		}
+		select {
+		case <-ctx.Done():
+			return sessionhandoff.Entry{}, false
+		case <-time.After(interval):
+		}
+	}
+}
+
+// fireRecover sends RecoverSessionReq to the broker EXACTLY ONCE per session
+// (guarded by recoverFired) and handles the response. Both the background watch
+// and the first-tools/call belt-and-suspenders recheck call it; the
+// CompareAndSwap ensures the broker never sees a duplicate recover for the same
+// session. On a Recovered response it remembers the attach (for reconnect replay)
+// and defers a CLI notice surfacing the held backlog. A late recover cannot
+// steal: the broker takes the record-only branch if the stub has since attached,
+// and skips a route held by another live session.
+func (a *adapter) fireRecover(ctx context.Context, entry sessionhandoff.Entry) {
+	if !a.recoverFired.CompareAndSwap(false, true) {
+		return // already fired (watch + first-activity recheck race) — idempotent.
+	}
 	respCh := make(chan ipc.RecoverSessionResp, 1)
 	a.rsmu.Lock()
 	a.rsPending = respCh
@@ -1762,12 +1820,40 @@ func (a *adapter) recoverSessionOnResume(ctx context.Context) {
 		})
 		log.Printf("recover-session: auto-attached to %q (queued=%d)", resp.Name, resp.QueuedCount)
 		if text := renderRecoverNotice(resp); text != "" {
-			// Defer rather than emit now: this runs in the resume idle gap,
+			// Defer rather than emit now: this may run in the resume idle gap,
 			// where Claude Code drops channel frames. The middleware flushes it
 			// on the first tools/call. (The broker's Telegram recover-welcome is
 			// the guaranteed signal; this is the best-effort CLI echo.)
 			a.setPendingRecoverNotice(text)
 		}
+	}
+}
+
+// recheckRecoverOnFirstActivity is the belt-and-suspenders half of BUG #1: on the
+// FIRST tools/call, if the background watch hasn't yet fired the recover (the
+// handoff landed between watch polls just as the first turn arrived), re-check
+// the handoff once and fire. Runs at most once (recoverRechecked) so a non-resume
+// session doesn't re-stat the file on every later call, and the round-trip runs
+// in a goroutine so it never blocks the tools/call. fireRecover's CompareAndSwap
+// still guarantees a single RecoverSessionReq even if the watch fires concurrently.
+func (a *adapter) recheckRecoverOnFirstActivity() {
+	if !a.recoverRechecked.CompareAndSwap(false, true) {
+		return // only on the very first tools/call.
+	}
+	if a.recoverFired.Load() {
+		return // the background watch already handled it.
+	}
+	inst := instanceIDFromEnv()
+	if inst == "" {
+		return
+	}
+	if e, ok := sessionhandoff.Read(inst); ok {
+		log.Printf("recover-session: handoff found on first tools/call (background watch had not yet fired) — recovering now")
+		ctx := a.runCtx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		go a.fireRecover(ctx, e)
 	}
 }
 
