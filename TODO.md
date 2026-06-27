@@ -586,7 +586,10 @@ Reopened (was mis-marked "Skipped (intentional)"):
   restarts.
 - [ ] **Slash commands handled in the broker** — `/status`, `/list`,
   `/route`, etc. without round-tripping to the LLM. Predecessor-bot-style
-  fast ops.
+  fast ops. **(Partially shipped: the `/status` Telegram bot command is now
+  answered directly by the broker — `internal/broker/status_command.go`,
+  registered via `setMyCommands`, intercepted before gating/routing; see
+  `docs/USAGE.md` + `docs/CHANNELS.md`. `/list`/`/route` not yet.)**
 - [ ] **Stream thinking / tool calls to Telegram** — research best UX
   first.
 - [ ] **Web chat channel** — second `Channel` impl alongside Telegram.

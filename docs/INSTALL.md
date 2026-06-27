@@ -57,10 +57,11 @@ Still inside Claude Code, run:
 /c3:build
 ```
 
-This is a slash command shipped by the plugin. It runs `go install ./cmd/...` from the plugin source dir. Five binaries land in `$GOBIN` (default `~/go/bin/`):
+This is a slash command shipped by the plugin. It runs `go install ./cmd/...` from the plugin source dir. Six binaries land in `$GOBIN` (default `~/go/bin/`):
 
 - `c3-broker` — the daemon
 - `c3-claude-adapter` — Claude Code MCP server
+- `claude-shim` — the `claude` wrapper that auto-injects the dev-channels flag (symlinked into PATH by `install-claude-shim`; see Step 4.5)
 - `codex` — the C3 launcher (will replace `which codex`)
 - `c3-codex-adapter` — Codex MCP server
 - `migrate-legacy` — one-shot migrator from a legacy Python-prototype config layout (only relevant if you have such a config)
