@@ -599,11 +599,21 @@ func (c *Channel) dispatchPollUpdate(updateID int64, poll *gotgbot.Poll) {
 // a callback InboundEvent. P7 wires outbound keyboards that make these
 // actionable; P4 only routes the inbound press.
 //
-// Pass-1 C4: CallbackQuery.Message is a MaybeInaccessibleMessage (interface),
-// not *Message. We type-assert to the accessible *gotgbot.Message for the chat /
-// thread coordinates; the inaccessible variant (the original message was deleted
-// or is too old) can't be routed to a chat, so we drop it with a metadata-only
-// log after still auto-acking (the user's button must not spin either way).
+// Pass-1 C4: CallbackQuery.Message is a MaybeInaccessibleMessage (interface).
+// gotgbot rc.34 resolves it in CallbackQuery.UnmarshalJSON via
+// unmarshalMaybeInaccessibleMessage (custom_helpers.go), which stores the
+// concrete *value* type — gotgbot.Message for an accessible message (date != 0)
+// or gotgbot.InaccessibleMessage for a deleted/too-old one (date == 0) — NOT a
+// pointer. The original code type-asserted to *gotgbot.Message, which never
+// matches the wire-decoded value, so EVERY real inline-keyboard callback was
+// dropped ("message inaccessible") — the 2026-06-25 live ask/keyboard bug.
+//
+// resolveCallbackMessage below accepts both the value (the real getUpdates
+// decode path) and the pointer (hand-built CallbackQuery values in tests / any
+// future synthetic caller), returning nil only for the genuinely-inaccessible
+// variant. An inaccessible message has no routable chat/thread, so we drop it
+// with a metadata-only log after still auto-acking (the user's button must not
+// spin either way).
 func (c *Channel) dispatchCallback(updateID int64, cq *gotgbot.CallbackQuery) {
 	if cq == nil {
 		return
@@ -616,8 +626,8 @@ func (c *Channel) dispatchCallback(updateID int64, cq *gotgbot.CallbackQuery) {
 		}
 	}
 
-	msg, ok := cq.Message.(*gotgbot.Message)
-	if !ok || msg == nil {
+	msg := resolveCallbackMessage(cq.Message)
+	if msg == nil {
 		// Inaccessible message (deleted / too old) — no chat to route to.
 		c.host.Logf("telegram: drop callback update=%d (message inaccessible; auto-acked, cannot route)", updateID)
 		return
@@ -641,6 +651,28 @@ func (c *Channel) dispatchCallback(updateID int64, cq *gotgbot.CallbackQuery) {
 		},
 	}
 	c.emitEvent(updateID, in, "callback")
+}
+
+// resolveCallbackMessage extracts the accessible *gotgbot.Message from a
+// CallbackQuery.Message (a MaybeInaccessibleMessage interface), or nil when the
+// message is the inaccessible variant (deleted / too old) or absent.
+//
+// CRUCIAL: gotgbot rc.34 unmarshals the interface to a concrete VALUE, not a
+// pointer (see unmarshalMaybeInaccessibleMessage in the module's
+// custom_helpers.go) — so the wire path yields a gotgbot.Message value. We also
+// accept *gotgbot.Message so hand-built CallbackQuery values (tests / future
+// synthetic callers) keep working. gotgbot.InaccessibleMessage (date == 0) has no
+// routable chat/thread and returns nil → the caller drops it gracefully.
+func resolveCallbackMessage(m gotgbot.MaybeInaccessibleMessage) *gotgbot.Message {
+	switch v := m.(type) {
+	case gotgbot.Message:
+		return &v
+	case *gotgbot.Message:
+		return v
+	default:
+		// gotgbot.InaccessibleMessage (value or pointer) or nil — not routable.
+		return nil
+	}
 }
 
 // dispatchReaction converts a message_reaction update into a reaction
