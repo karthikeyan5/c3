@@ -70,6 +70,18 @@ func richRawFor(p updateProbe) json.RawMessage {
 // dispatch handling.
 var allowedUpdates = []string{"message", "edited_message", "callback_query", "message_reaction", "poll"}
 
+// pollIdleBackoff paces the poll loop's NO-PROGRESS re-poll. When a long-poll
+// returns a non-empty batch in which every update was a dedup-skip of an un-acked
+// in-flight update still at the frontier (offset = Committed()+1), Telegram keeps
+// re-returning that same update on every call until its message is durably
+// persisted (a slow voice → STT inbound can hold the frontier for 12–110s). The
+// offset cannot — and must not — advance past an un-persisted update (that is the
+// loss-freedom property), so without pacing the loop would re-poll instantly at
+// ~3 getUpdates/sec for the whole persist window. We sleep this long between such
+// no-progress polls instead. It never delays a genuinely-new update: a new update
+// IS dispatched, so the loop does not pace that iteration.
+const pollIdleBackoff = 1 * time.Second
+
 // pollLoop runs Bot.GetUpdates in a loop, converting each Message into an
 // Inbound and emitting via host.Emit. Honors c.ctx cancellation.
 //
@@ -380,6 +392,11 @@ func (c *Channel) pollLoop() {
 		consecTransient = 0
 
 		var advanced bool
+		// dispatchedAny tracks whether THIS batch produced any newly-dispatched
+		// update. It stays false when the batch was empty or every update was a
+		// dedup-skip (the un-acked-frontier spin signature) — that is the signal to
+		// pace the next no-progress re-poll (see pollIdleBackoff at loop end).
+		var dispatchedAny bool
 		for i := range updates {
 			u := updates[i]
 			// Register the accepted update as in-flight in the persisted-offset
@@ -411,6 +428,7 @@ func (c *Channel) pollLoop() {
 				richRaw = richRawFor(probes[i])
 			}
 			c.dispatchGuarded(&u, richRaw)
+			dispatchedAny = true
 			if c.offTrk == nil && u.UpdateId >= offset {
 				offset = u.UpdateId + 1
 				advanced = true
@@ -445,6 +463,27 @@ func (c *Channel) pollLoop() {
 			} else {
 				consecSaveFail = 0
 				lastSaved = saveTo
+			}
+		}
+
+		// Pace the NO-PROGRESS re-poll. A non-empty batch that dispatched nothing
+		// new means every update was a dedup-skip of an un-acked in-flight update
+		// still sitting at the frontier (offset = Committed()+1) — a slow inbound
+		// (voice → STT) that Telegram re-returns on EVERY long-poll because the
+		// offset cannot advance past it until its message is durably persisted.
+		// Looping instantly here burns ~3 getUpdates/sec for the whole persist
+		// window (429 risk, log spam) and accomplishes nothing. Sleep
+		// ~pollIdleBackoff between such no-progress polls instead. This adds ZERO
+		// latency to genuinely-new updates (a new update IS dispatched →
+		// dispatchedAny=true → no pacing) and preserves loss-freedom: the offset
+		// still only advances on durable persist; we never skip the in-flight
+		// update, only re-fetch it less often until its persist callback advances
+		// Committed().
+		if len(updates) > 0 && !dispatchedAny {
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-time.After(pollIdleBackoff):
 			}
 		}
 	}
