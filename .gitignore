@@ -39,3 +39,8 @@ mappings.json
 mappings.json.bak
 *.env
 .envrc
+
+# Keep-out: operational docs carrying real infra values + internal run logs.
+# NEVER commit (would leak keep-out infra/personal paths to the public repo).
+docs/DEPLOY-telegram-proxy.md
+MORNING-REVIEW-2026-06-26.md
