@@ -472,6 +472,33 @@ func (w *RouteWorker) flushEvent(ctx context.Context, ev *c3types.Inbound) {
 	if w.broker == nil || ev == nil {
 		return
 	}
+	// Ask round-trip resolution (Phase 1): an inline-keyboard callback whose data
+	// is "ask:<askID>:<idx>" resolves a registered blocking ask — resolveAsk pushes
+	// the chosen option to the holder as an OpAskResult and clears the keyboard. On
+	// a match we SUPPRESS the generic event entirely (the tap was the answer, not a
+	// fresh <channel> event, and plugins should not observe it). A tap for an
+	// unknown/already-resolved ask returns false and falls through to the normal
+	// event path; the channel already auto-acked it either way.
+	if ev.Kind == c3types.InboundCallback && ev.Event != nil && ev.Event.Callback != nil {
+		cb := ev.Event.Callback
+		if strings.HasPrefix(cb.Data, askCallbackPrefix) {
+			if w.broker.resolveAsk(w.key, cb) {
+				return
+			}
+		}
+		// Permission relay (Phase 1): a "perm:<verb>:<id>" callback resolves a
+		// relayed permission prompt — resolvePerm pushes an OpPermissionVerdict to
+		// the holder and clears the keyboard, gated to the operator. A "perm:" tap is
+		// C3-internal — it is NEVER a meaningful generic event (unlike "ask:", whose
+		// prefix an agent-rendered reply button could legitimately reuse). So always
+		// SUPPRESS it, whether or not it resolved: a non-operator / unknown / expired /
+		// route-mismatched tap must not be surfaced as a raw callback event into the
+		// session (it's already auto-acked by the channel regardless).
+		if strings.HasPrefix(cb.Data, permCallbackPrefix) {
+			w.broker.resolvePerm(w.key, cb)
+			return
+		}
+	}
 	if w.broker.Plugins != nil {
 		next := w.broker.Plugins.FireOnInbound(ctx, ev)
 		if next == nil {

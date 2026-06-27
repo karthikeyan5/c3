@@ -135,6 +135,41 @@ func PollToolSchema() map[string]any {
 	}
 }
 
+// AskToolSchema is the JSON-schema for the blocking `ask` tool. The agent supplies
+// a `question` and a non-empty `options` array; C3 renders the question on the
+// channel with one inline-keyboard button per option and BLOCKS until the human
+// answers — the answer is returned as the tool result.
+//
+//   - single-select (default): the chosen option string.
+//   - multi (multi-select): each option toggles a ✓; a trailing "Done" button
+//     resolves with the comma-joined list of selected options.
+//   - allow_skip: adds a trailing "Skip" button that resolves with a skip notice.
+//
+// allow_other / free_text are accepted but NOT yet supported — the tool returns an
+// error if either is true (free-text answers intercept the durable-queue text path
+// and need a product decision). Mirrors PollToolSchema's shape.
+func AskToolSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"question": map[string]any{
+				"type":        "string",
+				"description": "The question to ask the human.",
+			},
+			"options": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "string"},
+				"description": "The choices — rendered one inline-keyboard button each. Required and non-empty.",
+			},
+			"multi":       map[string]any{"type": "boolean", "description": "Multi-select: each option toggles a ✓ and a 'Done' button resolves with the selected list. Default false (single-select)."},
+			"allow_skip":  map[string]any{"type": "boolean", "description": "Add a 'Skip' button that lets the human decline to answer. Default false."},
+			"allow_other": map[string]any{"type": "boolean", "description": "NOT yet supported (free-text 'Other'); setting true returns an error."},
+			"free_text":   map[string]any{"type": "boolean", "description": "NOT yet supported (free-text answers); setting true returns an error."},
+		},
+		"required": []string{"question", "options"},
+	}
+}
+
 // StopPollToolSchema is the JSON-schema for the `stop_poll` tool (P4). It
 // force-closes a bot-sent poll and returns its final aggregate tally — the
 // deterministic read path, since the passive poll-result event only arrives when

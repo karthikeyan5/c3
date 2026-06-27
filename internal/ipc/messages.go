@@ -111,6 +111,84 @@ type RetranscribeResp struct {
 	Err  string `json:"err,omitempty"`
 }
 
+// AskRegisterReq is the adapter → broker registration of a blocking, correlated
+// `ask`. It carries NO route field — the broker derives the route from the
+// stub's current claim (mirroring how OpToolCall is routed). AskID is generated
+// adapter-side (8-char base32) and used to correlate the later OpAskResult back
+// to the waiting tool call. Multi/AllowOther/AllowSkip/FreeText are accepted but
+// IGNORED in Phase 1 (single-select); they are wired now so the schema/registry
+// are Phase-2-ready without a wire change.
+type AskRegisterReq struct {
+	Op         Op       `json:"op"` // = OpAskRegister
+	AskID      string   `json:"ask_id"`
+	Question   string   `json:"question"`
+	Options    []string `json:"options,omitempty"`
+	Multi      bool     `json:"multi,omitempty"`
+	AllowOther bool     `json:"allow_other,omitempty"`
+	AllowSkip  bool     `json:"allow_skip,omitempty"`
+	FreeText   bool     `json:"free_text,omitempty"`
+}
+
+// AskRegisteredMsg is the broker → adapter SYNCHRONOUS ack to AskRegisterReq.
+// OK=true means the question + inline keyboard was sent (MessageID is the sent
+// message's id); OK=false means a fast failure (ask before attach, oversized
+// keyboard, channel/send error) carried in Err so the tool call bails fast
+// instead of blocking the full answer timeout.
+type AskRegisteredMsg struct {
+	Op        Op     `json:"op"` // = OpAskRegistered
+	AskID     string `json:"ask_id"`
+	OK        bool   `json:"ok"`
+	Err       string `json:"err,omitempty"`
+	MessageID int64  `json:"message_id,omitempty"`
+}
+
+// AskResultMsg is the broker → adapter UNSOLICITED push of a human's answer to a
+// previously-registered ask. Correlated to the waiting tool call by AskID;
+// delivered to the route holder exactly like OpInbound. Err is set (Answer zero)
+// only on an internal resolution failure.
+type AskResultMsg struct {
+	Op     Op        `json:"op"` // = OpAskResult
+	AskID  string    `json:"ask_id"`
+	Answer AskAnswer `json:"answer"`
+	Err    string    `json:"err,omitempty"`
+}
+
+// AskAnswer is the channel-neutral answer payload. Phase 1 only ever sets
+// Selected (one element, the tapped option) or TimedOut. Text / Skipped are
+// reserved for the Phase 2 taxonomy (free-text / Other / Skip).
+type AskAnswer struct {
+	Selected []string `json:"selected,omitempty"`
+	Text     string   `json:"text,omitempty"`
+	Skipped  bool     `json:"skipped,omitempty"`
+	TimedOut bool     `json:"timed_out,omitempty"`
+}
+
+// PermissionReq is the adapter → broker relay of a Claude Code tool-use
+// permission prompt. Like AskRegisterReq it carries NO route — the broker derives
+// it from the stub's current claim. RequestID is the harness-minted id (5 letters
+// [a-km-z]) used to correlate the later OpPermissionVerdict back to the prompt.
+// ToolName names the tool awaiting approval; Preview is a short, already-truncated
+// input snippet (input_preview, falling back to the description) — never a secret
+// body. Fire-and-forget: the broker sends no synchronous ack.
+type PermissionReq struct {
+	Op        Op     `json:"op"` // = OpPermissionRequest
+	RequestID string `json:"request_id"`
+	ToolName  string `json:"tool_name,omitempty"`
+	Preview   string `json:"preview,omitempty"`
+}
+
+// PermissionVerdictMsg is the broker → adapter UNSOLICITED push of a human's
+// Allow/Deny verdict for a previously-relayed permission_request. Behavior is the
+// STRING "allow" | "deny" (matching the reference Telegram plugin's contract);
+// the adapter emits it into Claude Code as notifications/claude/channel/permission
+// {request_id, behavior}. Correlated to the prompt by RequestID; delivered to the
+// route holder exactly like OpInbound.
+type PermissionVerdictMsg struct {
+	Op        Op     `json:"op"` // = OpPermissionVerdict
+	RequestID string `json:"request_id"`
+	Behavior  string `json:"behavior"`
+}
+
 // QueuedItem is one compact backlog-summary row carried in AttachedMsg. Preview
 // is a short, truncated text snippet (never the full body); Unix is the
 // message's timestamp.

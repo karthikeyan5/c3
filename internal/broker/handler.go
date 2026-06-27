@@ -126,6 +126,10 @@ func (b *Broker) HandleConn(nc net.Conn) {
 			b.handleRelease(stub)
 		case ipc.OpToolCall:
 			b.handleToolCall(conn, stub, raw)
+		case ipc.OpAskRegister:
+			b.handleAskRegister(conn, stub, raw)
+		case ipc.OpPermissionRequest:
+			b.handlePermissionRequest(conn, stub, raw)
 		case ipc.OpFetchQueue:
 			b.handleFetchQueue(conn, stub, raw)
 		case ipc.OpRetranscribe:
@@ -304,6 +308,182 @@ func (b *Broker) handleToolCall(conn *ipc.Conn, stub *Stub, raw []byte) {
 		resp.Result = res.Result
 	}
 	_ = conn.WriteJSON(resp)
+}
+
+// handleAskRegister registers a blocking, correlated `ask`, sends the question to
+// the stub's claimed route with an inline keyboard (single- or multi-select, with
+// an optional Skip button per the req flags), and replies with
+// a SYNCHRONOUS OpAskRegistered ack. The ANSWER is pushed later as an unsolicited
+// OpAskResult when the human taps (resolveAsk, worker.go) — this handler does NOT
+// block on it (mirrors OpInbound delivery, not the inline handleToolCall wait).
+//
+// Route resolution mirrors handleToolCall: AskRegisterReq carries no route, so it
+// is derived from stub.CurrentRoute(); a nil route returns OK=false fast. The
+// pendingAsk is registered BEFORE the send (fast-tap race), and removed on a send
+// error so the tool call returns immediately rather than after the answer timeout.
+func (b *Broker) handleAskRegister(conn *ipc.Conn, stub *Stub, raw []byte) {
+	var req ipc.AskRegisterReq
+	if err := json.Unmarshal(raw, &req); err != nil {
+		_ = conn.WriteJSON(ipc.AskRegisteredMsg{
+			Op: ipc.OpAskRegistered, OK: false, Err: "malformed ask_register: " + err.Error(),
+		})
+		return
+	}
+	if req.AskID == "" {
+		_ = conn.WriteJSON(ipc.AskRegisteredMsg{
+			Op: ipc.OpAskRegistered, OK: false, Err: "ask_register: missing ask id",
+		})
+		return
+	}
+	route := stub.CurrentRoute()
+	if route == nil {
+		_ = conn.WriteJSON(ipc.AskRegisteredMsg{
+			Op: ipc.OpAskRegistered, AskID: req.AskID, OK: false,
+			Err: "ask before attach: no route claimed",
+		})
+		return
+	}
+	// Single- and multi-select both require a non-empty option list (free-text /
+	// Other are not yet supported; the adapter rejects them before this point).
+	if len(req.Options) == 0 {
+		_ = conn.WriteJSON(ipc.AskRegisteredMsg{
+			Op: ipc.OpAskRegistered, AskID: req.AskID, OK: false,
+			Err: "ask: at least one option is required (single/multi-select)",
+		})
+		return
+	}
+	ch, err := b.Channel(route.Channel)
+	if err != nil {
+		_ = conn.WriteJSON(ipc.AskRegisteredMsg{
+			Op: ipc.OpAskRegistered, AskID: req.AskID, OK: false,
+			Err: fmt.Sprintf("channel lookup: %v", err),
+		})
+		return
+	}
+	// Capability gate (FIX-4): `ask` is an inline-keyboard round-trip, so refuse
+	// it on a channel that can't render inline keyboards rather than silently
+	// SendReply-ing buttons it will drop. No behavior change for Telegram
+	// (InlineKeyboards=true); closes the latent gap for future text-only channels.
+	// Checked BEFORE register, so there is no pending entry to clean up.
+	if !ch.Capabilities().InlineKeyboards {
+		_ = conn.WriteJSON(ipc.AskRegisteredMsg{
+			Op: ipc.OpAskRegistered, AskID: req.AskID, OK: false,
+			Err: "channel does not support interactive questions",
+		})
+		return
+	}
+
+	// Register BEFORE the send so a human who taps before the sendMessage
+	// round-trip returns still finds a live ask to resolve. Phase 2 carries the
+	// multi / allow_skip flags + per-option selection state (sized to the option
+	// list) so toggles and the Done/Skip buttons resolve correctly.
+	p := &pendingAsk{
+		askID: req.AskID, route: *route, question: req.Question, options: req.Options,
+		multi: req.Multi, allowSkip: req.AllowSkip, selected: make([]bool, len(req.Options)),
+	}
+	if !b.registerAsk(p) {
+		_ = conn.WriteJSON(ipc.AskRegisteredMsg{
+			Op: ipc.OpAskRegistered, AskID: req.AskID, OK: false,
+			Err: "ask id collision — retry",
+		})
+		return
+	}
+
+	var topicID *int64
+	if route.HasTopic {
+		t := route.TopicID
+		topicID = &t
+	}
+	msgID, err := ch.SendReply(c3types.ReplyArgs{
+		Channel: route.Channel,
+		ChatID:  route.ChatID,
+		TopicID: topicID,
+		Text:    req.Question,
+		Buttons: askKeyboardFor(p),
+	})
+	if err != nil {
+		// Send failed (oversized keyboard / Telegram error) — drop the pending and
+		// return fast so the tool errors immediately, not after the answer timeout.
+		b.Asks.delete(req.AskID)
+		_ = conn.WriteJSON(ipc.AskRegisteredMsg{
+			Op: ipc.OpAskRegistered, AskID: req.AskID, OK: false,
+			Err: fmt.Sprintf("ask send failed: %v", err),
+		})
+		return
+	}
+	b.Asks.setMessageID(req.AskID, msgID)
+	log.Printf("ask REGISTERED chan=%s chat=%d topic=%s ask=%s opts=%d msg=%d",
+		route.Channel, route.ChatID, TopicKeyStr(*route), req.AskID, len(req.Options), msgID)
+	_ = conn.WriteJSON(ipc.AskRegisteredMsg{
+		Op: ipc.OpAskRegistered, AskID: req.AskID, OK: true, MessageID: msgID,
+	})
+}
+
+// handlePermissionRequest relays a Claude Code tool-use permission prompt to the
+// stub's claimed route as an Allow/Deny inline keyboard. Mirrors handleAskRegister
+// (route via stub.CurrentRoute, capability gate, register-before-send, store
+// messageID) but is FIRE-AND-FORGET: there is no blocking tool to unblock, so a
+// nil route / channel error / send failure is logged and dropped with NO error
+// reply (CC simply keeps waiting in its TUI). The operator's tap later pushes an
+// OpPermissionVerdict (resolvePerm, worker.go).
+func (b *Broker) handlePermissionRequest(_ *ipc.Conn, stub *Stub, raw []byte) {
+	var req ipc.PermissionReq
+	if err := json.Unmarshal(raw, &req); err != nil {
+		log.Printf("perm: malformed permission_request: %v", err)
+		return
+	}
+	if req.RequestID == "" {
+		log.Printf("perm: permission_request missing request id — dropping")
+		return
+	}
+	route := stub.CurrentRoute()
+	if route == nil {
+		// No claim to surface on, and no blocking tool to error — drop + log.
+		log.Printf("perm DROP id=%s tool=%s: no route claimed", req.RequestID, req.ToolName)
+		return
+	}
+	ch, err := b.Channel(route.Channel)
+	if err != nil {
+		log.Printf("perm DROP id=%s: channel lookup: %v", req.RequestID, err)
+		return
+	}
+	// Capability gate: permission relay is an inline-keyboard round-trip, so refuse
+	// it on a channel that can't render keyboards rather than silently dropping
+	// buttons. No behavior change for Telegram (InlineKeyboards=true).
+	if !ch.Capabilities().InlineKeyboards {
+		log.Printf("perm DROP id=%s: channel %s does not support interactive keyboards", req.RequestID, route.Channel)
+		return
+	}
+
+	// Register BEFORE the send so a fast operator tap (before the sendMessage
+	// round-trip returns) still finds a live perm to resolve.
+	p := &pendingPerm{requestID: req.RequestID, route: *route, toolName: req.ToolName}
+	if !b.registerPerm(p) {
+		log.Printf("perm DROP id=%s: request id collision", req.RequestID)
+		return
+	}
+
+	var topicID *int64
+	if route.HasTopic {
+		t := route.TopicID
+		topicID = &t
+	}
+	msgID, err := ch.SendReply(c3types.ReplyArgs{
+		Channel: route.Channel,
+		ChatID:  route.ChatID,
+		TopicID: topicID,
+		Text:    permPromptText(req.ToolName, req.Preview),
+		Buttons: permKeyboard(req.RequestID),
+	})
+	if err != nil {
+		// Send failed — drop the pending so a never-shown keyboard can't be resolved.
+		b.Perms.delete(req.RequestID)
+		log.Printf("perm DROP id=%s: send failed: %v", req.RequestID, err)
+		return
+	}
+	b.Perms.setMessageID(req.RequestID, msgID)
+	log.Printf("perm REGISTERED chan=%s chat=%d topic=%s id=%s tool=%s msg=%d",
+		route.Channel, route.ChatID, TopicKeyStr(*route), req.RequestID, req.ToolName, msgID)
 }
 
 func (b *Broker) handleListTopics(conn *ipc.Conn) {

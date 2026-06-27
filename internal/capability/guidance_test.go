@@ -105,6 +105,12 @@ func TestGuidanceFor_PositiveLines(t *testing.T) {
 		"{text, data}",
 		"{text, url}",
 		"Keep callback\n  data short (<=64 bytes)",
+		// Ask round-trip (Phase 1) — also gated on InlineKeyboards.
+		"Asking a question with choices: use the `ask` tool",
+		"BLOCKS until the human taps one",
+		"NOT the host's AskUserQuestion, NOT a fire-and-forget `reply` with buttons",
+		// Sender-gating reality (FIX-3): the answer is not locked to one user.
+		"Anyone allowlisted who can post in this topic can tap an answer",
 	})
 	// On a fully-supported channel, the feature negatives do not appear.
 	// (Streaming is OFF even on the full Telegram manifest in v1, so its
@@ -159,5 +165,9 @@ func TestGuidanceFor_NegativeLines(t *testing.T) {
 		"Button presses:",
 		// Outbound inline-keyboard guidance is gated on InlineKeyboards.
 		"Buttons: attach an inline keyboard with the `buttons` arg",
+		// The ask-tool guidance is gated on InlineKeyboards too.
+		"Asking a question with choices: use the `ask` tool",
+		// The sender-gating note lives inside the InlineKeyboards block.
+		"Anyone allowlisted who can post in this topic can tap an answer",
 	})
 }

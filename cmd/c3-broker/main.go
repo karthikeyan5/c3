@@ -298,6 +298,12 @@ func runDaemon() (err error) {
 	// goroutine exits on br.Shutdown() (ctx cancel), so it never leaks.
 	br.StartHealthRefresh()
 
+	// Ask reaper: periodically expire stale `ask` round-trips (untapped, or
+	// multi-select toggled-but-never-Done) and best-effort clear their live
+	// keyboards, so an ask can't leak or leave a tappable keyboard past the
+	// adapter's answer timeout (FIX-1). Exits on br.Shutdown() (ctx cancel).
+	br.StartAskReaper()
+
 	if cc, ok := mf.Channels["telegram"]; ok && cc.BotToken != "" {
 		if err := br.RegisterChannel(telegram.New()); err != nil {
 			return fmt.Errorf("register telegram channel: %w", err)

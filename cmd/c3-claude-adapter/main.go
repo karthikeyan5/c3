@@ -34,6 +34,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base32"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -120,6 +122,10 @@ func run() error {
 
 	server := a.buildMCPServer()
 	a.notifyTx = newNotifyTransport(&mcp.StdioTransport{})
+	// Wire the receive interceptor: a diverted permission_request is relayed to the
+	// broker (Allow/Deny keyboard) instead of being silently dropped by the SDK.
+	// Must be set BEFORE server.Run drives notifyTx.Connect.
+	a.notifyTx.SetPermissionHandler(a.handlePermissionRequest)
 
 	go a.brokerReader(ctx)
 	go a.recoverSessionOnResume(ctx)
@@ -244,6 +250,14 @@ type adapter struct {
 	// triggering tools/call returns.
 	runCtx context.Context
 
+	// ask round-trip pending maps, keyed by askID (8-char base32 generated in
+	// toolAsk). askRegPending receives the broker's synchronous OpAskRegistered
+	// ack; askPending receives the later unsolicited OpAskResult once the human
+	// taps. Both guarded by askmu. Mirrors the fqPending fire-then-push pattern.
+	askmu         sync.Mutex
+	askRegPending map[string]chan ipc.AskRegisteredMsg
+	askPending    map[string]chan ipc.AskResultMsg
+
 	// Hello-ack response state, captured on connect.
 	helloAck ipc.HelloAckMsg
 
@@ -284,9 +298,11 @@ type adapter struct {
 
 func newAdapter() *adapter {
 	return &adapter{
-		pending:   map[string]chan ipc.ToolResultMsg{},
-		fqPending: map[string]chan ipc.FetchQueueResp{},
-		rtPending: map[string]chan ipc.RetranscribeResp{},
+		pending:       map[string]chan ipc.ToolResultMsg{},
+		fqPending:     map[string]chan ipc.FetchQueueResp{},
+		rtPending:     map[string]chan ipc.RetranscribeResp{},
+		askRegPending: map[string]chan ipc.AskRegisteredMsg{},
+		askPending:    map[string]chan ipc.AskResultMsg{},
 	}
 }
 
@@ -388,6 +404,12 @@ func (a *adapter) brokerReader(ctx context.Context) {
 			a.dispatchRetranscribeResult(raw)
 		case ipc.OpRecoverSessionResult:
 			a.dispatchRecoverSessionResult(raw)
+		case ipc.OpAskRegistered:
+			a.dispatchAskRegistered(raw)
+		case ipc.OpAskResult:
+			a.dispatchAskResult(raw)
+		case ipc.OpPermissionVerdict:
+			a.dispatchPermissionVerdict(raw)
 		case ipc.OpError:
 			var errMsg ipc.ErrorMsg
 			_ = json.Unmarshal(raw, &errMsg)
@@ -1091,6 +1113,12 @@ func (a *adapter) buildMCPServer() *mcp.Server {
 			// silently drop our `notifications/claude/channel` frames.
 			Experimental: map[string]any{
 				"claude/channel": map[string]any{},
+				// Declaring claude/channel/permission tells Claude Code this server
+				// relays tool-use permission prompts. Per the reference plugin's
+				// contract, declaring it ASSERTS that the channel authenticates the
+				// replier — C3 sender-gates a verdict to an allowlisted operator
+				// (resolvePerm), and an Allow tap over Telegram AUTHORIZES the tool use.
+				"claude/channel/permission": map[string]any{},
 			},
 		},
 	}
@@ -1152,8 +1180,15 @@ func (a *adapter) buildInstructions() string {
 	default:
 		head = "C3 connected. Use the `attach` tool to claim a Telegram topic for this session."
 	}
-	return head + mode.Combined(a.capsOrDefault())
+	return head + permissionContractNote + mode.Combined(a.capsOrDefault())
 }
+
+// permissionContractNote is the security contract carried in the MCP instructions
+// for the claude/channel/permission capability (mirrors the reference Telegram
+// plugin). Declaring the capability asserts C3 authenticates the replier — C3
+// only honors an Allow/Deny verdict from an allowlisted operator, and tapping
+// Allow over Telegram AUTHORIZES the pending tool use.
+const permissionContractNote = "\n\nPermission relay: C3 declares the claude/channel/permission capability, which asserts the channel authenticates the replier. C3 surfaces a tool-use permission prompt as an Allow/Deny keyboard, honors a verdict only from an allowlisted operator, and an Allow tap over Telegram authorizes the pending tool use."
 
 // capsOrDefault returns the channel capability manifest the broker delivered
 // on hello_ack (or a fresh attach), falling back to a sensible default when
@@ -1274,6 +1309,14 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 				InputSchema: mcptools.PollToolSchema(),
 			},
 			handler: a.toolForward("poll"),
+		},
+		{
+			tool: &mcp.Tool{
+				Name:        "ask",
+				Description: "Ask the human a question with choices and BLOCK until they answer. Provide `question` plus a non-empty `options` array; C3 shows the options as Telegram buttons and waits — the chosen option string is returned as this tool's result, so your turn proceeds deterministically with the answer in hand. Use this (NOT the host's AskUserQuestion, NOT a fire-and-forget `reply` with buttons) whenever you need the human to pick before you continue. Single-select in this phase; times out after ~10 minutes (returns a timeout notice you can recover from).",
+				InputSchema: mcptools.AskToolSchema(),
+			},
+			handler: a.toolAsk,
 		},
 		{
 			tool: &mcp.Tool{
@@ -1876,6 +1919,135 @@ func (a *adapter) dispatchRecoverSessionResult(raw []byte) {
 	}
 }
 
+// askAnswerTimeout bounds how long the `ask` tool blocks waiting for the human
+// to tap a button after the question was successfully delivered. 600s (10 min)
+// per the design; a var (not const) so tests can shorten it. On expiry the tool
+// returns a recoverable timeout notice (not an error) so the agent can proceed.
+var askAnswerTimeout = 600 * time.Second
+
+// askRegisterTimeout bounds the wait for the broker's SYNCHRONOUS registration
+// ack (OpAskRegistered). This only covers the local send round-trip, so it is
+// short; a var so tests can shorten it.
+var askRegisterTimeout = 30 * time.Second
+
+// toolAsk implements the blocking, correlated `ask` tool. It generates an askID,
+// registers two local pending channels (registration ack + answer), sends an
+// AskRegisterReq, waits for the broker's synchronous OpAskRegistered (bailing fast
+// on !OK so a send failure / ask-before-attach returns immediately), then blocks
+// until the human's OpAskResult arrives, the answer times out, or the call is
+// canceled. Mirrors toolFetchQueue's fire-then-push shape with a second wait.
+func (a *adapter) toolAsk(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, err := decodeArgs(req.Params.Arguments)
+	if err != nil {
+		return nil, fmt.Errorf("invalid params: %w", err)
+	}
+	question, _ := args["question"].(string)
+	if strings.TrimSpace(question) == "" {
+		return toolErrorResult("ask: question is required"), nil
+	}
+	// free_text (no-options questions) and allow_other (an option that opens a
+	// free-text answer) intercept the durable-queue text path and need a product
+	// decision; they are not yet supported. Reject up front (before any broker
+	// round-trip) so the agent learns to use single/multi-select instead.
+	if argBoolField(args, "free_text") || argBoolField(args, "allow_other") {
+		return toolErrorResult("ask: free_text / allow_other are not yet supported (single/multi-select only)"), nil
+	}
+	options := argStringList(args["options"])
+	if len(options) == 0 {
+		return toolErrorResult("ask: at least one option is required (single/multi-select; free-text questions are not yet available)"), nil
+	}
+
+	regCh := make(chan ipc.AskRegisteredMsg, 1)
+	resCh := make(chan ipc.AskResultMsg, 1)
+	a.askmu.Lock()
+	// Pick an askID not already in-flight (FIX-5). crypto/rand collisions are
+	// astronomically unlikely, but reusing a live id would silently clobber
+	// another pending ask's channels — cheap insurance to regenerate on a clash.
+	askID := newAskID()
+	for i := 0; i < 8; i++ {
+		_, regBusy := a.askRegPending[askID]
+		_, resBusy := a.askPending[askID]
+		if !regBusy && !resBusy {
+			break
+		}
+		askID = newAskID()
+	}
+	a.askRegPending[askID] = regCh
+	a.askPending[askID] = resCh
+	a.askmu.Unlock()
+	defer func() {
+		a.askmu.Lock()
+		delete(a.askRegPending, askID)
+		delete(a.askPending, askID)
+		a.askmu.Unlock()
+	}()
+
+	askReq := ipc.AskRegisterReq{
+		Op:       ipc.OpAskRegister,
+		AskID:    askID,
+		Question: question,
+		Options:  options,
+		// multi / allow_skip are functional (Phase 2); allow_other / free_text are
+		// rejected above and never reach here.
+		Multi:     argBoolField(args, "multi"),
+		AllowSkip: argBoolField(args, "allow_skip"),
+	}
+
+	conn := a.currentConn()
+	if conn == nil {
+		return toolErrorResult("broker reconnecting — retry ask in a moment"), nil
+	}
+	if err := conn.WriteJSON(askReq); err != nil {
+		return toolErrorResult("broker write: " + err.Error()), nil
+	}
+
+	// Wait for the broker's synchronous registration ack so a fast failure
+	// (ask-before-attach, oversized keyboard, channel/send error) returns the tool
+	// immediately instead of blocking the full answer timeout.
+	select {
+	case <-ctx.Done():
+		return toolErrorResult("canceled"), nil
+	case <-time.After(askRegisterTimeout):
+		return toolErrorResult("ask: timed out waiting for the broker to register the question"), nil
+	case reg := <-regCh:
+		if !reg.OK {
+			return toolErrorResult("ask: " + reg.Err), nil
+		}
+	}
+
+	// Registered + question delivered to Telegram; block until the human taps a
+	// button or the ask times out.
+	select {
+	case <-ctx.Done():
+		return toolErrorResult("canceled"), nil
+	case <-time.After(askAnswerTimeout):
+		return toolTextResult(renderAskAnswer(ipc.AskAnswer{TimedOut: true})), nil
+	case res := <-resCh:
+		if res.Err != "" {
+			return toolErrorResult("ask: " + res.Err), nil
+		}
+		return toolTextResult(renderAskAnswer(res.Answer)), nil
+	}
+}
+
+// dispatchAskRegistered routes an OpAskRegistered ack to the waiting toolAsk
+// caller, keyed by askID.
+func (a *adapter) dispatchAskRegistered(raw []byte) {
+	var msg ipc.AskRegisteredMsg
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return
+	}
+	a.askmu.Lock()
+	ch, ok := a.askRegPending[msg.AskID]
+	a.askmu.Unlock()
+	if ok {
+		select {
+		case ch <- msg:
+		default:
+		}
+	}
+}
+
 // renderRecoverNotice builds the one-shot auto-attach notice. With held backlog
 // it ACTIVELY SURFACES the messages — the oldest few (sender + kind + preview)
 // plus the total — and tells the agent to process them, then drain any remainder
@@ -1963,6 +2135,137 @@ func (a *adapter) flushPendingRecoverNotice() {
 	if text, ok := a.takePendingRecoverNotice(); ok {
 		a.emitRecoverNotice(text)
 	}
+}
+
+// handlePermissionRequest is the receive interceptor's callback (notify_transport
+// SetPermissionHandler): it relays a diverted Claude Code permission_request to
+// the broker as an OpPermissionRequest so the broker can surface an Allow/Deny
+// keyboard on the claimed route. Fire-and-forget — there is no caller to unblock;
+// a broker write failure (or a reconnecting broker) is logged and CC simply keeps
+// waiting in its TUI. NEVER logs the preview body (it can carry tool input).
+func (a *adapter) handlePermissionRequest(requestID, toolName, preview string) {
+	if requestID == "" {
+		return
+	}
+	conn := a.currentConn()
+	if conn == nil {
+		log.Printf("perm: broker reconnecting — dropping permission_request id=%s tool=%s (CC keeps waiting)", requestID, toolName)
+		return
+	}
+	if err := conn.WriteJSON(ipc.PermissionReq{
+		Op:        ipc.OpPermissionRequest,
+		RequestID: requestID,
+		ToolName:  toolName,
+		Preview:   preview,
+	}); err != nil {
+		log.Printf("perm: broker write failed id=%s tool=%s: %v", requestID, toolName, err)
+	}
+}
+
+// dispatchPermissionVerdict routes a broker OpPermissionVerdict into Claude Code:
+// it emits a notifications/claude/channel/permission frame {request_id, behavior}
+// (fire-and-forget — no pending-tool map, the harness consumes it directly). An
+// unknown/late verdict is harmless: CC silently drops it.
+func (a *adapter) dispatchPermissionVerdict(raw []byte) {
+	var msg ipc.PermissionVerdictMsg
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return
+	}
+	if msg.RequestID == "" || a.notifyTx == nil {
+		return
+	}
+	if err := a.notifyTx.Notify(context.Background(), "notifications/claude/channel/permission", map[string]any{
+		"request_id": msg.RequestID,
+		"behavior":   msg.Behavior,
+	}); err != nil {
+		log.Printf("perm: verdict notify failed id=%s behavior=%s: %v", msg.RequestID, msg.Behavior, err)
+	}
+}
+
+// dispatchAskResult routes an OpAskResult push to the waiting toolAsk caller,
+// keyed by askID. A result for an unknown/expired askID (the tool already
+// returned/timed out) is dropped.
+func (a *adapter) dispatchAskResult(raw []byte) {
+	var msg ipc.AskResultMsg
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return
+	}
+	a.askmu.Lock()
+	ch, ok := a.askPending[msg.AskID]
+	a.askmu.Unlock()
+	if ok {
+		select {
+		case ch <- msg:
+		default:
+		}
+	}
+}
+
+// renderAskAnswer renders an AskAnswer into the tool's text result so the agent
+// gets a clean value to branch on:
+//   - single-select (exactly one) → the chosen option verbatim.
+//   - multi-select (>1)           → a bulleted list, one option per line, so an
+//     option that itself contains a comma stays unambiguously separable (FIX-2:
+//     a plain ", " join could not be re-split by the agent).
+//   - multi-select (none toggled) → "Selected: (none)".
+//   - skip                        → a "(skipped)" notice.
+//   - timeout                     → a recoverable notice (re-ask or proceed).
+func renderAskAnswer(ans ipc.AskAnswer) string {
+	switch {
+	case ans.TimedOut:
+		return "No answer — the question timed out (no one tapped a button within the time limit). You can ask again or proceed without it."
+	case ans.Skipped:
+		return "(skipped)"
+	case len(ans.Selected) == 1:
+		// Single-select: the bare option string (unchanged contract).
+		return ans.Selected[0]
+	case len(ans.Selected) > 1:
+		// Multi-select: bulleted, one per line — unambiguous even if an option
+		// contains a comma.
+		return "Selected:\n• " + strings.Join(ans.Selected, "\n• ")
+	case ans.Text != "":
+		return ans.Text
+	default:
+		// Multi-select Done with nothing toggled (empty Selected, no text).
+		return "Selected: (none)"
+	}
+}
+
+// newAskID returns an 8-char lowercase base32 ask identifier (40 bits of
+// entropy). The base32 alphabet contains no colon, so it never collides with the
+// "ask:<id>:<idx>" callback_data separator.
+func newAskID() string {
+	var b [5]byte // 5 bytes = 40 bits → exactly 8 base32 chars (no padding)
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand failure is astronomically unlikely; fall back to a
+		// time-derived id so the tool still functions (uniqueness within a route's
+		// lifetime is all that's needed).
+		return strconv.FormatInt(time.Now().UnixNano(), 32)
+	}
+	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b[:]))
+}
+
+// argStringList parses a JSON array-of-strings arg (the []any form
+// json.Unmarshal produces) into []string, skipping empty/non-string elements.
+func argStringList(v any) []string {
+	list, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(list))
+	for _, e := range list {
+		if s, ok := e.(string); ok && s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// argBoolField reads an optional bool arg (the Phase-2-ready flags), defaulting
+// to false when absent or not a bool.
+func argBoolField(args map[string]any, key string) bool {
+	b, _ := args[key].(bool)
+	return b
 }
 
 // toolTextResult wraps a string into the standard CallToolResult shape

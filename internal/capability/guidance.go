@@ -114,6 +114,18 @@ func GuidanceFor(c c3types.Capabilities) string {
 		b.WriteString("  either {text, data} (a callback button — its tap comes back to you as a `<channel>` event\n")
 		b.WriteString("  carrying the data, so you can act on it) or {text, url} (just opens a link). Keep callback\n")
 		b.WriteString("  data short (<=64 bytes).\n")
+		// Ask round-trip (Phase 1): the blocking, correlated way to get an answer
+		// back. Distinct from fire-and-forget `reply`-with-buttons (whose taps
+		// arrive as informational events with no tool result) and from the host's
+		// AskUserQuestion (which has no channel surface), so call it out explicitly.
+		b.WriteString("- Asking a question with choices: use the `ask` tool (question + options). It shows the options\n")
+		b.WriteString("  as buttons and BLOCKS until the human taps one, returning the chosen option as the tool result —\n")
+		b.WriteString("  so use it (NOT the host's AskUserQuestion, NOT a fire-and-forget `reply` with buttons) whenever\n")
+		b.WriteString("  you need the human to pick before you continue. Set `multi:true` for multi-select (the human\n")
+		b.WriteString("  toggles options and taps Done; you get the selected list), and `allow_skip:true` to add a Skip\n")
+		b.WriteString("  button. (Free-text / Other questions are not yet supported.)\n")
+		b.WriteString("  Anyone allowlisted who can post in this topic can tap an answer — the question is not\n")
+		b.WriteString("  restricted to a single user, so treat the reply as coming from the group, not one identity.\n")
 	}
 
 	// Reactions (outbound `react` tool).

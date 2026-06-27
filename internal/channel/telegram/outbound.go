@@ -250,6 +250,23 @@ func (c *Channel) EditMessage(args c3types.EditArgs) (*c3types.EditResult, error
 	if useHTML {
 		opts.ParseMode = "HTML"
 	}
+	// Inline keyboard (Phase 1 ask round-trip). A non-nil args.Buttons sets the
+	// message's reply markup; a non-nil EMPTY keyboard CLEARS it (Telegram removes
+	// the keyboard when sent an empty inline_keyboard). A nil args.Buttons leaves
+	// the existing keyboard untouched, so pre-existing edit callers (edit_progress
+	// / placeholder lifecycle) keep their byte-identical behavior. Reuses
+	// buildInlineKeyboard so the same callback_data/shape limits apply.
+	if args.Buttons != nil {
+		markup, err := buildInlineKeyboard(args.Buttons)
+		if err != nil {
+			return nil, err
+		}
+		// EditMessageTextOpts.ReplyMarkup is a concrete InlineKeyboardMarkup value
+		// (unlike SendMessageOpts' ReplyMarkup interface), so dereference. An empty
+		// InlineKeyboard slice serializes as `{"inline_keyboard":[]}`, which Telegram
+		// treats as "remove the keyboard".
+		opts.ReplyMarkup = *markup
+	}
 	if err := c.rate.Wait(c.ctx, args.ChatID); err != nil {
 		return nil, fmt.Errorf("telegram: rate-wait: %w", err)
 	}

@@ -41,6 +41,18 @@ type Broker struct {
 	Plugins   *PluginHost
 	Pairing   *pairingState
 
+	// Asks is the registry of in-flight `ask` round-trips (blocking,
+	// correlated question→answer over an inline keyboard). Registered before the
+	// question is sent (fast-tap race) and resolved on the route worker goroutine
+	// when the human taps. See ask.go.
+	Asks *askRegistry
+
+	// Perms is the registry of in-flight permission relays (Claude Code tool-use
+	// prompts surfaced as Allow/Deny keyboards). Fire-and-forget: registered before
+	// the keyboard is sent and resolved on the route worker goroutine when the
+	// operator taps. See perm.go.
+	Perms *permRegistry
+
 	// Queue is the durable per-route inbound hold buffer. All file ops for a
 	// route are funneled through that route's RouteWorker goroutine (single
 	// owner ⇒ no file locks). May be nil if queue init failed at New (durable
@@ -95,6 +107,8 @@ func New(mf *mappings.MappingsFile) *Broker {
 		Routes:             NewRoutes(),
 		Fallbacks:          newFallbackTracker(defaultFallbackCooldown),
 		Pairing:            newPairingState(),
+		Asks:               newAskRegistry(),
+		Perms:              newPermRegistry(),
 		ctx:                ctx,
 		cancel:             cancel,
 		channels:           map[string]*channelRegistration{},

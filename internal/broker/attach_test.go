@@ -28,6 +28,7 @@ type fakeChannel struct {
 	createReturnID  int64
 	createReturnErr error
 	validateErr     error
+	sendReplyErr    error
 	// editMessages drives Capabilities().EditMessages so a test can opt into
 	// the edit-in-place held-reply path (BUG #3). Default false preserves the
 	// original cooldown-gated fallback behavior for every existing test.
@@ -39,6 +40,11 @@ type fakeChannel struct {
 	// editErr, when set, makes EditMessage fail so a test can exercise the
 	// "tracked message uneditable → resend" fallback.
 	editErr error
+	// caps optionally overrides the channel capability manifest. nil keeps the
+	// historical default (Channel="telegram" + EditMessages from the field above)
+	// so existing tests are unaffected; perm/ask tests that need inline keyboards
+	// set it.
+	caps *c3types.Capabilities
 }
 
 type createCall struct {
@@ -54,12 +60,18 @@ func (f *fakeChannel) Name() string                                  { return "t
 func (f *fakeChannel) Start(_ context.Context, _ channel.Host) error { return nil }
 func (f *fakeChannel) Stop() error                                   { return nil }
 func (f *fakeChannel) Capabilities() c3types.Capabilities {
+	if f.caps != nil {
+		return *f.caps
+	}
 	return c3types.Capabilities{Channel: "telegram", EditMessages: f.editMessages}
 }
 func (f *fakeChannel) SendReply(args c3types.ReplyArgs) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.replyCalls = append(f.replyCalls, args)
+	if f.sendReplyErr != nil {
+		return 0, f.sendReplyErr
+	}
 	return f.replyReturnID, nil
 }
 func (f *fakeChannel) sendRepliesSnapshot() []c3types.ReplyArgs {
@@ -85,6 +97,13 @@ func (f *fakeChannel) EditMessage(args c3types.EditArgs) (*c3types.EditResult, e
 		return nil, f.editErr
 	}
 	return &c3types.EditResult{MessageID: args.MessageID}, nil
+}
+func (f *fakeChannel) editSnapshot() []c3types.EditArgs {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]c3types.EditArgs, len(f.editCalls))
+	copy(out, f.editCalls)
+	return out
 }
 func (f *fakeChannel) React(c3types.ReactArgs) error             { return nil }
 func (f *fakeChannel) DownloadAttachment(string) (string, error) { return "", nil }

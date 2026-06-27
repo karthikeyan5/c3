@@ -114,7 +114,7 @@ func TestServerInfoName(t *testing.T) {
 	}
 	wantTools := []string{
 		"attach", "detach", "topics", "reply", "react",
-		"edit_message", "poll", "download_attachment",
+		"edit_message", "poll", "ask", "download_attachment",
 	}
 	got := map[string]bool{}
 	gotDesc := map[string]string{}

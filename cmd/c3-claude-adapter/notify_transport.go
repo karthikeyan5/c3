@@ -31,21 +31,57 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// permissionRequestMethod is the exact custom MCP notification method Claude
+// Code's harness emits to relay a tool-use permission prompt. The Go MCP SDK
+// will NOT deliver it to a handler (checkRequest rejects unknown methods before
+// middleware runs and there is no setNotificationHandler equivalent), so the
+// receive interceptor below diverts it off the SDK's read path. Every OTHER frame
+// passes through byte-for-byte.
+const permissionRequestMethod = "notifications/claude/channel/permission_request"
+
+// permRequestHandler is invoked (synchronously, on the SDK's read goroutine) for
+// each diverted permission_request frame, carrying the parsed
+// {request_id, tool_name, preview}. preview is input_preview (falling back to
+// description). Set via SetPermissionHandler BEFORE Connect; nil means a diverted
+// frame is simply dropped (logging-only fallback).
+type permRequestHandler func(requestID, toolName, preview string)
+
 // notifyTransport wraps an inner Transport and exposes the live Connection
-// for custom notifications.
+// for custom notifications. It ALSO wraps the inbound side: the Connection it
+// hands back from Connect intercepts permission_request frames (see interceptConn)
+// so the adapter can relay them, while passing every other frame through untouched.
 type notifyTransport struct {
 	inner mcp.Transport
 
-	mu   sync.Mutex
-	conn mcp.Connection
+	mu       sync.Mutex
+	conn     mcp.Connection
+	permFunc permRequestHandler
 }
 
 func newNotifyTransport(inner mcp.Transport) *notifyTransport {
 	return &notifyTransport{inner: inner}
 }
 
-// Connect implements mcp.Transport. It delegates to the wrapped transport
-// and captures the resulting Connection.
+// SetPermissionHandler installs the callback invoked for diverted
+// permission_request frames. Call it BEFORE Connect (the live session sets it
+// once at startup). Safe to call concurrently; the wrapped Read reads the handler
+// under the same lock so a late set is still observed.
+func (t *notifyTransport) SetPermissionHandler(h permRequestHandler) {
+	t.mu.Lock()
+	t.permFunc = h
+	t.mu.Unlock()
+}
+
+func (t *notifyTransport) permHandler() permRequestHandler {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.permFunc
+}
+
+// Connect implements mcp.Transport. It delegates to the wrapped transport,
+// captures the resulting Connection for the send side (Notify), and returns the
+// Connection WRAPPED so the SDK's read loop runs through the permission
+// interceptor.
 func (t *notifyTransport) Connect(ctx context.Context) (mcp.Connection, error) {
 	c, err := t.inner.Connect(ctx)
 	if err != nil {
@@ -54,7 +90,86 @@ func (t *notifyTransport) Connect(ctx context.Context) (mcp.Connection, error) {
 	t.mu.Lock()
 	t.conn = c
 	t.mu.Unlock()
-	return c, nil
+	return &interceptConn{Connection: c, owner: t}, nil
+}
+
+// interceptConn wraps an mcp.Connection and diverts permission_request
+// NOTIFICATIONS off the SDK's read path. It mirrors the SDK's loggingConn shape:
+// embed the delegate (so Write/Close/SessionID pass straight through) and override
+// only Read. CRITICAL: every frame that is not the exact permission_request
+// notification is returned UNCHANGED — this is on the inbound path the whole
+// session depends on.
+//
+// Accepted SDK deviation: embedding the Connection interface means the wrapper
+// fails the SDK's unexported `serverConnection` type assertion, so the server
+// skips one call to the inner conn's `sessionUpdated` (which only records the
+// negotiated protocol version, used solely to reject incoming JSON-RPC batches on
+// protocol >= 2025-06-18). Harmless on the CC stdio path (CC sends no batches;
+// the worst case is leniency, not a crash or a security hole), and the SDK's own
+// shipped loggingConn wrapper skips it identically. `hasSessionID` still passes
+// (SessionID is exported and promoted).
+type interceptConn struct {
+	mcp.Connection
+	owner *notifyTransport
+}
+
+// Read delegates to the inner Connection. If the next frame is a
+// permission_request notification (a *jsonrpc.Request with NO id whose Method is
+// permissionRequestMethod), it is diverted to the permission handler and the loop
+// reads the NEXT frame, so the SDK never sees it. Any other frame — request,
+// notification, response, error — is returned exactly as the inner conn produced
+// it.
+func (c *interceptConn) Read(ctx context.Context) (jsonrpc.Message, error) {
+	for {
+		msg, err := c.Connection.Read(ctx)
+		if err != nil {
+			return msg, err
+		}
+		req, ok := msg.(*jsonrpc.Request)
+		// Pass through anything that is not exactly a permission_request
+		// NOTIFICATION (a request carrying an id is a CALL, not the notification we
+		// divert; a Response is not a *jsonrpc.Request at all).
+		if !ok || req.ID.IsValid() || req.Method != permissionRequestMethod {
+			return msg, nil
+		}
+		if h := c.owner.permHandler(); h != nil {
+			if id, tool, preview := parsePermissionRequest(req.Params); id != "" {
+				// Dispatch ASYNC: the handler writes to the broker (which then does a
+				// blocking Telegram send), and this runs on the SDK's single inbound
+				// read goroutine — calling it synchronously would let a broker/Telegram
+				// stall freeze the whole session's inbound path. Per-request ordering is
+				// irrelevant (each relay is keyed by request_id), so a goroutine is safe
+				// and matches the fire-and-forget contract.
+				go h(id, tool, preview)
+			}
+		}
+		// Diverted — loop to read the next frame so the SDK never sees this one.
+	}
+}
+
+// parsePermissionRequest extracts {request_id, tool_name, preview} from a
+// permission_request notification's params. The harness payload is
+// {request_id, tool_name, description, input_preview}; preview prefers
+// input_preview (the truncated input snippet) and falls back to description. A
+// missing/garbled payload yields "" so the caller drops it.
+func parsePermissionRequest(params json.RawMessage) (requestID, toolName, preview string) {
+	if len(params) == 0 {
+		return "", "", ""
+	}
+	var p struct {
+		RequestID    string `json:"request_id"`
+		ToolName     string `json:"tool_name"`
+		Description  string `json:"description"`
+		InputPreview string `json:"input_preview"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return "", "", ""
+	}
+	preview = p.InputPreview
+	if preview == "" {
+		preview = p.Description
+	}
+	return p.RequestID, p.ToolName, preview
 }
 
 // Disconnect clears the stored Connection so a subsequent Notify will
