@@ -31,6 +31,25 @@ func TestRenderFetchedMessages_Codex_ExposesAttachmentFileID(t *testing.T) {
 	}
 }
 
+// D-A2: the queued (fetch_queue) renderer must expose the full reply context —
+// reply_to_user and reply_to_text — not just reply_to=<id>. Mirrors the Claude
+// adapter's renderQueuedInbound (the two are byte-identical).
+func TestRenderQueuedInbound_FullReplyContext_Codex(t *testing.T) {
+	got := renderQueuedInbound(&c3types.Inbound{
+		Channel: "telegram", ChatID: -100, MessageID: 9,
+		ReplyTo: &c3types.ReplyContext{
+			MessageID: 1708,
+			User:      c3types.Sender{UserID: 85720317, Username: "skarthi"},
+			Text:      ".",
+		},
+	})
+	for _, want := range []string{"reply_to=1708", "reply_to_user=@skarthi", `reply_to_text="."`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("renderQueuedInbound missing %q; got %q", want, got)
+		}
+	}
+}
+
 func TestPendingNudge_Codex(t *testing.T) {
 	if got := pendingNudge(2); !strings.Contains(got, "2 pending") {
 		t.Errorf("pendingNudge(2) = %q", got)

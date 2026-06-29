@@ -772,12 +772,9 @@ func renderQueuedInbound(in *c3types.Inbound) string {
 	if in.Text != "" {
 		parts = append(parts, fmt.Sprintf("text=%q", in.Text))
 	}
-	if in.ReplyTo != nil {
-		parts = append(parts, fmt.Sprintf("reply_to=%d", in.ReplyTo.MessageID))
-	}
+	parts = append(parts, c3types.ReplyContextFields(in.ReplyTo)...)
 	for _, att := range in.Attachments {
-		parts = append(parts, fmt.Sprintf("attachment{kind=%s file_id=%q mime=%s size=%d name=%q}",
-			att.Kind, att.FileID, att.MIME, att.Size, att.Name))
+		parts = append(parts, c3types.AttachmentField(att))
 	}
 	if in.IsEvent() {
 		parts = append(parts, fmt.Sprintf("event=%s", in.Kind))

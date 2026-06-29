@@ -3,14 +3,24 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/karthikeyan5/c3/internal/c3types"
 )
+
+// errCodexForwardNoWS signals that forwarding is enabled but no app-server WS URL
+// is configured, so the forward delivered NOTHING. It is returned (not nil) so the
+// caller does NOT ack: acking a no-op forward would let the broker consume the
+// queued copy of a message the agent never received live — a silent drop. It is a
+// distinct sentinel (not a generic error) so the caller can stay quiet about this
+// benign (mis)configuration instead of logging a "failure" per inbound.
+var errCodexForwardNoWS = errors.New("codex forward: no app-server WS URL configured (C3_CODEX_APP_SERVER_WS unset)")
 
 type codexForwardConfig struct {
 	WSURL    string
@@ -27,7 +37,7 @@ type codexWSClient struct {
 
 func forwardInboundToCodexAppServer(ctx context.Context, in *c3types.Inbound, cfg codexForwardConfig) error {
 	if cfg.WSURL == "" {
-		return nil
+		return errCodexForwardNoWS
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 15 * time.Second
@@ -185,6 +195,12 @@ func (c *codexWSClient) notify(method string, params map[string]any) error {
 	return nil
 }
 
+// formatInboundTurnText renders one inbound as a Codex turn. It carries the same
+// information density as the queued (fetch_queue) renderQueuedInbound — message_id,
+// the full reply context, and an attachment summary — so a message forwarded live
+// loses none of the metadata a message read via fetch_queue would carry (D-RC1).
+// The reply/attachment formatting is shared with renderQueuedInbound via the
+// c3types helpers so the two can't drift.
 func formatInboundTurnText(in *c3types.Inbound) string {
 	thread := "0"
 	if in.TopicID != nil {
@@ -194,7 +210,20 @@ func formatInboundTurnText(in *c3types.Inbound) string {
 	if sender == "" {
 		sender = strconv.FormatInt(in.Sender.UserID, 10)
 	}
-	return fmt.Sprintf("Telegram message from %s (chat=%d thread=%s)\n%s", sender, in.ChatID, thread, in.Text)
+	header := []string{fmt.Sprintf("chat=%d", in.ChatID), "thread=" + thread}
+	if in.MessageID != 0 {
+		header = append(header, fmt.Sprintf("message_id=%d", in.MessageID))
+	}
+	header = append(header, c3types.ReplyContextFields(in.ReplyTo)...)
+	out := fmt.Sprintf("Telegram message from %s (%s)\n%s", sender, strings.Join(header, " "), in.Text)
+	if len(in.Attachments) > 0 {
+		atts := make([]string, 0, len(in.Attachments))
+		for _, att := range in.Attachments {
+			atts = append(atts, c3types.AttachmentField(att))
+		}
+		out += "\n" + strings.Join(atts, " ")
+	}
+	return out
 }
 
 func stringSlice(v any) []string {

@@ -546,9 +546,12 @@ func (a *adapter) handleInbound(raw []byte) {
 		}
 	}
 
-	// WS forwarder (gated by env, see split-brain guard).
+	// WS forwarder (gated by env, see split-brain guard). On a SUCCESSFUL forward
+	// the goroutine acks the broker so it Consumes the queued copy (D-RC2); on
+	// failure it does NOT ack, so the content stays queued for fetch_queue recovery.
+	// Inbound is passed by value + Covered so the goroutine owns its own copy.
 	if codexForwardingAllowed() {
-		go a.forwardToCodexAppServer(&msg.Inbound)
+		go a.forwardToCodexAppServer(msg.Inbound, msg.Covered)
 	}
 }
 
@@ -610,9 +613,32 @@ func codexForwardingAllowed() bool {
 // Each inbound opens a fresh short-lived WebSocket (Codex app-server expects
 // new turns this way; long-lived sessions would conflict with the visible
 // TUI's connection).
-func (a *adapter) forwardToCodexAppServer(in *c3types.Inbound) {
-	if err := forwardInboundToCodexAppServer(context.Background(), in, codexForwardConfigFromEnv()); err != nil {
-		fmt.Fprintf(os.Stderr, "c3-codex-adapter: WS forward failed for inbound id=%d: %v\n", in.MessageID, err)
+func (a *adapter) forwardToCodexAppServer(in c3types.Inbound, covered int) {
+	if err := forwardInboundToCodexAppServer(context.Background(), &in, codexForwardConfigFromEnv()); err != nil {
+		// errCodexForwardNoWS = forwarding enabled but unconfigured (no WS URL): the
+		// forward delivered nothing, so we must NOT ack (acking a no-op forward would
+		// drop the message — broker consumes the queued copy the agent never received
+		// live). It's a benign config state, not a failure, so don't spam stderr per
+		// inbound. Any OTHER error is a real forward failure: log it, still no ack.
+		if !errors.Is(err, errCodexForwardNoWS) {
+			fmt.Fprintf(os.Stderr, "c3-codex-adapter: WS forward failed for inbound id=%d: %v\n", in.MessageID, err)
+		}
+		return // DO NOT ack on any error — content stays queued (recovery via fetch_queue).
+	}
+	// D-RC2: ack ONLY after a SUCCESSFUL live forward, gated exactly like the Claude
+	// adapter (cmd/c3-claude-adapter/main.go ~:655):
+	//   - codexForwardingAllowed() already held at the call site, so the notify-only
+	//     (forwarding-disabled) path never reaches here — we never ack content the
+	//     agent did not receive live (Watch-out #6; fetch_queue stays source of truth).
+	//   - !in.IsEvent(): a synthesized event (poll_result/reaction/callback) is never
+	//     queued, so it covers zero stored lines — acking one would over-consume real
+	//     backlog the event never delivered (Watch-out #5).
+	//   - covered >= 1: nothing to consume otherwise. The broker double-guards
+	//     (handleInboundDelivered drops Count<1, handleConsume skips Count<1) — this
+	//     adapter guard is the first line.
+	// ipc.Conn.WriteJSON is wmu-guarded, so this write is safe from the goroutine.
+	if conn := a.currentConn(); conn != nil && !in.IsEvent() && covered >= 1 {
+		_ = conn.WriteJSON(ipc.InboundDeliveredMsg{Op: ipc.OpInboundDelivered, UpdateID: in.MessageID, OK: true, Count: covered})
 	}
 }
 
@@ -1253,12 +1279,9 @@ func renderQueuedInbound(in *c3types.Inbound) string {
 	if in.Text != "" {
 		parts = append(parts, fmt.Sprintf("text=%q", in.Text))
 	}
-	if in.ReplyTo != nil {
-		parts = append(parts, fmt.Sprintf("reply_to=%d", in.ReplyTo.MessageID))
-	}
+	parts = append(parts, c3types.ReplyContextFields(in.ReplyTo)...)
 	for _, att := range in.Attachments {
-		parts = append(parts, fmt.Sprintf("attachment{kind=%s file_id=%q mime=%s size=%d name=%q}",
-			att.Kind, att.FileID, att.MIME, att.Size, att.Name))
+		parts = append(parts, c3types.AttachmentField(att))
 	}
 	if in.IsEvent() {
 		parts = append(parts, fmt.Sprintf("event=%s", in.Kind))
