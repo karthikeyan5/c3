@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -97,6 +98,134 @@ func startFakeCodexAppServer(t *testing.T) string {
 	}))
 	t.Cleanup(server.Close)
 	return "ws" + server.URL[len("http"):]
+}
+
+// startFlakyCodexAppServer stands up a fake Codex app-server where the first
+// failFirstN WebSocket dials are REFUSED (HTTP 500 → dial error → the forward
+// fails), and every dial after that completes the turn handshake successfully.
+// Because codexForwardLoop processes forwards serially, the Nth dial corresponds
+// to the Nth enqueued inbound — so failFirstN=1 fails exactly the first (oldest)
+// message and succeeds the rest. turns receives one value each time a turn/start
+// completes, so a test can wait until a later message was actually delivered live
+// before asserting on the (absence of an) ack.
+func startFlakyCodexAppServer(t *testing.T, failFirstN int) (wsURL string, turns <-chan struct{}) {
+	t.Helper()
+	upgrader := websocket.Upgrader{}
+	turnCh := make(chan struct{}, 16)
+	var connCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if int(connCount.Add(1)) <= failFirstN {
+			http.Error(w, "forced forward failure", http.StatusInternalServerError)
+			return
+		}
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		for {
+			var msg map[string]any
+			if err := c.ReadJSON(&msg); err != nil {
+				return
+			}
+			id, hasID := msg["id"]
+			if !hasID {
+				continue
+			}
+			method, _ := msg["method"].(string)
+			result := map[string]any{}
+			switch method {
+			case "thread/loaded/list":
+				result["data"] = []string{"thread-1"}
+			case "turn/start":
+				result["turn"] = map[string]any{"id": "turn-1"}
+			default:
+				result["ok"] = true
+			}
+			if err := c.WriteJSON(map[string]any{"id": id, "result": result}); err != nil {
+				return
+			}
+			if method == "turn/start" {
+				select {
+				case turnCh <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}))
+	t.Cleanup(server.Close)
+	return "ws" + server.URL[len("http"):], turnCh
+}
+
+// M2 loss regression: an OLDER message whose forward FAILS (correctly no ack)
+// followed by a NEWER message whose forward SUCCEEDS must NOT produce an ack for
+// the newer one — the broker's consume is count-off-HEAD, so acking the newer
+// message would Consume the OLDER (undelivered) message off the head → silent
+// loss. The retired per-inbound-goroutine design acked the newer message here;
+// the serial loop + `blocked` latch must not.
+func TestCodexForward_OlderFailLaterSuccess_DoesNotAck(t *testing.T) {
+	wsURL, turns := startFlakyCodexAppServer(t, 1) // first (oldest) forward fails; rest succeed
+	t.Setenv("C3_CODEX_ALLOW_MANUAL_FORWARD", "1")
+	t.Setenv("C3_CODEX_REMOTE_BRIDGE", "")
+	t.Setenv("C3_CODEX_APP_SERVER_WS", wsURL)
+	t.Setenv("C3_CODEX_THREAD_ID", "")
+
+	a, peer := adapterWithBrokerConn(t)
+
+	older := ipc.InboundMsg{Op: ipc.OpInbound, Covered: 1, Inbound: c3types.Inbound{Channel: "telegram", ChatID: -100, MessageID: 1, Text: "older"}}
+	newer := ipc.InboundMsg{Op: ipc.OpInbound, Covered: 1, Inbound: c3types.Inbound{Channel: "telegram", ChatID: -100, MessageID: 2, Text: "newer"}}
+	rawOlder, _ := json.Marshal(older)
+	rawNewer, _ := json.Marshal(newer)
+	a.handleInbound(rawOlder) // forward will FAIL → no ack, loop becomes blocked
+	a.handleInbound(rawNewer) // forward will SUCCEED but loop is blocked → must NOT ack
+
+	// Wait until the newer message's forward actually reaches turn/start, proving it
+	// was delivered live — so the only reason for no ack is the `blocked` latch.
+	select {
+	case <-turns:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the newer message's forward never completed a turn/start")
+	}
+
+	if ack, got := readDeliveredAck(t, peer, 500*time.Millisecond); got {
+		t.Fatalf("no ack may be sent while the older (head) message is undelivered — got %+v; acking it would Consume the older message off the head (loss)", ack)
+	}
+}
+
+// M2 common-case: two messages whose forwards both SUCCEED must both be acked, in
+// queue order (head-first), with each ack carrying its own covered count. Confirms
+// the serial path preserves the RC2 ack intent (the broker Consumes delivered live
+// pushes) — only the failure case stops acking.
+func TestCodexForward_AllSuccess_AcksInOrder(t *testing.T) {
+	wsURL, _ := startFlakyCodexAppServer(t, 0) // never fail
+	t.Setenv("C3_CODEX_ALLOW_MANUAL_FORWARD", "1")
+	t.Setenv("C3_CODEX_REMOTE_BRIDGE", "")
+	t.Setenv("C3_CODEX_APP_SERVER_WS", wsURL)
+	t.Setenv("C3_CODEX_THREAD_ID", "")
+
+	a, peer := adapterWithBrokerConn(t)
+
+	first := ipc.InboundMsg{Op: ipc.OpInbound, Covered: 1, Inbound: c3types.Inbound{Channel: "telegram", ChatID: -100, MessageID: 1, Text: "first"}}
+	second := ipc.InboundMsg{Op: ipc.OpInbound, Covered: 2, Inbound: c3types.Inbound{Channel: "telegram", ChatID: -100, MessageID: 2, Text: "second"}}
+	rawFirst, _ := json.Marshal(first)
+	rawSecond, _ := json.Marshal(second)
+	a.handleInbound(rawFirst)
+	a.handleInbound(rawSecond)
+
+	ack1, got1 := readDeliveredAck(t, peer, 3*time.Second)
+	if !got1 {
+		t.Fatal("first successful forward must ack")
+	}
+	ack2, got2 := readDeliveredAck(t, peer, 3*time.Second)
+	if !got2 {
+		t.Fatal("second successful forward must ack")
+	}
+	if !ack1.OK || ack1.UpdateID != 1 || ack1.Count != 1 {
+		t.Fatalf("ack1 = %+v, want {OK:true UpdateID:1 Count:1} (head-first)", ack1)
+	}
+	if !ack2.OK || ack2.UpdateID != 2 || ack2.Count != 2 {
+		t.Fatalf("ack2 = %+v, want {OK:true UpdateID:2 Count:2}", ack2)
+	}
 }
 
 // D-RC2: a live-forwarded text push that the app-server ACCEPTS must send an

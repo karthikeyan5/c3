@@ -193,14 +193,41 @@ type adapter struct {
 	// SystemEvent is surfaced once per outage, not on every recovery cycle.
 	// Reset on a successful reconnect so a later outage re-advises.
 	brokerDownAdvised atomic.Bool
+
+	// forwardCh feeds the SINGLE serial Codex-forward goroutine (codexForwardLoop,
+	// started in newAdapter). Enqueueing here instead of spawning a goroutine per
+	// inbound is the M2 loss fix: the broker's OpInboundDelivered consume is
+	// count-off-HEAD (worker.go handleConsume → Queue.Consume(n); MessageID only
+	// logged), so an ack is only safe when acks arrive in queue order, head-first,
+	// and never while an earlier message is undelivered. Serial processing gives
+	// in-order; codexForwardLoop's `blocked` latch gives never-ack-past-a-gap.
+	forwardCh chan codexForwardReq
+}
+
+// codexForwardReq is one inbound queued for the serial Codex-forward goroutine.
+// conn is captured at ENQUEUE time (handleInbound) — not resolved at completion —
+// so a broker reconnect+reattach during the up-to-15s forward can't make the ack
+// land on a route this stub no longer holds (M2 hazard b).
+type codexForwardReq struct {
+	inbound c3types.Inbound
+	covered int
+	conn    *ipc.Conn
 }
 
 func newAdapter() *adapter {
-	return &adapter{
+	a := &adapter{
 		pending:   map[string]chan ipc.ToolResultMsg{},
 		fqPending: map[string]chan ipc.FetchQueueResp{},
 		rtPending: map[string]chan ipc.RetranscribeResp{},
+		forwardCh: make(chan codexForwardReq, 256),
 	}
+	// Single serial Codex-forward consumer. Started here (not per-inbound) so all
+	// forwards + delivery acks go through one in-order path — the invariant the
+	// broker's count-off-head consume requires (M2). Parks on forwardCh until an
+	// inbound is enqueued; lives for the process lifetime like the old detached
+	// forward goroutines did (no separate shutdown).
+	go a.codexForwardLoop()
+	return a
 }
 
 func (a *adapter) connectBroker() error {
@@ -526,7 +553,13 @@ func (a *adapter) handleInbound(raw []byte) {
 	if pendingCount < 1 {
 		pendingCount = 1
 	}
-	if a.transport != nil {
+	// Nudge = the notify-only delivery signal (agent → fetch_queue → consume). It
+	// is SUPPRESSED in bridge mode (M2 hazard c): when forwarding is enabled the
+	// serial WS forward below is the SOLE delivery+consume path, and a nudge telling
+	// the agent to call fetch_queue(ack=true) would add a SECOND count-off-head
+	// consumer racing the forward's ack → over-consume → silent loss. In notify-only
+	// mode (forwarding disabled) the nudge is the only delivery signal, so it stays.
+	if a.transport != nil && !codexForwardingAllowed() {
 		if err := a.transport.Notify(context.Background(), "notifications/message", map[string]any{
 			"data": "c3: new Telegram message — call `fetch_queue` to read it. " + pendingNudge(pendingCount),
 		}); err != nil {
@@ -546,12 +579,25 @@ func (a *adapter) handleInbound(raw []byte) {
 		}
 	}
 
-	// WS forwarder (gated by env, see split-brain guard). On a SUCCESSFUL forward
-	// the goroutine acks the broker so it Consumes the queued copy (D-RC2); on
-	// failure it does NOT ack, so the content stays queued for fetch_queue recovery.
-	// Inbound is passed by value + Covered so the goroutine owns its own copy.
+	// WS forwarder (gated by env, see split-brain guard). Enqueue onto the SINGLE
+	// serial forwarder (codexForwardLoop) instead of spawning a goroutine per
+	// inbound — that per-inbound design was the M2 loss bug (an older message's
+	// forward failing while a newer one acked Count=1 consumed the OLDER undelivered
+	// message off the head). conn is captured NOW (a.currentConn()) so a reconnect
+	// during the forward can't redirect the later ack (hazard b). On a SUCCESSFUL,
+	// not-blocked forward the loop acks so the broker Consumes the queued copy
+	// (D-RC2); on failure it never acks and the content stays queued for fetch_queue
+	// recovery. Inbound is copied by value so the loop owns it.
 	if codexForwardingAllowed() {
-		go a.forwardToCodexAppServer(msg.Inbound, msg.Covered)
+		req := codexForwardReq{inbound: msg.Inbound, covered: msg.Covered, conn: a.currentConn()}
+		select {
+		case a.forwardCh <- req:
+		default:
+			// forwardCh full (256 buffered): skip this live forward best-effort and
+			// do NOT ack. The broker already durably queued this inbound, so the
+			// content is never lost — it stays queued for fetch_queue recovery.
+			log.Printf("codex forward queue full — skipping live forward for inbound id=%d; content stays durably queued (fetch_queue recovery)", msg.Inbound.MessageID)
+		}
 	}
 }
 
@@ -601,8 +647,9 @@ func codexForwardingAllowed() bool {
 		os.Getenv("C3_CODEX_ALLOW_MANUAL_FORWARD") == "1"
 }
 
-// forwardToCodexAppServer pushes one inbound as a Codex turn via WebSocket.
-// Runs in a goroutine; failure logged but doesn't error the whole adapter.
+// codexForwardLoop is the SINGLE consumer of forwardCh. It pushes each inbound as
+// a Codex turn via WebSocket, strictly in enqueue (= queue) order, and is the ONLY
+// path that sends an OpInboundDelivered ack.
 //
 // WS protocol per spec §4.4 Codex section:
 //
@@ -610,35 +657,62 @@ func codexForwardingAllowed() bool {
 //	(thread/list filtered by cwd if multiple loaded) → thread/resume →
 //	thread/turn/start
 //
-// Each inbound opens a fresh short-lived WebSocket (Codex app-server expects
-// new turns this way; long-lived sessions would conflict with the visible
-// TUI's connection).
-func (a *adapter) forwardToCodexAppServer(in c3types.Inbound, covered int) {
-	if err := forwardInboundToCodexAppServer(context.Background(), &in, codexForwardConfigFromEnv()); err != nil {
-		// errCodexForwardNoWS = forwarding enabled but unconfigured (no WS URL): the
-		// forward delivered nothing, so we must NOT ack (acking a no-op forward would
-		// drop the message — broker consumes the queued copy the agent never received
-		// live). It's a benign config state, not a failure, so don't spam stderr per
-		// inbound. Any OTHER error is a real forward failure: log it, still no ack.
-		if !errors.Is(err, errCodexForwardNoWS) {
-			fmt.Fprintf(os.Stderr, "c3-codex-adapter: WS forward failed for inbound id=%d: %v\n", in.MessageID, err)
+// Each inbound opens a fresh short-lived WebSocket (Codex app-server expects new
+// turns this way; long-lived sessions would conflict with the visible TUI's
+// connection).
+//
+// M2 correctness: the broker's OpInboundDelivered consume is count-off-HEAD
+// (worker.go handleConsume → Queue.Consume(n); MessageID is only logged). That is
+// safe ONLY if (1) acks arrive in queue order, head-first, and (2) we never ack
+// while an earlier message is still undelivered. The retired per-inbound goroutine
+// design broke both: an older message's forward could FAIL (correctly no ack) while
+// a newer one SUCCEEDED and acked Count=1 → the broker dropped 1 off the head = the
+// OLDER undelivered message → silent loss. Serial processing here gives (1); the
+// local `blocked` latch gives (2). `blocked` stays set for the session once any
+// forward fails — Codex then falls back to fetch_queue-as-source-of-truth (the safe
+// pre-RC2 behavior); a session restart resets it. No mutex: single goroutine.
+func (a *adapter) codexForwardLoop() {
+	blocked := false
+	for req := range a.forwardCh {
+		err := forwardInboundToCodexAppServer(context.Background(), &req.inbound, codexForwardConfigFromEnv())
+		if err != nil {
+			// errCodexForwardNoWS = forwarding enabled but unconfigured (no WS URL):
+			// the forward delivered nothing. It's a benign config state, not a real
+			// failure, so don't spam stderr per inbound. Any OTHER error is a real
+			// forward failure: log it. Either way the forward delivered nothing, so
+			// the head is now an undelivered message and any later ack would consume
+			// IT off the head → set blocked and never ack.
+			if !errors.Is(err, errCodexForwardNoWS) {
+				fmt.Fprintf(os.Stderr, "c3-codex-adapter: WS forward failed for inbound id=%d: %v\n", req.inbound.MessageID, err)
+			}
+			blocked = true
+			continue // DO NOT ack — content stays queued (recovery via fetch_queue).
 		}
-		return // DO NOT ack on any error — content stays queued (recovery via fetch_queue).
-	}
-	// D-RC2: ack ONLY after a SUCCESSFUL live forward, gated exactly like the Claude
-	// adapter (cmd/c3-claude-adapter/main.go ~:655):
-	//   - codexForwardingAllowed() already held at the call site, so the notify-only
-	//     (forwarding-disabled) path never reaches here — we never ack content the
-	//     agent did not receive live (Watch-out #6; fetch_queue stays source of truth).
-	//   - !in.IsEvent(): a synthesized event (poll_result/reaction/callback) is never
-	//     queued, so it covers zero stored lines — acking one would over-consume real
-	//     backlog the event never delivered (Watch-out #5).
-	//   - covered >= 1: nothing to consume otherwise. The broker double-guards
-	//     (handleInboundDelivered drops Count<1, handleConsume skips Count<1) — this
-	//     adapter guard is the first line.
-	// ipc.Conn.WriteJSON is wmu-guarded, so this write is safe from the goroutine.
-	if conn := a.currentConn(); conn != nil && !in.IsEvent() && covered >= 1 {
-		_ = conn.WriteJSON(ipc.InboundDeliveredMsg{Op: ipc.OpInboundDelivered, UpdateID: in.MessageID, OK: true, Count: covered})
+		if blocked {
+			// Delivered live, but an earlier message is still the undelivered head.
+			// Acking now would Consume that earlier message off the head → loss. So
+			// skip the ack: this (delivered) message stays queued and fetch_queue
+			// re-delivers it later — a benign duplicate, never loss.
+			continue
+		}
+		// Success AND not blocked: this message IS the current head and was delivered
+		// live → safe to ack so the broker Consumes exactly it. Gated exactly like the
+		// Claude adapter (cmd/c3-claude-adapter/main.go ~:655):
+		//   - codexForwardingAllowed() already held at the enqueue site, so the
+		//     notify-only (forwarding-disabled) path never enqueues — we never ack
+		//     content the agent did not receive live (Watch-out #6).
+		//   - !IsEvent(): a synthesized event (poll_result/reaction/callback) is never
+		//     queued, so it covers zero stored lines — acking one would over-consume
+		//     real backlog the event never delivered (Watch-out #5).
+		//   - covered >= 1: nothing to consume otherwise. The broker double-guards
+		//     (handleInboundDelivered drops Count<1, handleConsume skips Count<1) —
+		//     this adapter guard is the first line.
+		// req.conn was captured at ENQUEUE time (hazard b), so a reconnect during the
+		// forward can't make this land on a route the stub no longer holds.
+		// ipc.Conn.WriteJSON is wmu-guarded, so this write is safe from the goroutine.
+		if req.conn != nil && !req.inbound.IsEvent() && req.covered >= 1 {
+			_ = req.conn.WriteJSON(ipc.InboundDeliveredMsg{Op: ipc.OpInboundDelivered, UpdateID: req.inbound.MessageID, OK: true, Count: req.covered})
+		}
 	}
 }
 
