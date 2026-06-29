@@ -862,6 +862,117 @@ func TestTryClaim_ReplayFlagSuppressesWelcomeAfterBrokerBounce(t *testing.T) {
 	}
 }
 
+// ─── atomic attach switch (W1 Phase 5 / spec §C) ───────────────────────────
+//
+// tryClaim must claim the NEW route before releasing the OLD one, and release
+// the old one ONLY on a successful claim. A failed claim (live collision) must
+// leave the stub's existing claim fully intact — otherwise a rejected
+// attach-switch strands the stub attached to nothing and later messages to the
+// old route are silently held as "no claim".
+
+// drainedConn returns an *ipc.Conn whose writes are continuously drained by a
+// background reader, so a synchronous WriteJSON (e.g. tryClaim's force_steal
+// proposal on the collision path) completes instead of blocking on net.Pipe's
+// unbuffered wire. Closed via t.Cleanup.
+func drainedConn(t *testing.T) *ipc.Conn {
+	t.Helper()
+	near, far := net.Pipe()
+	go func() {
+		peer := ipc.NewConn(far)
+		for {
+			if _, err := peer.ReadFrame(); err != nil {
+				return
+			}
+		}
+	}()
+	conn := ipc.NewConn(near)
+	t.Cleanup(func() {
+		_ = near.Close()
+		_ = far.Close()
+	})
+	return conn
+}
+
+func TestTryClaim_FailedSwitchKeepsOldRoute(t *testing.T) {
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	dmKey := MakeRouteKey("telegram", 42, nil)
+	tid := int64(281)
+	c3Key := MakeRouteKey("telegram", -100, &tid)
+
+	// 1. stubA claims the DM. Registered (not a bare &Stub) so it gets a
+	// distinct ConnID — otherwise the zero-ConnID would make step 3's Claim
+	// look like an idempotent self-reclaim instead of a cross-session
+	// collision.
+	stubA := b.Stubs.Register("claude", 1, "/a", nil)
+	if !b.tryClaim(nil, stubA, dmKey, "DM", false, false) {
+		t.Fatal("stubA: DM claim should succeed")
+	}
+
+	// 2. A second, alive, different-logical-session stub claims topic c3. Its
+	// PID is a real live process, so the collision in step 3 is a LIVE
+	// collision (not a dead-holder displacement that would succeed).
+	stubB := b.Stubs.Register("codex", os.Getpid(), "/b", nil)
+	if !b.tryClaim(nil, stubB, c3Key, "c3", false, false) {
+		t.Fatal("stubB: c3 claim should succeed")
+	}
+
+	// 3. stubA tries to SWITCH to c3 without steal → live collision, false.
+	conn := drainedConn(t)
+	if b.tryClaim(conn, stubA, c3Key, "c3", false, false) {
+		t.Fatal("stubA: switch to held c3 (steal=false) must fail with a collision")
+	}
+
+	// 4. The failed switch must leave stubA's OLD route fully intact — both the
+	// stub's recorded route and the routes-table claim.
+	if got := stubA.CurrentRoute(); got == nil || *got != dmKey {
+		t.Errorf("stubA.CurrentRoute()=%v, want DM key %v (old route dropped on failed switch)", got, dmKey)
+	}
+	if h, ok := b.Routes.Holder(dmKey); !ok || h != stubA {
+		t.Errorf("Routes.Holder(DM)=%v ok=%v, want stubA — failed switch released the old claim", h, ok)
+	}
+	// stubB still holds c3 untouched.
+	if h, ok := b.Routes.Holder(c3Key); !ok || h != stubB {
+		t.Errorf("Routes.Holder(c3)=%v ok=%v, want stubB", h, ok)
+	}
+}
+
+func TestTryClaim_SuccessfulSwitchReleasesOld(t *testing.T) {
+	mf := mfWithTelegram()
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	dmKey := MakeRouteKey("telegram", 42, nil)
+	tid := int64(281)
+	c3Key := MakeRouteKey("telegram", -100, &tid)
+
+	stubA := b.Stubs.Register("claude", 1, "/a", nil)
+	if !b.tryClaim(nil, stubA, dmKey, "DM", false, false) {
+		t.Fatal("stubA: DM claim should succeed")
+	}
+
+	// Switch to an UNHELD topic → succeeds.
+	if !b.tryClaim(nil, stubA, c3Key, "c3", false, false) {
+		t.Fatal("stubA: switch to unheld c3 should succeed")
+	}
+
+	// Single-claim invariant: stubA now holds c3, and the old DM route is free
+	// (no double-hold).
+	if got := stubA.CurrentRoute(); got == nil || *got != c3Key {
+		t.Errorf("stubA.CurrentRoute()=%v, want c3 key %v", got, c3Key)
+	}
+	if h, ok := b.Routes.Holder(c3Key); !ok || h != stubA {
+		t.Errorf("Routes.Holder(c3)=%v ok=%v, want stubA", h, ok)
+	}
+	if h, ok := b.Routes.Holder(dmKey); ok && h == stubA {
+		t.Errorf("Routes.Holder(DM) still stubA — old route NOT released on successful switch (double-hold)")
+	}
+}
+
 // TestPing_SendsReplyToAttachedRoute is the happy-path for the
 // `/c3:ping` slash command. Attach a fake adapter to a topic; then a
 // separate transient client (mimicking `c3-broker ping`) connects with
