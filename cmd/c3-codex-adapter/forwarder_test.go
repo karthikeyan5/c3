@@ -155,18 +155,18 @@ func TestForwardInboundToCodexAppServerPicksLoadedThreadForCWD(t *testing.T) {
 func TestFormatInboundTurnText_IncludesReplyAndMessageID(t *testing.T) {
 	in := &c3types.Inbound{
 		Channel:   "telegram",
-		ChatID:    85720317,
-		MessageID: 1722,
-		Sender:    c3types.Sender{Username: "skarthi"},
+		ChatID:    -100,
+		MessageID: 102,
+		Sender:    c3types.Sender{Username: "alice"},
 		ReplyTo: &c3types.ReplyContext{
-			MessageID: 1718,
-			User:      c3types.Sender{Username: "skarthi"},
+			MessageID: 101,
+			User:      c3types.Sender{Username: "alice"},
 			Text:      ".",
 		},
 		Text: "Reply to this",
 	}
 	got := formatInboundTurnText(in)
-	for _, want := range []string{"message_id=1722", "reply_to=1718", "reply_to_user=@skarthi"} {
+	for _, want := range []string{"message_id=102", "reply_to=101", "reply_to_user=@alice"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("formatInboundTurnText missing %q; got %q", want, got)
 		}

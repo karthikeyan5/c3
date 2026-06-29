@@ -30,12 +30,12 @@ func TestRenderQueuedInbound_FullReplyContext(t *testing.T) {
 	got := renderQueuedInbound(&c3types.Inbound{
 		Channel: "telegram", ChatID: -100, MessageID: 9,
 		ReplyTo: &c3types.ReplyContext{
-			MessageID: 1708,
-			User:      c3types.Sender{UserID: 85720317, Username: "skarthi"},
+			MessageID: 100,
+			User:      c3types.Sender{UserID: 42, Username: "alice"},
 			Text:      ".",
 		},
 	})
-	for _, want := range []string{"reply_to=1708", "reply_to_user=@skarthi", `reply_to_text="."`} {
+	for _, want := range []string{"reply_to=100", "reply_to_user=@alice", `reply_to_text="."`} {
 		if !strings.Contains(got, want) {
 			t.Errorf("renderQueuedInbound missing %q; got %q", want, got)
 		}

@@ -61,12 +61,19 @@ func (b *Broker) handleFetchQueue(conn *ipc.Conn, stub *Stub, raw []byte) {
 		// the worker later runs the job, the batch is consumed (and the Telegram
 		// offset already advanced at persist time), but the result lands in a now-
 		// readerless cap-1 channel → the batch is consumed yet never delivered →
-		// permanent silent inbound loss. So we do NOT time out the destructive path;
-		// we block on <-resultCh. A1/A2 already fast-fail an EXITED worker via
-		// errWorkerStopped (shutdown() drains it), so this block only persists for an
-		// alive-but-BUSY worker — bounded by the STT deadline (sttFlushTimeout) — a
-		// bounded wait, never loss.
-		// Follow-up (W1 review): peek-then-explicit-ack to also bound the busy-worker wait without the read-loop block.
+		// permanent silent inbound loss. So the BROKER does NOT time out the
+		// destructive path; we block on <-resultCh. A1/A2 already fast-fail an EXITED
+		// worker via errWorkerStopped (shutdown() drains it), so this block only
+		// persists for an alive-but-BUSY worker (bounded by the STT deadline).
+		// CAVEAT (NOT yet fully fixed): the *adapter* still abandons this same
+		// round-trip at its own ~120s timeout (cmd/c3-*-adapter), which is < a long
+		// STT flush — so a fetch_queue(ack=true) queued behind a >120s STT can still
+		// be orphaned the same way (the worker later consumes; the adapter waiter is
+		// gone). That residual is PRE-EXISTING (byte-identical to master, not this
+		// branch); removing the broker's 30s timeout here only closed the worse
+		// regression this branch had introduced. The real fix is delivery-contingent:
+		// peek-then-explicit-ack (consume only after the FetchQueueResp is confirmed
+		// written), or an id-targeted consume — a design call tracked as a follow-up.
 		res = <-resultCh
 	} else {
 		// Non-destructive PEEK (Ack=false): a discarded peek consumes nothing, so
