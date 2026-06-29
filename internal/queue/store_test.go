@@ -25,6 +25,17 @@ func msg(id int64, text string) *c3types.Inbound {
 	return &c3types.Inbound{Channel: "telegram", ChatID: -100, MessageID: id, Text: text, Timestamp: time.Now()}
 }
 
+// freshKey returns a RouteKey for ONE logical topic route, minting a DISTINCT
+// *int64 for TopicID on every call — exactly what the broker's queueRouteKey does
+// per call (broker.go: t := k.TopicID; rk.TopicID = &t). Two of these are equal by
+// File() value but are DISTINCT Go map keys, which is the whole point of the B fix:
+// the status index must key by File() so per-call pointer churn can't accrue stale
+// duplicate rows.
+func freshKey() RouteKey {
+	t := int64(914)
+	return RouteKey{Channel: "telegram", ChatID: -100, TopicID: &t}
+}
+
 func TestAppendPeekConsumeAndDeleteOnEmpty(t *testing.T) {
 	s := newStore(t)
 	rk := RouteKey{Channel: "telegram", ChatID: -100}
@@ -297,6 +308,70 @@ func TestStatusFor_IndexBackedAndPointerSafe(t *testing.T) {
 	}
 	if got := s.StatusFor(query); got.Pending != 0 {
 		t.Fatalf("StatusFor after drain = %+v, want Pending 0", got)
+	}
+}
+
+// TestStatusFor_DistinctPointersPerCall pins the B fix: production mints a FRESH
+// *int64 RouteKey on EVERY Append/Consume (queueRouteKey), so a pointer-keyed index
+// accrues a stale row per call and StatusFor returns a map-order-random count that
+// never clears after drain. With the index keyed by File(), there is exactly ONE
+// canonical row per route: the count is deterministic and drain clears it.
+//
+// On the UNFIXED tree this FAILS — after draining via yet another distinct pointer,
+// refreshIndex deletes a key that was never the Append-time key, so the stale rows
+// survive and StatusFor reports a nonzero (1/2/3) count for an empty route.
+func TestStatusFor_DistinctPointersPerCall(t *testing.T) {
+	s := newStore(t)
+	// Append 3 messages, each routed by a freshKey() carrying a DISTINCT pointer
+	// to the same topic value — three separate Go map keys for one logical route.
+	for i := int64(1); i <= 3; i++ {
+		if err := s.Append(freshKey(), msg(i, "m")); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	if st := s.StatusFor(freshKey()); st.Pending != 3 {
+		t.Fatalf("StatusFor.Pending = %d, want 3 (one canonical row, no per-pointer stale duplicates)", st.Pending)
+	}
+	// Drain via ANOTHER distinct pointer; the index must clear to zero.
+	if _, err := s.Consume(freshKey(), -1); err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+	if st := s.StatusFor(freshKey()); st.Pending != 0 {
+		t.Fatalf("StatusFor after drain = %d, want 0 (no stale duplicate survives)", st.Pending)
+	}
+}
+
+// TestStatusAll_AfterDistinctPointerAppends_NoDuplicateRows pins that the
+// cross-route summary collapses per-call pointer churn into a single row, and that
+// the reconstructed RouteKey round-trips Channel/ChatID and the TopicID VALUE (so
+// statusGlobal, which reads k.Channel/k.ChatID/k.TopicID, still renders correctly).
+//
+// On the UNFIXED tree this FAILS: the pointer-keyed index holds three distinct map
+// entries for the one route, so StatusAll returns len 3.
+func TestStatusAll_AfterDistinctPointerAppends_NoDuplicateRows(t *testing.T) {
+	s := newStore(t)
+	for i := int64(1); i <= 3; i++ {
+		if err := s.Append(freshKey(), msg(i, "m")); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	all := s.StatusAll()
+	if len(all) != 1 {
+		t.Fatalf("StatusAll len = %d, want 1 canonical row (no per-pointer duplicate rows)", len(all))
+	}
+	var gotKey RouteKey
+	var gotStatus Status
+	for k, v := range all {
+		gotKey, gotStatus = k, v
+	}
+	if gotKey.Channel != "telegram" || gotKey.ChatID != -100 {
+		t.Fatalf("reconstructed key = %+v, want Channel telegram / ChatID -100", gotKey)
+	}
+	if gotKey.TopicID == nil || *gotKey.TopicID != 914 {
+		t.Fatalf("reconstructed TopicID = %v, want a pointer to value 914", gotKey.TopicID)
+	}
+	if gotStatus.Pending != 3 {
+		t.Fatalf("status.Pending = %d, want 3", gotStatus.Pending)
 	}
 }
 
