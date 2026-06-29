@@ -541,6 +541,79 @@ func TestTypingRelay_DisarmsAfterMaxPulses(t *testing.T) {
 	}
 }
 
+// TestWorker_StoppedAfterIdleExit pins A1's mutual-exclusion invariant: once a
+// worker's run() has exited (here via the IDLE timeout), Submit must report the
+// worker stopped (return false) rather than accepting a job into the buffer of a
+// dead worker whose run goroutine will never read it (the original strand). This
+// complements TestWorker_SubmitAfterStopReturnsFalse (which covers the explicit
+// Stop() path) by covering the idle exit path, where pre-fix `stopped` stayed
+// false for the worker's whole life.
+func TestWorker_StoppedAfterIdleExit(t *testing.T) {
+	w := newRouteWorker(context.Background(), RouteKey{Channel: "x"}, 20*time.Millisecond, nil)
+	select {
+	case <-w.Done():
+	case <-time.After(time.Second):
+		t.Fatal("worker did not idle out within 1s")
+	}
+	if w.Submit(Job{Kind: JobInbound}) {
+		t.Error("Submit after idle exit must return false (worker is stopped)")
+	}
+}
+
+// TestWorker_IdleExitDrainsPendingFetch pins A1's loss-free drain: when run()
+// exits with jobs still buffered in w.queue, every result-channel-bearing job
+// must be replied to with an error instead of being left stranded — a caller
+// blocked on <-resultCh would otherwise hang forever (the original fetch_queue
+// wedge).
+//
+// All four exit paths (ctx.Done, idleTimer, queue-closed, JobRelease) funnel
+// through the SAME single `defer w.shutdown()`, so exercising one exercises the
+// drain for all. We drive the JobRelease exit because it is the only
+// DETERMINISTIC strand: the idle/ctx selects race the queue read (Go `select`
+// picks a ready case at random when a job is also buffered), whereas a
+// JobRelease read returns WITHOUT re-entering the select, deterministically
+// leaving the jobs queued behind it un-processed for shutdown() to drain.
+// Mirrors JobFetch + JobOutbound (Watch-out: JobInbound carries no ResultCh and
+// must be dropped silently — exercised implicitly here, asserted by no hang).
+func TestWorker_IdleExitDrainsPendingFetch(t *testing.T) {
+	fetchCh := make(chan FetchResult, 1)
+	outCh := make(chan OutboundResult, 1)
+
+	// Build the worker WITHOUT starting run(), pre-load the queue so all jobs are
+	// buffered before the loop reads anything, THEN start run(). The loop reads the
+	// leading JobRelease and returns; the JobFetch + JobOutbound behind it are never
+	// processed and must be drained on exit. A no-ResultCh JobInbound is also
+	// buffered to prove the drain drops it silently (no panic, no hang).
+	w := &RouteWorker{
+		key:   RouteKey{Channel: "x"},
+		queue: make(chan Job, 64),
+		idle:  time.Hour,
+		done:  make(chan struct{}),
+	}
+	w.queue <- Job{Kind: JobRelease}
+	w.queue <- Job{Kind: JobFetch, Fetch: &FetchJob{All: true, ResultCh: fetchCh}}
+	w.queue <- Job{Kind: JobInbound} // no ResultCh — must be dropped silently
+	w.queue <- Job{Kind: JobOutbound, Outbound: &OutboundJob{Tool: "reply", ResultCh: outCh}}
+	go w.run(context.Background())
+
+	select {
+	case r := <-fetchCh:
+		if r.Err == nil {
+			t.Error("drained JobFetch must carry a non-nil error, got nil")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending JobFetch was stranded — run() exit did not drain the queue")
+	}
+	select {
+	case r := <-outCh:
+		if r.Err == nil {
+			t.Error("drained JobOutbound must carry a non-nil error, got nil")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending JobOutbound was stranded — run() exit did not drain the queue")
+	}
+}
+
 func TestWorker_OutboundStubReturnsErr(t *testing.T) {
 	w := newRouteWorker(context.Background(), RouteKey{Channel: "x"}, time.Hour, nil)
 	defer w.Stop()

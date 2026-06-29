@@ -34,25 +34,73 @@ func NewWorkerPool(parent context.Context, idle time.Duration, broker *Broker) *
 	}
 }
 
-// Submit enqueues job for the given route key, starting a worker if none
-// exists. Returns false if the pool is stopped or the worker queue is full.
+// Submit enqueues job for the given route key, starting a worker if none exists.
+// Returns false if the worker queue is genuinely full.
+//
+// A2: a map entry can point at a worker whose run() has already EXITED (idle/ctx/
+// release) but whose async reaper has not yet deleted it. Such a worker is treated
+// as absent and respawned, so a job is never handed to a dead worker. To also
+// cover the worker exiting in the window between releasing p.mu and w.Submit, the
+// submit is retried ONCE: if w.Submit returns false we re-enter under p.mu,
+// re-check Done(), and respawn if it exited. A1 guarantees a stopped worker's
+// Submit returns false rather than stranding, so this terminates — the retry
+// either lands on a live worker or a freshly-spawned one. (A genuinely full queue
+// on a live worker returns false on both attempts, preserving the old semantics.)
 func (p *WorkerPool) Submit(key RouteKey, job Job) bool {
-	p.mu.Lock()
-	w, ok := p.workers[key]
-	if !ok {
-		w = newRouteWorker(p.ctx, key, p.idle, p.broker)
-		p.workers[key] = w
-		p.wg.Add(1)
-		go func() {
-			<-w.Done()
-			p.mu.Lock()
-			delete(p.workers, key)
-			p.mu.Unlock()
-			p.wg.Done()
-		}()
+	for attempt := 0; attempt < 2; attempt++ {
+		p.mu.Lock()
+		w, ok := p.workers[key]
+		if ok && workerExited(w) {
+			ok = false // exited but not yet reaped — treat as absent, respawn below
+		}
+		if !ok {
+			w = p.spawnLocked(key)
+		}
+		p.mu.Unlock()
+
+		if w.Submit(job) {
+			return true
+		}
+		// w.Submit returned false: either the worker exited between unlock and
+		// Submit (A1 ⇒ it returned false instead of stranding) or its queue is full.
+		// Loop once more — the Done() re-check respawns for the former; for a full
+		// queue the worker is still live so we don't respawn and the retry also
+		// fails, returning false.
 	}
-	p.mu.Unlock()
-	return w.Submit(job)
+	return false
+}
+
+// workerExited reports whether w's run goroutine has already returned (Done
+// closed). Caller should hold p.mu when using the result to mutate the map.
+func workerExited(w *RouteWorker) bool {
+	select {
+	case <-w.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+// spawnLocked creates a fresh worker for key, installs it in the map (overwriting
+// any exited entry), and starts its reaper. Caller MUST hold p.mu.
+func (p *WorkerPool) spawnLocked(key RouteKey) *RouteWorker {
+	w := newRouteWorker(p.ctx, key, p.idle, p.broker)
+	p.workers[key] = w
+	p.wg.Add(1)
+	go func() {
+		<-w.Done()
+		p.mu.Lock()
+		// Delete-if-same (A2): only remove the entry if it still points at THIS
+		// worker. A respawn may have already replaced it; deleting unconditionally
+		// would clobber the live respawn (and the respawn's own reaper would then
+		// have nothing to clean up).
+		if cur, ok := p.workers[key]; ok && cur == w {
+			delete(p.workers, key)
+		}
+		p.mu.Unlock()
+		p.wg.Done()
+	}()
+	return w
 }
 
 // Stop signals all workers to exit and waits for them.

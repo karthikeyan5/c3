@@ -200,6 +200,14 @@ func newRouteWorker(parent context.Context, key RouteKey, idle time.Duration, br
 
 func (w *RouteWorker) run(ctx context.Context) {
 	defer close(w.done)
+	// A1: drain BEFORE done closes. Deferred LIFO ⇒ shutdown() runs first, then
+	// close(w.done). This ordering is load-bearing for A2: when WorkerPool.Submit /
+	// the reaper observe done closed, `stopped` is already true and the queue is
+	// already drained, so a stopped worker's Submit reliably returns false (never
+	// strands) and Submit's respawn loop terminates. shutdown runs on EVERY exit
+	// path (ctx.Done, idleTimer, queue-closed, JobRelease) and even on a recovered
+	// panic (recoverGoroutine below runs first, then this).
+	defer w.shutdown()
 	// Backstop: a panic in the run-loop machinery (outside the per-method guards
 	// below) is recovered + logged instead of crashing the whole broker. The
 	// worker then exits cleanly (done closes); WorkerPool.Submit respawns a fresh
@@ -1206,6 +1214,73 @@ func (w *RouteWorker) Submit(job Job) bool {
 	}
 }
 
+// shutdown makes "worker exiting" and "Submit accepting" mutually exclusive
+// (A1). It runs as a defer from run() on EVERY exit path. Under w.mu it (1) sets
+// w.stopped so any concurrent/subsequent Submit returns false instead of pushing
+// a job into the buffer of a worker whose run goroutine has already returned, and
+// (2) drains every job still queued, replying an error to each result-channel-
+// bearing job so a caller blocked on <-resultCh is never stranded (the original
+// fetch_queue/attach-backlog wedge). Submit also takes w.mu, so the set+drain is
+// atomic with respect to enqueue: after shutdown returns, the queue is empty and
+// no further job can be enqueued.
+//
+// Loss-freedom (W1 Watch-out #4): the drain MUST NOT mark any inbound update_id
+// done, consume any queue line, or advance any Telegram offset. It only replies
+// errors to ResultCh-bearing jobs. JobInbound / JobConsume carry no ResultCh and
+// are dropped silently — they re-deliver via the Telegram offset (JobInbound) or
+// remain durable backlog (JobConsume); only the real persisted path may ack.
+// Never fake-ack.
+//
+// Idempotent: the stopped flag set is guarded (Stop() may have set it already),
+// but the drain ALWAYS runs — a job can slip into the queue between Stop()'s set
+// and run()'s exit, and that job must still be drained.
+func (w *RouteWorker) shutdown() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.stopped {
+		w.stopped = true
+	}
+	for {
+		select {
+		case job := <-w.queue:
+			switch job.Kind {
+			case JobFetch:
+				if job.Fetch != nil && job.Fetch.ResultCh != nil {
+					select {
+					case job.Fetch.ResultCh <- FetchResult{Err: errWorkerStopped}:
+					default:
+					}
+				}
+			case JobOutbound:
+				if job.Outbound != nil && job.Outbound.ResultCh != nil {
+					select {
+					case job.Outbound.ResultCh <- OutboundResult{Err: errWorkerStopped}:
+					default:
+					}
+				}
+			case JobRefreshText:
+				if job.Refresh != nil && job.Refresh.ResultCh != nil {
+					select {
+					case job.Refresh.ResultCh <- RefreshResult{Err: errWorkerStopped}:
+					default:
+					}
+				}
+			case JobBacklog:
+				if job.Backlog != nil && job.Backlog.ResultCh != nil {
+					select {
+					case job.Backlog.ResultCh <- BacklogResult{Err: errWorkerStopped}:
+					default:
+					}
+				}
+				// JobInbound / JobConsume / JobRelease carry no ResultCh: drop
+				// silently (loss-free — see the doc comment above). Never ack.
+			}
+		default:
+			return
+		}
+	}
+}
+
 // Stop signals the worker to drain and exit. Idempotent.
 func (w *RouteWorker) Stop() {
 	w.mu.Lock()
@@ -1223,6 +1298,12 @@ func (w *RouteWorker) Stop() {
 func (w *RouteWorker) Done() <-chan struct{} { return w.done }
 
 var errOutboundNotImpl = workerErr("worker has no broker reference")
+
+// errWorkerStopped is the error replied to every result-channel-bearing job that
+// shutdown() drains when run() exits with the job still queued (A1). The caller
+// (handleFetch/handleToolCall/attach-backlog/retranscribe-refresh) returns this
+// as a clean error rather than wedging on a never-answered channel.
+var errWorkerStopped = workerErr("worker stopped before job ran")
 
 type workerErr string
 
