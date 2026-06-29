@@ -23,6 +23,7 @@ All configuration lives here — the Go shim is a thin spawn-and-wait wrapper.
 """
 import sys
 import os
+import re
 import json
 import time
 import urllib.request
@@ -148,45 +149,272 @@ def run_stt(audio_path, extra_env, timeout=270):
         return None
     return transcript
 
-# ── Telegram echo (testable) ──────────────────────────────────────────────────
+# ── Telegram echo: W4 three-band renderer (testable) ───────────────────────────
+#
+# A transcript renders as EXACTLY ONE chat item in one of three size bands:
+#   PLAIN    — short: header + whole transcript (HTML-escaped).
+#   INLINE   — medium: a first-N … last-N preview with a counted elision marker,
+#              above a <blockquote expandable> holding the WHOLE verbatim text.
+#   DOCUMENT — long: a .txt attachment (whole verbatim text) with the same
+#              preview in the caption.
+# The full transcript is NEVER summarized and NEVER truncated — only the *preview*
+# elides the middle. Band is chosen by the MEASURED UTF-16-displayed length of the
+# exact string about to be sent, so multi-message overflow is structurally
+# impossible (no chunk loop). A safety net wraps the text send: any Telegram error
+# falls back to the .txt document, then to a short notice, then to a non-fatal log.
 
-def send_transcript_to_telegram(token, chat_id, msg_id, thread_id, transcript, tg_fn=None):
-    """Echo a transcript back to Telegram, splitting into 4096-char chunks
-    when needed. Returns the number of chunks sent.
+HARD_MSG_CAP   = 4096   # sendMessage text cap, post-entities (capabilities.go:15)
+HARD_CAPTION   = 1024   # sendDocument caption cap, post-entities (capabilities.go:34)
+MARGIN         = 128    # slack below the hard wire cap
+CEIL           = HARD_MSG_CAP - MARGIN     # 3968 -> max DISPLAYED units for one sendMessage
+CAPTION_CEIL   = HARD_CAPTION - 32         # 992  -> caption ceiling with small slack
+T_PLAIN        = 1800   # <= this renders PLAIN. THE single UX dial; tune on a phone.
+N_PREVIEW_MAX  = 5      # max sentences shown each side
+PREVIEW_MAX    = 700    # UTF-16 cap on the preview block (keeps DOCUMENT caption < 1024)
+CHAR_WINDOW    = 400    # run-on fallback: chars each side (word-snapped)
+MAX_SEND_BYTES = 50 * 1024 * 1024  # sendDocument file ceiling (capabilities.go:36); unreachable
 
-    Critical invariant (regression-tested in test_stt_handler.py): every
-    chunk carries `message_thread_id` when `thread_id` is set. Without it,
-    Telegram routes chunks 2+ to the General topic — the regression Karthi
-    hit on 2026-05-14 because an older handler version only carried the
-    thread id implicitly via `reply_parameters` on the first chunk.
+_SENT = re.compile(r'(?<=[.!?।॥…])\s+')   # Latin + Devanagari danda + ellipsis
 
-    `tg_fn` is the Telegram-API caller (defaults to the module-level `tg`);
-    tests inject a fake to capture calls without doing network I/O.
+_INLINE_SIGNPOST = '<i>\U0001f4c4 Full transcript</i>'   # displayed: "📄 Full transcript"
+
+
+def _u16(s):
+    """UTF-16 code-unit length. Python len() counts CODEPOINTS and UNDER-counts
+    astral chars (🎤 = 2 UTF-16 units, 1 codepoint); all budget math MUST use this.
+
+    Telegram's 4096 cap is on the DISPLAYED text after entities parsing, so under
+    parse_mode='HTML' the tags (<b>, <blockquote expandable>, …) and escapes
+    (&amp; -> displayed '&') cost 0 — the wire cost of escaped content equals its
+    unescaped displayed length. We therefore measure the visible string and send
+    the same structure with tags + _esc()-ed content.
+    # TODO(W4 Phase 0): live-verify displayed-length budget; until then
+    # MARGIN+fallback-net cover it.
     """
-    if tg_fn is None:
-        tg_fn = tg
-    prefix = '\U0001f3a4 [Voice transcript]: '
-    full_text = prefix + transcript
-    MAX_LEN = 4096
-    thread_kwargs = {'message_thread_id': thread_id} if thread_id else {}
-    if len(full_text) <= MAX_LEN:
-        tg_fn(token, 'sendMessage',
-              chat_id=chat_id,
-              text=full_text,
-              reply_parameters={'message_id': msg_id},
-              **thread_kwargs)
-        return 1
-    chunks = []
-    remaining = full_text
-    while remaining:
-        chunks.append(remaining[:MAX_LEN])
-        remaining = remaining[MAX_LEN:]
-    for i, chunk in enumerate(chunks):
-        params = {'chat_id': chat_id, 'text': chunk, **thread_kwargs}
-        if i == 0:
-            params['reply_parameters'] = {'message_id': msg_id}
-        tg_fn(token, 'sendMessage', **params)
-    return len(chunks)
+    return len(s.encode('utf-16-le')) // 2
+
+
+def _esc(s):
+    """Escape '< > &' for Telegram HTML — '&' FIRST so we don't double-escape
+    (matches the displayed output of Go's escapeRune/escapeText, format.go:531)."""
+    return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+
+def _H(hint):
+    """Bold header. `hint` is '~N sentences' / '~N words' / None (no hint, PLAIN)."""
+    h = '\U0001f3a4 <b>Voice transcript</b>'
+    if hint:
+        h += f' · {hint}'
+    return h
+
+
+def _split_sentences(t):
+    """Pragmatic, multilingual-ish sentence split. Preview-only — imperfect is
+    fine (the openable/attached full text is always verbatim)."""
+    t = (t or '').strip()
+    if not t:
+        return []
+    return [p for p in _SENT.split(t) if p.strip()]
+
+
+def _cap_u16(s, limit):
+    """Trim s (on codepoints) until its UTF-16 length <= limit; append '…' if cut.
+    Final safety belt — callers budget so this is normally a no-op."""
+    if _u16(s) <= limit:
+        return s
+    out = s[:limit]                       # codepoints <= u16, so this is a safe upper bound
+    while out and _u16(out) > limit - 1:
+        out = out[:-1]
+    return out + '…'
+
+
+def _snap_head(t, limit_u16):
+    """Longest prefix of t with _u16 <= limit_u16, snapped back to a word boundary."""
+    out = t[:limit_u16]
+    while out and _u16(out) > limit_u16:
+        out = out[:-1]
+    if len(out) < len(t):
+        idx = out.rfind(' ')
+        if idx > 0:
+            out = out[:idx]
+    return out
+
+
+def _snap_tail(t, limit_u16):
+    """Longest suffix of t with _u16 <= limit_u16, snapped forward to a word boundary."""
+    start = max(0, len(t) - limit_u16)
+    out = t[start:]
+    while out and _u16(out) > limit_u16:
+        out = out[1:]
+    if start > 0:
+        idx = out.find(' ')
+        if 0 <= idx < len(out) - 1:
+            out = out[idx + 1:]
+    return out
+
+
+def _char_window_preview(t, budget):
+    """Run-on fallback: first ~K … last ~K chars (word-snapped), bare '[ … ]'
+    marker, header hint '~N words' (sentence count unreliable). Returns
+    (escaped_preview, hint, visible_u16)."""
+    t = t.strip()
+    words = len(t.split())
+    hint = f'~{words} words'
+    marker = '[ … ]'
+    overhead = _u16(marker) + 4                      # two blank-line separators
+    per_side = max(1, min(CHAR_WINDOW, (budget - overhead) // 2))
+    head = _snap_head(t, per_side)
+    tail = _snap_tail(t, per_side)
+    visible = f'{head}\n\n{marker}\n\n{tail}'
+    preview = f'{_esc(head)}\n\n{marker}\n\n{_esc(tail)}'
+    return preview, hint, _u16(visible)
+
+
+def _build_preview(sents, transcript, budget):
+    """Adaptive-N sentence elision (N=5→1) with a counted marker, falling to the
+    char-window when too few sentences to elide or no N fits `budget`. Returns
+    (escaped_preview, hint, visible_u16). Measurement is on the UNESCAPED visible
+    text (escaping is budget-neutral)."""
+    budget = min(budget, PREVIEW_MAX)
+    n = len(sents)
+    for N in range(N_PREVIEW_MAX, 0, -1):
+        if n >= 2 * N + 1:
+            middle = n - 2 * N
+            head = ' '.join(sents[:N])
+            tail = ' '.join(sents[-N:])
+            marker = f'[ … {middle} more sentences … ]'
+            visible = f'{head}\n\n{marker}\n\n{tail}'
+            if _u16(visible) <= budget:
+                preview = f'{_esc(head)}\n\n{marker}\n\n{_esc(tail)}'
+                return preview, f'~{n} sentences', _u16(visible)
+    return _char_window_preview((transcript or '').strip(), budget)
+
+
+def _render_inline(t):
+    """Build the largest-N inline message whose MEASURED displayed length <= CEIL
+    (preview + the whole verbatim transcript in <blockquote expandable>). Returns
+    (html_text, 'inline') or None (-> caller falls to DOCUMENT)."""
+    sents = _split_sentences(t)
+    words = len(t.split())
+    body_visible = _u16(t)
+    # Conservative header/signpost budget (raw u16 incl. tag chars over-counts
+    # displayed length — safe, absorbed by MARGIN).
+    hint_guess = f'~{max(len(sents), words, 1)} sentences'
+    hdr_u16 = _u16(_H(hint_guess))
+    signpost_u16 = _u16(_INLINE_SIGNPOST)
+    avail = CEIL - hdr_u16 - signpost_u16 - 4 - body_visible   # 4 = structural newlines
+    if avail < 24:                       # no room for even a minimal preview
+        return None
+    preview, hint, pv = _build_preview(sents, t, min(avail, PREVIEW_MAX))
+    header = _H(hint)
+    measured = _u16(header) + 1 + pv + 2 + signpost_u16 + 1 + body_visible
+    if measured > CEIL:
+        return None
+    body = _esc(t)
+    text = (f'{header}\n{preview}\n\n{_INLINE_SIGNPOST}\n'
+            f'<blockquote expandable>{body}</blockquote>')
+    return text, 'inline'
+
+
+def tg_document(token, chat_id, filename, content_bytes, **fields):
+    """stdlib multipart sendDocument. Object params (reply_parameters) MUST be
+    JSON-encoded strings in multipart; routes through API_BASE so the upload also
+    uses the India-IP reverse proxy."""
+    url = f'{API_BASE}/bot{token}/sendDocument'
+    boundary = '----c3' + os.urandom(8).hex()
+    buf = bytearray()
+
+    def add(name, value):
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value)            # object params MUST be JSON strings in multipart
+        buf.extend((f'--{boundary}\r\nContent-Disposition: form-data; '
+                    f'name="{name}"\r\n\r\n{value}\r\n').encode())
+
+    add('chat_id', str(chat_id))
+    for k, v in fields.items():
+        if v is None:
+            continue
+        add(k, v)
+    buf.extend((f'--{boundary}\r\nContent-Disposition: form-data; '
+                f'name="document"; filename="{filename}"\r\n'
+                f'Content-Type: text/plain; charset=utf-8\r\n\r\n').encode())
+    buf.extend(content_bytes)
+    buf.extend(b'\r\n')
+    buf.extend(f'--{boundary}--\r\n'.encode())
+    req = urllib.request.Request(
+        url, data=bytes(buf),
+        headers={'Content-Type': f'multipart/form-data; boundary={boundary}'})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+def send_transcript_to_telegram(token, chat_id, msg_id, thread_id, transcript,
+                                tg_fn=None, tg_doc_fn=None):
+    """Echo a transcript back to Telegram as ONE chat item. Returns the band
+    actually sent: 'plain' | 'inline' | 'document' | 'failed'.
+
+    Invariants (regression-tested in test_stt_handler.py):
+    - `message_thread_id` is carried ONLY when `thread_id` is truthy; DM (None)
+      omits it (Telegram rejects a null thread id). Since there is no chunk loop,
+      the 2026-05-14 "chunks 2+ leak to General" regression is gone by construction.
+    - `reply_parameters={'message_id': msg_id}` rides the SINGLE send of every band
+      (the source voice note), which also drives the reply-quote UX.
+    - Safety net: any Telegram error on the text send re-sends the WHOLE verbatim
+      transcript as a .txt document; if that fails, a short plain notice; if that
+      fails, a non-fatal log (stdout still carries the transcript to the agent).
+
+    `tg_fn`/`tg_doc_fn` are injectable (default to the module-level `tg`/`tg_document`)
+    so tests capture calls without network I/O.
+    """
+    tg_fn = tg_fn or tg
+    tg_doc_fn = tg_doc_fn or tg_document
+    t = (transcript or '').strip()
+    thread = {'message_thread_id': thread_id} if thread_id else {}
+    reply = {'message_id': msg_id}
+    B = _u16(t)
+
+    def _send_document():
+        sents = _split_sentences(t)
+        words = len(t.split())
+        signpost = f'<i>\U0001f4c4 Full transcript attached ({words} words)</i>'
+        hint_guess = f'~{max(len(sents), words, 1)} sentences'
+        budget = CAPTION_CEIL - _u16(_H(hint_guess)) - _u16(signpost) - 4
+        preview, hint, _pv = _build_preview(sents, t, max(0, budget))
+        caption = _cap_u16(f'{_H(hint)}\n{preview}\n\n{signpost}', CAPTION_CEIL)
+        fname = time.strftime(f'voice-transcript-{msg_id}-%Y%m%d-%H%M.txt')
+        tg_doc_fn(token, chat_id, fname, t.encode('utf-8'),
+                  caption=caption, parse_mode='HTML',
+                  reply_parameters=reply, **thread)
+        return 'document'
+
+    # 1) choose the text band (measured on the exact string we will send)
+    if B <= T_PLAIN:
+        text, band = f'{_H(None)}\n{_esc(t)}', 'plain'
+    else:
+        rendered = _render_inline(t)
+        if rendered is None:
+            return _send_document()
+        text, band = rendered
+
+    # 2) send the text band, with the safety net
+    try:
+        tg_fn(token, 'sendMessage', chat_id=chat_id, text=text,
+              parse_mode='HTML', reply_parameters=reply, **thread)
+        return band
+    except Exception as e:
+        logging.warning(f'inline/plain echo failed ({e}); falling back to .txt document')
+        try:
+            return _send_document()
+        except Exception as e2:
+            logging.warning(f'document fallback failed ({e2}); sending short notice')
+            try:
+                tg_fn(token, 'sendMessage', chat_id=chat_id,
+                      text='\U0001f3a4 <b>Voice transcript</b> (too long to display; '
+                           'delivery failed — see logs)',
+                      parse_mode='HTML', reply_parameters=reply, **thread)
+            except Exception:
+                pass
+            return 'failed'
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -261,13 +489,14 @@ def main():
         sys.exit(1)
     logging.info(f'Transcript ({len(transcript)} chars): {transcript[:80]}...')
 
-    # Echo transcript back to Telegram (chunked if it exceeds the 4096-char
-    # per-message cap). Extracted into a helper so the chunking + topic
-    # propagation is regression-tested in test_stt_handler.py.
+    # Echo transcript back to Telegram as ONE chat item (PLAIN / INLINE /
+    # DOCUMENT band by measured displayed length — never truncated). The helper
+    # has its own safety net (text-send error -> .txt document); this outer
+    # try/except is the final non-fatal backstop. Band selection + invariants
+    # are regression-tested in test_stt_handler.py.
     try:
-        n = send_transcript_to_telegram(token, chat_id, msg_id, thread_id, transcript)
-        if n > 1:
-            logging.info(f'Echo split into {n} messages')
+        band = send_transcript_to_telegram(token, chat_id, msg_id, thread_id, transcript)
+        logging.info(f'Echo sent as {band}')
     except Exception as e:
         logging.warning(f'Telegram echo failed (non-fatal): {e}')
         print(f'[stt-handler] telegram reply failed: {e}', file=sys.stderr)
