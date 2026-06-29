@@ -300,7 +300,19 @@ func (b *Broker) handleToolCall(conn *ipc.Conn, stub *Stub, raw []byte) {
 		return
 	}
 
-	res := <-resultCh
+	var res OutboundResult
+	select {
+	case res = <-resultCh:
+	case <-time.After(workerJobTimeout):
+		// A3: an EXITED worker already replied errWorkerStopped fast; this fires only
+		// for a worker that genuinely STALLED. Return THIS tool call's clean error so
+		// the read loop is not wedged on the never-written resultCh.
+		_ = conn.WriteJSON(ipc.ToolResultMsg{
+			Op: ipc.OpToolResult, ID: req.ID,
+			Error: &ipc.ErrorPayload{Code: -32000, Message: fmt.Sprintf("worker did not respond within %s", workerJobTimeout)},
+		})
+		return
+	}
 	resp := ipc.ToolResultMsg{Op: ipc.OpToolResult, ID: req.ID}
 	if res.Err != nil {
 		resp.Error = &ipc.ErrorPayload{Code: -32000, Message: res.Err.Error()}

@@ -1022,7 +1022,17 @@ func (b *Broker) backlogSummary(key RouteKey) (int, []ipc.QueuedItem) {
 		log.Printf("backlog summary %s: worker queue full or stopped — skipping summary", routeKeyStr(key))
 		return 0, nil
 	}
-	res := <-resultCh
+	var res BacklogResult
+	select {
+	case res = <-resultCh:
+	case <-time.After(workerJobTimeout):
+		// A3: an EXITED worker already replied errWorkerStopped fast; this fires only
+		// for a worker that genuinely STALLED. Fall back to the existing no-summary
+		// path so the attach completes instead of wedging on the never-written
+		// resultCh (the agent still learns of backlog via the next push's nudge).
+		log.Printf("backlog summary %s: worker did not respond within %s — skipping summary", routeKeyStr(key), workerJobTimeout)
+		return 0, nil
+	}
 	if res.Err != nil {
 		log.Printf("backlog summary peek FAIL %s: %v", routeKeyStr(key), res.Err)
 		// Total still came back fine; render the count without a preview.
