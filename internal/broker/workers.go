@@ -18,6 +18,13 @@ type WorkerPool struct {
 	mu      sync.Mutex
 	workers map[RouteKey]*RouteWorker
 	wg      sync.WaitGroup
+	// stopped is set true under mu by Stop() BEFORE cancel()/wg.Wait(). Submit
+	// checks it under mu and refuses to spawn once set, so spawnLocked's wg.Add(1)
+	// can never begin after wg.Wait() has started (the classic WaitGroup-reuse
+	// panic) and no orphan worker is spun during shutdown (m2, W1 review). The
+	// mutex-guarded flag — not ctx.Err() — is the race-free fix: cancel() is not
+	// under mu and would not synchronize with the Add.
+	stopped bool
 }
 
 // NewWorkerPool returns a pool with the given idle timeout for new workers.
@@ -49,6 +56,14 @@ func NewWorkerPool(parent context.Context, idle time.Duration, broker *Broker) *
 func (p *WorkerPool) Submit(key RouteKey, job Job) bool {
 	for attempt := 0; attempt < 2; attempt++ {
 		p.mu.Lock()
+		// m2 (W1 review): the pool is shutting down (Stop set this under p.mu before
+		// cancel()/wg.Wait()). Refuse WITHOUT spawning so spawnLocked's wg.Add(1)
+		// never runs after wg.Wait() began (WaitGroup-reuse panic) and we don't spin
+		// orphan workers. Stopped-check and the wg.Add now both happen under p.mu.
+		if p.stopped {
+			p.mu.Unlock()
+			return false
+		}
 		w, ok := p.workers[key]
 		if ok && workerExited(w) {
 			ok = false // exited but not yet reaped — treat as absent, respawn below
@@ -103,8 +118,15 @@ func (p *WorkerPool) spawnLocked(key RouteKey) *RouteWorker {
 	return w
 }
 
-// Stop signals all workers to exit and waits for them.
+// Stop signals all workers to exit and waits for them. It sets stopped under
+// p.mu BEFORE cancel()/wg.Wait() so a concurrent Submit (e.g. a live poll
+// goroutine still routing during Broker.Shutdown) observes stopped and refuses
+// to spawn — guaranteeing no spawnLocked wg.Add(1) can begin after wg.Wait()
+// has started (m2, W1 review).
 func (p *WorkerPool) Stop() {
+	p.mu.Lock()
+	p.stopped = true
+	p.mu.Unlock()
 	p.cancel()
 	p.wg.Wait()
 }

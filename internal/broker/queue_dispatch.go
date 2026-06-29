@@ -54,14 +54,34 @@ func (b *Broker) handleFetchQueue(conn *ipc.Conn, stub *Stub, raw []byte) {
 		return
 	}
 	var res FetchResult
-	select {
-	case res = <-resultCh:
-	case <-time.After(workerJobTimeout):
-		// A3: an EXITED worker already replied errWorkerStopped fast; this fires only
-		// for a worker that genuinely STALLED. Return THIS op's clean error and let
-		// the read loop keep serving — do NOT wedge on the never-written resultCh.
-		_ = conn.WriteJSON(ipc.FetchQueueResp{Op: ipc.OpFetchQueueResult, ID: req.ID, Err: "fetch_queue: worker did not respond within " + workerJobTimeout.String()})
-		return
+	if req.Ack {
+		// M1 (W1 review): an Ack=true fetch is DESTRUCTIVE — handleFetch runs
+		// Queue.Consume, which durably advances the cursor / deletes the lines BEFORE
+		// it writes resultCh. Abandoning it on workerJobTimeout orphans that consume:
+		// the worker later runs the job, the batch is consumed (and the Telegram
+		// offset already advanced at persist time), but the result lands in a now-
+		// readerless cap-1 channel → the batch is consumed yet never delivered →
+		// permanent silent inbound loss. So we do NOT time out the destructive path;
+		// we block on <-resultCh. A1/A2 already fast-fail an EXITED worker via
+		// errWorkerStopped (shutdown() drains it), so this block only persists for an
+		// alive-but-BUSY worker — bounded by the STT deadline (sttFlushTimeout) — a
+		// bounded wait, never loss.
+		// Follow-up (W1 review): peek-then-explicit-ack to also bound the busy-worker wait without the read-loop block.
+		res = <-resultCh
+	} else {
+		// Non-destructive PEEK (Ack=false): a discarded peek consumes nothing, so
+		// abandoning a genuinely stalled worker is safe and keeps the connection's
+		// single serial read loop alive (A3/A4). KEEP the timeout only here.
+		select {
+		case res = <-resultCh:
+		case <-time.After(workerJobTimeout):
+			// A3: an EXITED worker already replied errWorkerStopped fast; this fires
+			// only for a worker that genuinely STALLED. Return THIS op's clean error
+			// and let the read loop keep serving — do NOT wedge on the never-written
+			// resultCh.
+			_ = conn.WriteJSON(ipc.FetchQueueResp{Op: ipc.OpFetchQueueResult, ID: req.ID, Err: "fetch_queue: worker did not respond within " + workerJobTimeout.String()})
+			return
+		}
 	}
 	resp := ipc.FetchQueueResp{Op: ipc.OpFetchQueueResult, ID: req.ID, Remaining: res.Remaining}
 	if res.Err != nil {

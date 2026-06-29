@@ -123,6 +123,26 @@ func TestWorkerPool_ReaperDoesNotDeleteRespawn(t *testing.T) {
 	}
 }
 
+// TestWorkerPool_SubmitAfterStopReturnsFalse pins m2 (W1 review): once Stop() has
+// set the pool stopped (under p.mu, before cancel()/wg.Wait()), a later Submit must
+// return false WITHOUT spawning a worker — so spawnLocked's p.wg.Add(1) can never
+// run after wg.Wait() has started (the WaitGroup-reuse panic that crashes the
+// process when a live poll goroutine routes through Submit during Broker.Shutdown)
+// and no orphan worker is spun. Pre-fix Submit had no stopped-check: it spawned a
+// fresh worker (wg.Add) and returned true. Run under -race.
+func TestWorkerPool_SubmitAfterStopReturnsFalse(t *testing.T) {
+	pool := NewWorkerPool(context.Background(), time.Hour, nil)
+	pool.Stop()
+
+	key := RouteKey{Channel: "telegram", ChatID: -100, HasTopic: true, TopicID: 281}
+	if pool.Submit(key, Job{Kind: JobInbound}) {
+		t.Fatal("Submit after Stop must return false (pool is shutting down)")
+	}
+	if pool.Active() != 0 {
+		t.Fatalf("Submit after Stop must NOT spawn a worker; Active=%d, want 0", pool.Active())
+	}
+}
+
 func TestWorkerPool_StopDrains(t *testing.T) {
 	pool := NewWorkerPool(context.Background(), time.Hour, nil)
 	for i := 0; i < 5; i++ {

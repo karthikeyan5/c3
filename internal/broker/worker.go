@@ -1263,6 +1263,12 @@ func (w *RouteWorker) shutdown() {
 	for {
 		select {
 		case job := <-w.queue:
+			// Only ResultCh-bearing jobs (JobFetch / JobOutbound / JobRefreshText /
+			// JobBacklog) get an errWorkerStopped reply so a blocked caller is never
+			// stranded. JobInbound / JobConsume / JobRelease carry no ResultCh and
+			// have no case below — they drop silently (loss-free; see the doc comment
+			// above: they re-deliver via the Telegram offset or remain durable
+			// backlog). Never ack.
 			switch job.Kind {
 			case JobFetch:
 				if job.Fetch != nil && job.Fetch.ResultCh != nil {
@@ -1292,8 +1298,6 @@ func (w *RouteWorker) shutdown() {
 					default:
 					}
 				}
-				// JobInbound / JobConsume / JobRelease carry no ResultCh: drop
-				// silently (loss-free — see the doc comment above). Never ack.
 			}
 		default:
 			return
