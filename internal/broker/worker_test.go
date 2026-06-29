@@ -139,6 +139,61 @@ func TestFlushInbounds_VoiceWithSTTPluginUsesTranscript(t *testing.T) {
 	}
 }
 
+// Phase 3 (spec §E): the per-inbound STT call in flushInbounds runs on the
+// worker run-loop ctx. Before the fix it had NO per-call deadline (only the STT
+// builtin's ~300s subprocess budget), so a download that hangs BEFORE that
+// budget applies blocks the worker goroutine — and any JobFetch/JobConsume
+// queued behind it — for up to ~5 min. The fix wraps each call in a per-call
+// timeout (sttFlushTimeout). A timed-out call returns "" and falls through to
+// the existing self-documenting sttFailureText placeholder path. This test
+// registers a stub STT plugin that BLOCKS until its ctx is cancelled, shortens
+// sttFlushTimeout, and asserts flushInbounds returns promptly with the
+// placeholder (not a ~5min hang, not an empty transcript).
+func TestFlushInbounds_VoiceSTTTimeout_FallsBackToPlaceholder(t *testing.T) {
+	t.Setenv("C3_QUEUE_DIR", t.TempDir())
+
+	orig := sttFlushTimeout
+	sttFlushTimeout = 50 * time.Millisecond
+	defer func() { sttFlushTimeout = orig }()
+
+	b := New(&mappings.MappingsFile{SchemaVersion: 1})
+	defer b.Shutdown()
+
+	// Stub STT that hangs until its (per-call) ctx is cancelled, then returns
+	// an empty transcript — exactly what a download stuck past the deadline does.
+	b.Plugins.OnVoiceReceived(func(ctx context.Context, p c3types.VoicePayload) (string, error) {
+		<-ctx.Done()
+		return "", nil
+	})
+
+	w := newRouteWorker(context.Background(), RouteKey{Channel: "telegram", ChatID: -100}, time.Hour, b)
+	defer w.Stop()
+
+	in := &c3types.Inbound{
+		Channel: "telegram", ChatID: -100, MessageID: 45,
+		Attachments: []c3types.Attachment{{Kind: "voice", FileID: "HUNGFILE", MIME: "audio/ogg", Size: 1000}},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		w.flushInbounds(context.Background(), []*c3types.Inbound{in})
+		close(done)
+	}()
+
+	// Must return in ~the timeout, not the ~300s STT budget or ~5min hang.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("flushInbounds did not return within 5s — STT call is not bounded by sttFlushTimeout")
+	}
+
+	for _, want := range []string{"transcription failed", "HUNGFILE", "download_attachment", "retranscribe", "does not need to resend"} {
+		if !strings.Contains(in.Text, want) {
+			t.Errorf("STT-timeout fallback text missing %q; got %q", want, in.Text)
+		}
+	}
+}
+
 // Regression test for 2026-05-14: after /mcp reconnect, Claude Code killed
 // the old adapter; the broker kept the now-stale claim "while pid alive"
 // and every inbound failed with `holder.Conn is not *ipc.Conn` because the

@@ -323,6 +323,18 @@ func (w *RouteWorker) run(ctx context.Context) {
 	}
 }
 
+// sttFlushTimeout bounds each per-inbound voice STT call made by flushInbounds.
+// Without it the call inherits only the run-loop ctx (cancelled solely on broker
+// shutdown / w.cancel()) plus the STT builtin's own ~300s subprocess budget — so
+// a download that hangs BEFORE that budget applies blocks the worker goroutine,
+// and any JobFetch/JobConsume queued behind it, for up to ~5 min. It mirrors
+// retranscribeTimeout's value (330s, just above the STT builtin's 300s
+// subprocess deadline) so a healthy long voice note still completes, but a hung
+// download is cut off in bounded time; a timed-out call returns "" and falls
+// through to the self-documenting sttFailureText placeholder. It is a var (not a
+// const) only so a test can shorten it; production never reassigns it.
+var sttFlushTimeout = 330 * time.Second
+
 // flushInbounds runs the plugin pipeline + forwards a debounce-collapsed
 // batch as a single ipc.OpInbound.
 //
@@ -363,7 +375,15 @@ func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inboun
 				MIME:      in.Attachments[0].MIME,
 				Size:      in.Attachments[0].Size,
 			}
-			transcript := w.broker.Plugins.FireOnVoiceReceived(ctx, payload)
+			// Per-call deadline so a hung download can't block the worker
+			// goroutine (and the JobFetch/JobConsume jobs queued behind it).
+			// cancel() runs immediately (not deferred) because this is a
+			// per-inbound loop — a deferred cancel would leak every iteration's
+			// timer until flushInbounds returns. A "" result (incl. on timeout)
+			// flows to the sttFailureText placeholder path below.
+			sttCtx, cancel := context.WithTimeout(ctx, sttFlushTimeout)
+			transcript := w.broker.Plugins.FireOnVoiceReceived(sttCtx, payload)
+			cancel()
 			switch {
 			case transcript != "":
 				in.Text = w.sttPrefix(in.Channel) + transcript
