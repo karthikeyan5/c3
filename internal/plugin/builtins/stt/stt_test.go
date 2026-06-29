@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/karthikeyan5/c3/internal/c3types"
 	"github.com/karthikeyan5/c3/internal/channel"
@@ -129,6 +131,73 @@ func TestRegister_HandlerAppearsAfterStartup_NextCallTranscribes(t *testing.T) {
 	t2, _ := h.voiceCallback(context.Background(), c3types.VoicePayload{MessageID: 2})
 	if !strings.Contains(t2, "recovered transcript") {
 		t.Errorf("after handler restored: %q, want 'recovered transcript' — graceful recovery without restart", t2)
+	}
+}
+
+// TestRunHandler_DeadlineKillsGrandchild guards the I-7 fix: on the ctx
+// deadline the WHOLE process group must die, not just the direct child. The
+// handler spawns a grandchild that would write a sentinel AFTER the deadline;
+// with the old default cancel (Process.Kill on the direct PID only) the
+// grandchild reparents to init and writes the sentinel, leaking work + paid API
+// spend. With Setpgid + the group-kill Cancel, the grandchild dies with the
+// handler and the sentinel never appears.
+//
+// Red without the fix (sentinel written → fail), green with it.
+func TestRunHandler_DeadlineKillsGrandchild(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not available; process-group kill test needs a real interpreter")
+	}
+
+	tmp := t.TempDir()
+	handler := filepath.Join(tmp, "stt-handler.py")
+	started := filepath.Join(tmp, "started")
+	sentinel := filepath.Join(tmp, "sentinel")
+
+	// The handler: mark that it ran, spawn a grandchild that touches the
+	// sentinel after 3s (well past the 1s deadline below), then block so the
+	// deadline kills this process. If the group kill works, the grandchild is
+	// SIGKILL'd before it can touch the sentinel.
+	script := "import os, subprocess, time\n" +
+		"open(os.environ['C3_TEST_STARTED'], 'w').close()\n" +
+		"subprocess.Popen(['sh', '-c', 'sleep 3; touch \"$C3_TEST_SENTINEL\"'])\n" +
+		"time.sleep(30)\n"
+	if err := os.WriteFile(handler, []byte(script), 0o755); err != nil {
+		t.Fatalf("write handler: %v", err)
+	}
+	t.Setenv("C3_TEST_STARTED", started)
+	t.Setenv("C3_TEST_SENTINEL", sentinel)
+
+	h := &fakeHost{
+		cfg: Config{
+			Enabled:     true,
+			HandlerPath: handler,
+			Timeout:     1, // ctx deadline at ~1s → fires the group-kill Cancel
+		},
+		channelCfg: map[string]any{
+			"telegram": map[string]string{"bot_token": "tok"},
+		},
+	}
+	if err := Register(h); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	start := time.Now()
+	// Returns once the deadline kills the handler (group-killed; WaitDelay
+	// backstops any inherited-pipe hang). We only care about the side effect.
+	_, _ = h.voiceCallback(context.Background(), c3types.VoicePayload{MessageID: 1})
+
+	// Sanity: the handler actually ran (else the test would pass vacuously).
+	if _, err := os.Stat(started); err != nil {
+		t.Skipf("handler did not run (interpreter/env issue: %v); cannot assert group kill", err)
+	}
+
+	// Wait past the grandchild's 3s delay, then assert it was killed before it
+	// could touch the sentinel.
+	if d := time.Until(start.Add(4 * time.Second)); d > 0 {
+		time.Sleep(d)
+	}
+	if _, err := os.Stat(sentinel); err == nil {
+		t.Fatalf("grandchild survived the deadline and wrote %s — process group was not killed (I-7 regression)", sentinel)
 	}
 }
 
