@@ -104,8 +104,28 @@ def tg(token, method, **params):
     with urllib.request.urlopen(req, timeout=15) as r:
         return json.loads(r.read())
 
-def download_file(token, file_id, dest_path):
-    result = tg(token, 'getFile', file_id=file_id)
+class PermanentDownloadError(Exception):
+    """A getFile/download failure that retrying cannot fix.
+
+    Telegram returns {ok:false, description, error_code} for permanent
+    conditions — an expired/invalid file_id, or the Bot API's hard 20 MB
+    getFile ceiling ("file is too big"). Re-running getFile would fail
+    identically, so the download loop treats this as terminal and does NOT
+    burn the remaining retries (I-9)."""
+    pass
+
+
+def download_file(token, file_id, dest_path, tg_fn=None):
+    tg_fn = tg_fn or tg
+    result = tg_fn(token, 'getFile', file_id=file_id)
+    # I-9: a getFile error comes back as {ok:false, description, error_code}
+    # (NOT as an exception). Without this guard, dereferencing result['result']
+    # raises a cryptic KeyError that the caller's generic `except Exception`
+    # swallows and then retries 3× uselessly on a guaranteed-permanent failure.
+    if not result.get('ok'):
+        desc = result.get('description', '<no description>')
+        code = result.get('error_code')
+        raise PermanentDownloadError(f'getFile failed (error_code={code}): {desc}')
     file_path = result['result']['file_path']
     url = f'{API_BASE}/file/bot{token}/{file_path}'
     req = urllib.request.Request(url)
@@ -115,6 +135,18 @@ def download_file(token, file_id, dest_path):
             f.write(r.read())
 
 # ── STT ───────────────────────────────────────────────────────────────────────
+
+def _stderr_snippet(raw, limit=800):
+    """Best-effort printable snippet of a subprocess's captured stderr, which
+    may be None or — depending on Python version / text mode — bytes even when
+    text=True was requested. Guard both so logging the reason never itself
+    raises (I-2)."""
+    if raw is None:
+        return ''
+    if isinstance(raw, bytes):
+        raw = raw.decode('utf-8', 'replace')
+    return raw.strip()[:limit]
+
 
 def run_stt(audio_path, extra_env, timeout=270):
     """Dynamically load stt.py and run it. Returns transcript or None.
@@ -137,10 +169,23 @@ def run_stt(audio_path, extra_env, timeout=270):
     # `timeout` by the elapsed download time so a slow download can't push the
     # total past the broker's Go-side 300s context (the true backstop).
     env["C3_STT_BUDGET_SECONDS"] = str(timeout)
-    result = subprocess.run(
-        [sys.executable, STT_PKG, audio_path],
-        capture_output=True, text=True, env=env, timeout=timeout
-    )
+    # I-2: never let a TimeoutExpired (or any other subprocess failure) escape as
+    # a bare traceback — that would bypass main()'s human "could not transcribe"
+    # notice and the clean-exit path. Return None on any failure so the caller's
+    # existing `if not transcript:` branch fires uniformly.
+    try:
+        result = subprocess.run(
+            [sys.executable, STT_PKG, audio_path],
+            capture_output=True, text=True, env=env, timeout=timeout
+        )
+    except subprocess.TimeoutExpired as e:
+        snippet = _stderr_snippet(getattr(e, 'stderr', None))
+        logging.error(f'STT subprocess timed out after {timeout}s'
+                      + (f'; partial stderr: {snippet}' if snippet else ''))
+        return None
+    except Exception as e:
+        logging.error(f'STT subprocess failed to run: {e}')
+        return None
     transcript = result.stdout.strip()
     if result.returncode != 0 or not transcript:
         stderr_out = result.stderr.strip()
@@ -416,6 +461,42 @@ def send_transcript_to_telegram(token, chat_id, msg_id, thread_id, transcript,
                 pass
             return 'failed'
 
+# ── Terminal-failure helpers ────────────────────────────────────────────────────
+
+def notify_transcription_failed(token, chat_id, msg_id, thread_id, tg_fn=None):
+    """Best-effort human-facing "could not transcribe" notice (I-3).
+
+    Factored out of main()'s no-transcript branch so EVERY terminal failure —
+    transcription failure, a download/getFile failure, or an STT timeout (I-2)
+    that reaches None — leaves the sender with the same actionable notice
+    instead of silence. Uses the module-level `tg` by default so the API_BASE
+    reverse-proxy workaround is preserved; injectable for tests. Non-fatal: a
+    notify failure is logged and swallowed so it can never mask the original
+    failure's exit."""
+    tg_fn = tg_fn or tg
+    try:
+        tg_fn(token, 'sendMessage',
+              chat_id=chat_id,
+              text='\U0001f3a4 ⚠️ Could not transcribe that voice note (speech-to-text failed). Please retype or resend.',
+              reply_parameters={'message_id': msg_id},
+              **({'message_thread_id': thread_id} if thread_id else {}))
+    except Exception as e:
+        logging.warning(f'failed to send STT-failure notice to Telegram: {e}')
+
+
+def cleanup_audio(audio_path):
+    """Delete the downloaded .oga after transcription (I-10). Recovery never
+    depends on this local cache — both download_attachment and retranscribe
+    re-fetch from Telegram by file_id — so delete-always is safe and keeps the
+    inbox from growing unbounded. Non-fatal."""
+    try:
+        if audio_path and os.path.exists(audio_path):
+            os.remove(audio_path)
+            logging.debug(f'removed cached audio {audio_path}')
+    except OSError as e:
+        logging.warning(f'failed to remove cached audio {audio_path}: {e}')
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -450,60 +531,75 @@ def main():
                 break
             logging.warning(f'Downloaded file is 0 bytes [attempt {attempt}], retrying after 2s...')
             time.sleep(2)
+        except PermanentDownloadError as e:
+            # I-9 + I-3: non-retryable (expired/invalid file_id, >20MB getFile
+            # limit). Notify the sender and exit WITHOUT burning the remaining
+            # retries on a guaranteed-permanent failure.
+            logging.error(f'Download permanently failed (non-retryable): {e}')
+            print(f'[stt-handler] download failed: {e}', file=sys.stderr)
+            notify_transcription_failed(token, chat_id, msg_id, thread_id)
+            sys.exit(1)
         except Exception as e:
             logging.warning(f'Download failed [attempt {attempt}]: {e}')
             if attempt == 3:
                 logging.error(f'Download failed after 3 attempts: {e}')
                 print(f'[stt-handler] download failed: {e}', file=sys.stderr)
+                notify_transcription_failed(token, chat_id, msg_id, thread_id)  # I-3
                 sys.exit(1)
             time.sleep(2)
     else:
         logging.error('Download produced 0 bytes after 3 attempts')
+        notify_transcription_failed(token, chat_id, msg_id, thread_id)  # I-3
         sys.exit(1)
 
-    # Load API keys
-    keys = load_env(ENV_FILE)
-
-    # Budget the transcription so download + transcribe stays under the broker's
-    # 300s SIGKILL: 270s total minus the time the download already consumed,
-    # floored at 60s so a slow download doesn't leave an unusably tiny window.
-    dl_elapsed = time.time() - dl_start
-    stt_timeout = max(60, 270 - int(dl_elapsed))
-    logging.info(f'Download took {dl_elapsed:.1f}s; STT subprocess budget={stt_timeout}s')
-
-    # Transcribe
-    transcript = run_stt(audio_path, keys, timeout=stt_timeout)
-    if not transcript:
-        logging.error(f'STT returned no transcript for {audio_path}')
-        # Best-effort user-facing notice so the human knows immediately (the Go
-        # shim separately surfaces an [STT FAILED] marker to the agent). Without
-        # this the sender just sees their voice note silently ignored.
-        try:
-            tg(token, 'sendMessage',
-               chat_id=chat_id,
-               text='\U0001f3a4 ⚠️ Could not transcribe that voice note (speech-to-text failed). Please retype or resend.',
-               reply_parameters={'message_id': msg_id},
-               **({'message_thread_id': thread_id} if thread_id else {}))
-        except Exception as e:
-            logging.warning(f'failed to send STT-failure notice to Telegram: {e}')
-        sys.exit(1)
-    logging.info(f'Transcript ({len(transcript)} chars): {transcript[:80]}...')
-
-    # Echo transcript back to Telegram as ONE chat item (PLAIN / INLINE /
-    # DOCUMENT band by measured displayed length — never truncated). The helper
-    # has its own safety net (text-send error -> .txt document); this outer
-    # try/except is the final non-fatal backstop. Band selection + invariants
-    # are regression-tested in test_stt_handler.py.
+    # Everything past a successful download runs under a finally that always
+    # removes the cached .oga (I-10). The file has been written and is about to
+    # be read by run_stt; cleanup happens after that on BOTH the success and the
+    # failure-after-download (transcription failed / SystemExit) paths.
     try:
-        band = send_transcript_to_telegram(token, chat_id, msg_id, thread_id, transcript)
-        logging.info(f'Echo sent as {band}')
-    except Exception as e:
-        logging.warning(f'Telegram echo failed (non-fatal): {e}')
-        print(f'[stt-handler] telegram reply failed: {e}', file=sys.stderr)
-        # Non-fatal — the CLI side still gets the transcript via stdout
+        # Load API keys
+        keys = load_env(ENV_FILE)
 
-    # Print transcript to stdout for the Go-side STT shim to read
-    print(transcript)
+        # Budget the transcription so download + transcribe stays under the
+        # broker's 300s SIGKILL: 270s total minus the time the download already
+        # consumed, floored at 60s so a slow download doesn't leave an unusably
+        # tiny window.
+        dl_elapsed = time.time() - dl_start
+        stt_timeout = max(60, 270 - int(dl_elapsed))
+        logging.info(f'Download took {dl_elapsed:.1f}s; STT subprocess budget={stt_timeout}s')
+
+        # Transcribe
+        transcript = run_stt(audio_path, keys, timeout=stt_timeout)
+        if not transcript:
+            logging.error(f'STT returned no transcript for {audio_path}')
+            # Best-effort user-facing notice so the human knows immediately (the
+            # Go shim separately surfaces an [STT FAILED] marker to the agent).
+            # The I-2 timeout path also lands here (run_stt -> None). Without
+            # this the sender just sees their voice note silently ignored.
+            notify_transcription_failed(token, chat_id, msg_id, thread_id)  # I-3
+            sys.exit(1)
+        logging.info(f'Transcript ({len(transcript)} chars): {transcript[:80]}...')
+
+        # Echo transcript back to Telegram as ONE chat item (PLAIN / INLINE /
+        # DOCUMENT band by measured displayed length — never truncated). The
+        # helper has its own safety net (text-send error -> .txt document); this
+        # outer try/except is the final non-fatal backstop. Band selection +
+        # invariants are regression-tested in test_stt_handler.py.
+        try:
+            band = send_transcript_to_telegram(token, chat_id, msg_id, thread_id, transcript)
+            logging.info(f'Echo sent as {band}')
+        except Exception as e:
+            logging.warning(f'Telegram echo failed (non-fatal): {e}')
+            print(f'[stt-handler] telegram reply failed: {e}', file=sys.stderr)
+            # Non-fatal — the CLI side still gets the transcript via stdout
+
+        # Print transcript to stdout for the Go-side STT shim to read
+        print(transcript)
+    finally:
+        # I-10: always remove the downloaded .oga (success or failure-after-
+        # download). Runs even on the sys.exit(1) above (SystemExit) and on any
+        # unexpected exception. Safe because recovery re-fetches from Telegram.
+        cleanup_audio(audio_path)
 
 if __name__ == '__main__':
     main()

@@ -292,6 +292,197 @@ class TestSendTranscriptToTelegram(unittest.TestCase):
         self.assertEqual(content.decode("utf-8"), long.strip())
 
 
+class TestDownloadFileOkFalse(unittest.TestCase):
+    """I-9: a getFile {ok:false} envelope (expired/invalid file_id, or the Bot
+    API 20MB getFile limit -> 'file is too big') must NOT KeyError. It must be
+    raised as a PermanentDownloadError so the download loop treats it as
+    terminal instead of burning the 3 retries on a guaranteed failure."""
+
+    def setUp(self):
+        self.handler = load_handler()
+
+    def test_ok_false_raises_permanent_not_keyerror(self):
+        calls = []
+
+        def fake_tg(_token, method, **params):
+            calls.append((method, params))
+            return {"ok": False, "description": "file is too big", "error_code": 400}
+
+        with self.assertRaises(self.handler.PermanentDownloadError) as ctx:
+            self.handler.download_file(
+                "tok", "BADFID",
+                "/nonexistent/should-not-be-written.oga",
+                tg_fn=fake_tg,
+            )
+        # surfaces the real reason ...
+        self.assertIn("file is too big", str(ctx.exception))
+        self.assertIn("400", str(ctx.exception))
+        # ... and stops at getFile: no download attempt, no extra getFile calls.
+        # (Non-retry on the permanent failure is enforced by main()'s loop, which
+        # has a dedicated `except PermanentDownloadError` terminal branch.)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "getFile")
+
+    def test_ok_false_is_not_keyerror(self):
+        def fake_tg(_token, method, **params):
+            return {"ok": False, "description": "invalid file_id"}
+
+        try:
+            self.handler.download_file("tok", "X", "/x.oga", tg_fn=fake_tg)
+        except self.handler.PermanentDownloadError:
+            pass
+        except KeyError:
+            self.fail("download_file raised the pre-fix cryptic KeyError('result')")
+
+
+class TestRunSttFailureReturnsNone(unittest.TestCase):
+    """I-2: run_stt must never let a subprocess failure escape as a bare
+    traceback (which would bypass main()'s human 'could not transcribe' notice).
+    TimeoutExpired and any other exception both become a clean None."""
+
+    def setUp(self):
+        self.handler = load_handler()
+
+    def test_timeout_expired_returns_none(self):
+        import subprocess
+        from unittest import mock
+
+        def boom(*_a, **_k):
+            # text=True can still yield bytes/None stderr depending on version;
+            # bytes here also exercises _stderr_snippet's guard.
+            raise subprocess.TimeoutExpired(
+                cmd="stt", timeout=1, stderr=b"provider stalled mid-poll")
+
+        with mock.patch("subprocess.run", boom):
+            result = self.handler.run_stt("/tmp/nope.oga", {}, timeout=1)
+        self.assertIsNone(result)
+
+    def test_generic_exception_returns_none(self):
+        from unittest import mock
+        with mock.patch("subprocess.run", side_effect=OSError("exec failed")):
+            self.assertIsNone(self.handler.run_stt("/tmp/nope.oga", {}, timeout=5))
+
+
+class TestNotifyTranscriptionFailed(unittest.TestCase):
+    """I-3: the extracted sender-notice helper. Same wording/mechanism the
+    no-transcript branch used, now reusable from every terminal-failure path."""
+
+    def setUp(self):
+        self.handler = load_handler()
+
+    def test_sends_failure_notice(self):
+        calls = []
+
+        def fake_tg(_token, method, **params):
+            calls.append((method, params))
+            return {"ok": True}
+
+        self.handler.notify_transcription_failed("tok", "-100", 4711, 914, tg_fn=fake_tg)
+        self.assertEqual(len(calls), 1)
+        method, params = calls[0]
+        self.assertEqual(method, "sendMessage")
+        self.assertIn("Could not transcribe", params["text"])
+        self.assertEqual(params["reply_parameters"], {"message_id": 4711})
+        self.assertEqual(params["message_thread_id"], 914)
+
+    def test_dm_omits_thread(self):
+        calls = []
+
+        def fake_tg(_token, method, **params):
+            calls.append((method, params))
+            return {"ok": True}
+
+        self.handler.notify_transcription_failed("tok", "-100", 1, None, tg_fn=fake_tg)
+        self.assertNotIn("message_thread_id", calls[0][1])
+
+    def test_notify_failure_is_nonfatal(self):
+        def boom(*_a, **_k):
+            raise RuntimeError("network down")
+
+        # must not raise — a notify failure can never mask the original exit
+        self.handler.notify_transcription_failed("tok", "-100", 1, 2, tg_fn=boom)
+
+
+class TestMainDownloadTerminalFailureNotifies(unittest.TestCase):
+    """I-3 (branch): main()'s download-terminal-failure branch must call the
+    sender notice before exiting. Drives the PermanentDownloadError path because
+    it exits immediately (no retry sleeps, no network)."""
+
+    def setUp(self):
+        self.handler = load_handler()
+
+    def test_permanent_download_failure_notifies_and_exits(self):
+        from unittest import mock
+        import io
+
+        notify_calls = []
+
+        def fake_download(*_a, **_k):
+            raise self.handler.PermanentDownloadError("file is too big")
+
+        def fake_notify(*a, **k):
+            notify_calls.append((a, k))
+
+        with mock.patch.object(self.handler, "download_file", fake_download), \
+             mock.patch.object(self.handler, "notify_transcription_failed", fake_notify), \
+             mock.patch.object(sys, "argv",
+                               ["stt-handler.py", "-100", "4711", "FID", "914"]), \
+             mock.patch.object(sys, "stdin", io.StringIO("bottoken\n")):
+            with self.assertRaises(SystemExit) as ctx:
+                self.handler.main()
+
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertEqual(len(notify_calls), 1, "sender notice must fire on download-terminal failure")
+
+
+class TestCleanupAudio(unittest.TestCase):
+    """I-10: the downloaded .oga is deleted after use; missing file is non-fatal."""
+
+    def setUp(self):
+        self.handler = load_handler()
+
+    def test_removes_existing_file(self):
+        fd, path = tempfile.mkstemp(suffix=".oga")
+        os.close(fd)
+        self.assertTrue(os.path.exists(path))
+        self.handler.cleanup_audio(path)
+        self.assertFalse(os.path.exists(path))
+
+    def test_missing_file_is_nonfatal(self):
+        # must not raise on a path that doesn't exist
+        self.handler.cleanup_audio("/nonexistent/definitely/not/here.oga")
+
+    def test_main_success_flow_cleans_up_oga(self):
+        """End-to-end-ish: a full main() download+transcribe+echo flow leaves no
+        .oga behind. download_file is faked to actually write a temp file at the
+        path main() chose, so we can assert it's gone after main() returns."""
+        from unittest import mock
+        import io
+
+        created = {}
+
+        def fake_download(_token, _file_id, dest_path, **_k):
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            with open(dest_path, "wb") as f:
+                f.write(b"OggS-fake-audio")
+            created["path"] = dest_path
+
+        with mock.patch.object(self.handler, "download_file", fake_download), \
+             mock.patch.object(self.handler, "run_stt", lambda *a, **k: "hello world"), \
+             mock.patch.object(self.handler, "send_transcript_to_telegram",
+                               lambda *a, **k: "plain"), \
+             mock.patch.object(sys, "argv",
+                               ["stt-handler.py", "-100", "4711", "FID", "914"]), \
+             mock.patch.object(sys, "stdin", io.StringIO("bottoken\n")):
+            self.handler.main()
+
+        self.assertIn("path", created)
+        self.assertFalse(
+            os.path.exists(created["path"]),
+            "cached .oga should be removed after a successful transcribe",
+        )
+
+
 class TestImportCreatesParentDirs(unittest.TestCase):
     """TODO #12 (2026-05-16): on a fresh install
     ~/.claude/channels/telegram/ doesn't exist; logging.basicConfig(
