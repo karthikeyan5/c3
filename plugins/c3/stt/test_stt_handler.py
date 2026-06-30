@@ -131,28 +131,83 @@ class TestMainDownloadTerminalFailureExits(unittest.TestCase):
         self.assertEqual(len(download_calls), 1)
 
 
-class TestCleanupAudio(unittest.TestCase):
-    """I-10: the downloaded .oga is deleted after use; missing file is non-fatal."""
+class TestPruneInbox(unittest.TestCase):
+    """The rolling-window audio cache (replaces the old delete-immediately):
+    prune_inbox(keep_n) keeps the newest keep_n .oga files in INBOX_DIR and
+    deletes older ones; a negative keep_n keeps everything; a missing/unreadable
+    inbox is non-fatal. Recovery never depends on this cache — download_attachment
+    / retranscribe re-fetch from Telegram by file_id."""
 
     def setUp(self):
         self.handler = load_handler()
+        self.tmp = tempfile.mkdtemp(prefix="c3-stt-prune-")
+        # Point the handler's module-global INBOX_DIR (used by both prune_inbox
+        # and main()'s download path) at a hermetic temp dir, restored in tearDown.
+        self._saved_inbox = self.handler.INBOX_DIR
+        self.handler.INBOX_DIR = self.tmp
 
-    def test_removes_existing_file(self):
-        fd, path = tempfile.mkstemp(suffix=".oga")
-        os.close(fd)
-        self.assertTrue(os.path.exists(path))
-        self.handler.cleanup_audio(path)
-        self.assertFalse(os.path.exists(path))
+    def tearDown(self):
+        self.handler.INBOX_DIR = self._saved_inbox
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_missing_file_is_nonfatal(self):
-        # must not raise on a path that doesn't exist
-        self.handler.cleanup_audio("/nonexistent/definitely/not/here.oga")
+    def _make_oga(self, name, mtime):
+        p = os.path.join(self.tmp, name)
+        with open(p, "wb") as f:
+            f.write(b"OggS")
+        os.utime(p, (mtime, mtime))  # explicit mtime → deterministic ordering
+        return p
 
-    def test_main_success_flow_cleans_up_oga(self):
-        """End-to-end-ish: a full main() download+transcribe+print flow leaves no
-        .oga behind. download_file is faked to actually write a temp file at the
-        path main() chose, so we can assert it's gone after main() returns. The
-        Telegram echo is no longer in Python, so nothing is mocked for it."""
+    def test_keeps_newest_n(self):
+        # N + k files with strictly increasing mtimes: prune_inbox(N) keeps the
+        # newest N (highest mtimes) and removes the older k.
+        n, k = 5, 4
+        paths = [self._make_oga(f"{i}-fid.oga", mtime=1000 + i) for i in range(n + k)]
+        self.handler.prune_inbox(n)
+        survivors = [f for f in os.listdir(self.tmp) if f.endswith(".oga")]
+        self.assertEqual(len(survivors), n, "exactly the newest N must remain")
+        for i in range(n + k):
+            kept = os.path.exists(paths[i])
+            if i >= k:  # the n highest mtimes
+                self.assertTrue(kept, f"newest file {i} should be kept")
+            else:
+                self.assertFalse(kept, f"older file {i} should be pruned")
+
+    def test_negative_keeps_all(self):
+        paths = [self._make_oga(f"{i}-fid.oga", mtime=1000 + i) for i in range(6)]
+        self.handler.prune_inbox(-1)
+        for p in paths:
+            self.assertTrue(os.path.exists(p), "negative keep_n must keep every file")
+
+    def test_zero_deletes_all(self):
+        paths = [self._make_oga(f"{i}-fid.oga", mtime=1000 + i) for i in range(3)]
+        self.handler.prune_inbox(0)
+        for p in paths:
+            self.assertFalse(os.path.exists(p), "keep_n=0 must delete every file")
+
+    def test_missing_inbox_is_nonfatal(self):
+        # An inbox dir that doesn't exist must not raise (os.listdir OSError swallowed).
+        self.handler.INBOX_DIR = os.path.join(self.tmp, "does", "not", "exist")
+        self.handler.prune_inbox(5)  # no raise == pass
+
+    def test_non_oga_files_untouched(self):
+        # Only .oga participate in the window; other files are never pruned.
+        keep = self._make_oga("new-fid.oga", mtime=2000)
+        old = self._make_oga("old-fid.oga", mtime=1000)
+        other = os.path.join(self.tmp, "notes.txt")
+        with open(other, "wb") as f:
+            f.write(b"keepme")
+        self.handler.prune_inbox(1)
+        self.assertTrue(os.path.exists(keep), "newest .oga kept")
+        self.assertFalse(os.path.exists(old), "older .oga pruned")
+        self.assertTrue(os.path.exists(other), "non-.oga files are never pruned")
+
+    def test_main_success_flow_keeps_oga_under_default_retention(self):
+        """End-to-end-ish: a full main() download+transcribe+print flow now KEEPS
+        the cached .oga (rolling window — one file is well within the default 500),
+        replacing the old delete-immediately. download_file is faked to actually
+        write a file at the path main() chose (in our temp INBOX_DIR), so we can
+        assert it survives after main() returns. The Telegram echo is no longer in
+        Python, so nothing is mocked for it."""
         from unittest import mock
         import io
 
@@ -164,17 +219,19 @@ class TestCleanupAudio(unittest.TestCase):
                 f.write(b"OggS-fake-audio")
             created["path"] = dest_path
 
-        with mock.patch.object(self.handler, "download_file", fake_download), \
-             mock.patch.object(self.handler, "run_stt", lambda *a, **k: "hello world"), \
-             mock.patch.object(sys, "argv",
-                               ["stt-handler.py", "-100", "4711", "FID", "914"]), \
-             mock.patch.object(sys, "stdin", io.StringIO("bottoken\n")):
-            self.handler.main()
+        with mock.patch.dict(os.environ):
+            os.environ.pop("STT_AUDIO_RETENTION", None)  # force the default 500
+            with mock.patch.object(self.handler, "download_file", fake_download), \
+                 mock.patch.object(self.handler, "run_stt", lambda *a, **k: "hello world"), \
+                 mock.patch.object(sys, "argv",
+                                   ["stt-handler.py", "-100", "4711", "FID", "914"]), \
+                 mock.patch.object(sys, "stdin", io.StringIO("bottoken\n")):
+                self.handler.main()
 
         self.assertIn("path", created)
-        self.assertFalse(
+        self.assertTrue(
             os.path.exists(created["path"]),
-            "cached .oga should be removed after a successful transcribe",
+            "cached .oga should be KEPT after a successful transcribe (rolling window)",
         )
 
 

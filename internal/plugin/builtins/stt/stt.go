@@ -50,6 +50,11 @@ type Config struct {
 	// (PATH). STT needs only the standard library now (the Sarvam batch path was
 	// ported to native urllib), so no venv is required — system python3 works.
 	Python string `json:"python"`
+	// AudioRetention is how many of the most-recent downloaded .oga voice files the
+	// handler keeps in its inbox (a rolling window); older ones are pruned after
+	// each transcription. Retains recent audio for retranscribe/testing while
+	// bounding disk. 0/unset ⇒ defaultAudioRetention (500); negative ⇒ keep all.
+	AudioRetention int `json:"audio_retention"`
 }
 
 // defaultTimeoutSeconds is the broker's hard deadline for the STT subprocess.
@@ -58,6 +63,12 @@ type Config struct {
 // SIGKILL'd before either provider returned. 300s gives room for slow
 // downloads + a long-audio transcription cycle without surprising the user.
 const defaultTimeoutSeconds = 300
+
+// defaultAudioRetention is how many recent .oga voice files the handler keeps in
+// its inbox when plugins.stt.audio_retention is unset (0). Recent audio stays
+// available for retranscribe/testing; older files are pruned after each
+// transcription. A negative config value keeps everything.
+const defaultAudioRetention = 500
 
 // Register subscribes the plugin's OnVoiceReceived callback. Called once at
 // broker startup if mappings.json:plugins.stt.enabled (default true).
@@ -75,6 +86,9 @@ func Register(host plugin.Host) error {
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = defaultTimeoutSeconds
+	}
+	if cfg.AudioRetention == 0 {
+		cfg.AudioRetention = defaultAudioRetention
 	}
 	// Handler existence is checked PER-CALL (inside the callback) rather than
 	// once at startup. Two reasons:
@@ -189,6 +203,10 @@ func runHandler(ctx context.Context, host plugin.Host, cfg Config, token, apiBas
 	if apiBaseURL != "" {
 		cmd.Env = append(cmd.Env, "C3_TELEGRAM_API_URL="+apiBaseURL)
 	}
+	// Rolling-window audio retention: the handler keeps the newest N .oga in its
+	// inbox and prunes older ones after each transcription (recent audio stays
+	// available for retranscribe/testing). N is passed from config.
+	cmd.Env = append(cmd.Env, "STT_AUDIO_RETENTION="+strconv.Itoa(cfg.AudioRetention))
 
 	// I-7: kill the whole process group on the ctx deadline, not just the direct
 	// child. Setpgid makes stt-handler.py the leader of its OWN process group, so

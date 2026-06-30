@@ -201,17 +201,33 @@ def run_stt(audio_path, extra_env, timeout=270):
 
 # ── Cleanup ─────────────────────────────────────────────────────────────────────
 
-def cleanup_audio(audio_path):
-    """Delete the downloaded .oga after transcription (I-10). Recovery never
-    depends on this local cache — both download_attachment and retranscribe
-    re-fetch from Telegram by file_id — so delete-always is safe and keeps the
-    inbox from growing unbounded. Non-fatal."""
+def prune_inbox(keep_n):
+    """Keep the newest keep_n .oga files in INBOX_DIR; delete older ones. Unlike a
+    delete-immediately-after-transcription, this RETAINS recent audio so the user
+    or agent can retranscribe / re-test by file_id without re-fetching, while still
+    bounding disk use. keep_n comes from STT_AUDIO_RETENTION (the Go shim passes
+    mappings.json:plugins.stt.audio_retention; default 500). A negative keep_n
+    disables pruning (keep everything). Non-fatal — recovery never depends on this
+    cache (download_attachment / retranscribe re-fetch from Telegram by file_id)."""
+    if keep_n < 0:
+        return
     try:
-        if audio_path and os.path.exists(audio_path):
-            os.remove(audio_path)
-            logging.debug(f'removed cached audio {audio_path}')
-    except OSError as e:
-        logging.warning(f'failed to remove cached audio {audio_path}: {e}')
+        names = [f for f in os.listdir(INBOX_DIR) if f.endswith('.oga')]
+    except OSError:
+        return
+    stamped = []
+    for f in names:
+        p = os.path.join(INBOX_DIR, f)
+        try:
+            stamped.append((os.path.getmtime(p), p))
+        except OSError:
+            continue  # vanished under us (concurrent prune); skip
+    stamped.sort(reverse=True)  # newest first
+    for _, p in stamped[keep_n:]:
+        try:
+            os.remove(p)
+        except OSError as e:
+            logging.warning(f'prune_inbox: failed to remove {p}: {e}')
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -299,10 +315,17 @@ def main():
         # (internal/channel/telegram/readback.go) — the handler sends nothing.
         print(transcript)
     finally:
-        # I-10: always remove the downloaded .oga (success or failure-after-
-        # download). Runs even on the sys.exit(1) above (SystemExit) and on any
-        # unexpected exception. Safe because recovery re-fetches from Telegram.
-        cleanup_audio(audio_path)
+        # Rolling-window audio cleanup (replaces the old delete-immediately, per
+        # the maintainer's call): keep the newest N .oga in the inbox so recent
+        # audio stays available for retranscribe/testing, while disk stays bounded.
+        # N from STT_AUDIO_RETENTION (Go shim -> mappings.json:plugins.stt.
+        # audio_retention; default 500). Runs on success AND failure-after-download
+        # (SystemExit / any exception). Safe — recovery re-fetches from Telegram.
+        try:
+            _keep_n = int(os.environ.get('STT_AUDIO_RETENTION', '500'))
+        except ValueError:
+            _keep_n = 500
+        prune_inbox(_keep_n)
 
 if __name__ == '__main__':
     main()

@@ -26,10 +26,12 @@ import (
 // sendRichMessage via sendRichHTML (LONG band), and SendDocument (HUGE band) —
 // and never writes raw HTTP. The FROZEN render format (locked with Karthi
 // 2026-06-30): a summary preview on top → "Full Transcript" heading → the WHOLE
-// verbatim transcript (an expandable blockquote when it fits one message, a
-// plain rich message with Telegram's native "show more" when longer, a .txt
-// document when huge). The transcript is NEVER truncated or summarized; only the
-// preview elides the middle.
+// verbatim transcript — a normal message with an expandable blockquote when it
+// fits one message (≤4096 UTF-16), a PLAIN rich message with Telegram's native
+// "Show More" when much longer (DISPLAYED >9000, up to ~32k assembled), a .txt
+// document for the 4096–9000 dead zone (no smooth in-message collapse exists
+// there) and for anything huge. The transcript is NEVER truncated or summarized;
+// only the preview elides the middle.
 
 // readbackBand is the render band chosen by the transcript's DISPLAYED length.
 type readbackBand int
@@ -41,11 +43,15 @@ const (
 	// bandShort — summary + heading + the whole transcript in an expandable
 	// blockquote, when the DISPLAYED message fits one sendMessage (≤4096 UTF-16).
 	bandShort
-	// bandLong — a plain rich message (native show-more), when the SHORT message
-	// would overflow 4096 but the assembled rich HTML fits the rich budget.
+	// bandLong — a PLAIN rich message (no blockquote) that Telegram's native
+	// "Show More" collapses once content exceeds ~8000 chars, when the SHORT
+	// message's DISPLAYED length is past the 9000 native-collapse margin but the
+	// assembled rich HTML still fits the rich budget.
 	bandLong
-	// bandHuge — the .txt document fallback (and the last-resort target when any
-	// of the above send paths errors).
+	// bandHuge — the .txt document fallback: the 4096–9000 DISPLAYED dead zone
+	// (too long for one message, too short for native "Show More" — no smooth
+	// in-message collapse exists there) and anything over the rich budget, plus
+	// the last-resort target when any of the above send paths errors.
 	bandHuge
 )
 
@@ -74,6 +80,13 @@ const (
 	// code units (Telegram's per-message cap). The measurement strips tags and
 	// counts entities as their visible character, so a fit here cannot 400.
 	readbackShortMaxU16 = 4096
+	// readbackNativeMinU16 — the LONG band's DISPLAYED-length floor in UTF-16 code
+	// units. Telegram's native rich-message "Show More" appears once content
+	// exceeds ~8000 chars (Telegram's blog); 9000 is a safe margin. The
+	// 4096 < x ≤ 9000 window is a dead zone with no smooth in-message collapse
+	// (too long for one message, too short for native "Show More") → it falls to
+	// the .txt document band instead.
+	readbackNativeMinU16 = 9000
 	// readbackRichMaxBytes — the LONG band's assembled-HTML budget in UTF-8 bytes.
 	// Conservative below the real 32768 sendRichMessage cap (over which Telegram
 	// 400s with RICH_MESSAGE_TEXT_TOO_LONG); over this → the .txt document band.
@@ -191,7 +204,7 @@ func renderReadback(transcript string) (method, payload string, band readbackBan
 
 	f3, l3, more := buildPreview(sents)
 	header := fmt.Sprintf("🎤 <b>Voice transcript</b> · ~%d words", words)
-	elision := fmt.Sprintf("… %d more sentences …", more)
+	elision := fmt.Sprintf("✂️ %d more sentences", more)
 
 	// SHORT candidate — summary + heading + the whole transcript in an expandable
 	// blockquote. Measure the DISPLAYED text: tags cost 0, and an escaped entity
@@ -202,25 +215,32 @@ func renderReadback(transcript string) (method, payload string, band readbackBan
 		"\n\n<b>Full Transcript</b>\n<blockquote expandable>" + htmlEscape(full) + "</blockquote>"
 	shortVisible := fmt.Sprintf("🎤 Voice transcript · ~%d words", words) + "\n" + f3 +
 		"\n" + elision + "\n" + l3 + "\n\nFull Transcript\n" + full
-	if uint16Len(shortVisible) <= readbackShortMaxU16 {
+	shortVisibleU16 := uint16Len(shortVisible)
+	if shortVisibleU16 <= readbackShortMaxU16 {
 		return "sendMessage", shortHTML, bandShort
 	}
 
-	// LONG candidate — a plain rich message (no \n: rich messages don't honor it,
-	// so use <p> blocks; no blockquote: its auto-collapse is unreliable at length,
-	// and Telegram's native show-more collapses a long rich message). Budget on
-	// the assembled HTML's UTF-8 BYTE length.
+	// LONG candidate — a PLAIN rich message (no \n: rich messages don't honor it,
+	// so the summary/heading use <p> blocks; no blockquote: the whole transcript
+	// is a plain <p> body). Telegram's native rich-message "Show More" collapses a
+	// rich message once its content exceeds ~8000 chars, so a plain body whose
+	// DISPLAYED length is past the 9000 margin collapses smoothly. The
+	// 4096 < shortVisible ≤ 9000 dead zone falls through to the document band
+	// instead (no smooth in-message collapse exists there). Budget the LONG band
+	// on the assembled HTML's UTF-8 BYTE length.
 	richHTML := "<p>" + header + "</p>" +
 		"<p>" + htmlEscape(f3) + "</p>" +
 		"<p><i>" + elision + "</i></p>" +
 		"<p>" + htmlEscape(l3) + "</p>" +
 		"<p><b>Full Transcript</b></p>" +
 		"<p>" + htmlEscape(full) + "</p>"
-	if len(richHTML) <= readbackRichMaxBytes {
+	if shortVisibleU16 > readbackNativeMinU16 && len(richHTML) <= readbackRichMaxBytes {
 		return "sendRichMessage", richHTML, bandLong
 	}
 
-	// HUGE — the .txt document fallback; the caller writes the file + caption.
+	// DOCUMENT — the 4096–9000 DISPLAYED dead zone (no smooth in-message collapse)
+	// OR a rich HTML over the budget: the caller writes the whole verbatim
+	// transcript as a .txt file + caption.
 	return "sendDocument", "", bandHuge
 }
 
@@ -237,7 +257,7 @@ func readbackCaption(transcript string) string {
 	header := fmt.Sprintf("🎤 <b>Voice transcript</b> · ~%d words", words)
 	body := f3
 	if more > 0 {
-		body = fmt.Sprintf("%s\n… %d more sentences …\n%s", f3, more, l3)
+		body = fmt.Sprintf("%s\n✂️ %d more sentences\n%s", f3, more, l3)
 	}
 	// Cap the VISIBLE preview conservatively before escaping so the final escaped
 	// caption (header + body) stays under the 1024-UTF-16 cap for ordinary speech.

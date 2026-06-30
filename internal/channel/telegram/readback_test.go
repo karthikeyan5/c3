@@ -113,9 +113,10 @@ func TestHTMLEscape(t *testing.T) {
 }
 
 func TestRenderReadback_BandSelection(t *testing.T) {
-	tiny, _ := "One. Two. Three.", 0       // 3 sentences → TINY
+	tiny, _ := "One. Two. Three.", 0        // 3 sentences → TINY
 	short, _ := rbSentenceDoc(2000, 40)     // ~48 sentences, ~2k visible → SHORT
-	long, _ := rbSentenceDoc(5000, 40)      // ~5k visible (>4096) but rich ≤32000 → LONG
+	deadzone, _ := rbSentenceDoc(5000, 40)  // ~5k visible (4096<x≤9000 dead zone) → DOCUMENT
+	long, _ := rbSentenceDoc(12000, 40)     // ~12k visible (>9000) but rich ≤32000 → LONG
 	huge, _ := rbSentenceDoc(33000, 40)     // rich html >32000 bytes → HUGE
 
 	cases := []struct {
@@ -126,6 +127,7 @@ func TestRenderReadback_BandSelection(t *testing.T) {
 	}{
 		{"tiny", tiny, "sendMessage", bandTiny},
 		{"short", short, "sendMessage", bandShort},
+		{"deadzone", deadzone, "sendDocument", bandHuge},
 		{"long", long, "sendRichMessage", bandLong},
 		{"huge", huge, "sendDocument", bandHuge},
 	}
@@ -161,7 +163,7 @@ func TestRenderReadback_ShortExact(t *testing.T) {
 	}
 	want := "🎤 <b>Voice transcript</b> · ~16 words\n" +
 		"S1 alpha. S2 bravo. S3 charlie.\n" +
-		"<i>… 2 more sentences …</i>\n" +
+		"<i>✂️ 2 more sentences</i>\n" +
 		"S6 foxtrot. S7 golf. S8 hotel.\n\n" +
 		"<b>Full Transcript</b>\n" +
 		"<blockquote expandable>" + in + "</blockquote>"
@@ -170,11 +172,14 @@ func TestRenderReadback_ShortExact(t *testing.T) {
 	}
 }
 
-// TestRenderReadback_LongAssembly verifies the LONG band's <p>-block assembly
-// (no \n, no blockquote, plain body with native show-more) against the same
-// parts, without hardcoding the multi-KB transcript.
+// TestRenderReadback_LongAssembly verifies the LONG band's assembly: <p> blocks
+// for the summary/heading AND a PLAIN <p> body for the whole transcript (no \n —
+// rich messages don't honor it; no blockquote — Telegram's native "Show More"
+// collapses the long plain rich message), against the same parts, without
+// hardcoding the multi-KB transcript. The input is sized past the 9000 DISPLAYED
+// native-collapse floor so it lands in LONG (not the 4k–9k document dead zone).
 func TestRenderReadback_LongAssembly(t *testing.T) {
-	in, _ := rbSentenceDoc(5000, 40)
+	in, _ := rbSentenceDoc(12000, 40)
 	method, payload, band := renderReadback(in)
 	if band != bandLong || method != "sendRichMessage" {
 		t.Fatalf("got method=%q band=%v; want sendRichMessage/long", method, band)
@@ -184,7 +189,7 @@ func TestRenderReadback_LongAssembly(t *testing.T) {
 	words := len(strings.Fields(in))
 	want := fmt.Sprintf("<p>🎤 <b>Voice transcript</b> · ~%d words</p>", words) +
 		"<p>" + htmlEscape(f3) + "</p>" +
-		fmt.Sprintf("<p><i>… %d more sentences …</i></p>", more) +
+		fmt.Sprintf("<p><i>✂️ %d more sentences</i></p>", more) +
 		"<p>" + htmlEscape(l3) + "</p>" +
 		"<p><b>Full Transcript</b></p>" +
 		"<p>" + htmlEscape(in) + "</p>"
@@ -192,8 +197,17 @@ func TestRenderReadback_LongAssembly(t *testing.T) {
 		t.Errorf("LONG payload mismatch:\n got (len=%d): %.120q…\nwant (len=%d): %.120q…",
 			len(payload), payload, len(want), want)
 	}
-	if strings.Contains(payload, "\n") || strings.Contains(payload, "<blockquote") {
-		t.Error("LONG band must not contain \\n or a blockquote")
+	if strings.Contains(payload, "\n") {
+		t.Error("LONG band must not contain \\n (rich messages don't honor it)")
+	}
+	if strings.Contains(payload, "<blockquote") {
+		t.Error("LONG band must be a plain <p> body, not a blockquote")
+	}
+	if !strings.Contains(payload, "<p>") {
+		t.Error("LONG band must assemble the summary/body as <p> blocks")
+	}
+	if !strings.Contains(payload, fmt.Sprintf("✂️ %d more sentences", more)) {
+		t.Error("LONG band must carry the elision marker")
 	}
 	if len(payload) > readbackRichMaxBytes {
 		t.Errorf("LONG payload %d bytes exceeds rich budget %d", len(payload), readbackRichMaxBytes)
