@@ -1,7 +1,7 @@
 # Trivial-fixes sweep — 2026-05-19
 
 Single sweep landing all MINOR + safe NIT items from the code-review report
-at `/home/karthi/arogara/code-review/reports/c3-2026-05-19.md` that fit the
+at `~/arogara/code-review/reports/c3-2026-05-19.md` that fit the
 "<50 lines + single-file + no design choice" bar. Karthi explicitly directed:
 "Fix all of them and come back with the final list that actually needs my
 attention."

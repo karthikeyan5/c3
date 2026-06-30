@@ -1,6 +1,6 @@
 # 2026-05-19 — fix 3 MAJOR findings from overnight code review
 
-Source: `/home/karthi/arogara/code-review/reports/c3-2026-05-19.md`
+Source: `~/arogara/code-review/reports/c3-2026-05-19.md`
 
 Karthi's goal: "fix all BLOCKER/MAJOR findings before morning." 0 BLOCKER,
 3 MAJOR (M1, M2, M3). All three are code-review follow-ups — they close

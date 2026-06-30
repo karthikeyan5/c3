@@ -1,7 +1,7 @@
 # C3 Channel-Capability Gaps — Root Cause, Completeness-Gate Safeguard, Coverage Matrix, and Hardened Fix Design
 
 Date: 2026-06-16
-Repo: `/home/karthi/arogara/c3`
+Repo: `~/arogara/c3`
 Status: hardened design (design + Pass-1 code-grounding + Pass-2 contracts/go-nogo folded in)
 
 This document is the single source of truth for closing the four capability gaps Karthi flagged

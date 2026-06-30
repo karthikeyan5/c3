@@ -22,10 +22,10 @@
 go version
 ```
 
-If "command not found": tell the user to install Go ≥1.22 from
+If "command not found": tell the user to install Go ≥1.25 from
 https://go.dev/dl/, then re-run this install. Stop.
 
-If the printed version is older than 1.22: tell the user to upgrade Go
+If the printed version is older than 1.25: tell the user to upgrade Go
 and re-run. Stop.
 
 ## 2. Clone the repo and add as a local marketplace
@@ -231,7 +231,11 @@ re-running is safe. Tell the user to open a fresh terminal and verify with
 If they don't have Codex installed yet, skip — they can run this later
 after `npm install -g @openai/codex` (or however they get Codex).
 
-## 6.5. (Optional) Supervise the broker with systemd
+## 6.5. (Optional, Linux only) Supervise the broker with systemd
+
+> **macOS:** there is no `systemd`/`systemctl` — skip this step. The default
+> on-demand spawn model works fine; if you want always-on supervision, write a
+> `launchd` LaunchAgent that runs `c3-broker` instead.
 
 By default the broker is spawned on demand by the first adapter and stays up as
 a singleton. If you want it auto-restarted even when **no CLI session is open**

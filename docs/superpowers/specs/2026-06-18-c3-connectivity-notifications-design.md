@@ -171,7 +171,7 @@ if invasive {
   ```json
   "statusLine": {
     "type": "command",
-    "command": "bash /home/karthi/.claude/statusline-command.sh",
+    "command": "bash ~/.claude/statusline-command.sh",
     "refreshInterval": 5
   }
   ```

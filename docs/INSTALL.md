@@ -6,7 +6,7 @@ Set-up steps for someone who has never run C3 before. Five minutes if everything
 
 You need:
 
-- **Go ≥1.22** on your `PATH`. C3 is built from source on first install. `go version` should print `go1.22` or newer.
+- **Go ≥1.25** on your `PATH`. C3 is built from source on first install. `go version` should print `go1.25` or newer. (The `go` directive in `go.mod` pins `1.25.0`; older toolchains will fail the build or silently auto-download 1.25.)
 - **A Telegram bot + group, set up per the checklist below.** Five minutes if you've done it before, ten if not. See [docs/research/2026-05-18-telegram-bot-setup.md](research/2026-05-18-telegram-bot-setup.md) for the "why" on each step.
 
   Use **Telegram Desktop, iOS, Android, or macOS** for the group-side steps — *not Telegram Web*. Web's Topics-enable and admin-rights UIs are incomplete.
@@ -234,7 +234,7 @@ The `~/.config/c3/mappings.json` lives outside both plugins; uninstalling the pl
 
 ## Troubleshooting first-install issues
 
-- **`/c3:build` fails with `command not found: go`** — install Go ≥1.22.
+- **`/c3:build` fails with `command not found: go`** — install Go ≥1.25.
 - **Build succeeds but `c3-broker` not on PATH** — `$GOBIN` isn't on `PATH`. See Step 2.
 - **`/c3:setup` says it can't reach Telegram** — check the bot token. Try `curl https://api.telegram.org/bot<TOKEN>/getMe`; should return your bot's info.
 - **Topic creation fails** — the bot isn't an admin with `Manage Topics` in the supergroup. Group settings → Administrators → your bot → toggle "Manage Topics" on.

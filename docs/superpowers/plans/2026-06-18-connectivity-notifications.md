@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Module path: `github.com/karthikeyan5/c3`. All `go test` commands run from repo root `/home/karthi/arogara/c3`.
+- Module path: `github.com/karthikeyan5/c3`. All `go test` commands run from repo root `~/arogara/c3`.
 - Work on branch `feat/connectivity-notifications` (already created; the design spec is committed there). **Do NOT push and do NOT merge to master** — Karthi ratifies in the morning.
 - Toggle: `notifications.invasive`, represented as `*bool` (nil ⇒ default `true`). A bare `bool` would zero-value to `false` and silently disable alerts — forbidden.
 - Status file: `$XDG_STATE_HOME/c3/health.json` (fallback `$HOME/.local/state/c3/health.json`), resolved by `HealthFilePath()`; env `C3_HEALTH_FILE` overrides (tests only). Dir mode `0700`, file mode `0600`.

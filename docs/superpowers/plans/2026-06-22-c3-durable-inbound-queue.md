@@ -19,7 +19,7 @@
 
 Additional operational constraints:
 
-- Module path `github.com/karthikeyan5/c3`; all `go test` commands run from repo root `/home/karthi/arogara/c3`.
+- Module path `github.com/karthikeyan5/c3`; all `go test` commands run from repo root `~/arogara/c3`.
 - Follow existing code patterns (table tests, `t.TempDir()`, `t.Setenv`, metadata-only logging per DEBUGGING.md — never log message text on success paths). TDD: failing test → minimal impl → green. Commit after each task.
 - **Do NOT run `git commit` while authoring the plan.** During *execution*, commit each task with the verbatim trailer above.
 - Queue dir: `$XDG_STATE_HOME/c3/queue/` (fallback `~/.local/state/c3/queue/`), resolved next to the existing offset store (`telegram/offset_store.go:xdgStateHomeC3()`). Env `C3_QUEUE_DIR` overrides (tests). Dir mode `0700`, file mode `0600`.

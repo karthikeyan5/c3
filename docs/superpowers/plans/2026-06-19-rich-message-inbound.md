@@ -16,7 +16,7 @@
 - **Config default-true trap:** the toggle is `*bool` (nil ⇒ true). NEVER a bare `bool` (zero-values to false, silently disabling).
 - **Commit trailer (every commit):** `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
 - **Branch:** `feat/rich-message-inbound`.
-- **Run all tests** with `go test ./...` from `/home/karthi/arogara/c3`; package tests with `go test ./internal/channel/telegram/ -run <Name> -v`.
+- **Run all tests** with `go test ./...` from `~/arogara/c3`; package tests with `go test ./internal/channel/telegram/ -run <Name> -v`.
 
 ---
 
@@ -1569,7 +1569,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - [ ] `go vet ./...` — clean.
 - [ ] **R-1 live-poll check (critical):** rebuild (`go install ./cmd/...`), restart the broker, confirm the log shows `telegram: connected` and that a normal text message still round-trips end-to-end (the raw `getUpdates` swap did not regress polling/offset/timeout). A quiet long-poll that returns zero updates must NOT be logged as a failure.
 - [ ] Send (or simulate) a rich message and confirm it surfaces as markdown, not empty.
-- [ ] PII audit before any push: `~/arogara/pii-audit/scan.sh /home/karthi/arogara/c3`.
+- [ ] PII audit before any push: `~/arogara/pii-audit/scan.sh ~/arogara/c3`.
 
 ## Self-Review (completed by plan author)
 
