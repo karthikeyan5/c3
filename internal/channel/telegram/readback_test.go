@@ -58,24 +58,25 @@ func TestSplitSentences(t *testing.T) {
 }
 
 func TestBuildPreview(t *testing.T) {
-	// >= 7 sentences: first 3 / last 3 / M = total − 6.
-	eight := []string{"a.", "b.", "c.", "d.", "e.", "f.", "g.", "h."}
-	f3, l3, more := buildPreview(eight)
+	// >= 13 sentences: first 3 / last 3 / M = total − 6.
+	thirteen := []string{"a.", "b.", "c.", "d.", "e.", "f.", "g.", "h.", "i.", "j.", "k.", "l.", "m."}
+	f3, l3, more := buildPreview(thirteen)
 	if f3 != "a. b. c." {
 		t.Errorf("first3 = %q; want %q", f3, "a. b. c.")
 	}
-	if l3 != "f. g. h." {
-		t.Errorf("last3 = %q; want %q", l3, "f. g. h.")
+	if l3 != "k. l. m." {
+		t.Errorf("last3 = %q; want %q", l3, "k. l. m.")
 	}
-	if more != 2 {
-		t.Errorf("more = %d; want 2 (8 − 6)", more)
+	if more != 7 {
+		t.Errorf("more = %d; want 7 (13 − 6)", more)
 	}
 
-	// < 7 sentences: all joined as first3, empty last3, M = 0 (no elision).
-	four := []string{"a.", "b.", "c.", "d."}
-	f3, l3, more = buildPreview(four)
-	if f3 != "a. b. c. d." || l3 != "" || more != 0 {
-		t.Errorf("buildPreview(4) = (%q, %q, %d); want (%q, \"\", 0)", f3, l3, more, "a. b. c. d.")
+	// < 13 sentences: all joined as first3, empty last3, M = 0 (no elision).
+	twelve := []string{"a.", "b.", "c.", "d.", "e.", "f.", "g.", "h.", "i.", "j.", "k.", "l."}
+	want := "a. b. c. d. e. f. g. h. i. j. k. l."
+	f3, l3, more = buildPreview(twelve)
+	if f3 != want || l3 != "" || more != 0 {
+		t.Errorf("buildPreview(12) = (%q, %q, %d); want (%q, \"\", 0)", f3, l3, more, want)
 	}
 }
 
@@ -115,7 +116,7 @@ func TestHTMLEscape(t *testing.T) {
 func TestRenderReadback_BandSelection(t *testing.T) {
 	tiny, _ := "One. Two. Three.", 0        // 3 sentences → TINY
 	short, _ := rbSentenceDoc(2000, 40)     // ~48 sentences, ~2k visible → SHORT
-	deadzone, _ := rbSentenceDoc(5000, 40)  // ~5k visible (4096<x≤9000 dead zone) → DOCUMENT
+	deadzone, _ := rbSentenceDoc(5000, 40)  // ~5k visible (4096<x≤9000 dead zone) → DEADZONE <details>
 	long, _ := rbSentenceDoc(12000, 40)     // ~12k visible (>9000) but rich ≤32000 → LONG
 	huge, _ := rbSentenceDoc(33000, 40)     // rich html >32000 bytes → HUGE
 
@@ -127,7 +128,7 @@ func TestRenderReadback_BandSelection(t *testing.T) {
 	}{
 		{"tiny", tiny, "sendMessage", bandTiny},
 		{"short", short, "sendMessage", bandShort},
-		{"deadzone", deadzone, "sendDocument", bandHuge},
+		{"deadzone", deadzone, "sendRichMessage", bandDeadzone},
 		{"long", long, "sendRichMessage", bandLong},
 		{"huge", huge, "sendDocument", bandHuge},
 	}
@@ -148,6 +149,9 @@ func TestRenderReadback_BandSelection(t *testing.T) {
 					t.Errorf("%v band payload should be non-empty", band)
 				}
 			}
+			if band == bandDeadzone && !strings.Contains(payload, "<details>") {
+				t.Errorf("DEADZONE band payload must contain a <details> collapse, got %q", payload)
+			}
 		})
 	}
 }
@@ -156,15 +160,16 @@ func TestRenderReadback_BandSelection(t *testing.T) {
 // (header · word count, first-3 … M more … last-3 summary, the heading, and the
 // whole verbatim transcript in an expandable blockquote).
 func TestRenderReadback_ShortExact(t *testing.T) {
-	in := "S1 alpha. S2 bravo. S3 charlie. S4 delta. S5 echo. S6 foxtrot. S7 golf. S8 hotel."
+	in := "S1 alpha. S2 bravo. S3 charlie. S4 delta. S5 echo. S6 foxtrot. S7 golf. " +
+		"S8 hotel. S9 india. S10 juliet. S11 kilo. S12 lima. S13 mike."
 	method, payload, band := renderReadback(in)
 	if band != bandShort || method != "sendMessage" {
 		t.Fatalf("got method=%q band=%v; want sendMessage/short", method, band)
 	}
-	want := "🎤 <b>Voice transcript</b> · ~16 words\n" +
+	want := "🎤 <b>Voice transcript</b> · ~26 words\n" +
 		"S1 alpha. S2 bravo. S3 charlie.\n" +
-		"<i>✂️ 2 more sentences</i>\n" +
-		"S6 foxtrot. S7 golf. S8 hotel.\n\n" +
+		"<i>✂️✂️ 7 more sentences ✂️✂️</i>\n" +
+		"S11 kilo. S12 lima. S13 mike.\n\n" +
 		"<b>Full Transcript</b>\n" +
 		"<blockquote expandable>" + in + "</blockquote>"
 	if payload != want {
@@ -189,7 +194,7 @@ func TestRenderReadback_LongAssembly(t *testing.T) {
 	words := len(strings.Fields(in))
 	want := fmt.Sprintf("<p>🎤 <b>Voice transcript</b> · ~%d words</p>", words) +
 		"<p>" + htmlEscape(f3) + "</p>" +
-		fmt.Sprintf("<p><i>✂️ %d more sentences</i></p>", more) +
+		fmt.Sprintf("<p><i>✂️✂️ %d more sentences ✂️✂️</i></p>", more) +
 		"<p>" + htmlEscape(l3) + "</p>" +
 		"<p><b>Full Transcript</b></p>" +
 		"<p>" + htmlEscape(in) + "</p>"
@@ -203,10 +208,13 @@ func TestRenderReadback_LongAssembly(t *testing.T) {
 	if strings.Contains(payload, "<blockquote") {
 		t.Error("LONG band must be a plain <p> body, not a blockquote")
 	}
+	if strings.Contains(payload, "<details") {
+		t.Error("LONG band must be a plain <p> body, not a <details> collapse")
+	}
 	if !strings.Contains(payload, "<p>") {
 		t.Error("LONG band must assemble the summary/body as <p> blocks")
 	}
-	if !strings.Contains(payload, fmt.Sprintf("✂️ %d more sentences", more)) {
+	if !strings.Contains(payload, fmt.Sprintf("✂️✂️ %d more sentences ✂️✂️", more)) {
 		t.Error("LONG band must carry the elision marker")
 	}
 	if len(payload) > readbackRichMaxBytes {
@@ -235,6 +243,27 @@ func TestRenderReadback_TinyEscapes(t *testing.T) {
 	}
 	if strings.Contains(payload, "Full Transcript") || strings.Contains(payload, "more sentences") {
 		t.Error("TINY band must carry no summary/heading")
+	}
+}
+
+// TestRenderReadback_TwelveSentencesTiny pins the no-elide threshold: 12
+// sentences (= 2× the 6-sentence preview) still render as the bare TINY band,
+// because only >12 sentences have a meaningful middle to elide.
+func TestRenderReadback_TwelveSentencesTiny(t *testing.T) {
+	in := "A. B. C. D. E. F. G. H. I. J. K. L."
+	if n := len(splitSentences(in)); n != 12 {
+		t.Fatalf("fixture has %d sentences, want 12", n)
+	}
+	method, payload, band := renderReadback(in)
+	if band != bandTiny || method != "sendMessage" {
+		t.Fatalf("got method=%q band=%v; want sendMessage/tiny", method, band)
+	}
+	want := "🎤 <b>Voice transcript</b>\n" + htmlEscape(in)
+	if payload != want {
+		t.Errorf("TINY payload mismatch:\n got: %q\nwant: %q", payload, want)
+	}
+	if strings.Contains(payload, "more sentences") || strings.Contains(payload, "Full Transcript") {
+		t.Error("TINY band must carry no summary/elision/heading")
 	}
 }
 

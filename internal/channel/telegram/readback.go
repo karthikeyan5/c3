@@ -23,15 +23,15 @@ import (
 // and every send error here is best-effort.
 //
 // It REUSES the channel's existing senders — sendMessage (TINY/SHORT bands),
-// sendRichMessage via sendRichHTML (LONG band), and SendDocument (HUGE band) —
-// and never writes raw HTTP. The FROZEN render format (locked with Karthi
+// sendRichMessage via sendRichHTML (LONG/DEADZONE bands), and SendDocument (HUGE
+// band) — and never writes raw HTTP. The FROZEN render format (locked with Karthi
 // 2026-06-30): a summary preview on top → "Full Transcript" heading → the WHOLE
 // verbatim transcript — a normal message with an expandable blockquote when it
 // fits one message (≤4096 UTF-16), a PLAIN rich message with Telegram's native
-// "Show More" when much longer (DISPLAYED >9000, up to ~32k assembled), a .txt
-// document for the 4096–9000 dead zone (no smooth in-message collapse exists
-// there) and for anything huge. The transcript is NEVER truncated or summarized;
-// only the preview elides the middle.
+// "Show More" when much longer (DISPLAYED >9000, up to ~32k assembled), a rich
+// message with a searchable <details> collapse for the 4096–9000 dead zone (no
+// native "Show More" there), and a .txt document only for anything huge. The
+// transcript is NEVER truncated or summarized; only the preview elides the middle.
 
 // readbackBand is the render band chosen by the transcript's DISPLAYED length.
 type readbackBand int
@@ -48,10 +48,13 @@ const (
 	// message's DISPLAYED length is past the 9000 native-collapse margin but the
 	// assembled rich HTML still fits the rich budget.
 	bandLong
-	// bandHuge — the .txt document fallback: the 4096–9000 DISPLAYED dead zone
-	// (too long for one message, too short for native "Show More" — no smooth
-	// in-message collapse exists there) and anything over the rich budget, plus
-	// the last-resort target when any of the above send paths errors.
+	// bandDeadzone — the 4096 < DISPLAYED ≤ 9000 window: too long for one
+	// sendMessage, too short for Telegram's native "Show More". Renders as a rich
+	// message that wraps the whole transcript in a searchable <details> collapse.
+	bandDeadzone
+	// bandHuge — the .txt document fallback: a transcript whose assembled rich HTML
+	// exceeds the rich budget (>32k), plus the last-resort target when any of the
+	// above send paths errors. (The 4096–9000 dead zone is now bandDeadzone.)
 	bandHuge
 )
 
@@ -63,6 +66,8 @@ func (b readbackBand) String() string {
 		return "short"
 	case bandLong:
 		return "long"
+	case bandDeadzone:
+		return "deadzone"
 	case bandHuge:
 		return "huge"
 	default:
@@ -72,10 +77,11 @@ func (b readbackBand) String() string {
 
 const (
 	// readbackTinyMaxSentences — a transcript with fewer than this many sentences
-	// has no meaningful middle to elide (the preview is first 3 + last 3 = 6
-	// sentences), so it renders as the bare TINY band. 7 = the first count at
-	// which M (= total − 6) is ≥ 1.
-	readbackTinyMaxSentences = 7
+	// renders as the bare TINY band (no preview/elision/collapse). The preview
+	// shows first 3 + last 3 = 6 sentences; below 2× that (≤12) the elided preview
+	// would reveal as much as it hides, so only >12 sentences get the elided
+	// preview. 13 = first count at which the middle (= total − 6) exceeds the 6 shown.
+	readbackTinyMaxSentences = 13
 	// readbackShortMaxU16 — the SHORT band's DISPLAYED-length ceiling in UTF-16
 	// code units (Telegram's per-message cap). The measurement strips tags and
 	// counts entities as their visible character, so a fit here cannot 400.
@@ -83,9 +89,9 @@ const (
 	// readbackNativeMinU16 — the LONG band's DISPLAYED-length floor in UTF-16 code
 	// units. Telegram's native rich-message "Show More" appears once content
 	// exceeds ~8000 chars (Telegram's blog); 9000 is a safe margin. The
-	// 4096 < x ≤ 9000 window is a dead zone with no smooth in-message collapse
-	// (too long for one message, too short for native "Show More") → it falls to
-	// the .txt document band instead.
+	// 4096 < x ≤ 9000 window has no native "Show More" (too long for one message,
+	// too short for native collapse) → it renders as the bandDeadzone <details>
+	// collapse rich message instead.
 	readbackNativeMinU16 = 9000
 	// readbackRichMaxBytes — the LONG band's assembled-HTML budget in UTF-8 bytes.
 	// Conservative below the real 32768 sendRichMessage cap (over which Telegram
@@ -188,10 +194,11 @@ func capUTF16(s string, n int) string {
 // transcript, with NO network — so band selection, the preview elision, the
 // measurement, and the escaping are all unit-testable directly. It returns the
 // Telegram API method name, the payload to send, and the band:
-//   - bandTiny  → ("sendMessage",     HTML message text)
-//   - bandShort → ("sendMessage",     HTML message text)
-//   - bandLong  → ("sendRichMessage", rich HTML)
-//   - bandHuge  → ("sendDocument",    "" — the caller builds the .txt + caption)
+//   - bandTiny     → ("sendMessage",     HTML message text)
+//   - bandShort    → ("sendMessage",     HTML message text)
+//   - bandLong     → ("sendRichMessage", rich HTML)
+//   - bandDeadzone → ("sendRichMessage", rich HTML with a <details> collapse)
+//   - bandHuge     → ("sendDocument",    "" — the caller builds the .txt + caption)
 func renderReadback(transcript string) (method, payload string, band readbackBand) {
 	full := strings.TrimSpace(transcript)
 	sents := splitSentences(full)
@@ -204,7 +211,7 @@ func renderReadback(transcript string) (method, payload string, band readbackBan
 
 	f3, l3, more := buildPreview(sents)
 	header := fmt.Sprintf("🎤 <b>Voice transcript</b> · ~%d words", words)
-	elision := fmt.Sprintf("✂️ %d more sentences", more)
+	elision := fmt.Sprintf("✂️✂️ %d more sentences ✂️✂️", more)
 
 	// SHORT candidate — summary + heading + the whole transcript in an expandable
 	// blockquote. Measure the DISPLAYED text: tags cost 0, and an escaped entity
@@ -220,26 +227,37 @@ func renderReadback(transcript string) (method, payload string, band readbackBan
 		return "sendMessage", shortHTML, bandShort
 	}
 
-	// LONG candidate — a PLAIN rich message (no \n: rich messages don't honor it,
-	// so the summary/heading use <p> blocks; no blockquote: the whole transcript
-	// is a plain <p> body). Telegram's native rich-message "Show More" collapses a
-	// rich message once its content exceeds ~8000 chars, so a plain body whose
-	// DISPLAYED length is past the 9000 margin collapses smoothly. The
-	// 4096 < shortVisible ≤ 9000 dead zone falls through to the document band
-	// instead (no smooth in-message collapse exists there). Budget the LONG band
-	// on the assembled HTML's UTF-8 BYTE length.
+	// LONG / DEADZONE candidates — both are PLAIN rich messages (no \n: rich
+	// messages don't honor it, so the summary/heading use <p> blocks). LONG is a
+	// plain <p> body that Telegram's native "Show More" collapses once content
+	// exceeds ~8000 chars, so a body whose DISPLAYED length is past the 9000 margin
+	// collapses smoothly. The 4096 < shortVisible ≤ 9000 dead zone (too short for
+	// native "Show More") instead wraps the whole transcript in a searchable
+	// <details> collapse. Budget both on the assembled HTML's UTF-8 BYTE length.
 	richHTML := "<p>" + header + "</p>" +
 		"<p>" + htmlEscape(f3) + "</p>" +
 		"<p><i>" + elision + "</i></p>" +
 		"<p>" + htmlEscape(l3) + "</p>" +
 		"<p><b>Full Transcript</b></p>" +
 		"<p>" + htmlEscape(full) + "</p>"
+	detailsHTML := "<p>" + header + "</p>" +
+		"<p>" + htmlEscape(f3) + "</p>" +
+		"<p><i>" + elision + "</i></p>" +
+		"<p>" + htmlEscape(l3) + "</p>" +
+		"<details><summary><b>📄 Full Transcript</b></summary><p>" + htmlEscape(full) + "</p></details>"
+
+	// DEADZONE — the 4096 < shortVisible ≤ 9000 window renders as a searchable
+	// <details> collapse rich message.
+	if shortVisibleU16 <= readbackNativeMinU16 && len(detailsHTML) <= readbackRichMaxBytes {
+		return "sendRichMessage", detailsHTML, bandDeadzone
+	}
+	// LONG — past the 9000 native-collapse margin, the plain rich body fits budget.
 	if shortVisibleU16 > readbackNativeMinU16 && len(richHTML) <= readbackRichMaxBytes {
 		return "sendRichMessage", richHTML, bandLong
 	}
 
-	// DOCUMENT — the 4096–9000 DISPLAYED dead zone (no smooth in-message collapse)
-	// OR a rich HTML over the budget: the caller writes the whole verbatim
+	// DOCUMENT — rich HTML over the budget (>32k assembled), or a dead-zone
+	// detailsHTML somehow over budget: the caller writes the whole verbatim
 	// transcript as a .txt file + caption.
 	return "sendDocument", "", bandHuge
 }
@@ -257,7 +275,7 @@ func readbackCaption(transcript string) string {
 	header := fmt.Sprintf("🎤 <b>Voice transcript</b> · ~%d words", words)
 	body := f3
 	if more > 0 {
-		body = fmt.Sprintf("%s\n✂️ %d more sentences\n%s", f3, more, l3)
+		body = fmt.Sprintf("%s\n✂️✂️ %d more sentences ✂️✂️\n%s", f3, more, l3)
 	}
 	// Cap the VISIBLE preview conservatively before escaping so the final escaped
 	// caption (header + body) stays under the 1024-UTF-16 cap for ordinary speech.
@@ -274,8 +292,8 @@ func readbackCaption(transcript string) string {
 // STT succeeds (worker.flushInbounds). Returns the sent message_id.
 //
 // Failure cascade (each step best-effort; non-fatal at the caller): a send error
-// in TINY/SHORT/LONG → retry as the .txt document (HUGE) → retry a short plain
-// notice → return the error. The transcript is NEVER truncated or summarized.
+// in TINY/SHORT/LONG/DEADZONE → retry as the .txt document (HUGE) → retry a short
+// plain notice → return the error. The transcript is NEVER truncated or summarized.
 func (c *Channel) SendReadback(args c3types.ReadbackArgs) (int64, error) {
 	if c.bot == nil {
 		return 0, errors.New("telegram: channel not started")
@@ -289,7 +307,7 @@ func (c *Channel) SendReadback(args c3types.ReadbackArgs) (int64, error) {
 		} else {
 			c.host.Logf("telegram: readback %s (%s) failed, falling back to .txt document: %v", band, method, err)
 		}
-	case bandLong:
+	case bandLong, bandDeadzone:
 		if id, err := c.sendRichHTML(args.ChatID, payload, args.TopicID, args.ReplyTo); err == nil {
 			return id, nil
 		} else {
@@ -299,8 +317,8 @@ func (c *Channel) SendReadback(args c3types.ReadbackArgs) (int64, error) {
 		// Falls straight through to the document path below.
 	}
 
-	// HUGE band, or a TINY/SHORT/LONG send error → the whole verbatim transcript
-	// as a .txt document, captioned with the summary preview.
+	// HUGE band, or a TINY/SHORT/LONG/DEADZONE send error → the whole verbatim
+	// transcript as a .txt document, captioned with the summary preview.
 	if id, err := c.sendReadbackDocument(args, readbackCaption(args.Transcript)); err == nil {
 		return id, nil
 	} else {
