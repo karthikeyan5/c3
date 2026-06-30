@@ -394,6 +394,12 @@ func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inboun
 				// recoverable; the user never re-forwards.
 				in.Text = sttFailureText(in, "no_transcript")
 			}
+			// Voice-transcript readback echo (moved out of the Python STT handler).
+			// ADDITIVE + NON-FATAL: it is a SEND, so it can never affect the
+			// agent-surface in.Text set above, inbound delivery, persistence, or
+			// loss-freedom. Synchronous in the loop (the worker already blocks on
+			// STT for seconds; this preserves per-voice ordering).
+			w.echoReadback(in, transcript)
 		}
 	}
 
@@ -486,6 +492,68 @@ func sttFailureText(in *c3types.Inbound, reason string) string {
 	dur = "duration unknown"
 	return fmt.Sprintf("⚠️ [voice transcription failed: %s] The audio is saved and recoverable — the user does not need to resend. Call download_attachment with file_id=%q (%s, %s) to retrieve it, or retranscribe with the same file_id to re-run transcription. Provider traceback: %s",
 		reason, fileID, mime, dur, LogPath())
+}
+
+// isSTTFailureMarker reports whether a transcript is the STT builtin's failure
+// marker ("[STT FAILED: <reason> — see <path>]", see stt.sttFailureMarker)
+// rather than a real transcript. A marker (or the empty string) means STT did
+// not produce text, so the readback echoes a human notice instead of a
+// transcript. Kept as a local predicate so worker.go needs no import of the stt
+// builtin (which would be a plugin→broker import cycle).
+func isSTTFailureMarker(transcript string) bool {
+	return strings.HasPrefix(transcript, "[STT FAILED:")
+}
+
+// echoReadback sends the voice-transcript readback back to the SOURCE chat — the
+// move of Python's send_transcript_to_telegram / notify_transcription_failed
+// into Go, reusing the channel's own reliable senders. It is ADDITIVE and
+// strictly NON-FATAL: a SEND can never affect inbound delivery, persistence, or
+// loss-freedom, so every error here only logs.
+//
+//   - On a REAL transcript (non-empty, not a marker): resolve the channel and,
+//     IF it implements the OPTIONAL readbacker interface (only Telegram does
+//     today), render the frozen readback via SendReadback. A channel without it
+//     is skipped silently — other channels need no changes.
+//   - On an STT FAILURE (empty transcript or a "[STT FAILED:" marker): send a
+//     short human-facing notice via the channel's normal SendReply (this
+//     replaces Python's notify_transcription_failed). Once per failed voice
+//     inbound, best-effort.
+func (w *RouteWorker) echoReadback(in *c3types.Inbound, transcript string) {
+	if w.broker == nil {
+		return
+	}
+	ch, err := w.broker.Channel(in.Channel)
+	if err != nil {
+		// Channel not resolvable (unit tests / non-telegram route): nothing to
+		// echo to. Skip silently — the agent surface (in.Text) is already set.
+		return
+	}
+	// Failure: an empty transcript or the STT failure marker → a human notice,
+	// not a transcript. The agent-surface marker path (in.Text) is unchanged.
+	if transcript == "" || isSTTFailureMarker(transcript) {
+		if _, serr := ch.SendReply(c3types.ReplyArgs{
+			Channel: in.Channel, ChatID: in.ChatID, TopicID: in.TopicID, ReplyTo: &in.MessageID,
+			Text: "⚠️ Couldn't transcribe that voice note — see logs / try again.",
+		}); serr != nil {
+			log.Printf("readback notice chan=%s chat=%d topic=%s msg=%d: send failed (non-fatal): %v",
+				w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, serr)
+		}
+		return
+	}
+	// Success: echo the transcript via the channel's optional readback renderer.
+	// Other channels simply don't implement it and are skipped.
+	rb, ok := ch.(interface {
+		SendReadback(c3types.ReadbackArgs) (int64, error)
+	})
+	if !ok {
+		return
+	}
+	if _, serr := rb.SendReadback(c3types.ReadbackArgs{
+		ChatID: in.ChatID, ReplyTo: &in.MessageID, TopicID: in.TopicID, Transcript: transcript,
+	}); serr != nil {
+		log.Printf("readback chan=%s chat=%d topic=%s msg=%d: SendReadback failed (non-fatal): %v",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, serr)
+	}
 }
 
 // flushEvent forwards a single synthesized channel EVENT (poll_result /

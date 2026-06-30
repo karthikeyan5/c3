@@ -171,3 +171,68 @@ func (c *Channel) sendRich(args c3types.ReplyArgs) (int64, error) {
 	c.recordOutboundSuccess()
 	return res.MessageId, nil
 }
+
+// buildRichHTMLParams builds the sendRichMessage request params for the HTML
+// dialect (the voice-readback LONG band, readback.go). It mirrors
+// buildRichParams but carries rich_message.html instead of .markdown:
+//
+//	{
+//	  "chat_id": <id>,
+//	  "message_thread_id": <topic>,    // only when topicID != nil
+//	  "rich_message": {"html": <html>},
+//	  "reply_parameters": {...},       // only when replyTo != nil
+//	}
+//
+// PURE (no network) so the param shape is unit-testable.
+func buildRichHTMLParams(chatID int64, html string, topicID, replyTo *int64) map[string]any {
+	params := map[string]any{
+		"chat_id":      chatID,
+		"rich_message": map[string]any{"html": html},
+	}
+	if topicID != nil {
+		params["message_thread_id"] = *topicID
+	}
+	if replyTo != nil {
+		params["reply_parameters"] = map[string]any{
+			"message_id":                  *replyTo,
+			"allow_sending_without_reply": true,
+		}
+	}
+	return params
+}
+
+// sendRichHTML sends ONE rich message in the HTML dialect (rich_message.html)
+// and returns the new message_id. It is the SIBLING of sendRich used by the
+// voice-readback LONG band (readback.go): IDENTICAL rate.Wait →
+// RequestWithContext("sendRichMessage") → recordOutboundErr/Success machinery,
+// only the dialect differs (html vs markdown). sendRich (the GFM-table path) and
+// richTableEligible are intentionally left byte-identical — this is an additive
+// sibling, not a change to the table route.
+func (c *Channel) sendRichHTML(chatID int64, html string, topicID, replyTo *int64) (int64, error) {
+	if c.bot == nil {
+		return 0, errors.New("telegram: channel not started")
+	}
+	params := buildRichHTMLParams(chatID, html, topicID, replyTo)
+	if err := c.rate.Wait(c.ctx, chatID); err != nil {
+		return 0, fmt.Errorf("telegram: rate-wait: %w", err)
+	}
+	raw, err := c.bot.RequestWithContext(
+		c.ctx,
+		"sendRichMessage",
+		params,
+		c.requestOptsFor("sendRichMessage"),
+	)
+	if err != nil {
+		c.recordOutboundErr(err)
+		return 0, fmt.Errorf("telegram: sendRichMessage(html): %w", err)
+	}
+	var res struct {
+		MessageId int64 `json:"message_id"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		c.recordOutboundErr(err)
+		return 0, fmt.Errorf("telegram: sendRichMessage(html): decode result: %w", err)
+	}
+	c.recordOutboundSuccess()
+	return res.MessageId, nil
+}

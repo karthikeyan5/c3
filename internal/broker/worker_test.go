@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -684,5 +685,125 @@ func TestWorker_OutboundStubReturnsErr(t *testing.T) {
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("no result within 500ms")
+	}
+}
+
+// readbackRecorderChannel embeds *fakeChannel and additionally implements the
+// OPTIONAL SendReadback method, so flushInbounds' echoReadback hook resolves it
+// via the readbacker type-assert. A channel WITHOUT this method (the bare
+// fakeChannel) is skipped silently — the additive contract.
+type readbackRecorderChannel struct {
+	*fakeChannel
+	rbMu      sync.Mutex
+	readbacks []c3types.ReadbackArgs
+}
+
+func (r *readbackRecorderChannel) SendReadback(a c3types.ReadbackArgs) (int64, error) {
+	r.rbMu.Lock()
+	defer r.rbMu.Unlock()
+	r.readbacks = append(r.readbacks, a)
+	return 99, nil
+}
+
+func (r *readbackRecorderChannel) readbackSnapshot() []c3types.ReadbackArgs {
+	r.rbMu.Lock()
+	defer r.rbMu.Unlock()
+	out := make([]c3types.ReadbackArgs, len(r.readbacks))
+	copy(out, r.readbacks)
+	return out
+}
+
+func registerReadbackChannel(b *Broker, rc *readbackRecorderChannel) {
+	b.chMu.Lock()
+	b.channels[rc.Name()] = &channelRegistration{Channel: rc}
+	b.chMu.Unlock()
+}
+
+// TestFlushInbounds_ReadbackOnSuccess: a REAL transcript drives exactly one
+// SendReadback carrying the verbatim transcript (ChatID/TopicID/ReplyTo set), and
+// no "couldn't transcribe" failure notice. The agent surface (in.Text) still
+// carries the transcript — the echo is purely additive.
+func TestFlushInbounds_ReadbackOnSuccess(t *testing.T) {
+	t.Setenv("C3_QUEUE_DIR", t.TempDir())
+	b := New(&mappings.MappingsFile{SchemaVersion: 1})
+	defer b.Shutdown()
+
+	rc := &readbackRecorderChannel{fakeChannel: &fakeChannel{}}
+	registerReadbackChannel(b, rc)
+	b.Plugins.OnVoiceReceived(func(ctx context.Context, p c3types.VoicePayload) (string, error) {
+		return "hello from the voice note", nil
+	})
+
+	w := newRouteWorker(context.Background(), RouteKey{Channel: "telegram", ChatID: -100}, time.Hour, b)
+	defer w.Stop()
+
+	tid := int64(7)
+	in := &c3types.Inbound{
+		Channel: "telegram", ChatID: -100, TopicID: &tid, MessageID: 51,
+		Attachments: []c3types.Attachment{{Kind: "voice", FileID: "VF"}},
+	}
+	w.flushInbounds(context.Background(), []*c3types.Inbound{in})
+
+	rbs := rc.readbackSnapshot()
+	if len(rbs) != 1 {
+		t.Fatalf("want exactly 1 SendReadback on success, got %d", len(rbs))
+	}
+	if rbs[0].Transcript != "hello from the voice note" {
+		t.Errorf("readback transcript = %q; want verbatim transcript", rbs[0].Transcript)
+	}
+	if rbs[0].ChatID != -100 || rbs[0].ReplyTo == nil || *rbs[0].ReplyTo != 51 ||
+		rbs[0].TopicID == nil || *rbs[0].TopicID != 7 {
+		t.Errorf("readback routing wrong: %+v", rbs[0])
+	}
+	if !strings.Contains(in.Text, "hello from the voice note") {
+		t.Errorf("agent surface lost the transcript: in.Text=%q", in.Text)
+	}
+	for _, rp := range rc.sendRepliesSnapshot() {
+		if strings.Contains(rp.Text, "Couldn't transcribe") {
+			t.Error("a success readback must not also send the failure notice")
+		}
+	}
+}
+
+// TestFlushInbounds_ReadbackFailureNotice: an STT failure marker drives NO
+// SendReadback but DOES send the human "couldn't transcribe" notice via the
+// channel's normal SendReply. The agent-surface marker (in.Text) is unchanged.
+func TestFlushInbounds_ReadbackFailureNotice(t *testing.T) {
+	t.Setenv("C3_QUEUE_DIR", t.TempDir())
+	b := New(&mappings.MappingsFile{SchemaVersion: 1})
+	defer b.Shutdown()
+
+	rc := &readbackRecorderChannel{fakeChannel: &fakeChannel{}}
+	registerReadbackChannel(b, rc)
+	b.Plugins.OnVoiceReceived(func(ctx context.Context, p c3types.VoicePayload) (string, error) {
+		return "[STT FAILED: timeout — see /tmp/broker.log]", nil
+	})
+
+	w := newRouteWorker(context.Background(), RouteKey{Channel: "telegram", ChatID: -100}, time.Hour, b)
+	defer w.Stop()
+
+	in := &c3types.Inbound{
+		Channel: "telegram", ChatID: -100, MessageID: 52,
+		Attachments: []c3types.Attachment{{Kind: "voice", FileID: "VF"}},
+	}
+	w.flushInbounds(context.Background(), []*c3types.Inbound{in})
+
+	if n := len(rc.readbackSnapshot()); n != 0 {
+		t.Fatalf("want 0 SendReadback on STT failure, got %d", n)
+	}
+	sawNotice := false
+	for _, rp := range rc.sendRepliesSnapshot() {
+		if strings.Contains(rp.Text, "Couldn't transcribe that voice note") {
+			sawNotice = true
+			if rp.ReplyTo == nil || *rp.ReplyTo != 52 {
+				t.Errorf("failure notice should reply-quote the voice msg, got %+v", rp)
+			}
+		}
+	}
+	if !sawNotice {
+		t.Error("STT failure must send the human 'couldn't transcribe' notice via SendReply")
+	}
+	if !strings.Contains(in.Text, "[STT FAILED: timeout") {
+		t.Errorf("agent-surface marker changed: in.Text=%q", in.Text)
 	}
 }

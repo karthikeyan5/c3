@@ -282,6 +282,24 @@ type ReactArgs struct {
 	Emoji     string
 }
 
+// ReadbackArgs is the argument shape for the OPTIONAL Channel.SendReadback method
+// — the voice-transcript "readback" a channel echoes back to the source chat
+// after STT succeeds. It is deliberately NOT part of the channel.Channel
+// interface: only channels that can render the readback implement it, and the
+// broker reaches it via an optional interface type-assert (see
+// internal/broker/worker.go), so other channels need no changes.
+//
+// ChatID/TopicID/ReplyTo follow the same conventions as Outbound (TopicID nil =
+// DM/no thread; ReplyTo = the source voice message_id, for the reply-quote UX).
+// Transcript is the FULL verbatim transcript — the channel never truncates or
+// summarizes it (only a preview may elide the middle).
+type ReadbackArgs struct {
+	ChatID     int64
+	ReplyTo    *int64 // source voice message_id (reply-quote)
+	TopicID    *int64
+	Transcript string // full verbatim transcript
+}
+
 // VoicePayload is the input the plugin host passes to OnVoiceReceived
 // callbacks (the STT plugin's entry point). FileID identifies the
 // voice attachment on the source channel; MIME and Size are hints
