@@ -278,3 +278,34 @@ func TestReadbackCaption(t *testing.T) {
 		t.Errorf("caption prefix wrong: %.60q", capt)
 	}
 }
+
+// Entity-safety regression (review finding 3): a transcript whose preview is dense
+// with &/</> must produce a caption that is (a) under the Telegram caption cap AND
+// (b) free of any SLICED HTML entity. Truncating the already-escaped string could cut
+// "&amp;" → "&am", which is malformed HTML and 400s the .txt document send (that path
+// has no plaintext fallback), so the whole transcript would fail to deliver. The cap
+// must apply to the UNescaped preview and escape exactly once.
+func TestReadbackCaption_EntityDense_NoSlicedEntity(t *testing.T) {
+	var b strings.Builder
+	for i := 0; i < 60; i++ {
+		b.WriteString("a & b < c > d & e < f > g & h < i > j & k. ")
+	}
+	capt := readbackCaption(b.String())
+
+	if u := uint16Len(capt); u > readbackCaptionMaxU16 {
+		t.Fatalf("entity-dense caption is %d UTF-16 units, exceeds cap %d", u, readbackCaptionMaxU16)
+	}
+	// The header carries only literal <b> tags (no '&'), so every '&' in the caption
+	// must begin a COMPLETE entity produced by htmlEscape. A dangling/partial "&..."
+	// means truncation sliced an entity — the exact bug this guards. '&' is ASCII, so
+	// byte-scanning is safe.
+	for i := 0; i < len(capt); i++ {
+		if capt[i] != '&' {
+			continue
+		}
+		rest := capt[i:]
+		if !(strings.HasPrefix(rest, "&amp;") || strings.HasPrefix(rest, "&lt;") || strings.HasPrefix(rest, "&gt;")) {
+			t.Fatalf("caption has a sliced/partial HTML entity at byte %d: %.12q", i, rest)
+		}
+	}
+}

@@ -277,11 +277,21 @@ func readbackCaption(transcript string) string {
 	if more > 0 {
 		body = fmt.Sprintf("%s\n✂️✂️ %d more sentences ✂️✂️\n%s", f3, more, l3)
 	}
-	// Cap the VISIBLE preview conservatively before escaping so the final escaped
-	// caption (header + body) stays under the 1024-UTF-16 cap for ordinary speech.
-	caption := header + "\n" + htmlEscape(capUTF16(body, readbackCaptionPreviewBudget))
-	if uint16Len(caption) > readbackCaptionMaxU16 {
-		caption = capUTF16(caption, readbackCaptionMaxU16)
+	// Cap the VISIBLE preview BEFORE escaping, so truncation always lands on a rune
+	// boundary of the UNescaped text — never inside an HTML entity (&amp;/&lt;/&gt;),
+	// which would be malformed HTML and 400 the send (the .txt document path has no
+	// parse_mode fallback). The header carries fixed, intentional <b> tags and is
+	// small; if a preview dense with &/</> still pushes the escaped caption past the
+	// 1024-UTF-16 ceiling, shrink the VISIBLE budget and re-escape until it fits —
+	// we NEVER capUTF16 the already-escaped string.
+	visibleBudget := readbackCaptionPreviewBudget
+	caption := header + "\n" + htmlEscape(capUTF16(body, visibleBudget))
+	for uint16Len(caption) > readbackCaptionMaxU16 && visibleBudget > 0 {
+		visibleBudget -= 128
+		if visibleBudget < 0 {
+			visibleBudget = 0
+		}
+		caption = header + "\n" + htmlEscape(capUTF16(body, visibleBudget))
 	}
 	return caption
 }
