@@ -4,12 +4,105 @@ import (
 	"encoding/json"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/karthikeyan5/c3/internal/c3types"
 	"github.com/karthikeyan5/c3/internal/ipc"
 	"github.com/karthikeyan5/c3/internal/mappings"
 )
+
+// blockingReplyChannel embeds the test fakeChannel but makes SendReply block
+// until release is closed, so a JobOutbound (reply) parks the route worker
+// mid-dispatch — simulating a worker that genuinely STALLS and never writes its
+// result channel. started is closed once SendReply is entered so a test can wait
+// for the worker to be wedged before driving a second op behind it.
+type blockingReplyChannel struct {
+	*fakeChannel
+	release   chan struct{}
+	started   chan struct{}
+	startOnce sync.Once
+}
+
+func (c *blockingReplyChannel) SendReply(args c3types.ReplyArgs) (int64, error) {
+	c.startOnce.Do(func() { close(c.started) })
+	<-c.release // park here until the test cleanup releases the worker
+	return c.fakeChannel.SendReply(args)
+}
+
+// brokerWithBlockingReply wires a broker whose telegram channel's SendReply
+// blocks, used to manufacture a stalled worker. Cleanups are registered so the
+// worker is unblocked (close release) BEFORE Shutdown's wg.Wait runs — LIFO order
+// matters or Shutdown would deadlock on the parked worker.
+func brokerWithBlockingReply(t *testing.T) (*Broker, *blockingReplyChannel) {
+	t.Helper()
+	bc := &blockingReplyChannel{
+		fakeChannel: &fakeChannel{},
+		release:     make(chan struct{}),
+		started:     make(chan struct{}),
+	}
+	b := brokerWithChannel(t, mfWithTelegram(), &fakeChannel{})
+	b.chMu.Lock()
+	b.channels["telegram"] = &channelRegistration{Channel: bc}
+	b.chMu.Unlock()
+	t.Cleanup(func() { b.Shutdown() })       // registered first  -> runs LAST
+	t.Cleanup(func() { close(bc.release) })  // registered second -> runs FIRST
+	return b, bc
+}
+
+// TestHandleToolCall_WorkerStall_ReturnsError mirrors the fetch_queue stall test
+// for the tool_call path: when the route worker stalls (its SendReply blocks and
+// it never writes resultCh), handleToolCall must return a ToolResultMsg with a
+// worker-timeout Error within workerJobTimeout rather than wedging the read loop.
+func TestHandleToolCall_WorkerStall_ReturnsError(t *testing.T) {
+	t.Setenv("C3_QUEUE_DIR", t.TempDir())
+	b, _ := brokerWithBlockingReply(t)
+
+	prev := workerJobTimeout
+	workerJobTimeout = 50 * time.Millisecond
+	defer func() { workerJobTimeout = prev }()
+
+	tid := int64(914)
+	key := MakeRouteKey("telegram", -100, &tid)
+	stub := claimedHolder(t, b, key)
+	stub.SetRoute(&key)
+
+	agentSide, brokerSide := newConnPair(t)
+	raw, _ := json.Marshal(ipc.ToolCallReq{Op: ipc.OpToolCall, ID: "1", Name: "reply", Args: map[string]any{"text": "hi"}})
+
+	done := make(chan struct{})
+	go func() {
+		b.handleToolCall(brokerSide, stub, raw)
+		close(done)
+	}()
+
+	respCh := make(chan ipc.ToolResultMsg, 1)
+	go func() {
+		frame, err := agentSide.ReadFrame()
+		if err != nil {
+			return
+		}
+		var r ipc.ToolResultMsg
+		_ = json.Unmarshal(frame, &r)
+		respCh <- r
+	}()
+
+	select {
+	case resp := <-respCh:
+		if resp.Error == nil || resp.Error.Message == "" {
+			t.Fatalf("stalled worker: expected a non-empty Error, got %+v", resp)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleToolCall did not return on a stalled worker — the read loop is wedged")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleToolCall did not return after writing the timeout error")
+	}
+}
 
 func runHandlerWithPeer(t *testing.T, mf *mappings.MappingsFile) (*ipc.Conn, func()) {
 	t.Helper()

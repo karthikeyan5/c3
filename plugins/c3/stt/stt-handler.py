@@ -13,20 +13,26 @@ in `ps` / `/proc/<pid>/cmdline` / audit logs (addresses code-review
 stdin before invoking us.
 
 The optional <message_thread_id> is the forum topic the voice was sent in;
-when present, the echo-back sendMessage calls pass it so every chunk of a
-long transcript lands in the right topic instead of leaking to General.
+it is still accepted in argv for contract compatibility, but the handler no
+longer sends anything to Telegram itself.
 
-On success: prints transcript to stdout and sends it back to Telegram.
-On failure: prints nothing (Go shim falls back to raw voice attachment).
+On success: prints the transcript to stdout (the Go shim reads it and the Go
+broker/channel renders the readback echo back to Telegram — see
+internal/channel/telegram/readback.go).
+On failure: prints nothing + exits non-zero (the Go shim sees empty stdout,
+surfaces an [STT FAILED] marker to the agent, and the broker sends the human
+"couldn't transcribe" notice — see internal/broker/worker.go echoReadback).
 
-All configuration lives here — the Go shim is a thin spawn-and-wait wrapper.
+This handler now does ONLY download + whisper + print-to-stdout; all Telegram
+sending lives in Go (the "don't reinvent the wheel" move). The Go↔Python
+contract is unchanged: token on stdin line 1, transcript on stdout, argv
+<chat_id> <reply_msg_id> <file_id> [<message_thread_id>].
 """
 import sys
 import os
 import json
 import time
 import urllib.request
-import urllib.parse
 import importlib.util
 import logging
 
@@ -103,8 +109,28 @@ def tg(token, method, **params):
     with urllib.request.urlopen(req, timeout=15) as r:
         return json.loads(r.read())
 
-def download_file(token, file_id, dest_path):
-    result = tg(token, 'getFile', file_id=file_id)
+class PermanentDownloadError(Exception):
+    """A getFile/download failure that retrying cannot fix.
+
+    Telegram returns {ok:false, description, error_code} for permanent
+    conditions — an expired/invalid file_id, or the Bot API's hard 20 MB
+    getFile ceiling ("file is too big"). Re-running getFile would fail
+    identically, so the download loop treats this as terminal and does NOT
+    burn the remaining retries (I-9)."""
+    pass
+
+
+def download_file(token, file_id, dest_path, tg_fn=None):
+    tg_fn = tg_fn or tg
+    result = tg_fn(token, 'getFile', file_id=file_id)
+    # I-9: a getFile error comes back as {ok:false, description, error_code}
+    # (NOT as an exception). Without this guard, dereferencing result['result']
+    # raises a cryptic KeyError that the caller's generic `except Exception`
+    # swallows and then retries 3× uselessly on a guaranteed-permanent failure.
+    if not result.get('ok'):
+        desc = result.get('description', '<no description>')
+        code = result.get('error_code')
+        raise PermanentDownloadError(f'getFile failed (error_code={code}): {desc}')
     file_path = result['result']['file_path']
     url = f'{API_BASE}/file/bot{token}/{file_path}'
     req = urllib.request.Request(url)
@@ -114,6 +140,18 @@ def download_file(token, file_id, dest_path):
             f.write(r.read())
 
 # ── STT ───────────────────────────────────────────────────────────────────────
+
+def _stderr_snippet(raw, limit=800):
+    """Best-effort printable snippet of a subprocess's captured stderr, which
+    may be None or — depending on Python version / text mode — bytes even when
+    text=True was requested. Guard both so logging the reason never itself
+    raises (I-2)."""
+    if raw is None:
+        return ''
+    if isinstance(raw, bytes):
+        raw = raw.decode('utf-8', 'replace')
+    return raw.strip()[:limit]
+
 
 def run_stt(audio_path, extra_env, timeout=270):
     """Dynamically load stt.py and run it. Returns transcript or None.
@@ -136,10 +174,23 @@ def run_stt(audio_path, extra_env, timeout=270):
     # `timeout` by the elapsed download time so a slow download can't push the
     # total past the broker's Go-side 300s context (the true backstop).
     env["C3_STT_BUDGET_SECONDS"] = str(timeout)
-    result = subprocess.run(
-        [sys.executable, STT_PKG, audio_path],
-        capture_output=True, text=True, env=env, timeout=timeout
-    )
+    # I-2: never let a TimeoutExpired (or any other subprocess failure) escape as
+    # a bare traceback — that would bypass main()'s human "could not transcribe"
+    # notice and the clean-exit path. Return None on any failure so the caller's
+    # existing `if not transcript:` branch fires uniformly.
+    try:
+        result = subprocess.run(
+            [sys.executable, STT_PKG, audio_path],
+            capture_output=True, text=True, env=env, timeout=timeout
+        )
+    except subprocess.TimeoutExpired as e:
+        snippet = _stderr_snippet(getattr(e, 'stderr', None))
+        logging.error(f'STT subprocess timed out after {timeout}s'
+                      + (f'; partial stderr: {snippet}' if snippet else ''))
+        return None
+    except Exception as e:
+        logging.error(f'STT subprocess failed to run: {e}')
+        return None
     transcript = result.stdout.strip()
     if result.returncode != 0 or not transcript:
         stderr_out = result.stderr.strip()
@@ -148,45 +199,36 @@ def run_stt(audio_path, extra_env, timeout=270):
         return None
     return transcript
 
-# ── Telegram echo (testable) ──────────────────────────────────────────────────
+# ── Cleanup ─────────────────────────────────────────────────────────────────────
 
-def send_transcript_to_telegram(token, chat_id, msg_id, thread_id, transcript, tg_fn=None):
-    """Echo a transcript back to Telegram, splitting into 4096-char chunks
-    when needed. Returns the number of chunks sent.
+def prune_inbox(keep_n):
+    """Keep the newest keep_n .oga files in INBOX_DIR; delete older ones. Unlike a
+    delete-immediately-after-transcription, this RETAINS recent audio so the user
+    or agent can retranscribe / re-test by file_id without re-fetching, while still
+    bounding disk use. keep_n comes from STT_AUDIO_RETENTION (the Go shim passes
+    mappings.json:plugins.stt.audio_retention; default 500). A negative keep_n
+    disables pruning (keep everything). Non-fatal — recovery never depends on this
+    cache (download_attachment / retranscribe re-fetch from Telegram by file_id)."""
+    if keep_n < 0:
+        return
+    try:
+        names = [f for f in os.listdir(INBOX_DIR) if f.endswith('.oga')]
+    except OSError:
+        return
+    stamped = []
+    for f in names:
+        p = os.path.join(INBOX_DIR, f)
+        try:
+            stamped.append((os.path.getmtime(p), p))
+        except OSError:
+            continue  # vanished under us (concurrent prune); skip
+    stamped.sort(reverse=True)  # newest first
+    for _, p in stamped[keep_n:]:
+        try:
+            os.remove(p)
+        except OSError as e:
+            logging.warning(f'prune_inbox: failed to remove {p}: {e}')
 
-    Critical invariant (regression-tested in test_stt_handler.py): every
-    chunk carries `message_thread_id` when `thread_id` is set. Without it,
-    Telegram routes chunks 2+ to the General topic — the regression Karthi
-    hit on 2026-05-14 because an older handler version only carried the
-    thread id implicitly via `reply_parameters` on the first chunk.
-
-    `tg_fn` is the Telegram-API caller (defaults to the module-level `tg`);
-    tests inject a fake to capture calls without doing network I/O.
-    """
-    if tg_fn is None:
-        tg_fn = tg
-    prefix = '\U0001f3a4 [Voice transcript]: '
-    full_text = prefix + transcript
-    MAX_LEN = 4096
-    thread_kwargs = {'message_thread_id': thread_id} if thread_id else {}
-    if len(full_text) <= MAX_LEN:
-        tg_fn(token, 'sendMessage',
-              chat_id=chat_id,
-              text=full_text,
-              reply_parameters={'message_id': msg_id},
-              **thread_kwargs)
-        return 1
-    chunks = []
-    remaining = full_text
-    while remaining:
-        chunks.append(remaining[:MAX_LEN])
-        remaining = remaining[MAX_LEN:]
-    for i, chunk in enumerate(chunks):
-        params = {'chat_id': chat_id, 'text': chunk, **thread_kwargs}
-        if i == 0:
-            params['reply_parameters'] = {'message_id': msg_id}
-        tg_fn(token, 'sendMessage', **params)
-    return len(chunks)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -222,6 +264,14 @@ def main():
                 break
             logging.warning(f'Downloaded file is 0 bytes [attempt {attempt}], retrying after 2s...')
             time.sleep(2)
+        except PermanentDownloadError as e:
+            # I-9: non-retryable (expired/invalid file_id, >20MB getFile limit).
+            # Exit WITHOUT burning the remaining retries on a guaranteed-permanent
+            # failure. The Go shim sees empty stdout → [STT FAILED] marker, and the
+            # broker sends the human "couldn't transcribe" notice.
+            logging.error(f'Download permanently failed (non-retryable): {e}')
+            print(f'[stt-handler] download failed: {e}', file=sys.stderr)
+            sys.exit(1)
         except Exception as e:
             logging.warning(f'Download failed [attempt {attempt}]: {e}')
             if attempt == 3:
@@ -233,48 +283,49 @@ def main():
         logging.error('Download produced 0 bytes after 3 attempts')
         sys.exit(1)
 
-    # Load API keys
-    keys = load_env(ENV_FILE)
-
-    # Budget the transcription so download + transcribe stays under the broker's
-    # 300s SIGKILL: 270s total minus the time the download already consumed,
-    # floored at 60s so a slow download doesn't leave an unusably tiny window.
-    dl_elapsed = time.time() - dl_start
-    stt_timeout = max(60, 270 - int(dl_elapsed))
-    logging.info(f'Download took {dl_elapsed:.1f}s; STT subprocess budget={stt_timeout}s')
-
-    # Transcribe
-    transcript = run_stt(audio_path, keys, timeout=stt_timeout)
-    if not transcript:
-        logging.error(f'STT returned no transcript for {audio_path}')
-        # Best-effort user-facing notice so the human knows immediately (the Go
-        # shim separately surfaces an [STT FAILED] marker to the agent). Without
-        # this the sender just sees their voice note silently ignored.
-        try:
-            tg(token, 'sendMessage',
-               chat_id=chat_id,
-               text='\U0001f3a4 ⚠️ Could not transcribe that voice note (speech-to-text failed). Please retype or resend.',
-               reply_parameters={'message_id': msg_id},
-               **({'message_thread_id': thread_id} if thread_id else {}))
-        except Exception as e:
-            logging.warning(f'failed to send STT-failure notice to Telegram: {e}')
-        sys.exit(1)
-    logging.info(f'Transcript ({len(transcript)} chars): {transcript[:80]}...')
-
-    # Echo transcript back to Telegram (chunked if it exceeds the 4096-char
-    # per-message cap). Extracted into a helper so the chunking + topic
-    # propagation is regression-tested in test_stt_handler.py.
+    # Everything past a successful download runs under a finally that always
+    # removes the cached .oga (I-10). The file has been written and is about to
+    # be read by run_stt; cleanup happens after that on BOTH the success and the
+    # failure-after-download (transcription failed / SystemExit) paths.
     try:
-        n = send_transcript_to_telegram(token, chat_id, msg_id, thread_id, transcript)
-        if n > 1:
-            logging.info(f'Echo split into {n} messages')
-    except Exception as e:
-        logging.warning(f'Telegram echo failed (non-fatal): {e}')
-        print(f'[stt-handler] telegram reply failed: {e}', file=sys.stderr)
-        # Non-fatal — the CLI side still gets the transcript via stdout
+        # Load API keys
+        keys = load_env(ENV_FILE)
 
-    # Print transcript to stdout for the Go-side STT shim to read
-    print(transcript)
+        # Budget the transcription so download + transcribe stays under the
+        # broker's 300s SIGKILL: 270s total minus the time the download already
+        # consumed, floored at 60s so a slow download doesn't leave an unusably
+        # tiny window.
+        dl_elapsed = time.time() - dl_start
+        stt_timeout = max(60, 270 - int(dl_elapsed))
+        logging.info(f'Download took {dl_elapsed:.1f}s; STT subprocess budget={stt_timeout}s')
+
+        # Transcribe
+        transcript = run_stt(audio_path, keys, timeout=stt_timeout)
+        if not transcript:
+            # The I-2 timeout path also lands here (run_stt -> None). Exit
+            # non-zero: the Go shim sees empty stdout → [STT FAILED] marker → the
+            # broker sends the human "couldn't transcribe" notice. Telegram
+            # sending is no longer this handler's job.
+            logging.error(f'STT returned no transcript for {audio_path}')
+            sys.exit(1)
+        logging.info(f'Transcript ({len(transcript)} chars): {transcript[:80]}...')
+
+        # Print transcript to stdout for the Go-side STT shim to read. The Go
+        # broker/channel renders the Telegram readback echo from this transcript
+        # (internal/channel/telegram/readback.go) — the handler sends nothing.
+        print(transcript)
+    finally:
+        # Rolling-window audio cleanup (replaces the old delete-immediately, per
+        # the maintainer's call): keep the newest N .oga in the inbox so recent
+        # audio stays available for retranscribe/testing, while disk stays bounded.
+        # N from STT_AUDIO_RETENTION (Go shim -> mappings.json:plugins.stt.
+        # audio_retention; default 500). Runs on success AND failure-after-download
+        # (SystemExit / any exception). Safe — recovery re-fetches from Telegram.
+        try:
+            _keep_n = int(os.environ.get('STT_AUDIO_RETENTION', '500'))
+        except ValueError:
+            _keep_n = 500
+        prune_inbox(_keep_n)
 
 if __name__ == '__main__':
     main()

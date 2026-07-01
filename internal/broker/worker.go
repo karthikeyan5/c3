@@ -200,6 +200,14 @@ func newRouteWorker(parent context.Context, key RouteKey, idle time.Duration, br
 
 func (w *RouteWorker) run(ctx context.Context) {
 	defer close(w.done)
+	// A1: drain BEFORE done closes. Deferred LIFO ⇒ shutdown() runs first, then
+	// close(w.done). This ordering is load-bearing for A2: when WorkerPool.Submit /
+	// the reaper observe done closed, `stopped` is already true and the queue is
+	// already drained, so a stopped worker's Submit reliably returns false (never
+	// strands) and Submit's respawn loop terminates. shutdown runs on EVERY exit
+	// path (ctx.Done, idleTimer, queue-closed, JobRelease) and even on a recovered
+	// panic (recoverGoroutine below runs first, then this).
+	defer w.shutdown()
 	// Backstop: a panic in the run-loop machinery (outside the per-method guards
 	// below) is recovered + logged instead of crashing the whole broker. The
 	// worker then exits cleanly (done closes); WorkerPool.Submit respawns a fresh
@@ -315,6 +323,18 @@ func (w *RouteWorker) run(ctx context.Context) {
 	}
 }
 
+// sttFlushTimeout bounds each per-inbound voice STT call made by flushInbounds.
+// Without it the call inherits only the run-loop ctx (cancelled solely on broker
+// shutdown / w.cancel()) plus the STT builtin's own ~300s subprocess budget — so
+// a download that hangs BEFORE that budget applies blocks the worker goroutine,
+// and any JobFetch/JobConsume queued behind it, for up to ~5 min. It mirrors
+// retranscribeTimeout's value (330s, just above the STT builtin's 300s
+// subprocess deadline) so a healthy long voice note still completes, but a hung
+// download is cut off in bounded time; a timed-out call returns "" and falls
+// through to the self-documenting sttFailureText placeholder. It is a var (not a
+// const) only so a test can shorten it; production never reassigns it.
+var sttFlushTimeout = 330 * time.Second
+
 // flushInbounds runs the plugin pipeline + forwards a debounce-collapsed
 // batch as a single ipc.OpInbound.
 //
@@ -355,7 +375,15 @@ func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inboun
 				MIME:      in.Attachments[0].MIME,
 				Size:      in.Attachments[0].Size,
 			}
-			transcript := w.broker.Plugins.FireOnVoiceReceived(ctx, payload)
+			// Per-call deadline so a hung download can't block the worker
+			// goroutine (and the JobFetch/JobConsume jobs queued behind it).
+			// cancel() runs immediately (not deferred) because this is a
+			// per-inbound loop — a deferred cancel would leak every iteration's
+			// timer until flushInbounds returns. A "" result (incl. on timeout)
+			// flows to the sttFailureText placeholder path below.
+			sttCtx, cancel := context.WithTimeout(ctx, sttFlushTimeout)
+			transcript := w.broker.Plugins.FireOnVoiceReceived(sttCtx, payload)
+			cancel()
 			switch {
 			case transcript != "":
 				in.Text = w.sttPrefix(in.Channel) + transcript
@@ -366,6 +394,12 @@ func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inboun
 				// recoverable; the user never re-forwards.
 				in.Text = sttFailureText(in, "no_transcript")
 			}
+			// Voice-transcript readback echo (moved out of the Python STT handler).
+			// ADDITIVE + NON-FATAL: it is a SEND, so it can never affect the
+			// agent-surface in.Text set above, inbound delivery, persistence, or
+			// loss-freedom. Synchronous in the loop (the worker already blocks on
+			// STT for seconds; this preserves per-voice ordering).
+			w.echoReadback(in, transcript)
 		}
 	}
 
@@ -458,6 +492,68 @@ func sttFailureText(in *c3types.Inbound, reason string) string {
 	dur = "duration unknown"
 	return fmt.Sprintf("⚠️ [voice transcription failed: %s] The audio is saved and recoverable — the user does not need to resend. Call download_attachment with file_id=%q (%s, %s) to retrieve it, or retranscribe with the same file_id to re-run transcription. Provider traceback: %s",
 		reason, fileID, mime, dur, LogPath())
+}
+
+// isSTTFailureMarker reports whether a transcript is the STT builtin's failure
+// marker ("[STT FAILED: <reason> — see <path>]", see stt.sttFailureMarker)
+// rather than a real transcript. A marker (or the empty string) means STT did
+// not produce text, so the readback echoes a human notice instead of a
+// transcript. Kept as a local predicate so worker.go needs no import of the stt
+// builtin (which would be a plugin→broker import cycle).
+func isSTTFailureMarker(transcript string) bool {
+	return strings.HasPrefix(transcript, "[STT FAILED:")
+}
+
+// echoReadback sends the voice-transcript readback back to the SOURCE chat — the
+// move of Python's send_transcript_to_telegram / notify_transcription_failed
+// into Go, reusing the channel's own reliable senders. It is ADDITIVE and
+// strictly NON-FATAL: a SEND can never affect inbound delivery, persistence, or
+// loss-freedom, so every error here only logs.
+//
+//   - On a REAL transcript (non-empty, not a marker): resolve the channel and,
+//     IF it implements the OPTIONAL readbacker interface (only Telegram does
+//     today), render the frozen readback via SendReadback. A channel without it
+//     is skipped silently — other channels need no changes.
+//   - On an STT FAILURE (empty transcript or a "[STT FAILED:" marker): send a
+//     short human-facing notice via the channel's normal SendReply (this
+//     replaces Python's notify_transcription_failed). Once per failed voice
+//     inbound, best-effort.
+func (w *RouteWorker) echoReadback(in *c3types.Inbound, transcript string) {
+	if w.broker == nil {
+		return
+	}
+	ch, err := w.broker.Channel(in.Channel)
+	if err != nil {
+		// Channel not resolvable (unit tests / non-telegram route): nothing to
+		// echo to. Skip silently — the agent surface (in.Text) is already set.
+		return
+	}
+	// Failure: an empty transcript or the STT failure marker → a human notice,
+	// not a transcript. The agent-surface marker path (in.Text) is unchanged.
+	if transcript == "" || isSTTFailureMarker(transcript) {
+		if _, serr := ch.SendReply(c3types.ReplyArgs{
+			Channel: in.Channel, ChatID: in.ChatID, TopicID: in.TopicID, ReplyTo: &in.MessageID,
+			Text: "⚠️ Couldn't transcribe that voice note — see logs / try again.",
+		}); serr != nil {
+			log.Printf("readback notice chan=%s chat=%d topic=%s msg=%d: send failed (non-fatal): %v",
+				w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, serr)
+		}
+		return
+	}
+	// Success: echo the transcript via the channel's optional readback renderer.
+	// Other channels simply don't implement it and are skipped.
+	rb, ok := ch.(interface {
+		SendReadback(c3types.ReadbackArgs) (int64, error)
+	})
+	if !ok {
+		return
+	}
+	if _, serr := rb.SendReadback(c3types.ReadbackArgs{
+		ChatID: in.ChatID, ReplyTo: &in.MessageID, TopicID: in.TopicID, Transcript: transcript,
+	}); serr != nil {
+		log.Printf("readback chan=%s chat=%d topic=%s msg=%d: SendReadback failed (non-fatal): %v",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, serr)
+	}
 }
 
 // flushEvent forwards a single synthesized channel EVENT (poll_result /
@@ -1206,6 +1302,77 @@ func (w *RouteWorker) Submit(job Job) bool {
 	}
 }
 
+// shutdown makes "worker exiting" and "Submit accepting" mutually exclusive
+// (A1). It runs as a defer from run() on EVERY exit path. Under w.mu it (1) sets
+// w.stopped so any concurrent/subsequent Submit returns false instead of pushing
+// a job into the buffer of a worker whose run goroutine has already returned, and
+// (2) drains every job still queued, replying an error to each result-channel-
+// bearing job so a caller blocked on <-resultCh is never stranded (the original
+// fetch_queue/attach-backlog wedge). Submit also takes w.mu, so the set+drain is
+// atomic with respect to enqueue: after shutdown returns, the queue is empty and
+// no further job can be enqueued.
+//
+// Loss-freedom (W1 Watch-out #4): the drain MUST NOT mark any inbound update_id
+// done, consume any queue line, or advance any Telegram offset. It only replies
+// errors to ResultCh-bearing jobs. JobInbound / JobConsume carry no ResultCh and
+// are dropped silently — they re-deliver via the Telegram offset (JobInbound) or
+// remain durable backlog (JobConsume); only the real persisted path may ack.
+// Never fake-ack.
+//
+// Idempotent: the stopped flag set is guarded (Stop() may have set it already),
+// but the drain ALWAYS runs — a job can slip into the queue between Stop()'s set
+// and run()'s exit, and that job must still be drained.
+func (w *RouteWorker) shutdown() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.stopped {
+		w.stopped = true
+	}
+	for {
+		select {
+		case job := <-w.queue:
+			// Only ResultCh-bearing jobs (JobFetch / JobOutbound / JobRefreshText /
+			// JobBacklog) get an errWorkerStopped reply so a blocked caller is never
+			// stranded. JobInbound / JobConsume / JobRelease carry no ResultCh and
+			// have no case below — they drop silently (loss-free; see the doc comment
+			// above: they re-deliver via the Telegram offset or remain durable
+			// backlog). Never ack.
+			switch job.Kind {
+			case JobFetch:
+				if job.Fetch != nil && job.Fetch.ResultCh != nil {
+					select {
+					case job.Fetch.ResultCh <- FetchResult{Err: errWorkerStopped}:
+					default:
+					}
+				}
+			case JobOutbound:
+				if job.Outbound != nil && job.Outbound.ResultCh != nil {
+					select {
+					case job.Outbound.ResultCh <- OutboundResult{Err: errWorkerStopped}:
+					default:
+					}
+				}
+			case JobRefreshText:
+				if job.Refresh != nil && job.Refresh.ResultCh != nil {
+					select {
+					case job.Refresh.ResultCh <- RefreshResult{Err: errWorkerStopped}:
+					default:
+					}
+				}
+			case JobBacklog:
+				if job.Backlog != nil && job.Backlog.ResultCh != nil {
+					select {
+					case job.Backlog.ResultCh <- BacklogResult{Err: errWorkerStopped}:
+					default:
+					}
+				}
+			}
+		default:
+			return
+		}
+	}
+}
+
 // Stop signals the worker to drain and exit. Idempotent.
 func (w *RouteWorker) Stop() {
 	w.mu.Lock()
@@ -1223,6 +1390,12 @@ func (w *RouteWorker) Stop() {
 func (w *RouteWorker) Done() <-chan struct{} { return w.done }
 
 var errOutboundNotImpl = workerErr("worker has no broker reference")
+
+// errWorkerStopped is the error replied to every result-channel-bearing job that
+// shutdown() drains when run() exits with the job still queued (A1). The caller
+// (handleFetch/handleToolCall/attach-backlog/retranscribe-refresh) returns this
+// as a clean error rather than wedging on a never-answered channel.
+var errWorkerStopped = workerErr("worker stopped before job ran")
 
 type workerErr string
 

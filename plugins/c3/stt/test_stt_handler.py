@@ -1,7 +1,14 @@
 """Regression tests for stt-handler.py.
 
-Run with: python3 -m unittest plugins/c3/stt/test_stt_handler.py
+Run with: python3 -m unittest plugins.c3.stt.test_stt_handler -v
 (from the repo root).
+
+2026-06-30: the Telegram transcript "readback" echo moved OUT of this handler
+and INTO the Go broker/channel (internal/channel/telegram/readback.go +
+internal/broker/worker.go). The handler now does ONLY download + whisper +
+print-to-stdout, so the old echo tests (send_transcript_to_telegram band
+selection, notify_transcription_failed) are gone; what remains exercises the
+download / run_stt / cleanup / main-flow contract the Go shim depends on.
 """
 import importlib.util
 import os
@@ -21,93 +28,211 @@ def load_handler():
     return mod
 
 
-class TestSendTranscriptToTelegram(unittest.TestCase):
-    """Karthi 2026-05-14: long transcripts used to drop topic on chunks 2+ —
-    the first chunk replied to the source message (which carries
-    message_thread_id implicitly via reply_parameters), but subsequent
-    chunks had no message_thread_id and landed in General. These tests
-    guard the fix in send_transcript_to_telegram."""
+class TestDownloadFileOkFalse(unittest.TestCase):
+    """I-9: a getFile {ok:false} envelope (expired/invalid file_id, or the Bot
+    API 20MB getFile limit -> 'file is too big') must NOT KeyError. It must be
+    raised as a PermanentDownloadError so the download loop treats it as
+    terminal instead of burning the 3 retries on a guaranteed failure."""
 
     def setUp(self):
         self.handler = load_handler()
-        self.calls = []
 
-    def fake_tg(self, _token, method, **params):
-        self.calls.append((method, params))
-        return {"ok": True}
+    def test_ok_false_raises_permanent_not_keyerror(self):
+        calls = []
 
-    def test_short_transcript_single_call_with_thread(self):
-        n = self.handler.send_transcript_to_telegram(
-            "tok", "-100", 42, 914, "hi there", tg_fn=self.fake_tg
-        )
-        self.assertEqual(n, 1)
-        self.assertEqual(len(self.calls), 1)
-        method, params = self.calls[0]
-        self.assertEqual(method, "sendMessage")
-        self.assertEqual(params["message_thread_id"], 914)
-        self.assertEqual(params["reply_parameters"], {"message_id": 42})
-        self.assertIn("[Voice transcript]:", params["text"])
+        def fake_tg(_token, method, **params):
+            calls.append((method, params))
+            return {"ok": False, "description": "file is too big", "error_code": 400}
 
-    def test_long_transcript_every_chunk_carries_thread(self):
-        # ~10000 chars → at least 3 chunks of 4096.
-        n = self.handler.send_transcript_to_telegram(
-            "tok", "-100", 42, 914, "x" * 10000, tg_fn=self.fake_tg
-        )
-        self.assertGreaterEqual(n, 3, "expected >=3 chunks for 10000-char transcript")
-        self.assertEqual(len(self.calls), n)
-        for i, (_method, params) in enumerate(self.calls):
-            self.assertEqual(
-                params.get("message_thread_id"),
-                914,
-                f"chunk {i} missing message_thread_id: {params!r}",
+        with self.assertRaises(self.handler.PermanentDownloadError) as ctx:
+            self.handler.download_file(
+                "tok", "BADFID",
+                "/nonexistent/should-not-be-written.oga",
+                tg_fn=fake_tg,
             )
+        # surfaces the real reason ...
+        self.assertIn("file is too big", str(ctx.exception))
+        self.assertIn("400", str(ctx.exception))
+        # ... and stops at getFile: no download attempt, no extra getFile calls.
+        # (Non-retry on the permanent failure is enforced by main()'s loop, which
+        # has a dedicated `except PermanentDownloadError` terminal branch.)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "getFile")
 
-    def test_long_transcript_only_first_chunk_has_reply_parameters(self):
-        # Subsequent chunks must NOT carry reply_parameters — that would
-        # make every chunk a "reply to the voice message", spamming
-        # notifications and confusing the reply chain.
-        self.handler.send_transcript_to_telegram(
-            "tok", "-100", 42, 914, "y" * 9000, tg_fn=self.fake_tg
-        )
-        first_params = self.calls[0][1]
-        self.assertEqual(first_params.get("reply_parameters"), {"message_id": 42})
-        for i, (_m, params) in enumerate(self.calls[1:], start=1):
-            self.assertNotIn(
-                "reply_parameters",
-                params,
-                f"chunk {i} should not have reply_parameters: {params!r}",
-            )
+    def test_ok_false_is_not_keyerror(self):
+        def fake_tg(_token, method, **params):
+            return {"ok": False, "description": "invalid file_id"}
 
-    def test_no_thread_id_omits_kwarg(self):
-        # DM case — no topic. message_thread_id must NOT appear in params
-        # (Telegram rejects null thread ids; absence is the correct shape).
-        self.handler.send_transcript_to_telegram(
-            "tok", "99", 42, None, "hi", tg_fn=self.fake_tg
-        )
-        params = self.calls[0][1]
-        self.assertNotIn(
-            "message_thread_id",
-            params,
-            "message_thread_id should be omitted when thread_id is None",
-        )
+        try:
+            self.handler.download_file("tok", "X", "/x.oga", tg_fn=fake_tg)
+        except self.handler.PermanentDownloadError:
+            pass
+        except KeyError:
+            self.fail("download_file raised the pre-fix cryptic KeyError('result')")
 
-    def test_chunk_boundary_4096(self):
-        # Exactly 4096 chars after prefix → single chunk (no off-by-one).
-        prefix_len = len("\U0001f3a4 [Voice transcript]: ")
-        transcript = "a" * (4096 - prefix_len)
-        n = self.handler.send_transcript_to_telegram(
-            "tok", "-100", 42, 914, transcript, tg_fn=self.fake_tg
-        )
-        self.assertEqual(n, 1, "transcript exactly at the limit should NOT split")
 
-    def test_chunk_boundary_4097(self):
-        # One char past the limit → exactly two chunks.
-        prefix_len = len("\U0001f3a4 [Voice transcript]: ")
-        transcript = "a" * (4097 - prefix_len)
-        n = self.handler.send_transcript_to_telegram(
-            "tok", "-100", 42, 914, transcript, tg_fn=self.fake_tg
+class TestRunSttFailureReturnsNone(unittest.TestCase):
+    """I-2: run_stt must never let a subprocess failure escape as a bare
+    traceback (which would bypass main()'s clean non-zero exit). TimeoutExpired
+    and any other exception both become a clean None."""
+
+    def setUp(self):
+        self.handler = load_handler()
+
+    def test_timeout_expired_returns_none(self):
+        import subprocess
+        from unittest import mock
+
+        def boom(*_a, **_k):
+            # text=True can still yield bytes/None stderr depending on version;
+            # bytes here also exercises _stderr_snippet's guard.
+            raise subprocess.TimeoutExpired(
+                cmd="stt", timeout=1, stderr=b"provider stalled mid-poll")
+
+        with mock.patch("subprocess.run", boom):
+            result = self.handler.run_stt("/tmp/nope.oga", {}, timeout=1)
+        self.assertIsNone(result)
+
+    def test_generic_exception_returns_none(self):
+        from unittest import mock
+        with mock.patch("subprocess.run", side_effect=OSError("exec failed")):
+            self.assertIsNone(self.handler.run_stt("/tmp/nope.oga", {}, timeout=5))
+
+
+class TestMainDownloadTerminalFailureExits(unittest.TestCase):
+    """A non-retryable download failure (PermanentDownloadError) must exit
+    non-zero WITHOUT burning the remaining retries. The human "couldn't
+    transcribe" notice is now the Go broker's job (worker.go echoReadback): the
+    handler just logs + exits, the Go shim sees empty stdout → [STT FAILED]
+    marker, and the broker sends the notice."""
+
+    def setUp(self):
+        self.handler = load_handler()
+
+    def test_permanent_download_failure_exits_nonzero_first_attempt(self):
+        from unittest import mock
+        import io
+
+        download_calls = []
+
+        def fake_download(*a, **k):
+            download_calls.append((a, k))
+            raise self.handler.PermanentDownloadError("file is too big")
+
+        with mock.patch.object(self.handler, "download_file", fake_download), \
+             mock.patch.object(sys, "argv",
+                               ["stt-handler.py", "-100", "4711", "FID", "914"]), \
+             mock.patch.object(sys, "stdin", io.StringIO("bottoken\n")):
+            with self.assertRaises(SystemExit) as ctx:
+                self.handler.main()
+
+        self.assertEqual(ctx.exception.code, 1)
+        # Exited on the FIRST attempt — the permanent failure didn't retry.
+        self.assertEqual(len(download_calls), 1)
+
+
+class TestPruneInbox(unittest.TestCase):
+    """The rolling-window audio cache (replaces the old delete-immediately):
+    prune_inbox(keep_n) keeps the newest keep_n .oga files in INBOX_DIR and
+    deletes older ones; a negative keep_n keeps everything; a missing/unreadable
+    inbox is non-fatal. Recovery never depends on this cache — download_attachment
+    / retranscribe re-fetch from Telegram by file_id."""
+
+    def setUp(self):
+        self.handler = load_handler()
+        self.tmp = tempfile.mkdtemp(prefix="c3-stt-prune-")
+        # Point the handler's module-global INBOX_DIR (used by both prune_inbox
+        # and main()'s download path) at a hermetic temp dir, restored in tearDown.
+        self._saved_inbox = self.handler.INBOX_DIR
+        self.handler.INBOX_DIR = self.tmp
+
+    def tearDown(self):
+        self.handler.INBOX_DIR = self._saved_inbox
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_oga(self, name, mtime):
+        p = os.path.join(self.tmp, name)
+        with open(p, "wb") as f:
+            f.write(b"OggS")
+        os.utime(p, (mtime, mtime))  # explicit mtime → deterministic ordering
+        return p
+
+    def test_keeps_newest_n(self):
+        # N + k files with strictly increasing mtimes: prune_inbox(N) keeps the
+        # newest N (highest mtimes) and removes the older k.
+        n, k = 5, 4
+        paths = [self._make_oga(f"{i}-fid.oga", mtime=1000 + i) for i in range(n + k)]
+        self.handler.prune_inbox(n)
+        survivors = [f for f in os.listdir(self.tmp) if f.endswith(".oga")]
+        self.assertEqual(len(survivors), n, "exactly the newest N must remain")
+        for i in range(n + k):
+            kept = os.path.exists(paths[i])
+            if i >= k:  # the n highest mtimes
+                self.assertTrue(kept, f"newest file {i} should be kept")
+            else:
+                self.assertFalse(kept, f"older file {i} should be pruned")
+
+    def test_negative_keeps_all(self):
+        paths = [self._make_oga(f"{i}-fid.oga", mtime=1000 + i) for i in range(6)]
+        self.handler.prune_inbox(-1)
+        for p in paths:
+            self.assertTrue(os.path.exists(p), "negative keep_n must keep every file")
+
+    def test_zero_deletes_all(self):
+        paths = [self._make_oga(f"{i}-fid.oga", mtime=1000 + i) for i in range(3)]
+        self.handler.prune_inbox(0)
+        for p in paths:
+            self.assertFalse(os.path.exists(p), "keep_n=0 must delete every file")
+
+    def test_missing_inbox_is_nonfatal(self):
+        # An inbox dir that doesn't exist must not raise (os.listdir OSError swallowed).
+        self.handler.INBOX_DIR = os.path.join(self.tmp, "does", "not", "exist")
+        self.handler.prune_inbox(5)  # no raise == pass
+
+    def test_non_oga_files_untouched(self):
+        # Only .oga participate in the window; other files are never pruned.
+        keep = self._make_oga("new-fid.oga", mtime=2000)
+        old = self._make_oga("old-fid.oga", mtime=1000)
+        other = os.path.join(self.tmp, "notes.txt")
+        with open(other, "wb") as f:
+            f.write(b"keepme")
+        self.handler.prune_inbox(1)
+        self.assertTrue(os.path.exists(keep), "newest .oga kept")
+        self.assertFalse(os.path.exists(old), "older .oga pruned")
+        self.assertTrue(os.path.exists(other), "non-.oga files are never pruned")
+
+    def test_main_success_flow_keeps_oga_under_default_retention(self):
+        """End-to-end-ish: a full main() download+transcribe+print flow now KEEPS
+        the cached .oga (rolling window — one file is well within the default 500),
+        replacing the old delete-immediately. download_file is faked to actually
+        write a file at the path main() chose (in our temp INBOX_DIR), so we can
+        assert it survives after main() returns. The Telegram echo is no longer in
+        Python, so nothing is mocked for it."""
+        from unittest import mock
+        import io
+
+        created = {}
+
+        def fake_download(_token, _file_id, dest_path, **_k):
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            with open(dest_path, "wb") as f:
+                f.write(b"OggS-fake-audio")
+            created["path"] = dest_path
+
+        with mock.patch.dict(os.environ):
+            os.environ.pop("STT_AUDIO_RETENTION", None)  # force the default 500
+            with mock.patch.object(self.handler, "download_file", fake_download), \
+                 mock.patch.object(self.handler, "run_stt", lambda *a, **k: "hello world"), \
+                 mock.patch.object(sys, "argv",
+                                   ["stt-handler.py", "-100", "4711", "FID", "914"]), \
+                 mock.patch.object(sys, "stdin", io.StringIO("bottoken\n")):
+                self.handler.main()
+
+        self.assertIn("path", created)
+        self.assertTrue(
+            os.path.exists(created["path"]),
+            "cached .oga should be KEPT after a successful transcribe (rolling window)",
         )
-        self.assertEqual(n, 2)
 
 
 class TestImportCreatesParentDirs(unittest.TestCase):

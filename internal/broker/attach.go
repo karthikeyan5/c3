@@ -555,9 +555,13 @@ func (b *Broker) tryClaim(conn *ipc.Conn, stub *Stub, key RouteKey, label string
 		}
 	}
 
-	if old := stub.CurrentRoute(); old != nil && *old != key {
-		b.Routes.Release(*old, stub.ConnID)
-	}
+	// Atomic switch (2026-06-29 reliability fix C): claim the NEW route BEFORE
+	// releasing the OLD one, and release the old one ONLY on a successful claim.
+	// A failed claim (live collision) must leave the stub's existing route fully
+	// intact — releasing first then failing the claim left the stub attached to
+	// nothing, and later messages to the old route were silently held as "no
+	// claim". The steal pre-step stays before the claim: the user has already
+	// confirmed displacement, so we evict the current holder of `key` first.
 	if steal {
 		b.Routes.ForceReleaseKey(key)
 	}
@@ -578,6 +582,16 @@ func (b *Broker) tryClaim(conn *ipc.Conn, stub *Stub, key RouteKey, label string
 				label, holder.CLI, holder.PID, holder.CWD),
 		})
 		return false
+	}
+	// Claim succeeded — now drop the stub's previous route. Single-claim-per-stub
+	// is enforced ONLY by this explicit Release (Routes.Claim is per-key and does
+	// not enforce it). The only window where the stub holds both keys is these
+	// few sequential statements in one goroutine — never an observable steady
+	// state. The `*old != key` guard keeps an idempotent self-reclaim (Claim
+	// returns idempotent/transfer-true when this stub already holds key) from
+	// releasing the very route it just kept.
+	if old := stub.CurrentRoute(); old != nil && *old != key {
+		b.Routes.Release(*old, stub.ConnID)
 	}
 	stub.SetRoute(&key)
 	b.clearHeldReplyOnClaim(key)
@@ -1008,7 +1022,17 @@ func (b *Broker) backlogSummary(key RouteKey) (int, []ipc.QueuedItem) {
 		log.Printf("backlog summary %s: worker queue full or stopped — skipping summary", routeKeyStr(key))
 		return 0, nil
 	}
-	res := <-resultCh
+	var res BacklogResult
+	select {
+	case res = <-resultCh:
+	case <-time.After(workerJobTimeout):
+		// A3: an EXITED worker already replied errWorkerStopped fast; this fires only
+		// for a worker that genuinely STALLED. Fall back to the existing no-summary
+		// path so the attach completes instead of wedging on the never-written
+		// resultCh (the agent still learns of backlog via the next push's nudge).
+		log.Printf("backlog summary %s: worker did not respond within %s — skipping summary", routeKeyStr(key), workerJobTimeout)
+		return 0, nil
+	}
 	if res.Err != nil {
 		log.Printf("backlog summary peek FAIL %s: %v", routeKeyStr(key), res.Err)
 		// Total still came back fine; render the count without a preview.

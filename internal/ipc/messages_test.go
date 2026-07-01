@@ -118,10 +118,10 @@ func TestAttachedMsg_CwdDefaultCollision_Roundtrip(t *testing.T) {
 		OK:      false,
 		Status:  AttachStatusCwdDefaultCollision,
 		Name:    "c3",
-		CWD:     "/home/karthi/arogara",
+		CWD:     "/home/user/projects",
 		ChatID:  -100,
 		TopicID: &tid,
-		Holder:  &Holder{CLI: "claude", PID: 9823, CWD: "/home/karthi/arogara"},
+		Holder:  &Holder{CLI: "claude", PID: 9823, CWD: "/home/user/projects"},
 		Err:     "cwd maps to a topic held by another session",
 	}
 	data, err := json.Marshal(in)
@@ -135,8 +135,8 @@ func TestAttachedMsg_CwdDefaultCollision_Roundtrip(t *testing.T) {
 	if out.Status != AttachStatusCwdDefaultCollision {
 		t.Errorf("Status=%q want %q", out.Status, AttachStatusCwdDefaultCollision)
 	}
-	if out.Name != "c3" || out.CWD != "/home/karthi/arogara" {
-		t.Errorf("Name=%q CWD=%q want c3 / /home/karthi/arogara", out.Name, out.CWD)
+	if out.Name != "c3" || out.CWD != "/home/user/projects" {
+		t.Errorf("Name=%q CWD=%q want c3 / /home/user/projects", out.Name, out.CWD)
 	}
 	if out.Holder == nil || out.Holder.CLI != "claude" || out.Holder.PID != 9823 {
 		t.Errorf("Holder roundtrip mismatch: %+v", out.Holder)

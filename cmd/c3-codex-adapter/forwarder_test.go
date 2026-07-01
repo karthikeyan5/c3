@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -91,7 +92,7 @@ func TestForwardInboundToCodexAppServerStartsTurn(t *testing.T) {
 	input := params["input"].([]any)
 	item := input[0].(map[string]any)
 	text := item["text"].(string)
-	if text != "Telegram message from alice (chat=12345678 thread=0)\n[Transcribed voice]: Hello my testing 1 2 3" {
+	if text != "Telegram message from alice (chat=12345678 thread=0 message_id=1491)\n[Transcribed voice]: Hello my testing 1 2 3" {
 		t.Fatalf("turn text = %q", text)
 	}
 }
@@ -144,5 +145,30 @@ func TestForwardInboundToCodexAppServerPicksLoadedThreadForCWD(t *testing.T) {
 	if threadListParams["cwd"] != "/home/user/projects/c3" {
 		encoded, _ := json.Marshal(threadListParams)
 		t.Fatalf("thread/list params = %s", encoded)
+	}
+}
+
+// D-RC1: the live-forward turn text must carry the same information density as the
+// queued (fetch_queue) renderer — message_id and the full reply context — not just
+// sender/chat/thread/text. Without this, a reply forwarded live to Codex loses the
+// quoted-message metadata the agent needs to thread its response.
+func TestFormatInboundTurnText_IncludesReplyAndMessageID(t *testing.T) {
+	in := &c3types.Inbound{
+		Channel:   "telegram",
+		ChatID:    -100,
+		MessageID: 102,
+		Sender:    c3types.Sender{Username: "alice"},
+		ReplyTo: &c3types.ReplyContext{
+			MessageID: 101,
+			User:      c3types.Sender{Username: "alice"},
+			Text:      ".",
+		},
+		Text: "Reply to this",
+	}
+	got := formatInboundTurnText(in)
+	for _, want := range []string{"message_id=102", "reply_to=101", "reply_to_user=@alice"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("formatInboundTurnText missing %q; got %q", want, got)
+		}
 	}
 }

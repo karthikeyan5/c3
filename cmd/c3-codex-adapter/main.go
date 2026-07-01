@@ -193,14 +193,51 @@ type adapter struct {
 	// SystemEvent is surfaced once per outage, not on every recovery cycle.
 	// Reset on a successful reconnect so a later outage re-advises.
 	brokerDownAdvised atomic.Bool
+
+	// forwardCh feeds the SINGLE serial Codex-forward goroutine (codexForwardLoop,
+	// started in newAdapter). Enqueueing here instead of spawning a goroutine per
+	// inbound is the M2 loss fix: the broker's OpInboundDelivered consume is
+	// count-off-HEAD (worker.go handleConsume → Queue.Consume(n); MessageID only
+	// logged), so an ack is only safe when acks arrive in queue order, head-first,
+	// and never while an earlier message is undelivered. Serial processing gives
+	// in-order; the forwardBlocked latch gives never-ack-past-a-gap.
+	forwardCh chan codexForwardReq
+
+	// forwardBlocked latches true the instant an undelivered gap opens at/near the
+	// queue head — a forward FAILURE in codexForwardLoop OR a forwardCh buffer-full
+	// DROP in handleInbound (which runs on the IPC-read goroutine and cannot reach
+	// the loop's local scope). Once set, codexForwardLoop stops acking, so no later
+	// successful forward's count-off-head ack can Consume the undelivered head
+	// message off the queue → no silent loss. Shared across two goroutines, so it
+	// is atomic. Latched for the session (a process restart resets it); the
+	// false→true transition fires exactly one fetch_queue recovery nudge.
+	forwardBlocked atomic.Bool
+}
+
+// codexForwardReq is one inbound queued for the serial Codex-forward goroutine.
+// conn is captured at ENQUEUE time (handleInbound) — not resolved at completion —
+// so a broker reconnect+reattach during the up-to-15s forward can't make the ack
+// land on a route this stub no longer holds (M2 hazard b).
+type codexForwardReq struct {
+	inbound c3types.Inbound
+	covered int
+	conn    *ipc.Conn
 }
 
 func newAdapter() *adapter {
-	return &adapter{
+	a := &adapter{
 		pending:   map[string]chan ipc.ToolResultMsg{},
 		fqPending: map[string]chan ipc.FetchQueueResp{},
 		rtPending: map[string]chan ipc.RetranscribeResp{},
+		forwardCh: make(chan codexForwardReq, 256),
 	}
+	// Single serial Codex-forward consumer. Started here (not per-inbound) so all
+	// forwards + delivery acks go through one in-order path — the invariant the
+	// broker's count-off-head consume requires (M2). Parks on forwardCh until an
+	// inbound is enqueued; lives for the process lifetime like the old detached
+	// forward goroutines did (no separate shutdown).
+	go a.codexForwardLoop()
+	return a
 }
 
 func (a *adapter) connectBroker() error {
@@ -526,7 +563,13 @@ func (a *adapter) handleInbound(raw []byte) {
 	if pendingCount < 1 {
 		pendingCount = 1
 	}
-	if a.transport != nil {
+	// Nudge = the notify-only delivery signal (agent → fetch_queue → consume). It
+	// is SUPPRESSED in bridge mode (M2 hazard c): when forwarding is enabled the
+	// serial WS forward below is the SOLE delivery+consume path, and a nudge telling
+	// the agent to call fetch_queue(ack=true) would add a SECOND count-off-head
+	// consumer racing the forward's ack → over-consume → silent loss. In notify-only
+	// mode (forwarding disabled) the nudge is the only delivery signal, so it stays.
+	if a.transport != nil && !codexForwardingAllowed() {
 		if err := a.transport.Notify(context.Background(), "notifications/message", map[string]any{
 			"data": "c3: new Telegram message — call `fetch_queue` to read it. " + pendingNudge(pendingCount),
 		}); err != nil {
@@ -546,9 +589,31 @@ func (a *adapter) handleInbound(raw []byte) {
 		}
 	}
 
-	// WS forwarder (gated by env, see split-brain guard).
+	// WS forwarder (gated by env, see split-brain guard). Enqueue onto the SINGLE
+	// serial forwarder (codexForwardLoop) instead of spawning a goroutine per
+	// inbound — that per-inbound design was the M2 loss bug (an older message's
+	// forward failing while a newer one acked Count=1 consumed the OLDER undelivered
+	// message off the head). conn is captured NOW (a.currentConn()) so a reconnect
+	// during the forward can't redirect the later ack (hazard b). On a SUCCESSFUL,
+	// not-blocked forward the loop acks so the broker Consumes the queued copy
+	// (D-RC2); on failure it never acks and the content stays queued for fetch_queue
+	// recovery. Inbound is copied by value so the loop owns it.
 	if codexForwardingAllowed() {
-		go a.forwardToCodexAppServer(&msg.Inbound)
+		req := codexForwardReq{inbound: msg.Inbound, covered: msg.Covered, conn: a.currentConn()}
+		select {
+		case a.forwardCh <- req:
+		default:
+			// forwardCh full (256 buffered): skip this live forward and do NOT ack.
+			// The inbound is durably queued in the broker, but skipping the forward
+			// leaves it UNDELIVERED at/near the head. The broker's ack is
+			// count-off-HEAD, so a later successful forward acking Count>=1 would
+			// Consume THIS undelivered line off the head → silent loss. So latch
+			// forwardBlocked exactly as a forward FAILURE does: codexForwardLoop then
+			// stops acking and the content survives for fetch_queue recovery, which
+			// the one-shot nudge (latchForwardBlocked) prompts even in bridge mode.
+			log.Printf("codex forward queue full — skipping live forward for inbound id=%d; latching forwardBlocked so no later ack consumes it (fetch_queue recovery)", msg.Inbound.MessageID)
+			a.latchForwardBlocked("forward queue full")
+		}
 	}
 }
 
@@ -598,8 +663,9 @@ func codexForwardingAllowed() bool {
 		os.Getenv("C3_CODEX_ALLOW_MANUAL_FORWARD") == "1"
 }
 
-// forwardToCodexAppServer pushes one inbound as a Codex turn via WebSocket.
-// Runs in a goroutine; failure logged but doesn't error the whole adapter.
+// codexForwardLoop is the SINGLE consumer of forwardCh. It pushes each inbound as
+// a Codex turn via WebSocket, strictly in enqueue (= queue) order, and is the ONLY
+// path that sends an OpInboundDelivered ack.
 //
 // WS protocol per spec §4.4 Codex section:
 //
@@ -607,12 +673,91 @@ func codexForwardingAllowed() bool {
 //	(thread/list filtered by cwd if multiple loaded) → thread/resume →
 //	thread/turn/start
 //
-// Each inbound opens a fresh short-lived WebSocket (Codex app-server expects
-// new turns this way; long-lived sessions would conflict with the visible
-// TUI's connection).
-func (a *adapter) forwardToCodexAppServer(in *c3types.Inbound) {
-	if err := forwardInboundToCodexAppServer(context.Background(), in, codexForwardConfigFromEnv()); err != nil {
-		fmt.Fprintf(os.Stderr, "c3-codex-adapter: WS forward failed for inbound id=%d: %v\n", in.MessageID, err)
+// Each inbound opens a fresh short-lived WebSocket (Codex app-server expects new
+// turns this way; long-lived sessions would conflict with the visible TUI's
+// connection).
+//
+// M2 correctness: the broker's OpInboundDelivered consume is count-off-HEAD
+// (worker.go handleConsume → Queue.Consume(n); MessageID is only logged). That is
+// safe ONLY if (1) acks arrive in queue order, head-first, and (2) we never ack
+// while an earlier message is still undelivered. The retired per-inbound goroutine
+// design broke both: an older message's forward could FAIL (correctly no ack) while
+// a newer one SUCCEEDED and acked Count=1 → the broker dropped 1 off the head = the
+// OLDER undelivered message → silent loss. Serial processing here gives (1); the
+// shared forwardBlocked latch gives (2). forwardBlocked stays set for the session
+// once any forward fails OR handleInbound drops a buffer-full inbound (both open an
+// undelivered head gap) — Codex then falls back to fetch_queue-as-source-of-truth
+// (the safe pre-RC2 behavior); a session restart resets it. It is atomic because
+// handleInbound (the IPC-read goroutine) latches it too.
+func (a *adapter) codexForwardLoop() {
+	for req := range a.forwardCh {
+		err := forwardInboundToCodexAppServer(context.Background(), &req.inbound, codexForwardConfigFromEnv())
+		if err != nil {
+			// errCodexForwardNoWS = forwarding enabled but unconfigured (no WS URL):
+			// the forward delivered nothing. It's a benign config state, not a real
+			// failure, so don't spam stderr per inbound. Any OTHER error is a real
+			// forward failure: log it. Either way the forward delivered nothing, so
+			// the head is now an undelivered message and any later ack would consume
+			// IT off the head → set blocked and never ack.
+			if !errors.Is(err, errCodexForwardNoWS) {
+				fmt.Fprintf(os.Stderr, "c3-codex-adapter: WS forward failed for inbound id=%d: %v\n", req.inbound.MessageID, err)
+			}
+			a.latchForwardBlocked("WS forward failed")
+			continue // DO NOT ack — content stays queued (recovery via fetch_queue).
+		}
+		if a.forwardBlocked.Load() {
+			// Delivered live, but an earlier message is still the undelivered head.
+			// Acking now would Consume that earlier message off the head → loss. So
+			// skip the ack: this (delivered) message stays queued and fetch_queue
+			// re-delivers it later — a benign duplicate, never loss.
+			continue
+		}
+		// Success AND not blocked: this message IS the current head and was delivered
+		// live → safe to ack so the broker Consumes exactly it. Gated exactly like the
+		// Claude adapter (cmd/c3-claude-adapter/main.go ~:655):
+		//   - codexForwardingAllowed() already held at the enqueue site, so the
+		//     notify-only (forwarding-disabled) path never enqueues — we never ack
+		//     content the agent did not receive live (Watch-out #6).
+		//   - !IsEvent(): a synthesized event (poll_result/reaction/callback) is never
+		//     queued, so it covers zero stored lines — acking one would over-consume
+		//     real backlog the event never delivered (Watch-out #5).
+		//   - covered >= 1: nothing to consume otherwise. The broker double-guards
+		//     (handleInboundDelivered drops Count<1, handleConsume skips Count<1) —
+		//     this adapter guard is the first line.
+		// req.conn was captured at ENQUEUE time (hazard b), so a reconnect during the
+		// forward can't make this land on a route the stub no longer holds.
+		// ipc.Conn.WriteJSON is wmu-guarded, so this write is safe from the goroutine.
+		if req.conn != nil && !req.inbound.IsEvent() && req.covered >= 1 {
+			_ = req.conn.WriteJSON(ipc.InboundDeliveredMsg{Op: ipc.OpInboundDelivered, UpdateID: req.inbound.MessageID, OK: true, Count: req.covered})
+		}
+	}
+}
+
+// latchForwardBlocked marks the Codex forward path blocked the first time an
+// undelivered gap opens at the queue head — either a forward FAILURE
+// (codexForwardLoop) or a forwardCh buffer-full DROP (handleInbound). It is
+// idempotent and concurrency-safe: both callers race through CompareAndSwap, and
+// only the goroutine that wins the false→true transition proceeds. Once latched,
+// codexForwardLoop stops acking so no later count-off-head ack consumes the
+// undelivered head message (the loss vector this closes).
+//
+// On the transition it fires exactly ONE fetch_queue recovery nudge so the agent
+// drains the durable backlog even in bridge mode — where the steady-state nudge in
+// handleInbound is intentionally suppressed (it would race the forward's ack). This
+// restores the "fetch_queue as source of truth" fallback the design assumes without
+// waiting for a session restart. The nudge is best-effort; the content is durably
+// queued regardless, so a Notify failure is logged, not fatal.
+func (a *adapter) latchForwardBlocked(reason string) {
+	if !a.forwardBlocked.CompareAndSwap(false, true) {
+		return // already latched this session — the one-shot nudge already fired
+	}
+	if a.transport == nil {
+		return
+	}
+	if err := a.transport.Notify(context.Background(), "notifications/message", map[string]any{
+		"data": "c3: live message forwarding interrupted (" + reason + ") — call `fetch_queue` to read pending Telegram messages.",
+	}); err != nil {
+		log.Printf("codex forwardBlocked recovery nudge FAIL (%s): %v — content durably queued; call fetch_queue to drain", reason, err)
 	}
 }
 
@@ -1253,12 +1398,9 @@ func renderQueuedInbound(in *c3types.Inbound) string {
 	if in.Text != "" {
 		parts = append(parts, fmt.Sprintf("text=%q", in.Text))
 	}
-	if in.ReplyTo != nil {
-		parts = append(parts, fmt.Sprintf("reply_to=%d", in.ReplyTo.MessageID))
-	}
+	parts = append(parts, c3types.ReplyContextFields(in.ReplyTo)...)
 	for _, att := range in.Attachments {
-		parts = append(parts, fmt.Sprintf("attachment{kind=%s file_id=%q mime=%s size=%d name=%q}",
-			att.Kind, att.FileID, att.MIME, att.Size, att.Name))
+		parts = append(parts, c3types.AttachmentField(att))
 	}
 	if in.IsEvent() {
 		parts = append(parts, fmt.Sprintf("event=%s", in.Kind))

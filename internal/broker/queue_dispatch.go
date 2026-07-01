@@ -21,6 +21,18 @@ import (
 // const) only so a test can shorten it; production never reassigns it.
 var retranscribeTimeout = 330 * time.Second
 
+// workerJobTimeout bounds every blocking worker round-trip the broker performs
+// on an IPC read goroutine (fetch_queue, tool_call, the retranscribe in-place
+// refresh, the attach backlog-summary peek). Phase 1 made an EXITED worker reply
+// errWorkerStopped fast, so the common failure already unblocks <-resultCh; this
+// is the defense-in-depth backstop for a worker that genuinely STALLS without
+// exiting (a hung handler / stuck send) — then nothing is ever sent on resultCh
+// and the broker's single serial per-connection read loop would wedge forever.
+// On timeout each handler returns its own clean error/no-op for THIS op and the
+// read loop keeps serving the connection. It is a var (not a const) only so a
+// test can shorten it; production never reassigns it.
+var workerJobTimeout = 30 * time.Second
+
 // handleFetchQueue routes a fetch_queue pull through the claimed route's worker
 // (single-owner file access). Limit default + max are clamped by the adapter;
 // the broker honors All (drain everything) and Ack (consume vs peek).
@@ -41,7 +53,43 @@ func (b *Broker) handleFetchQueue(conn *ipc.Conn, stub *Stub, raw []byte) {
 		_ = conn.WriteJSON(ipc.FetchQueueResp{Op: ipc.OpFetchQueueResult, ID: req.ID, Err: "worker queue full or stopped"})
 		return
 	}
-	res := <-resultCh
+	var res FetchResult
+	if req.Ack {
+		// M1 (W1 review): an Ack=true fetch is DESTRUCTIVE — handleFetch runs
+		// Queue.Consume, which durably advances the cursor / deletes the lines BEFORE
+		// it writes resultCh. Abandoning it on workerJobTimeout orphans that consume:
+		// the worker later runs the job, the batch is consumed (and the Telegram
+		// offset already advanced at persist time), but the result lands in a now-
+		// readerless cap-1 channel → the batch is consumed yet never delivered →
+		// permanent silent inbound loss. So the BROKER does NOT time out the
+		// destructive path; we block on <-resultCh. A1/A2 already fast-fail an EXITED
+		// worker via errWorkerStopped (shutdown() drains it), so this block only
+		// persists for an alive-but-BUSY worker (bounded by the STT deadline).
+		// CAVEAT (NOT yet fully fixed): the *adapter* still abandons this same
+		// round-trip at its own ~120s timeout (cmd/c3-*-adapter), which is < a long
+		// STT flush — so a fetch_queue(ack=true) queued behind a >120s STT can still
+		// be orphaned the same way (the worker later consumes; the adapter waiter is
+		// gone). That residual is PRE-EXISTING (byte-identical to master, not this
+		// branch); removing the broker's 30s timeout here only closed the worse
+		// regression this branch had introduced. The real fix is delivery-contingent:
+		// peek-then-explicit-ack (consume only after the FetchQueueResp is confirmed
+		// written), or an id-targeted consume — a design call tracked as a follow-up.
+		res = <-resultCh
+	} else {
+		// Non-destructive PEEK (Ack=false): a discarded peek consumes nothing, so
+		// abandoning a genuinely stalled worker is safe and keeps the connection's
+		// single serial read loop alive (A3/A4). KEEP the timeout only here.
+		select {
+		case res = <-resultCh:
+		case <-time.After(workerJobTimeout):
+			// A3: an EXITED worker already replied errWorkerStopped fast; this fires
+			// only for a worker that genuinely STALLED. Return THIS op's clean error
+			// and let the read loop keep serving — do NOT wedge on the never-written
+			// resultCh.
+			_ = conn.WriteJSON(ipc.FetchQueueResp{Op: ipc.OpFetchQueueResult, ID: req.ID, Err: "fetch_queue: worker did not respond within " + workerJobTimeout.String()})
+			return
+		}
+	}
 	resp := ipc.FetchQueueResp{Op: ipc.OpFetchQueueResult, ID: req.ID, Remaining: res.Remaining}
 	if res.Err != nil {
 		resp.Err = res.Err.Error()
@@ -122,11 +170,18 @@ func (b *Broker) handleRetranscribe(conn *ipc.Conn, stub *Stub, raw []byte) {
 		resultCh := make(chan RefreshResult, 1)
 		job := Job{Kind: JobRefreshText, Refresh: &RefreshTextJob{MessageID: req.MessageID, NewText: transcript, ResultCh: resultCh}}
 		if b.Workers.Submit(*route, job) {
-			res := <-resultCh
-			if res.Err != nil {
-				log.Printf("retranscribe refresh chan=%s file_id=%s msg=%d: refresh error: %v", chanName, req.FileID, req.MessageID, res.Err)
+			select {
+			case res := <-resultCh:
+				if res.Err != nil {
+					log.Printf("retranscribe refresh chan=%s file_id=%s msg=%d: refresh error: %v", chanName, req.FileID, req.MessageID, res.Err)
+				}
+				refreshed = res.Refreshed
+			case <-time.After(workerJobTimeout):
+				// A3: the STT result was already delivered above; the in-place refresh
+				// is best-effort. A stalled refresh worker must not wedge the read loop —
+				// log (mirroring the refresh-failure log) and fall through to return Text.
+				log.Printf("retranscribe refresh chan=%s file_id=%s msg=%d: worker did not respond within %s — skipping in-place refresh", chanName, req.FileID, req.MessageID, workerJobTimeout)
 			}
-			refreshed = res.Refreshed
 		} else {
 			log.Printf("retranscribe refresh chan=%s file_id=%s msg=%d: worker queue full or stopped", chanName, req.FileID, req.MessageID)
 		}

@@ -29,6 +29,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/karthikeyan5/c3/internal/c3types"
@@ -49,6 +50,11 @@ type Config struct {
 	// (PATH). STT needs only the standard library now (the Sarvam batch path was
 	// ported to native urllib), so no venv is required — system python3 works.
 	Python string `json:"python"`
+	// AudioRetention is how many of the most-recent downloaded .oga voice files the
+	// handler keeps in its inbox (a rolling window); older ones are pruned after
+	// each transcription. Retains recent audio for retranscribe/testing while
+	// bounding disk. 0/unset ⇒ defaultAudioRetention (500); negative ⇒ keep all.
+	AudioRetention int `json:"audio_retention"`
 }
 
 // defaultTimeoutSeconds is the broker's hard deadline for the STT subprocess.
@@ -57,6 +63,12 @@ type Config struct {
 // SIGKILL'd before either provider returned. 300s gives room for slow
 // downloads + a long-audio transcription cycle without surprising the user.
 const defaultTimeoutSeconds = 300
+
+// defaultAudioRetention is how many recent .oga voice files the handler keeps in
+// its inbox when plugins.stt.audio_retention is unset (0). Recent audio stays
+// available for retranscribe/testing; older files are pruned after each
+// transcription. A negative config value keeps everything.
+const defaultAudioRetention = 500
 
 // Register subscribes the plugin's OnVoiceReceived callback. Called once at
 // broker startup if mappings.json:plugins.stt.enabled (default true).
@@ -74,6 +86,9 @@ func Register(host plugin.Host) error {
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = defaultTimeoutSeconds
+	}
+	if cfg.AudioRetention == 0 {
+		cfg.AudioRetention = defaultAudioRetention
 	}
 	// Handler existence is checked PER-CALL (inside the callback) rather than
 	// once at startup. Two reasons:
@@ -188,6 +203,37 @@ func runHandler(ctx context.Context, host plugin.Host, cfg Config, token, apiBas
 	if apiBaseURL != "" {
 		cmd.Env = append(cmd.Env, "C3_TELEGRAM_API_URL="+apiBaseURL)
 	}
+	// Rolling-window audio retention: the handler keeps the newest N .oga in its
+	// inbox and prunes older ones after each transcription (recent audio stays
+	// available for retranscribe/testing). N is passed from config.
+	cmd.Env = append(cmd.Env, "STT_AUDIO_RETENTION="+strconv.Itoa(cfg.AudioRetention))
+
+	// I-7: kill the whole process group on the ctx deadline, not just the direct
+	// child. Setpgid makes stt-handler.py the leader of its OWN process group, so
+	// the custom Cancel can SIGKILL the negative PID — reaping the Python
+	// grandchild (subprocess.run stt.py), ffprobe, and any in-flight provider HTTP
+	// together with the handler. Without this, exec.CommandContext's default
+	// cancel (Process.Kill → SIGKILL to the direct child only) orphans those
+	// grandchildren to init, wasting paid API spend after the deadline.
+	// (Precedent: internal/spawn sets Setsid for an analogous detach reason.)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		// exec only invokes Cancel after a successful Start, so Process is
+		// non-nil here; guard anyway to match defensive conventions. Negative
+		// PID = signal the whole process group started by Setpgid.
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	// I-7 backstop: the deadline only TRIGGERS the kill — it can't unblock a
+	// cmd.Wait() that's stuck on an inherited stdout pipe held open by a surviving
+	// child. WaitDelay bounds that: after Cancel fires, Wait force-closes the I/O
+	// and returns within WaitDelay instead of hanging the serial worker. Today the
+	// grandchild uses capture_output (no inherited pipe) so this is latent, but it
+	// keeps the 300s/330s deadlines real if a future edit changes that.
+	cmd.WaitDelay = 5 * time.Second
+
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

@@ -164,14 +164,14 @@ func TestFormatAttached_CwdDefaultCollision(t *testing.T) {
 		OK:      false,
 		Status:  AttachStatusCwdDefaultCollision,
 		Name:    "c3",
-		CWD:     "/home/karthi/arogara",
+		CWD:     "/home/user/projects",
 		ChatID:  -100,
 		TopicID: &tid,
-		Holder:  &Holder{CLI: "claude", PID: 9823, CWD: "/home/karthi/arogara"},
+		Holder:  &Holder{CLI: "claude", PID: 9823, CWD: "/home/user/projects"},
 	}
 	got := FormatAttached(msg)
 	for _, w := range []string{
-		"/home/karthi/arogara", // the colliding cwd
+		"/home/user/projects", // the colliding cwd
 		"c3",                   // the resolved topic name
 		"claude",               // holder cli
 		"9823",                 // holder pid

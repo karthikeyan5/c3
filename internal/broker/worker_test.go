@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -136,6 +137,61 @@ func TestFlushInbounds_VoiceWithSTTPluginUsesTranscript(t *testing.T) {
 
 	if !strings.Contains(in.Text, "transcribed text") {
 		t.Errorf("voice with STT plugin: in.Text=%q, want transcript embedded", in.Text)
+	}
+}
+
+// Phase 3 (spec §E): the per-inbound STT call in flushInbounds runs on the
+// worker run-loop ctx. Before the fix it had NO per-call deadline (only the STT
+// builtin's ~300s subprocess budget), so a download that hangs BEFORE that
+// budget applies blocks the worker goroutine — and any JobFetch/JobConsume
+// queued behind it — for up to ~5 min. The fix wraps each call in a per-call
+// timeout (sttFlushTimeout). A timed-out call returns "" and falls through to
+// the existing self-documenting sttFailureText placeholder path. This test
+// registers a stub STT plugin that BLOCKS until its ctx is cancelled, shortens
+// sttFlushTimeout, and asserts flushInbounds returns promptly with the
+// placeholder (not a ~5min hang, not an empty transcript).
+func TestFlushInbounds_VoiceSTTTimeout_FallsBackToPlaceholder(t *testing.T) {
+	t.Setenv("C3_QUEUE_DIR", t.TempDir())
+
+	orig := sttFlushTimeout
+	sttFlushTimeout = 50 * time.Millisecond
+	defer func() { sttFlushTimeout = orig }()
+
+	b := New(&mappings.MappingsFile{SchemaVersion: 1})
+	defer b.Shutdown()
+
+	// Stub STT that hangs until its (per-call) ctx is cancelled, then returns
+	// an empty transcript — exactly what a download stuck past the deadline does.
+	b.Plugins.OnVoiceReceived(func(ctx context.Context, p c3types.VoicePayload) (string, error) {
+		<-ctx.Done()
+		return "", nil
+	})
+
+	w := newRouteWorker(context.Background(), RouteKey{Channel: "telegram", ChatID: -100}, time.Hour, b)
+	defer w.Stop()
+
+	in := &c3types.Inbound{
+		Channel: "telegram", ChatID: -100, MessageID: 45,
+		Attachments: []c3types.Attachment{{Kind: "voice", FileID: "HUNGFILE", MIME: "audio/ogg", Size: 1000}},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		w.flushInbounds(context.Background(), []*c3types.Inbound{in})
+		close(done)
+	}()
+
+	// Must return in ~the timeout, not the ~300s STT budget or ~5min hang.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("flushInbounds did not return within 5s — STT call is not bounded by sttFlushTimeout")
+	}
+
+	for _, want := range []string{"transcription failed", "HUNGFILE", "download_attachment", "retranscribe", "does not need to resend"} {
+		if !strings.Contains(in.Text, want) {
+			t.Errorf("STT-timeout fallback text missing %q; got %q", want, in.Text)
+		}
 	}
 }
 
@@ -541,6 +597,79 @@ func TestTypingRelay_DisarmsAfterMaxPulses(t *testing.T) {
 	}
 }
 
+// TestWorker_StoppedAfterIdleExit pins A1's mutual-exclusion invariant: once a
+// worker's run() has exited (here via the IDLE timeout), Submit must report the
+// worker stopped (return false) rather than accepting a job into the buffer of a
+// dead worker whose run goroutine will never read it (the original strand). This
+// complements TestWorker_SubmitAfterStopReturnsFalse (which covers the explicit
+// Stop() path) by covering the idle exit path, where pre-fix `stopped` stayed
+// false for the worker's whole life.
+func TestWorker_StoppedAfterIdleExit(t *testing.T) {
+	w := newRouteWorker(context.Background(), RouteKey{Channel: "x"}, 20*time.Millisecond, nil)
+	select {
+	case <-w.Done():
+	case <-time.After(time.Second):
+		t.Fatal("worker did not idle out within 1s")
+	}
+	if w.Submit(Job{Kind: JobInbound}) {
+		t.Error("Submit after idle exit must return false (worker is stopped)")
+	}
+}
+
+// TestWorker_IdleExitDrainsPendingFetch pins A1's loss-free drain: when run()
+// exits with jobs still buffered in w.queue, every result-channel-bearing job
+// must be replied to with an error instead of being left stranded — a caller
+// blocked on <-resultCh would otherwise hang forever (the original fetch_queue
+// wedge).
+//
+// All four exit paths (ctx.Done, idleTimer, queue-closed, JobRelease) funnel
+// through the SAME single `defer w.shutdown()`, so exercising one exercises the
+// drain for all. We drive the JobRelease exit because it is the only
+// DETERMINISTIC strand: the idle/ctx selects race the queue read (Go `select`
+// picks a ready case at random when a job is also buffered), whereas a
+// JobRelease read returns WITHOUT re-entering the select, deterministically
+// leaving the jobs queued behind it un-processed for shutdown() to drain.
+// Mirrors JobFetch + JobOutbound (Watch-out: JobInbound carries no ResultCh and
+// must be dropped silently — exercised implicitly here, asserted by no hang).
+func TestWorker_IdleExitDrainsPendingFetch(t *testing.T) {
+	fetchCh := make(chan FetchResult, 1)
+	outCh := make(chan OutboundResult, 1)
+
+	// Build the worker WITHOUT starting run(), pre-load the queue so all jobs are
+	// buffered before the loop reads anything, THEN start run(). The loop reads the
+	// leading JobRelease and returns; the JobFetch + JobOutbound behind it are never
+	// processed and must be drained on exit. A no-ResultCh JobInbound is also
+	// buffered to prove the drain drops it silently (no panic, no hang).
+	w := &RouteWorker{
+		key:   RouteKey{Channel: "x"},
+		queue: make(chan Job, 64),
+		idle:  time.Hour,
+		done:  make(chan struct{}),
+	}
+	w.queue <- Job{Kind: JobRelease}
+	w.queue <- Job{Kind: JobFetch, Fetch: &FetchJob{All: true, ResultCh: fetchCh}}
+	w.queue <- Job{Kind: JobInbound} // no ResultCh — must be dropped silently
+	w.queue <- Job{Kind: JobOutbound, Outbound: &OutboundJob{Tool: "reply", ResultCh: outCh}}
+	go w.run(context.Background())
+
+	select {
+	case r := <-fetchCh:
+		if r.Err == nil {
+			t.Error("drained JobFetch must carry a non-nil error, got nil")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending JobFetch was stranded — run() exit did not drain the queue")
+	}
+	select {
+	case r := <-outCh:
+		if r.Err == nil {
+			t.Error("drained JobOutbound must carry a non-nil error, got nil")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending JobOutbound was stranded — run() exit did not drain the queue")
+	}
+}
+
 func TestWorker_OutboundStubReturnsErr(t *testing.T) {
 	w := newRouteWorker(context.Background(), RouteKey{Channel: "x"}, time.Hour, nil)
 	defer w.Stop()
@@ -556,5 +685,125 @@ func TestWorker_OutboundStubReturnsErr(t *testing.T) {
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("no result within 500ms")
+	}
+}
+
+// readbackRecorderChannel embeds *fakeChannel and additionally implements the
+// OPTIONAL SendReadback method, so flushInbounds' echoReadback hook resolves it
+// via the readbacker type-assert. A channel WITHOUT this method (the bare
+// fakeChannel) is skipped silently — the additive contract.
+type readbackRecorderChannel struct {
+	*fakeChannel
+	rbMu      sync.Mutex
+	readbacks []c3types.ReadbackArgs
+}
+
+func (r *readbackRecorderChannel) SendReadback(a c3types.ReadbackArgs) (int64, error) {
+	r.rbMu.Lock()
+	defer r.rbMu.Unlock()
+	r.readbacks = append(r.readbacks, a)
+	return 99, nil
+}
+
+func (r *readbackRecorderChannel) readbackSnapshot() []c3types.ReadbackArgs {
+	r.rbMu.Lock()
+	defer r.rbMu.Unlock()
+	out := make([]c3types.ReadbackArgs, len(r.readbacks))
+	copy(out, r.readbacks)
+	return out
+}
+
+func registerReadbackChannel(b *Broker, rc *readbackRecorderChannel) {
+	b.chMu.Lock()
+	b.channels[rc.Name()] = &channelRegistration{Channel: rc}
+	b.chMu.Unlock()
+}
+
+// TestFlushInbounds_ReadbackOnSuccess: a REAL transcript drives exactly one
+// SendReadback carrying the verbatim transcript (ChatID/TopicID/ReplyTo set), and
+// no "couldn't transcribe" failure notice. The agent surface (in.Text) still
+// carries the transcript — the echo is purely additive.
+func TestFlushInbounds_ReadbackOnSuccess(t *testing.T) {
+	t.Setenv("C3_QUEUE_DIR", t.TempDir())
+	b := New(&mappings.MappingsFile{SchemaVersion: 1})
+	defer b.Shutdown()
+
+	rc := &readbackRecorderChannel{fakeChannel: &fakeChannel{}}
+	registerReadbackChannel(b, rc)
+	b.Plugins.OnVoiceReceived(func(ctx context.Context, p c3types.VoicePayload) (string, error) {
+		return "hello from the voice note", nil
+	})
+
+	w := newRouteWorker(context.Background(), RouteKey{Channel: "telegram", ChatID: -100}, time.Hour, b)
+	defer w.Stop()
+
+	tid := int64(7)
+	in := &c3types.Inbound{
+		Channel: "telegram", ChatID: -100, TopicID: &tid, MessageID: 51,
+		Attachments: []c3types.Attachment{{Kind: "voice", FileID: "VF"}},
+	}
+	w.flushInbounds(context.Background(), []*c3types.Inbound{in})
+
+	rbs := rc.readbackSnapshot()
+	if len(rbs) != 1 {
+		t.Fatalf("want exactly 1 SendReadback on success, got %d", len(rbs))
+	}
+	if rbs[0].Transcript != "hello from the voice note" {
+		t.Errorf("readback transcript = %q; want verbatim transcript", rbs[0].Transcript)
+	}
+	if rbs[0].ChatID != -100 || rbs[0].ReplyTo == nil || *rbs[0].ReplyTo != 51 ||
+		rbs[0].TopicID == nil || *rbs[0].TopicID != 7 {
+		t.Errorf("readback routing wrong: %+v", rbs[0])
+	}
+	if !strings.Contains(in.Text, "hello from the voice note") {
+		t.Errorf("agent surface lost the transcript: in.Text=%q", in.Text)
+	}
+	for _, rp := range rc.sendRepliesSnapshot() {
+		if strings.Contains(rp.Text, "Couldn't transcribe") {
+			t.Error("a success readback must not also send the failure notice")
+		}
+	}
+}
+
+// TestFlushInbounds_ReadbackFailureNotice: an STT failure marker drives NO
+// SendReadback but DOES send the human "couldn't transcribe" notice via the
+// channel's normal SendReply. The agent-surface marker (in.Text) is unchanged.
+func TestFlushInbounds_ReadbackFailureNotice(t *testing.T) {
+	t.Setenv("C3_QUEUE_DIR", t.TempDir())
+	b := New(&mappings.MappingsFile{SchemaVersion: 1})
+	defer b.Shutdown()
+
+	rc := &readbackRecorderChannel{fakeChannel: &fakeChannel{}}
+	registerReadbackChannel(b, rc)
+	b.Plugins.OnVoiceReceived(func(ctx context.Context, p c3types.VoicePayload) (string, error) {
+		return "[STT FAILED: timeout — see /tmp/broker.log]", nil
+	})
+
+	w := newRouteWorker(context.Background(), RouteKey{Channel: "telegram", ChatID: -100}, time.Hour, b)
+	defer w.Stop()
+
+	in := &c3types.Inbound{
+		Channel: "telegram", ChatID: -100, MessageID: 52,
+		Attachments: []c3types.Attachment{{Kind: "voice", FileID: "VF"}},
+	}
+	w.flushInbounds(context.Background(), []*c3types.Inbound{in})
+
+	if n := len(rc.readbackSnapshot()); n != 0 {
+		t.Fatalf("want 0 SendReadback on STT failure, got %d", n)
+	}
+	sawNotice := false
+	for _, rp := range rc.sendRepliesSnapshot() {
+		if strings.Contains(rp.Text, "Couldn't transcribe that voice note") {
+			sawNotice = true
+			if rp.ReplyTo == nil || *rp.ReplyTo != 52 {
+				t.Errorf("failure notice should reply-quote the voice msg, got %+v", rp)
+			}
+		}
+	}
+	if !sawNotice {
+		t.Error("STT failure must send the human 'couldn't transcribe' notice via SendReply")
+	}
+	if !strings.Contains(in.Text, "[STT FAILED: timeout") {
+		t.Errorf("agent-surface marker changed: in.Text=%q", in.Text)
 	}
 }

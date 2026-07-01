@@ -28,8 +28,14 @@ type Status struct {
 type Store struct {
 	dir string
 
-	mu  sync.Mutex // guards idx ONLY (the cross-route status counters)
-	idx map[RouteKey]Status
+	mu sync.Mutex // guards idx ONLY (the cross-route status counters)
+	// idx is keyed by the canonical RouteKey.File() string, NOT by RouteKey:
+	// RouteKey.TopicID is a *int64 and queueRouteKey mints a FRESH pointer per
+	// call, so two RouteKeys for the same logical route are DISTINCT Go map keys.
+	// Keying by File() collapses that per-call pointer churn into exactly one
+	// canonical entry per route — so the count is deterministic, drain clears it,
+	// and StatusFor/StatusAll stay file-free / race-free (I7).
+	idx map[string]Status
 }
 
 // NewStore creates the queue dir (0700) and returns a Store. Call
@@ -38,7 +44,7 @@ func NewStore(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("queue: mkdir %s: %w", dir, err)
 	}
-	return &Store{dir: dir, idx: map[RouteKey]Status{}}, nil
+	return &Store{dir: dir, idx: map[string]Status{}}, nil
 }
 
 func (s *Store) jsonlPath(rk RouteKey) string { return filepath.Join(s.dir, rk.File()+".jsonl") }
@@ -228,20 +234,14 @@ func (s *Store) Pending(rk RouteKey) (int, time.Time) {
 // (Pending 0). See I7.
 //
 // RouteKey's TopicID is a *int64, so two RouteKeys for the same route can carry
-// distinct pointers and would NOT be equal as Go map keys. We therefore match by
-// VALUE identity (the canonical File() basename, which is what the rest of the
-// store and the on-disk layout key on), never by raw map lookup — the same reason
-// statusGlobal rebuilds keys from StatusAll rather than reusing the stored ones.
+// distinct pointers and would NOT be equal as Go map keys. The index is therefore
+// keyed by the canonical File() basename (what the rest of the store and the
+// on-disk layout key on), so a single keyed lookup matches by VALUE identity
+// regardless of which pointer the caller's RouteKey carries.
 func (s *Store) StatusFor(rk RouteKey) Status {
-	want := rk.File()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for k, v := range s.idx {
-		if k.File() == want {
-			return v
-		}
-	}
-	return Status{}
+	return s.idx[rk.File()]
 }
 
 // StatusAll returns a snapshot of the in-memory status index (all known routes
@@ -250,9 +250,11 @@ func (s *Store) StatusAll() map[RouteKey]Status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make(map[RouteKey]Status, len(s.idx))
-	for k, v := range s.idx {
+	for fileBase, v := range s.idx {
 		if v.Pending > 0 {
-			out[k] = v
+			if rk, ok := parseRouteFile(fileBase); ok {
+				out[rk] = v
+			}
 		}
 	}
 	return out
@@ -513,13 +515,14 @@ func (s *Store) rewrite(rk RouteKey, lines []c3types.Inbound) error {
 // refreshIndex recomputes the cheap status counters for one route.
 func (s *Store) refreshIndex(rk RouteKey) {
 	n, oldest := s.Pending(rk)
+	key := rk.File()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if n == 0 {
-		delete(s.idx, rk)
+		delete(s.idx, key)
 		return
 	}
-	s.idx[rk] = Status{Pending: n, OldestUnix: oldest.Unix()}
+	s.idx[key] = Status{Pending: n, OldestUnix: oldest.Unix()}
 }
 
 // parseRouteFile reverses RouteKey.File(): "<channel>__<chat>__<topic|none>".
