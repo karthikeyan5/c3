@@ -200,8 +200,18 @@ type adapter struct {
 	// count-off-HEAD (worker.go handleConsume → Queue.Consume(n); MessageID only
 	// logged), so an ack is only safe when acks arrive in queue order, head-first,
 	// and never while an earlier message is undelivered. Serial processing gives
-	// in-order; codexForwardLoop's `blocked` latch gives never-ack-past-a-gap.
+	// in-order; the forwardBlocked latch gives never-ack-past-a-gap.
 	forwardCh chan codexForwardReq
+
+	// forwardBlocked latches true the instant an undelivered gap opens at/near the
+	// queue head — a forward FAILURE in codexForwardLoop OR a forwardCh buffer-full
+	// DROP in handleInbound (which runs on the IPC-read goroutine and cannot reach
+	// the loop's local scope). Once set, codexForwardLoop stops acking, so no later
+	// successful forward's count-off-head ack can Consume the undelivered head
+	// message off the queue → no silent loss. Shared across two goroutines, so it
+	// is atomic. Latched for the session (a process restart resets it); the
+	// false→true transition fires exactly one fetch_queue recovery nudge.
+	forwardBlocked atomic.Bool
 }
 
 // codexForwardReq is one inbound queued for the serial Codex-forward goroutine.
@@ -593,10 +603,16 @@ func (a *adapter) handleInbound(raw []byte) {
 		select {
 		case a.forwardCh <- req:
 		default:
-			// forwardCh full (256 buffered): skip this live forward best-effort and
-			// do NOT ack. The broker already durably queued this inbound, so the
-			// content is never lost — it stays queued for fetch_queue recovery.
-			log.Printf("codex forward queue full — skipping live forward for inbound id=%d; content stays durably queued (fetch_queue recovery)", msg.Inbound.MessageID)
+			// forwardCh full (256 buffered): skip this live forward and do NOT ack.
+			// The inbound is durably queued in the broker, but skipping the forward
+			// leaves it UNDELIVERED at/near the head. The broker's ack is
+			// count-off-HEAD, so a later successful forward acking Count>=1 would
+			// Consume THIS undelivered line off the head → silent loss. So latch
+			// forwardBlocked exactly as a forward FAILURE does: codexForwardLoop then
+			// stops acking and the content survives for fetch_queue recovery, which
+			// the one-shot nudge (latchForwardBlocked) prompts even in bridge mode.
+			log.Printf("codex forward queue full — skipping live forward for inbound id=%d; latching forwardBlocked so no later ack consumes it (fetch_queue recovery)", msg.Inbound.MessageID)
+			a.latchForwardBlocked("forward queue full")
 		}
 	}
 }
@@ -668,11 +684,12 @@ func codexForwardingAllowed() bool {
 // design broke both: an older message's forward could FAIL (correctly no ack) while
 // a newer one SUCCEEDED and acked Count=1 → the broker dropped 1 off the head = the
 // OLDER undelivered message → silent loss. Serial processing here gives (1); the
-// local `blocked` latch gives (2). `blocked` stays set for the session once any
-// forward fails — Codex then falls back to fetch_queue-as-source-of-truth (the safe
-// pre-RC2 behavior); a session restart resets it. No mutex: single goroutine.
+// shared forwardBlocked latch gives (2). forwardBlocked stays set for the session
+// once any forward fails OR handleInbound drops a buffer-full inbound (both open an
+// undelivered head gap) — Codex then falls back to fetch_queue-as-source-of-truth
+// (the safe pre-RC2 behavior); a session restart resets it. It is atomic because
+// handleInbound (the IPC-read goroutine) latches it too.
 func (a *adapter) codexForwardLoop() {
-	blocked := false
 	for req := range a.forwardCh {
 		err := forwardInboundToCodexAppServer(context.Background(), &req.inbound, codexForwardConfigFromEnv())
 		if err != nil {
@@ -685,10 +702,10 @@ func (a *adapter) codexForwardLoop() {
 			if !errors.Is(err, errCodexForwardNoWS) {
 				fmt.Fprintf(os.Stderr, "c3-codex-adapter: WS forward failed for inbound id=%d: %v\n", req.inbound.MessageID, err)
 			}
-			blocked = true
+			a.latchForwardBlocked("WS forward failed")
 			continue // DO NOT ack — content stays queued (recovery via fetch_queue).
 		}
-		if blocked {
+		if a.forwardBlocked.Load() {
 			// Delivered live, but an earlier message is still the undelivered head.
 			// Acking now would Consume that earlier message off the head → loss. So
 			// skip the ack: this (delivered) message stays queued and fetch_queue
@@ -713,6 +730,34 @@ func (a *adapter) codexForwardLoop() {
 		if req.conn != nil && !req.inbound.IsEvent() && req.covered >= 1 {
 			_ = req.conn.WriteJSON(ipc.InboundDeliveredMsg{Op: ipc.OpInboundDelivered, UpdateID: req.inbound.MessageID, OK: true, Count: req.covered})
 		}
+	}
+}
+
+// latchForwardBlocked marks the Codex forward path blocked the first time an
+// undelivered gap opens at the queue head — either a forward FAILURE
+// (codexForwardLoop) or a forwardCh buffer-full DROP (handleInbound). It is
+// idempotent and concurrency-safe: both callers race through CompareAndSwap, and
+// only the goroutine that wins the false→true transition proceeds. Once latched,
+// codexForwardLoop stops acking so no later count-off-head ack consumes the
+// undelivered head message (the loss vector this closes).
+//
+// On the transition it fires exactly ONE fetch_queue recovery nudge so the agent
+// drains the durable backlog even in bridge mode — where the steady-state nudge in
+// handleInbound is intentionally suppressed (it would race the forward's ack). This
+// restores the "fetch_queue as source of truth" fallback the design assumes without
+// waiting for a session restart. The nudge is best-effort; the content is durably
+// queued regardless, so a Notify failure is logged, not fatal.
+func (a *adapter) latchForwardBlocked(reason string) {
+	if !a.forwardBlocked.CompareAndSwap(false, true) {
+		return // already latched this session — the one-shot nudge already fired
+	}
+	if a.transport == nil {
+		return
+	}
+	if err := a.transport.Notify(context.Background(), "notifications/message", map[string]any{
+		"data": "c3: live message forwarding interrupted (" + reason + ") — call `fetch_queue` to read pending Telegram messages.",
+	}); err != nil {
+		log.Printf("codex forwardBlocked recovery nudge FAIL (%s): %v — content durably queued; call fetch_queue to drain", reason, err)
 	}
 }
 
