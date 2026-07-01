@@ -80,6 +80,7 @@ Spawn-and-own a Claude/Codex CLI and drive it from Telegram or another agent; th
 
 ### Packaging / install
 - **Eliminate `--dangerously-load-development-channels` / register a private trusted plugin store** — *medium.* Karthi is ready to sign a cert to drop the dangerous flag and officially register his own trusted plugin store (he'll maintain many private plugins). Status unverified against current CC.
+- **Auto-update from GitHub release tags** — *medium (maintainer wants; update cadence is rising).* When a new GitHub **release** is published, C3 pulls it and self-deploys, so fixes reach users without a manual redeploy. Two modes to support/decide: (a) fully autonomous self-deploy, or (b) ask-in-a-turn then update **agentically** on approval (the Allow/Deny surface already exists). **Research first:** whether official Claude Code plugins have a built-in auto-update mechanism to use — else wire it ourselves off release tags. Depends on the broker being restart-safe (it is) and a versioned release process.
 - **`install-claude-shim` existing-symlink clobber bug** — *fix.* `cmd/c3-broker/install_claude_shim.go:79-82` assumes any existing `~/.local/bin/claude` symlink is a prior shim; on Karthi's machine it points at the real binary → replacing it orphans `claude` in PATH. Not yet triggered. Fix path is Karthi's call (see Decisions).
 
 ### Access control
