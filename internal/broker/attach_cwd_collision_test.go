@@ -11,7 +11,7 @@ import (
 )
 
 // SYMPTOM-3 (2026-06-04): multiple `claude` instances launched from the
-// SAME parent dir (/home/karthi/arogara) report identical os.Getwd(). A
+// SAME parent dir (/home/user/projects) report identical os.Getwd(). A
 // bare `/c3:attach` (cwd-default, no name) from a session that MEANT a
 // different sub-project silently resolves the saved parent→topic mapping
 // and races/steals the topic already held by a live sibling session.
@@ -44,7 +44,7 @@ func collisionSetup(t *testing.T, launchCWD string) (*Broker, *fakeChannel) {
 // Status==cwd_default_collision and a message naming the holder, plus the
 // two escape hatches. Before the fix this hit the raw force_steal proposal.
 func TestAttach_CwdDefault_HeldByDifferentLiveSession_WarnsCollision(t *testing.T) {
-	const launch = "/home/karthi/arogara"
+	const launch = "/home/user/projects"
 	b, _ := collisionSetup(t, launch)
 	defer b.Shutdown()
 
@@ -115,7 +115,7 @@ func TestAttach_CwdDefault_HeldByDifferentLiveSession_WarnsCollision(t *testing.
 // The accepted residual "wrong but free" case stays silent (attach-by-name
 // is the documented tool; there is no signal to detect "wrong project").
 func TestAttach_CwdDefault_TopicFree_ClaimsNormally(t *testing.T) {
-	const launch = "/home/karthi/arogara"
+	const launch = "/home/user/projects"
 	b, _ := collisionSetup(t, launch)
 	defer b.Shutdown()
 
@@ -157,7 +157,7 @@ func TestHeldByDifferentLiveSession_Predicate(t *testing.T) {
 
 	tid := int64(281)
 	key := MakeRouteKey("telegram", -100, &tid)
-	caller := &Stub{CLI: "claude", PID: 1, CWD: "/home/karthi/arogara"}
+	caller := &Stub{CLI: "claude", PID: 1, CWD: "/home/user/projects"}
 
 	// (a) Unheld → no collision.
 	if h, c := b.heldByDifferentLiveSession(key, caller); c || h != nil {
@@ -166,7 +166,7 @@ func TestHeldByDifferentLiveSession_Predicate(t *testing.T) {
 
 	// (b) Held by a DIFFERENT live session → collision. Use the running
 	// test process's own PID so IsAlive() is unambiguously true.
-	live := &Stub{CLI: "claude", PID: os.Getpid(), CWD: "/home/karthi/arogara", Conn: struct{}{}}
+	live := &Stub{CLI: "claude", PID: os.Getpid(), CWD: "/home/user/projects", Conn: struct{}{}}
 	if _, ok := b.Routes.Claim(key, live); !ok {
 		t.Fatal("seeding the live holder claim should succeed")
 	}
@@ -207,7 +207,7 @@ func TestHeldByDifferentLiveSession_Predicate(t *testing.T) {
 // user explicitly asked for that topic, so the held-topic prompt is
 // correct there.
 func TestAttach_ExplicitName_HeldTopic_StillForceSteal(t *testing.T) {
-	const launch = "/home/karthi/arogara"
+	const launch = "/home/user/projects"
 	b, _ := collisionSetup(t, launch)
 	defer b.Shutdown()
 
@@ -248,7 +248,7 @@ func TestAttach_ExplicitName_HeldTopic_StillForceSteal(t *testing.T) {
 // SAME logical session (same CLI+PID+CWD), the caller IS the holder — a
 // re-attach, not a collision. Must claim (transfer) normally, no warning.
 func TestAttach_CwdDefault_HeldBySameLogicalSession_NoWarn(t *testing.T) {
-	const launch = "/home/karthi/arogara"
+	const launch = "/home/user/projects"
 	b, _ := collisionSetup(t, launch)
 	defer b.Shutdown()
 
