@@ -14,10 +14,10 @@ printf %s 'THE_TOKEN' | c3-broker setup token
 
 It validates the token via getMe and writes it to `~/.config/c3/mappings.json` (mode 0600). Tell the user the bot's @username it reports.
 
-**Step 2 — pair the user's account (discovers their user id — no id hunting).** Pick a random 4-digit code yourself and tell the user: open a DM with @<bot username>, press START, and send exactly that code. Then run (it blocks until the code arrives — give the command a timeout at least as long as `--timeout-sec`):
+**Step 2 — pair the user's account (discovers their user id — no id hunting).** Generate a fresh random 4-digit code — run `shuf -i 1000-9999 -n 1` (or equivalent); never invent, reuse, or copy an example code — and tell the user: open a DM with @<bot username>, press START, and send exactly that code. Then run, passing the generated code via `--code` (it blocks until the code arrives — give the command a timeout at least as long as `--timeout-sec`):
 
 ```
-c3-broker setup pair dm --code 1234 --timeout-sec 240
+c3-broker setup pair dm --code <GENERATED_CODE> --timeout-sec 240
 ```
 
 On success it prints the captured user id and records `dm_chat_id`, `master_user_id`, and the allowlist entry. It pauses a running broker during the wait and restarts it after — that is expected. If the window expires: re-check the bot username and the exact code, then re-run with a fresh code. Last resort only (user already knows their numeric id): `c3-broker setup pair dm --id <user_id>`.
@@ -29,10 +29,10 @@ On success it prints the captured user id and records `dm_chat_id`, `master_user
 3. Add the bot as a member.
 4. Promote the bot to admin with exactly: Manage Topics, Send Messages, Delete Messages, Pin Messages.
 
-Then pick a fresh 4-digit code, ask the user (or any member) to send it **in the group**, and run:
+Then generate another fresh random 4-digit code (`shuf -i 1000-9999 -n 1` again — never reuse the DM code or an example), ask the user to send it **in the group from their own just-paired account** (once a DM pairing exists, codes from other members are ignored), and run:
 
 ```
-c3-broker setup pair group --code 5678 --name main --timeout-sec 240
+c3-broker setup pair group --code <GENERATED_CODE> --name main --timeout-sec 240
 ```
 
 `--name` is the config name for the group (omit it to default to the group's Telegram title, else "main"). On success it prints the captured chat id and records the group, `default_group` (if unset), and the allowlist entry. If it expires, the usual causes are bot privacy mode still enabled (@BotFather → `/setprivacy` → Disable) or the bot not actually in the group. Last resort: `c3-broker setup pair group --id <chat_id> --name main`.

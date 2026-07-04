@@ -220,12 +220,39 @@ func runSetupInteractive() error {
 
 	// Pairing owns the bot's getUpdates stream, so a running broker (which
 	// long-polls the same stream) must be stopped first — two consumers
-	// steal each other's updates. It is restarted at the end of setup.
+	// steal each other's updates. It is restarted at the end of setup, and —
+	// via the deferred restore below — on EVERY early error return in
+	// between (a failed pairing must never strand the broker stopped).
+	//
+	// Stopping is not enough on its own: a live adapter auto-respawns a dead
+	// broker within seconds (adapter recoverBroker → connectBroker), and the
+	// respawn would re-read the token we just wrote and steal getUpdates —
+	// gate-dropping the pairing code. So setup also HOLDS the broker
+	// singleton flock for the whole pairing window; a respawned broker then
+	// exits silently by design (runDaemon treats a lost flock race as a
+	// no-op). The lock is released before anything that (re)starts a broker.
+	var pairingLock *broker.SingletonLock
 	if needDM || needGroup {
-		if stopped, note := stopBrokerIfRunning(); stopped {
+		stopped, note := stopBrokerFn()
+		if stopped {
 			fmt.Println(note)
 		} else if note != "" {
 			fmt.Fprintln(os.Stderr, note)
+		}
+		defer func() {
+			// LIFO within this defer: release the flock FIRST so the broker
+			// we restore can actually take it. ensureBrokerUpFn is
+			// idempotent, so on the success path (where
+			// restartBrokerForNewConfig already ran) this is a no-op.
+			releasePairingLock(&pairingLock)
+			if stopped {
+				ensureBrokerUpFn()
+			}
+		}()
+		if lock, lockErr := acquireBrokerPairingLock(); lockErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not hold the broker singleton lock during pairing (%v) — if an adapter respawns the broker mid-window, pairing may miss your code\n", lockErr)
+		} else {
+			pairingLock = lock
 		}
 	}
 
@@ -240,12 +267,23 @@ func runSetupInteractive() error {
 		}
 		fmt.Printf("✓ paired — your Telegram user id is %d (recorded + allowlisted)\n", userID)
 	} else {
+		// Legacy configs (pre-allowlist schema, or a dropped allowlist) can
+		// hold dm_chat_id/groups WITHOUT the allowlist entries — the
+		// default-deny gate then drops all inbound while setup reports
+		// "already paired". Re-apply the pair mutations idempotently (they
+		// only append what's missing).
+		if repairAllowlist(mf) {
+			if err := writeMappingsFile(mfPath, mf); err != nil {
+				return err
+			}
+			fmt.Println("✓ repaired missing allowlist entries for the configured DM/group (legacy config)")
+		}
 		fmt.Printf("✓ DM already paired: Telegram user id %d\n", progress.DMChatID)
 	}
 
 	if needGroup {
 		walkBotGroupChecklist(r)
-		capture, err := pairGroupInteractive(r, token)
+		capture, err := pairGroupInteractive(r, token, groupPairSenderGate(mf))
 		if err != nil {
 			return err
 		}
@@ -256,8 +294,18 @@ func runSetupInteractive() error {
 		}
 		fmt.Printf("✓ paired — group %q has chat_id %d (recorded + allowlisted)\n", name, capture.ChatID)
 	} else {
+		if repairAllowlist(mf) {
+			if err := writeMappingsFile(mfPath, mf); err != nil {
+				return err
+			}
+			fmt.Println("✓ repaired missing allowlist entries for the configured DM/group (legacy config)")
+		}
 		fmt.Printf("✓ group already configured: %q (chat_id %d)\n", progress.GroupName, progress.GroupChatID)
 	}
+
+	// Pairing done — release the flock BEFORE anything below can start a
+	// broker (restartBrokerForNewConfig at the end of this flow).
+	releasePairingLock(&pairingLock)
 
 	fmt.Printf("✓ wrote %s (mode 0600)\n", mfPath)
 
@@ -427,16 +475,29 @@ func runSetupPair(args []string) error {
 	}
 
 	// Pairing needs exclusive getUpdates access; pause a running broker
-	// for the duration and put it back after (success or failure).
-	stopped, note := stopBrokerIfRunning()
+	// for the duration and put it back after (success or failure). The
+	// pause only HOLDS if setup also takes the broker singleton flock: a
+	// live adapter auto-respawns a stopped broker within seconds, and the
+	// respawn would steal getUpdates and gate-drop the pairing code. With
+	// the flock held, a respawned broker exits silently by design
+	// (runDaemon treats a lost flock race as a no-op).
+	stopped, note := stopBrokerFn()
 	if note != "" {
 		fmt.Println(note)
 	}
+	var pairingLock *broker.SingletonLock
 	defer func() {
+		// Release the flock FIRST so the broker we restore can take it.
+		releasePairingLock(&pairingLock)
 		if stopped {
-			ensureBrokerUp()
+			ensureBrokerUpFn()
 		}
 	}()
+	if lock, lockErr := acquireBrokerPairingLock(); lockErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not hold the broker singleton lock during pairing (%v) — if an adapter respawns the broker mid-window, pairing may miss your code\n", lockErr)
+	} else {
+		pairingLock = lock
+	}
 
 	deadline := time.Now().Add(time.Duration(*timeoutSec) * time.Second)
 	fmt.Printf("PAIRING CODE: %s\n", pairCode)
@@ -456,8 +517,13 @@ func runSetupPair(args []string) error {
 		fmt.Printf("✓ paired — Telegram user id %d recorded + allowlisted for DM\n", capture.UserID)
 		fmt.Println("Next: `c3-broker setup pair group` to discover + record the group's chat id.")
 	case "group":
-		fmt.Printf("Send exactly `%s` in the group (bot added, Topics on — any member can send it). Waiting up to %ds...\n", pairCode, *timeoutSec)
 		poller := newPairPoller(token, pairCode, pairTargetGroup)
+		poller.senderAllowed = groupPairSenderGate(mf)
+		if poller.senderAllowed != nil {
+			fmt.Printf("Send exactly `%s` in the group (bot added, Topics on) FROM YOUR PAIRED ACCOUNT — codes from other members are ignored. Waiting up to %ds...\n", pairCode, *timeoutSec)
+		} else {
+			fmt.Printf("Send exactly `%s` in the group (bot added, Topics on — any member can send it). Waiting up to %ds...\n", pairCode, *timeoutSec)
+		}
 		capture, err := poller.wait(deadline)
 		if err != nil {
 			return fmt.Errorf("%w — usual causes: bot privacy mode still enabled (@BotFather → /setprivacy → Disable) or bot not in the group. Re-run for a fresh code, or record the id directly with `c3-broker setup pair group --id <chat_id>`", err)
@@ -514,6 +580,17 @@ func runSetupFinish() error {
 	}
 	if progress.GroupChatID == 0 {
 		fmt.Fprintln(os.Stderr, "warning: no group configured — run `c3-broker setup pair group`")
+	}
+	// Legacy configs can hold dm_chat_id/groups without allowlist entries
+	// (pre-allowlist schema, or a dropped allowlist) — the default-deny gate
+	// then drops all inbound even though every step reads as done. Repair
+	// idempotently; finish runs on both setup paths, so this catches the
+	// agent-guided flow too.
+	if repairAllowlist(mf) {
+		if err := writeMappingsFile(mfPath, mf); err != nil {
+			return err
+		}
+		fmt.Println("✓ repaired missing allowlist entries for the configured DM/group (legacy config)")
 	}
 
 	host := DetectHostCLI()
@@ -723,6 +800,41 @@ func applyGroupPair(mf *mappings.MappingsFile, name string, chatID int64, title 
 	mf.AddAllowedGroup(chatID)
 }
 
+// repairAllowlist idempotently re-applies the pair mutations for every
+// identity already recorded in the config, and reports whether anything was
+// missing. A legacy config (pre-allowlist schema, or the known
+// dropped-allowlist incident) can hold dm_chat_id/groups WITHOUT allowlist
+// entries — the default-deny inbound gate then drops everything while setup
+// reports the steps as done. applyDMPair/applyGroupPair only append missing
+// entries, so this never clobbers an intact config.
+func repairAllowlist(mf *mappings.MappingsFile) bool {
+	cc := mf.Channels[telegramChannelName]
+	repaired := false
+	if cc.DMChatID != 0 && !mf.IsUserAllowed(cc.DMChatID) {
+		applyDMPair(mf, cc.DMChatID)
+		repaired = true
+	}
+	for name, g := range cc.Groups {
+		if g.ChatID != 0 && !mf.IsGroupAllowed(g.ChatID) {
+			applyGroupPair(mf, name, g.ChatID, g.Title)
+			repaired = true
+		}
+	}
+	return repaired
+}
+
+// groupPairSenderGate returns the sender filter for GROUP pairing. Once an
+// operator allowlist exists (both flows pair the DM first, so by group time
+// the owner is allowlisted), only an allowlisted sender's code is accepted —
+// a random group member must not be able to complete the pairing. The
+// any-sender behavior survives only for the bootstrap case (empty Users).
+func groupPairSenderGate(mf *mappings.MappingsFile) func(int64) bool {
+	if len(mf.AllowlistOrEmpty().Users) == 0 {
+		return nil
+	}
+	return mf.IsUserAllowed
+}
+
 // writeMappingsFile persists mf at path (0600, parent 0700).
 func writeMappingsFile(path string, mf *mappings.MappingsFile) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -825,6 +937,21 @@ type pairPoller struct {
 	retryDelay  time.Duration // sleep after a transient fetch error
 	client      *http.Client
 	progress    func(remaining time.Duration) // optional between-poll hook
+	// senderAllowed, when non-nil, restricts a GROUP pairing match to codes
+	// sent by an approved sender (the already-allowlisted operator). nil =
+	// any sender (the bootstrap case). See groupPairSenderGate.
+	senderAllowed func(userID int64) bool
+	// warn is where non-fatal poller warnings go; nil = os.Stderr. A test
+	// seam so the full-page-skip warning is assertable.
+	warn io.Writer
+}
+
+// warnWriter returns the poller's warning sink (os.Stderr by default).
+func (p *pairPoller) warnWriter() io.Writer {
+	if p.warn != nil {
+		return p.warn
+	}
+	return os.Stderr
 }
 
 // newPairPoller returns a production-configured poller.
@@ -865,7 +992,9 @@ func (p *pairPoller) fetchPairUpdates(offset int64) (updates []pairUpdate, fatal
 	url := fmt.Sprintf("%s/bot%s/getUpdates?timeout=%d&offset=%d", p.base, p.token, p.pollTimeout, offset)
 	resp, err := p.client.Get(url)
 	if err != nil {
-		return nil, false, fmt.Errorf("network: %w", err)
+		// Redact before wrapping: Go's *url.Error embeds the full
+		// token-bearing request URL, and this error reaches stderr.
+		return nil, false, fmt.Errorf("network: %s", redactToken(err.Error(), p.token))
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
@@ -894,12 +1023,36 @@ func (p *pairPoller) fetchPairUpdates(offset int64) (updates []pairUpdate, fatal
 	return parsed.Result, false, nil
 }
 
+// pairPageFull is Telegram's getUpdates page cap (limit defaults to 100). A
+// page this full may be hiding the code behind it, so it is the ONLY case in
+// which wait advances the getUpdates offset — see the loss-freedom note on
+// wait.
+const pairPageFull = 100
+
+// pairMaxWrongCodes is the fail-closed cap on wrong 4-digit candidate codes
+// observed in the watched chat type during one pairing window. Past it the
+// window aborts — someone is guessing codes.
+const pairMaxWrongCodes = 10
+
 // wait polls until the code arrives, the deadline passes, or a fatal
 // error occurs. Telegram keeps a 24h update backlog, so a code the user
 // sent BEFORE the first poll is still captured — the interactive flow's
 // "press enter to start waiting" gate loses nothing.
+//
+// Loss-freedom: wait polls WITHOUT advancing the getUpdates offset, so no
+// unrelated update (or the broker's unconfirmed backlog) is ever confirmed —
+// i.e. irreversibly destroyed — by setup, on success OR failure. Re-polls
+// return the same backlog again; `seen` dedupes it in memory. Nothing is
+// confirmed even on a successful match: the restarted broker re-fetches the
+// whole backlog, and the pairing code resurfacing there as a normal message
+// is acceptable noise (message loss is not). The single exception: a FULL
+// page (pairPageFull updates) with no code would hide every later update
+// forever, so as a last resort wait advances past that page — confirming it
+// server-side — with a loud warning.
 func (p *pairPoller) wait(deadline time.Time) (pairCapture, error) {
 	var offset int64
+	seen := make(map[int64]bool)
+	wrongCodes := 0
 	var lastTransient string
 	for time.Now().Before(deadline) {
 		updates, fatal, err := p.fetchPairUpdates(offset)
@@ -910,60 +1063,74 @@ func (p *pairPoller) wait(deadline time.Time) (pairCapture, error) {
 			// Transient — retry until the deadline; surface each distinct
 			// cause once so a persistent 409 isn't silent.
 			if err.Error() != lastTransient {
-				fmt.Fprintf(os.Stderr, "  (retrying: %v)\n", err)
+				fmt.Fprintf(p.warnWriter(), "  (retrying: %v)\n", err)
 				lastTransient = err.Error()
 			}
 			time.Sleep(p.retryDelay)
 			continue
 		}
 		lastTransient = ""
+		pageMax := int64(-1)
 		for _, upd := range updates {
-			if upd.UpdateID >= offset {
-				offset = upd.UpdateID + 1
+			if upd.UpdateID > pageMax {
+				pageMax = upd.UpdateID
 			}
+			if seen[upd.UpdateID] {
+				continue
+			}
+			seen[upd.UpdateID] = true
 			m := upd.Message
-			if m == nil || strings.TrimSpace(m.Text) != p.code {
+			if m == nil {
+				continue
+			}
+			// Scope to the watched chat type first: positive chat id =
+			// private chat (chat id == user id) — the same signal
+			// internal/broker/pairing.go isPrivateChat uses.
+			inScope := (p.target == pairTargetDM && m.Chat.ID > 0) ||
+				(p.target == pairTargetGroup && m.Chat.ID < 0)
+			if !inScope {
+				continue
+			}
+			text := strings.TrimSpace(m.Text)
+			if text != p.code {
+				// Fail closed on repeated wrong 4-digit guesses in the
+				// watched chat type (non-code chatter doesn't count).
+				if isPairCode(text) {
+					wrongCodes++
+					if wrongCodes >= pairMaxWrongCodes {
+						return pairCapture{}, fmt.Errorf("too many wrong codes (%d) during the pairing window — aborting", wrongCodes)
+					}
+				}
 				continue
 			}
 			switch p.target {
 			case pairTargetDM:
-				// Positive chat id = private chat (chat id == user id);
-				// same signal internal/broker/pairing.go isPrivateChat uses.
-				if m.Chat.ID > 0 && m.From != nil && m.From.ID > 0 {
-					p.commitOffset(offset)
+				if m.From != nil && m.From.ID > 0 {
 					return pairCapture{UserID: m.From.ID, ChatID: m.Chat.ID}, nil
 				}
 			case pairTargetGroup:
-				if m.Chat.ID < 0 {
-					capture := pairCapture{ChatID: m.Chat.ID, ChatTitle: m.Chat.Title}
-					if m.From != nil {
-						capture.UserID = m.From.ID
-					}
-					p.commitOffset(offset)
-					return capture, nil
+				var fromID int64
+				if m.From != nil {
+					fromID = m.From.ID
 				}
+				if p.senderAllowed != nil && !p.senderAllowed(fromID) {
+					fmt.Fprintf(p.warnWriter(), "  (ignored the group code from non-allowlisted sender %d — send it from the paired account)\n", fromID)
+					continue
+				}
+				return pairCapture{UserID: fromID, ChatID: m.Chat.ID, ChatTitle: m.Chat.Title}, nil
 			}
+		}
+		if len(updates) >= pairPageFull && pageMax >= offset {
+			// Last resort: a full page with no code — advance past it so
+			// later updates (which may hold the code) become visible.
+			offset = pageMax + 1
+			fmt.Fprintf(p.warnWriter(), "warning: pairing scanned a full page of %d unrelated Telegram updates without finding the code — skipping past them to keep looking; those updates are confirmed to Telegram and will NOT be re-delivered to the broker\n", len(updates))
 		}
 		if p.progress != nil {
 			p.progress(time.Until(deadline))
 		}
 	}
 	return pairCapture{}, fmt.Errorf("pairing window expired without receiving code %s", p.code)
-}
-
-// commitOffset advances Telegram's server-side update cursor past the
-// consumed pairing traffic so the broker that starts right after setup
-// doesn't re-read the code message and the /start noise (they'd be
-// gate-dropped anyway, but a clean cursor avoids a stale-update burst
-// on its first poll). Best-effort.
-func (p *pairPoller) commitOffset(offset int64) {
-	url := fmt.Sprintf("%s/bot%s/getUpdates?timeout=0&offset=%d", p.base, p.token, offset)
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return
-	}
-	_ = resp.Body.Close()
 }
 
 // generatePairCode returns a crypto-random 4-digit zero-padded code — the
@@ -1006,7 +1173,14 @@ func dmPairIntro(botUsername, code string) string {
 }
 
 // groupPairIntro is the group pairing banner shown before the wait.
-func groupPairIntro(code string) string {
+// restricted=true once an operator allowlist exists: only the paired
+// account's code is accepted then (see groupPairSenderGate).
+func groupPairIntro(code string, restricted bool) string {
+	if restricted {
+		return fmt.Sprintf(`Pair the group — C3 discovers the group's chat id from a code
+  In the group (bot added, Topics on), send exactly this code: %s
+  Send it from your own (paired) account — codes from other members are ignored.`, code)
+	}
 	return fmt.Sprintf(`Pair the group — C3 discovers the group's chat id from a code
   In the group (bot added, Topics on), send exactly this code: %s
   Any member can send it — C3 records the group, not the sender.`, code)
@@ -1058,15 +1232,16 @@ func pairDMInteractive(r *bufio.Reader, token, botUsername string) (int64, error
 }
 
 // pairGroupInteractive is pairDMInteractive's group twin. The direct-entry
-// gate accepts a negative chat id.
-func pairGroupInteractive(r *bufio.Reader, token string) (pairCapture, error) {
+// gate accepts a negative chat id. senderAllowed (nil = any sender) scopes
+// which sender's code completes the pairing — see groupPairSenderGate.
+func pairGroupInteractive(r *bufio.Reader, token string, senderAllowed func(int64) bool) (pairCapture, error) {
 	for attempt := 1; attempt <= 3; attempt++ {
 		code, err := generatePairCode()
 		if err != nil {
 			return pairCapture{}, err
 		}
 		fmt.Println()
-		fmt.Println(groupPairIntro(code))
+		fmt.Println(groupPairIntro(code, senderAllowed != nil))
 		fmt.Print(pairArmPrompt)
 		if line := readLine(r); line != "" {
 			id, perr := strconv.ParseInt(line, 10, 64)
@@ -1077,6 +1252,7 @@ func pairGroupInteractive(r *bufio.Reader, token string) (pairCapture, error) {
 		}
 		fmt.Printf("Waiting up to %s for code %s...\n", pairWaitBudget, code)
 		poller := newPairPoller(token, code, pairTargetGroup)
+		poller.senderAllowed = senderAllowed
 		poller.progress = waitProgressPrinter()
 		capture, err := poller.wait(time.Now().Add(pairWaitBudget))
 		if err == nil {
@@ -1116,6 +1292,47 @@ func fallbackGroupName(title string) string {
 // ---------------------------------------------------------------------------
 // Broker lifecycle around setup
 // ---------------------------------------------------------------------------
+
+// stopBrokerFn / ensureBrokerUpFn are the package-level indirections through
+// which setup touches the broker lifecycle. Production points at the real
+// helpers below; tests swap fakes so no real broker is stopped or spawned
+// (same pattern as installRunFn / installClaudeShimFn).
+var (
+	stopBrokerFn     = stopBrokerIfRunning
+	ensureBrokerUpFn = ensureBrokerUp
+)
+
+// acquireBrokerPairingLock takes the broker singleton flock (the same lock
+// runDaemon holds) so that, for the whole pairing window, any broker an
+// adapter auto-respawns loses the flock race and exits silently at startup —
+// instead of stealing the bot's getUpdates stream and gate-dropping the
+// pairing code. Retries briefly: the just-stopped broker may still be
+// releasing the lock, or an adapter may have respawned one in the gap (stop
+// it again and retry). While held, the pid file carries setup's own pid.
+func acquireBrokerPairingLock() (*broker.SingletonLock, error) {
+	var lastErr error
+	for attempt := 0; attempt < 10; attempt++ {
+		lock, err := broker.AcquireSingleton(broker.PidFilePath())
+		if err == nil {
+			return lock, nil
+		}
+		lastErr = err
+		// Someone else holds it — a respawned broker, most likely. Stop it
+		// and try again.
+		stopBrokerFn()
+		time.Sleep(200 * time.Millisecond)
+	}
+	return nil, lastErr
+}
+
+// releasePairingLock releases *lock if held and nils it, so the deferred
+// safety-net release and the explicit happy-path release can't double-free.
+func releasePairingLock(lock **broker.SingletonLock) {
+	if *lock != nil {
+		(*lock).Release()
+		*lock = nil
+	}
+}
 
 // brokerReachable reports whether a broker answers on the unix socket.
 func brokerReachable() bool {
@@ -1192,12 +1409,12 @@ func ensureBrokerUp() {
 // live. A SIGHUP reload is NOT sufficient after a token change — the
 // telegram channel is initialized at broker start.
 func restartBrokerForNewConfig() {
-	if stopped, note := stopBrokerIfRunning(); stopped {
+	if stopped, note := stopBrokerFn(); stopped {
 		fmt.Println("Restarting the C3 broker with the new config...")
 	} else if note != "" {
 		fmt.Fprintln(os.Stderr, note)
 	}
-	ensureBrokerUp()
+	ensureBrokerUpFn()
 }
 
 // ---------------------------------------------------------------------------
@@ -1639,6 +1856,17 @@ func validateBotToken(token string) (string, error) {
 	return validateBotTokenAt(telegramAPIBase(), token)
 }
 
+// redactToken masks the bot token anywhere it appears in s. Go's *url.Error
+// embeds the full request URL — for the Bot API that means the token-bearing
+// /bot<token>/ path segment — and setup prints these errors to stderr, so
+// every setup HTTP error must pass through here before it can be returned.
+func redactToken(s, token string) string {
+	if token == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, token, "<redacted>")
+}
+
 // validateBotTokenAt is validateBotToken against an explicit base URL
 // (injectable for tests).
 func validateBotTokenAt(base, token string) (string, error) {
@@ -1646,7 +1874,8 @@ func validateBotTokenAt(base, token string) (string, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
-		return "", fmt.Errorf("network: %w", err)
+		// Redact before wrapping — the transport error embeds the URL.
+		return "", fmt.Errorf("network: %s", redactToken(err.Error(), token))
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
