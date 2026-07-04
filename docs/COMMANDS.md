@@ -96,6 +96,7 @@ from any shell — the shared broker logic is identical either way.
 | `sessions`      | `/c3:sessions` (`commands/sessions.md`)         | `c3-broker sessions` (shell)            |
 | `attach`        | `/c3:attach` + `attach` MCP tool                | `attach` MCP tool                       |
 | `detach`        | `/c3:detach` + `detach` MCP tool                | — (no `detach` tool yet)                |
+| `update`        | `/c3:update` (`commands/update.md`)             | `c3-broker update [--check]` (shell)    |
 
 When adding a new verb:
 1. Implement the shared interface (broker subcommand or MCP tool).

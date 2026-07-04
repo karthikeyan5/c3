@@ -27,6 +27,15 @@ type MappingsFile struct {
 	// need a pointer to tell "unset" apart from an explicit false. omitempty
 	// keeps pre-feature and opted-out config files byte-identical.
 	AutoAttachOnResume bool `json:"auto_attach_on_resume,omitempty"`
+	// AutoUpdate gates whether the broker installs a newer C3 release ITSELF when
+	// its ~6h check finds one (downloads + checksum-verifies + atomic-swaps the
+	// binaries, then drains and exits so adapters reconnect onto the new broker).
+	// Absent or false ⇒ DISABLED, the v1 default: the always-on "update available"
+	// notice (status line + log) STILL fires — only the self-install is opt-in.
+	// A plain bool (not *bool) is correct here for the same reason as
+	// AutoAttachOnResume: the desired default IS the zero value, false. omitempty
+	// keeps pre-feature and opted-out config files byte-identical.
+	AutoUpdate bool `json:"auto_update,omitempty"`
 }
 
 // NotificationsConfig governs the "invasive" health-notification surfaces
@@ -53,6 +62,13 @@ func (mf *MappingsFile) InvasiveNotifications() bool {
 // a resumed session stays unattached until it attaches explicitly).
 func (mf *MappingsFile) AutoAttachOnResumeEnabled() bool {
 	return mf != nil && mf.AutoAttachOnResume
+}
+
+// AutoUpdateEnabled reports whether broker-driven self-update is enabled. A nil
+// file or an absent field ⇒ false (the v1 default: notices fire, but the broker
+// does not install updates on its own). SIGHUP-reloadable like other mappings.
+func (mf *MappingsFile) AutoUpdateEnabled() bool {
+	return mf != nil && mf.AutoUpdate
 }
 
 // Allowlist enforces default-deny inbound traffic. The channel layer drops

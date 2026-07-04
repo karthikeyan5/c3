@@ -37,6 +37,7 @@ in git.
 
 - [ ] Prebuilt binaries (Linux + macOS, amd64/arm64) — may slip to v1.1
 - [ ] GitHub-source marketplace edit — paired with prebuilt binaries
+- [x] Auto-update system: always-on status-line update notice + `/c3:update` / `c3-broker update` (checksum-verified atomic swap) + opt-in `auto_update` toggle (broker self-updates and restartlessly bounces). Binaries carry a build version via `-ldflags -X`. Needs one live end-to-end verify once the first GitHub release exists.
 
 ## Ship
 
