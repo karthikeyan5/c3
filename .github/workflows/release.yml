@@ -1,0 +1,52 @@
+name: release
+
+# Cut a GitHub release with prebuilt C3 binaries whenever a v* tag is pushed.
+# Pure-Go cross-compile (CGO disabled) builds every OS/arch on one Linux runner,
+# so no macOS runners and no artifact hand-off between jobs are needed.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # required to create the release and upload assets
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod # tracks the go directive in go.mod, no drift
+          cache: true
+
+      - name: Verify module and build
+        run: |
+          go mod verify
+          go build ./...
+
+      - name: Build release tarballs
+        run: make dist VERSION="${GITHUB_REF_NAME}"
+
+      - name: List artifacts
+        run: ls -l dist
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          notes_flags="--generate-notes"
+          case "$TAG" in
+            *-*) prerelease="--prerelease" ;; # v1.0.0-rc1 etc. → prerelease
+            *)   prerelease="" ;;
+          esac
+          gh release create "$TAG" \
+            dist/*.tar.gz dist/SHA256SUMS \
+            --title "$TAG" \
+            --verify-tag \
+            $notes_flags $prerelease

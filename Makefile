@@ -1,6 +1,10 @@
-.PHONY: build test clean install
+.PHONY: build test clean install dist
 
 BIN_DIR := bin
+DIST_DIR := dist
+# Release version: pass VERSION=v1.0.0 explicitly, or fall back to git describe.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
 build:
 	@mkdir -p $(BIN_DIR)
@@ -18,3 +22,14 @@ clean:
 
 install:
 	go install ./cmd/...
+
+# Cross-compile every platform into $(DIST_DIR)/ as release tarballs + SHA256SUMS.
+# Mirrors what .github/workflows/release.yml runs on a v* tag, for local testing.
+dist:
+	@rm -rf $(DIST_DIR) && mkdir -p $(DIST_DIR)
+	@for p in $(PLATFORMS); do \
+		os=$${p%/*}; arch=$${p#*/}; \
+		sh scripts/package.sh $$os $$arch $(VERSION) $(DIST_DIR); \
+	done
+	@cd $(DIST_DIR) && { sha256sum *.tar.gz > SHA256SUMS 2>/dev/null || shasum -a 256 *.tar.gz > SHA256SUMS; }
+	@echo "built $(DIST_DIR)/:"; ls -1 $(DIST_DIR)
