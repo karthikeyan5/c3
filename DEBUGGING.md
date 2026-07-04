@@ -66,6 +66,7 @@ and the log is the last place to find it.
 | Path | Content logged? |
 |---|---|
 | `delivered chan=… to cli=…` | **No** — message reached a CLI, content lives there. |
+| `deliver HELD … cannot render` | **No** — the session can't render inbound (e.g. launched without the dev-channels flag); the message is held in the durable queue, recover with `fetch_queue`. Not a loss. |
 | `deliver FAIL …` (write error to adapter) | **Yes** — `from=@user(uid=N) text="…" attach=kind/size`. |
 | `drop … no claim, fallback in cooldown` | **Yes** — bot didn't even reply, message is fully lost. |
 | `fallback … sent fallback reply` | **Yes** — user got a boilerplate, but no CLI processed the original. |
@@ -114,6 +115,17 @@ What to look for, in order:
    adapter-side or Claude Code side. Move to the next section.
 
 ### "Broker says delivered but Claude Code doesn't show the message"
+
+**First, the flagless case (v1).** If this session was launched without
+`--dangerously-load-development-channels plugin:c3@c3`, it can't render
+`<channel>` blocks at all. As of v1 the adapter detects a host that can't
+render (a lightweight ancestor-process check) and reports it at hello, so
+the broker **holds** that session's inbound in the durable queue instead of
+dropping it — a held-notice fires in the topic, the broker log shows
+`deliver HELD … cannot render`, and `fetch_queue` recovers the messages.
+The session keeps its claim for outbound. Relaunch with the flag for live
+rendering. The rest of this section covers the case where the flag *is* set
+but frames still don't appear.
 
 The adapter logs to its own stderr (transient). To capture it for one
 session, run the adapter outside Claude Code:
@@ -314,7 +326,7 @@ alive. The user is confused — they thought they'd closed it.
 
 **Why the broker doesn't auto-detect.** The broker doesn't
 periodically ping each adapter asking "is a human still driving
-you?" — intentional (Karthi 2026-05-18, TODO #19(d) Out of scope).
+you?" — intentional (out of scope).
 Adding heartbeats for an edge case adds plumbing and false-positive
 risk that outweighs the papercut. The PID-liveness check
 (`stubs.go::isPIDAlive`) only releases when the OS process is
@@ -337,12 +349,12 @@ actually gone; an idle-but-alive tab keeps its claim by design.
    actually holds the claim posts a one-shot identification message
    (cwd / cli / pid / timestamp) to the Telegram topic; tabs that
    aren't holders get `not attached` and stay silent. See
-   `plugins/c3/commands/c3-ping.md` for the slash command and
+   `plugins/c3/commands/ping.md` for the slash command and
    `internal/broker/handler.go::handlePingThisSession` for wire
    semantics.
 
-**Related verifications** (TODO #19(d) covered them as tests so the
-behaviour can't regress silently):
+**Related verifications** (covered as tests so the behaviour can't
+regress silently):
 
 - `internal/broker/handler_test.go::TestConnDrop_ReleasesClaimWhenPIDDead`
   — closing a conn whose stub's PID is already dead releases the
@@ -374,7 +386,7 @@ behaviour can't regress silently):
 
 ## Codex policy layer rejected attach
 
-**Failure mode (Sakthi's install pilot, 2026-05-16).** Codex was
+**Failure mode (from an install pilot).** Codex was
 configured with `approvals_reviewer = "auto_review"` (or
 `"guardian_subagent"`) in `~/.codex/config.toml`. A fresh `attach`
 tool call from a Codex session was silently classified as an
@@ -407,8 +419,7 @@ user couldn't distinguish "broker isn't configured" from "tenant
 policy blocked the call" from "broker succeeded but delivery
 dropped."
 
-**Why the adapter can't detect it itself.** Investigated 2026-05-19;
-see `docs/plans/2026-05-19-codex-policy-3state.md` (Phase 0).
+**Why the adapter can't detect it itself.**
 `approvals_reviewer` and `mcp_servers.<name>.tools.<tool>.approval_mode`
 live in `~/.codex/config.toml` — host-owned, not exposed via env or
 the MCP initialize handshake to spawned MCP servers. Any per-request

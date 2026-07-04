@@ -10,7 +10,7 @@ Three jobs, every one of them small:
 
 1. **Speak the host CLI's MCP protocol over stdio.** Claude Code and Codex both use a JSON-RPC 2.0 dialect very close to the MCP standard, with extensions for unsolicited notifications. A new CLI may differ in small ways; understand its dialect before starting.
 2. **Maintain a connection to the broker over `$XDG_RUNTIME_DIR/c3.sock`** (falls back to `/tmp/c3-$UID/c3.sock` when `XDG_RUNTIME_DIR` is unset — see internal/broker/paths.go) and translate MCP tool calls into broker IPC ops.
-3. **Translate inbound messages from the broker into whatever the host CLI can render.** Claude Code natively renders `notifications/claude/channel`. Codex doesn't render unsolicited notifications today, so the Codex adapter buffers them for a poll tool and (separately) forwards them via WebSocket into the running app-server. A new CLI may need yet another delivery path.
+3. **Translate inbound messages from the broker into whatever the host CLI can render.** Claude Code natively renders `notifications/claude/channel`. Codex doesn't render unsolicited notifications today, so the Codex adapter forwards them via WebSocket into the running app-server; anything held while a session is down is read back from the broker's durable queue with `fetch_queue`. A new CLI may need yet another delivery path.
 
 ## The broker IPC contract
 
@@ -21,7 +21,7 @@ Every adapter speaks the same broker IPC over `$XDG_RUNTIME_DIR/c3.sock`. Newlin
 | adapter → broker | `hello` | `{cli, pid, cwd}`. Broker replies with auto-attach state. |
 | adapter → broker | `server_info` | Get serverInfo + capabilities + instructions for the host CLI's `initialize`. |
 | adapter → broker | `tools_list` | Get the broker's tool list (channel-specific + plugin-registered + universal). |
-| adapter → broker | `attach` | `{cwd?, name?, target?, topic_id?, group?, channel?, create?}`. See attach semantics in `architecture.md` §5. |
+| adapter → broker | `attach` | `{cwd?, name?, target?, topic_id?, group?, channel?, create?}`. See the attach parser + proposal flow in [`COMMANDS.md`](COMMANDS.md). |
 | adapter → broker | `list_topics` | All known topics across channels + claim state. |
 | adapter → broker | `tool_call` | Forward a tool invocation to the broker (which dispatches to the right channel/plugin). |
 | broker → adapter | `hello_ack` | `{auto_attached, mapping?, claim_holder?, no_config?}`. |
@@ -31,7 +31,7 @@ Every adapter speaks the same broker IPC over `$XDG_RUNTIME_DIR/c3.sock`. Newlin
 | broker → adapter | `topics_list` | Listing response. |
 | broker → adapter | `error` | Generic error. |
 
-Implement this in a small Go package — `internal/adapter/broker/` provides shared client code that both built-in adapters use. New adapters import it.
+There is no shared adapter-client package to import. Each adapter hand-rolls its broker IPC on the low-level `internal/ipc` primitives (`ipc.NewConn`, `Conn.WriteJSON`, `Conn.ReadFrame`) dialed at `broker.SocketPath()`. Budget for real work: the two built-in adapters are ~2.3k LOC (Claude Code) and ~1.5k LOC (Codex), each reimplementing the handshake, attach, tool-forward, reconnect, and host-specific inbound translation described below. This is the hardest of C3's three extension seams.
 
 ## Adapter responsibilities, in order
 
@@ -77,11 +77,12 @@ The broker emits a normalized `Inbound{}` payload. Your adapter has to convert i
 
 **Codex** doesn't render unsolicited MCP notifications in the TUI today (open issues #18056, #17543, #15299). The Codex adapter therefore does three things in parallel:
 
-1. Buffer the inbound for an `inbox(limit, ack)` poll tool the agent can call to drain.
-2. Emit a `notifications/message` log notification (cheap, future-proofs for when Codex starts surfacing them).
-3. **If `C3_CODEX_REMOTE_BRIDGE=1`** is set in env (the C3 launcher sets it), forward the inbound as a real `turn/start` to the running Codex app-server via WebSocket. This is the only path that makes a Telegram message appear as a normal turn in the user's TUI.
+1. Emit a `notifications/message` log notification (cheap; future-proofs for when Codex starts surfacing unsolicited notifications).
+2. **If `C3_CODEX_REMOTE_BRIDGE=1`** is set in env (the C3 launcher sets it), forward the inbound as a real `turn/start` to the running Codex app-server via WebSocket. This is the path that makes a Telegram message appear as a normal turn in the user's TUI.
 
-For a new CLI, look at what unsolicited-notification capability it has. If none, the inbox-poll fallback is the safe baseline. If there's a push API (websocket, HTTP, IPC), use it; the adapter can have multiple delivery paths in parallel.
+Held messages — anything that arrived while no session was attached — are **not** buffered in the adapter. They live in the broker's durable per-route queue, and the agent drains them with the universal `fetch_queue` tool (both adapters expose it). An earlier Codex-only in-memory `inbox(limit, ack)` ring was retired in favor of that durable queue.
+
+For a new CLI, look at what unsolicited-notification capability it has. If none, `fetch_queue` against the broker's durable queue is the safe baseline. If there's a push API (websocket, HTTP, IPC), use it; the adapter can have multiple delivery paths in parallel.
 
 ## Codex adapter specifics
 
@@ -107,7 +108,7 @@ If your target CLI has a plugin marketplace, your adapter ships as a thin market
 ## Adding a new adapter — checklist
 
 - [ ] Cmd at `cmd/<cli>-adapter/main.go`
-- [ ] Uses `internal/adapter/broker` for the broker IPC client
+- [ ] Speaks broker IPC directly over `internal/ipc` (`ipc.NewConn` / `Conn.WriteJSON` / `Conn.ReadFrame`) at `broker.SocketPath()`
 - [ ] MCP server speaks the host CLI's exact dialect (initialize fields, capabilities, notification methods)
 - [ ] `attach` and `topics` implemented adapter-locally with the right user-facing wording
 - [ ] Inbound translation matches what the host CLI renders (rich notification, buffer + poll, websocket push, or whichever combination)
