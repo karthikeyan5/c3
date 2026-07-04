@@ -177,15 +177,29 @@ func runValidate(args []string) error {
 	return nil
 }
 
-// runRelease drops the claim on a route bound to args[0] (cwd). Requires a
-// running broker — sends the release op via the unix socket.
-//
-// v1 stub: not yet implemented. Print a TODO.
+// runRelease would drop the claim on a route bound to args[0] (cwd) via a
+// release-by-cwd IPC op. That op is deferred to v2; for v1 there is no
+// broker-side release, so this prints the two supported ways to free a held
+// topic instead of failing opaquely. (No `os.Exit(failure)` — this is guidance,
+// not an error: the caller in main.go only treats a non-nil return as failure.)
 func runRelease(args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: c3-broker release <cwd>")
 	}
-	// TODO: open /tmp/c3.sock, send a release-by-cwd op (new IPC op needed).
-	// For v1 the workaround is killing the holding session; for v2 add the op.
-	return fmt.Errorf("c3-broker release not yet implemented; for now, /exit the holding CLI session")
+	cwd := args[0]
+	fmt.Printf(`c3-broker release is not a live operation in v1 (the release-by-cwd IPC op is v2).
+
+To free the topic bound to %q, use one of the two supported paths:
+
+  1. From the session that HOLDS it: run the `+"`/c3:detach`"+` tool (or just
+     `+"`/exit`"+` that CLI). The claim drops as soon as that session lets go.
+
+  2. From the NEW session that wants it: attach by the topic's name and confirm
+     the force-steal, e.g. `+"`/c3:attach <topic>`"+` then re-invoke attach with
+     steal=true when prompted. This evicts the current holder.
+
+Run `+"`c3-broker status`"+` (or the `+"`topics`"+` tool) to see which session currently
+holds the route.
+`, cwd)
+	return nil
 }
