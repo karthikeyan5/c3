@@ -23,6 +23,12 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Every main package under cmd/ that ships as a runnable binary.
 BINS="c3-broker c3-claude-adapter c3-codex-adapter codex claude-shim migrate-legacy"
 
+# Go package path whose Version var the auto-updater reads; injected at build
+# time via -ldflags -X so a release binary knows its own version (dev builds,
+# built without this, report "dev" and never auto-update). Must stay in sync
+# with internal/version.
+VERSIONPKG="github.com/karthikeyan5/c3/internal/version.Version"
+
 # sha256 helper that works on both Linux (sha256sum) and macOS (shasum).
 sha256() {
 	if command -v sha256sum >/dev/null 2>&1; then
@@ -44,7 +50,7 @@ BUILT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "==> building $PKG"
 for b in $BINS; do
 	CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
-		go -C "$ROOT" build -trimpath -ldflags "-s -w" \
+		go -C "$ROOT" build -trimpath -ldflags "-s -w -X ${VERSIONPKG}=${VERSION}" \
 		-o "$DEST/$b" "./cmd/$b"
 done
 
