@@ -82,6 +82,15 @@ const (
 	// would reveal as much as it hides, so only >12 sentences get the elided
 	// preview. 13 = first count at which the middle (= total − 6) exceeds the 6 shown.
 	readbackTinyMaxSentences = 13
+	// readbackTinyMaxU16 — the DISPLAYED-length ceiling (UTF-16 units) below which a
+	// transcript renders as the bare TINY band REGARDLESS of sentence count: a short
+	// note that fits on one screen must show the whole verbatim text with no middle
+	// elision, even when it has many short sentences. Tunable.
+	readbackTinyMaxU16 = 1000
+	// readbackPreviewPartMaxU16 — the per-part hard cap (UTF-16 units) on the preview
+	// head (first 3) and tail (last 3): a few very long, rambly sentences are cut
+	// mid-sentence with '…' so the summary can't fill the screen. Tunable.
+	readbackPreviewPartMaxU16 = 220
 	// readbackShortMaxU16 — the SHORT band's DISPLAYED-length ceiling in UTF-16
 	// code units (Telegram's per-message cap). The measurement strips tags and
 	// counts entities as their visible character, so a fit here cannot 400.
@@ -204,12 +213,31 @@ func renderReadback(transcript string) (method, payload string, band readbackBan
 	sents := splitSentences(full)
 	words := len(strings.Fields(full))
 
-	// TINY: too few sentences for a meaningful middle elision.
-	if len(sents) < readbackTinyMaxSentences {
+	// TINY — the whole transcript displayed verbatim (header + escaped transcript),
+	// with no summary/elision/collapse. Chosen when EITHER there are too few sentences
+	// for a meaningful middle elision (< readbackTinyMaxSentences) OR the whole
+	// DISPLAYED message is short enough to sit on one screen (≤ readbackTinyMaxU16),
+	// REGARDLESS of sentence count — a short note of many short sentences fits and must
+	// not get the middle elision. BOTH tiny paths are guarded by the sendMessage hard
+	// cap: if the DISPLAYED tiny message would exceed readbackShortMaxU16 (Telegram's
+	// 4096 post-parse limit), fall through to the length-sized band logic rather than
+	// emit an oversized sendMessage — which also closes a latent bug where a
+	// few-but-huge-sentence note used to emit an over-4096 TINY message. The visible
+	// header mirrors the payload header with its <b> tags stripped (tags cost 0).
+	tinyDisplayedU16 := uint16Len("🎤 Voice transcript\n") + uint16Len(full)
+	if (len(sents) < readbackTinyMaxSentences || tinyDisplayedU16 <= readbackTinyMaxU16) &&
+		tinyDisplayedU16 <= readbackShortMaxU16 {
 		return "sendMessage", "🎤 <b>Voice transcript</b>\n" + htmlEscape(full), bandTiny
 	}
 
 	f3, l3, more := buildPreview(sents)
+	// BUG B: hard-cap each preview part so a few very long, rambly sentences can't fill
+	// the screen — cut mid-sentence with '…' at readbackPreviewPartMaxU16 UTF-16 units
+	// per part. Cap the UNescaped text then escape once (entity-safe, like the caption);
+	// every SHORT/DEADZONE/LONG assembly below reads the capped f3/l3, so the elided
+	// summary and its DISPLAYED-length measurement stay consistent.
+	f3 = capUTF16(f3, readbackPreviewPartMaxU16)
+	l3 = capUTF16(l3, readbackPreviewPartMaxU16)
 	header := fmt.Sprintf("🎤 <b>Voice transcript</b> · ~%d words", words)
 	elision := fmt.Sprintf("✂️✂️ %d more sentences ✂️✂️", more)
 
@@ -271,6 +299,11 @@ func readbackCaption(transcript string) string {
 	sents := splitSentences(full)
 	words := len(strings.Fields(full))
 	f3, l3, more := buildPreview(sents)
+	// Match the message bands' per-part preview cap (BUG B) before the caption's own
+	// budget cap below, so the caption's head/tail are bounded the same way. capUTF16
+	// is a no-op when a part already fits, so this never double-elides.
+	f3 = capUTF16(f3, readbackPreviewPartMaxU16)
+	l3 = capUTF16(l3, readbackPreviewPartMaxU16)
 
 	header := fmt.Sprintf("🎤 <b>Voice transcript</b> · ~%d words", words)
 	body := f3

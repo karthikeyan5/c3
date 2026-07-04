@@ -87,9 +87,9 @@ func TestUint16Len(t *testing.T) {
 	}{
 		{"", 0},
 		{"abc", 3},
-		{"🎤", 2},            // astral rune = surrogate pair = 2 UTF-16 units
-		{"a🎤🎤", 5},          // 1 + 2 + 2
-		{"नमस्ते", 6},        // BMP runes count 1 each
+		{"🎤", 2},      // astral rune = surrogate pair = 2 UTF-16 units
+		{"a🎤🎤", 5},    // 1 + 2 + 2
+		{"नमस्ते", 6}, // BMP runes count 1 each
 	}
 	for _, tc := range cases {
 		if got := uint16Len(tc.in); got != tc.want {
@@ -114,11 +114,11 @@ func TestHTMLEscape(t *testing.T) {
 }
 
 func TestRenderReadback_BandSelection(t *testing.T) {
-	tiny, _ := "One. Two. Three.", 0        // 3 sentences → TINY
-	short, _ := rbSentenceDoc(2000, 40)     // ~48 sentences, ~2k visible → SHORT
-	deadzone, _ := rbSentenceDoc(5000, 40)  // ~5k visible (4096<x≤9000 dead zone) → DEADZONE <details>
-	long, _ := rbSentenceDoc(12000, 40)     // ~12k visible (>9000) but rich ≤32000 → LONG
-	huge, _ := rbSentenceDoc(33000, 40)     // rich html >32000 bytes → HUGE
+	tiny, _ := "One. Two. Three.", 0       // 3 sentences → TINY
+	short, _ := rbSentenceDoc(2000, 40)    // ~48 sentences, ~2k visible → SHORT
+	deadzone, _ := rbSentenceDoc(5000, 40) // ~5k visible (4096<x≤9000 dead zone) → DEADZONE <details>
+	long, _ := rbSentenceDoc(12000, 40)    // ~12k visible (>9000) but rich ≤32000 → LONG
+	huge, _ := rbSentenceDoc(33000, 40)    // rich html >32000 bytes → HUGE
 
 	cases := []struct {
 		name       string
@@ -158,22 +158,41 @@ func TestRenderReadback_BandSelection(t *testing.T) {
 
 // TestRenderReadback_ShortExact pins the EXACT assembled SHORT-band string
 // (header · word count, first-3 … M more … last-3 summary, the heading, and the
-// whole verbatim transcript in an expandable blockquote).
+// whole verbatim transcript in an expandable blockquote). The fixture must exceed
+// readbackTinyMaxU16 DISPLAYED so it clears the length-based TINY gate (BUG A) and
+// actually lands in SHORT; it uses short 40-char sentences so the per-part preview
+// cap (BUG B) is a no-op and the assembly is fully predictable. (The original
+// ~150-u16 13-sentence fixture asserted the pre-BUG-A behavior — a screen-sized note
+// getting the middle elision — and now correctly renders as TINY; see
+// TestRenderReadback_ManyShortSentencesTiny.)
 func TestRenderReadback_ShortExact(t *testing.T) {
-	in := "S1 alpha. S2 bravo. S3 charlie. S4 delta. S5 echo. S6 foxtrot. S7 golf. " +
-		"S8 hotel. S9 india. S10 juliet. S11 kilo. S12 lima. S13 mike."
+	in, _ := rbSentenceDoc(1500, 40) // >1000 u16 displayed, ~37 short sentences → SHORT
 	method, payload, band := renderReadback(in)
 	if band != bandShort || method != "sendMessage" {
 		t.Fatalf("got method=%q band=%v; want sendMessage/short", method, band)
 	}
-	want := "🎤 <b>Voice transcript</b> · ~26 words\n" +
-		"S1 alpha. S2 bravo. S3 charlie.\n" +
-		"<i>✂️✂️ 7 more sentences ✂️✂️</i>\n" +
-		"S11 kilo. S12 lima. S13 mike.\n\n" +
-		"<b>Full Transcript</b>\n" +
-		"<blockquote expandable>" + in + "</blockquote>"
+	sents := splitSentences(in)
+	f3, l3, more := buildPreview(sents)
+	f3 = capUTF16(f3, readbackPreviewPartMaxU16) // no-op for 40-char sentences
+	l3 = capUTF16(l3, readbackPreviewPartMaxU16)
+	words := len(strings.Fields(in))
+	want := fmt.Sprintf("🎤 <b>Voice transcript</b> · ~%d words", words) + "\n" +
+		htmlEscape(f3) + "\n<i>" + fmt.Sprintf("✂️✂️ %d more sentences ✂️✂️", more) + "</i>\n" +
+		htmlEscape(l3) + "\n\n<b>Full Transcript</b>\n" +
+		"<blockquote expandable>" + htmlEscape(in) + "</blockquote>"
 	if payload != want {
 		t.Errorf("SHORT payload mismatch:\n got: %q\nwant: %q", payload, want)
+	}
+	// Structural pins that survive the programmatic want (guard against silent
+	// co-mutation of code + expectation).
+	if !strings.Contains(payload, "<blockquote expandable>") {
+		t.Error("SHORT band must wrap the full transcript in an expandable blockquote")
+	}
+	if !strings.Contains(payload, "<b>Full Transcript</b>") {
+		t.Error("SHORT band must carry the Full Transcript heading")
+	}
+	if !strings.Contains(payload, fmt.Sprintf("✂️✂️ %d more sentences ✂️✂️", more)) {
+		t.Error("SHORT band must carry the middle-elision marker")
 	}
 }
 
@@ -307,5 +326,174 @@ func TestReadbackCaption_EntityDense_NoSlicedEntity(t *testing.T) {
 		if !(strings.HasPrefix(rest, "&amp;") || strings.HasPrefix(rest, "&lt;") || strings.HasPrefix(rest, "&gt;")) {
 			t.Fatalf("caption has a sliced/partial HTML entity at byte %d: %.12q", i, rest)
 		}
+	}
+}
+
+// TestRenderReadback_ManyShortSentencesTiny is the BUG A regression: a real 45s
+// note — many short sentences, ~131 words — whose whole DISPLAYED message is under
+// readbackTinyMaxU16 must render as the bare TINY band (whole verbatim text, NO
+// middle elision), even though it has far more than readbackTinyMaxSentences
+// sentences. Before the fix it hit the SHORT-band "✂️ N more sentences ✂️" elision
+// despite easily fitting on screen.
+func TestRenderReadback_ManyShortSentencesTiny(t *testing.T) {
+	parts := []string{
+		"Hey I just finished the call with the vendor.",  // 9
+		"They can ship the units by next Tuesday.",       // 8
+		"The price is a little higher than we hoped.",    // 9
+		"But the quality is much better this time.",      // 8
+		"I told them we need the invoice first.",         // 8
+		"Can you check the budget for this quarter?",     // 8
+		"We might need to move some money around.",       // 8
+		"Also the paint order is still pending today.",   // 8
+		"I will follow up with them tomorrow morning.",   // 8
+		"The team wants to meet on Thursday instead.",    // 8
+		"That works for me if it works for you.",         // 9
+		"Let me know your thoughts when you get this.",   // 9
+		"Nothing else is urgent on my side today.",       // 8
+		"Talk soon and thanks for all of your help.",     // 9
+		"One more thing about the new shipping labels.",  // 8
+		"We should reuse the old template for now okay.", // 9
+	}
+	in := strings.Join(parts, " ")
+
+	sents := splitSentences(in)
+	if len(sents) <= readbackTinyMaxSentences {
+		t.Fatalf("fixture has %d sentences, want well over %d to exercise the length gate",
+			len(sents), readbackTinyMaxSentences)
+	}
+	if words := len(strings.Fields(in)); words < 120 || words > 145 {
+		t.Fatalf("fixture has %d words, want ~131", words)
+	}
+	displayed := uint16Len("🎤 Voice transcript\n" + in)
+	if displayed >= readbackTinyMaxU16 {
+		t.Fatalf("fixture DISPLAYED is %d u16, want < %d", displayed, readbackTinyMaxU16)
+	}
+
+	method, payload, band := renderReadback(in)
+	if band != bandTiny || method != "sendMessage" {
+		t.Fatalf("got method=%q band=%v; want sendMessage/tiny (BUG A: a screen-sized note must not be elided)", method, band)
+	}
+	// TINY carries the WHOLE verbatim transcript (no special chars → escape is identity).
+	if !strings.Contains(payload, in) {
+		t.Errorf("TINY payload must contain the full transcript verbatim; got %q", payload)
+	}
+	for _, marker := range []string{"✂️", "more sentences", "Full Transcript", "<blockquote"} {
+		if strings.Contains(payload, marker) {
+			t.Errorf("TINY payload must carry no elision/summary/collapse, but contains %q", marker)
+		}
+	}
+}
+
+// TestRenderReadback_TinyLengthBoundary pins the BUG A length gate at exactly
+// readbackTinyMaxU16 DISPLAYED units, using fixtures with 13 sentences (== the
+// count threshold, so the sentence-count gate never fires and only the length gate
+// decides). Just-at → TINY; one unit over → the length-sized band (SHORT here).
+func TestRenderReadback_TinyLengthBoundary(t *testing.T) {
+	// mk builds an ASCII transcript (u16 == byte len) of exactly fullU16 units with
+	// exactly 13 sentences: 12 "a." sentences + one padded final sentence.
+	mk := func(fullU16 int) string {
+		prefix := strings.Repeat("a. ", 12) // 12 sentences, 36 chars
+		rest := fullU16 - len(prefix)       // chars for the padded 13th sentence
+		if rest < 2 {
+			rest = 2
+		}
+		return prefix + strings.Repeat("w", rest-1) + "."
+	}
+	// header visible = "🎤 Voice transcript\n" = 20 u16; DISPLAYED = 20 + fullU16.
+	const headerU16 = 20
+	under := mk(readbackTinyMaxU16 - headerU16)    // DISPLAYED == readbackTinyMaxU16 → TINY
+	over := mk(readbackTinyMaxU16 - headerU16 + 1) // DISPLAYED == readbackTinyMaxU16+1 → SHORT
+
+	if n := len(splitSentences(under)); n != 13 {
+		t.Fatalf("under fixture has %d sentences, want 13", n)
+	}
+	if got := uint16Len("🎤 Voice transcript\n" + under); got != readbackTinyMaxU16 {
+		t.Fatalf("under DISPLAYED = %d, want exactly %d", got, readbackTinyMaxU16)
+	}
+	if got := uint16Len("🎤 Voice transcript\n" + over); got != readbackTinyMaxU16+1 {
+		t.Fatalf("over DISPLAYED = %d, want exactly %d", got, readbackTinyMaxU16+1)
+	}
+
+	if _, _, band := renderReadback(under); band != bandTiny {
+		t.Errorf("just-at %d u16 (13 sentences) → band=%v; want tiny", readbackTinyMaxU16, band)
+	}
+	if _, _, band := renderReadback(over); band != bandShort {
+		t.Errorf("just-over %d u16 (13 sentences) → band=%v; want short", readbackTinyMaxU16, band)
+	}
+}
+
+// TestRenderReadback_RamblyPreviewCapped is the BUG B regression: when the first
+// and last sentences are very long and rambly, the preview head (first 3) and tail
+// (last 3) must each be hard-capped at readbackPreviewPartMaxU16 UTF-16 units and
+// cut mid-sentence with a trailing '…', so the summary can't fill the screen. The
+// full uncapped head string must NOT appear in the rendered payload.
+func TestRenderReadback_RamblyPreviewCapped(t *testing.T) {
+	rambly := strings.TrimSpace(strings.Repeat("word ", 120)) + " end." // one ~604-char sentence
+	var parts []string
+	parts = append(parts, rambly) // sentence 0 (long)
+	for i := 0; i < 12; i++ {
+		parts = append(parts, "ok.") // short middle sentences
+	}
+	parts = append(parts, rambly) // last sentence (long)
+	in := strings.Join(parts, " ")
+
+	method, payload, band := renderReadback(in)
+	if band != bandShort || method != "sendMessage" {
+		t.Fatalf("got method=%q band=%v; want sendMessage/short (sanity for the fixture)", method, band)
+	}
+
+	sents := splitSentences(in)
+	rawF3, rawL3, _ := buildPreview(sents)
+	if uint16Len(rawF3) <= readbackPreviewPartMaxU16 || uint16Len(rawL3) <= readbackPreviewPartMaxU16 {
+		t.Fatalf("fixture preview parts are not over the cap (head=%d tail=%d, cap=%d); nothing to elide",
+			uint16Len(rawF3), uint16Len(rawL3), readbackPreviewPartMaxU16)
+	}
+	capF3 := capUTF16(rawF3, readbackPreviewPartMaxU16)
+	capL3 := capUTF16(rawL3, readbackPreviewPartMaxU16)
+
+	for name, part := range map[string]string{"head": capF3, "tail": capL3} {
+		if u := uint16Len(part); u > readbackPreviewPartMaxU16+1 {
+			t.Errorf("preview %s is %d u16, exceeds cap %d(+1)", name, u, readbackPreviewPartMaxU16)
+		}
+		if !strings.HasSuffix(part, "…") {
+			t.Errorf("preview %s was cut but does not end with '…': %q", name, part)
+		}
+		if !strings.Contains(payload, htmlEscape(part)) {
+			t.Errorf("rendered payload is missing the capped %s preview", name)
+		}
+	}
+	// The whole verbatim transcript (which necessarily contains the full head text)
+	// still lands in the expandable blockquote — the cap only bounds the SUMMARY. So
+	// scope the "uncapped head is gone" check to the PREVIEW region (everything before
+	// the Full Transcript heading), where the capped head must appear and the full one
+	// must not.
+	previewRegion := payload
+	if idx := strings.Index(payload, "<b>Full Transcript</b>"); idx >= 0 {
+		previewRegion = payload[:idx]
+	}
+	if !strings.Contains(previewRegion, htmlEscape(capF3)) {
+		t.Error("preview region is missing the capped head")
+	}
+	if strings.Contains(previewRegion, htmlEscape(rawF3)) {
+		t.Error("BUG B: preview region still contains the full uncapped head")
+	}
+}
+
+// TestRenderReadback_FewButHugeNotOversized is the latent-oversize regression: a
+// note of a FEW very long sentences (each ~1500 u16) has fewer than
+// readbackTinyMaxSentences sentences, so before the fix it took the unconditional
+// TINY path and emitted a sendMessage payload far over Telegram's 4096 post-parse
+// cap (a guaranteed 400). The guard must now route it away from sendMessage.
+func TestRenderReadback_FewButHugeNotOversized(t *testing.T) {
+	one := strings.Repeat("w", 1498) + "." // one ~1499-char sentence
+	in := strings.TrimSpace(strings.Repeat(one+" ", 5))
+	if n := len(splitSentences(in)); n >= readbackTinyMaxSentences {
+		t.Fatalf("fixture has %d sentences, want fewer than %d to hit the old TINY path", n, readbackTinyMaxSentences)
+	}
+
+	method, payload, band := renderReadback(in)
+	if method == "sendMessage" && uint16Len(payload) > readbackShortMaxU16 {
+		t.Fatalf("few-but-huge note emitted an oversized sendMessage: %d u16 (> %d) band=%v",
+			uint16Len(payload), readbackShortMaxU16, band)
 	}
 }
