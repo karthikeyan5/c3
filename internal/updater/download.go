@@ -21,17 +21,29 @@ const (
 	maxAsset = 500 << 20
 )
 
+// httpsOnlyRedirect rejects any redirect hop that leaves https. requireHTTPS
+// validates the INITIAL url; without this policy Go's default client would
+// happily follow an https→http downgrade redirect, quietly voiding the
+// https-only invariant. The download is checksum-gated regardless, so this is
+// defense-in-depth, but it makes the stated guarantee actually hold.
+func httpsOnlyRedirect(req *http.Request, _ []*http.Request) error {
+	if req.URL.Scheme != "https" {
+		return fmt.Errorf("refusing redirect to non-https url %q", req.URL.String())
+	}
+	return nil
+}
+
 // DefaultClient returns the HTTP client used for the release-API CHECK: a
 // conservative whole-request timeout, and http.DefaultTransport so a configured
 // HTTP(S)_PROXY / NO_PROXY in the environment is honoured automatically.
 func DefaultClient() *http.Client {
-	return &http.Client{Timeout: checkTimeout}
+	return &http.Client{Timeout: checkTimeout, CheckRedirect: httpsOnlyRedirect}
 }
 
 // downloadClient returns the client for asset DOWNLOADS — same proxy-aware
 // default transport, but a much longer timeout than the API check allows.
 func downloadClient() *http.Client {
-	return &http.Client{Timeout: assetDownloadTimeout}
+	return &http.Client{Timeout: assetDownloadTimeout, CheckRedirect: httpsOnlyRedirect}
 }
 
 // downloadClientFn is the factory Update uses to build its asset-download client.
