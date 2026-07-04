@@ -594,10 +594,36 @@ func (c *Channel) dispatchPollUpdate(updateID int64, poll *gotgbot.Poll) {
 	c.emitEvent(updateID, in, "poll_result")
 }
 
+// permTapDataPrefix mirrors the broker's permCallbackPrefix (internal/broker/
+// perm.go): the opaque callback_data namespace of relayed tool-use permission
+// keyboards ("perm:<verb>:<id>"). Taps in this namespace get a DEFERRED ack —
+// see dispatchCallback. Keep the two constants in lockstep.
+const permTapDataPrefix = "perm:"
+
+// Perm-tap feedback texts, delivered via answerCallbackQuery when the tap can
+// never reach the broker's resolver (which otherwise owns the deferred answer).
+// Short (Telegram caps answer text at 200 chars) and content-free — they never
+// echo the prompt body.
+const (
+	permTapNotAuthorizedText = "⛔ Not authorized — this Telegram account/chat is not paired with C3, so the tap was ignored."
+	permTapNotProcessedText  = "⚠️ C3 could not process the tap right now — try again shortly."
+	permTapUnroutableText    = "⚠️ This permission prompt is no longer accessible — tap not processed."
+)
+
 // dispatchCallback auto-acks an inline-keyboard callback (Q-RESULT-2: no
 // "loading…" spinner, no agent-in-the-loop for the ack) and THEN surfaces it as
 // a callback InboundEvent. P7 wires outbound keyboards that make these
 // actionable; P4 only routes the inbound press.
+//
+// EXCEPTION — permission taps ("perm:" namespace) get a DEFERRED ack. Telegram
+// answers a callback query exactly once, and for a permission tap that single
+// answer is the only user-visible feedback surface a button press has. The
+// original bare auto-ack spent it before the broker decided anything, so a tap
+// the broker refused (non-operator / expired / unknown) looked like "Allow did
+// nothing" — the 2026-06-30 fresh-install live bug. Now the broker's
+// resolvePerm answers with the tap's real outcome, and every early exit below
+// that stops a perm tap short of the broker answers explicitly instead
+// (emitPermTap) — a perm tap can never again die silently.
 //
 // Pass-1 C4: CallbackQuery.Message is a MaybeInaccessibleMessage (interface).
 // gotgbot rc.34 resolves it in CallbackQuery.UnmarshalJSON via
@@ -618,9 +644,12 @@ func (c *Channel) dispatchCallback(updateID int64, cq *gotgbot.CallbackQuery) {
 	if cq == nil {
 		return
 	}
+	permTap := strings.HasPrefix(cq.Data, permTapDataPrefix)
 	// Auto-ack immediately, regardless of whether we can route the event. A
-	// failed ack is logged but not fatal — the surfacing still proceeds.
-	if c.bot != nil {
+	// failed ack is logged but not fatal — the surfacing still proceeds. Perm
+	// taps are the exception: their single answer is deferred to the outcome
+	// (see the EXCEPTION note above).
+	if !permTap && c.bot != nil {
 		if _, err := c.bot.AnswerCallbackQuery(cq.Id, &gotgbot.AnswerCallbackQueryOpts{}); err != nil {
 			c.host.Logf("telegram: callback update=%d answerCallbackQuery failed: %v", updateID, err)
 		}
@@ -628,8 +657,13 @@ func (c *Channel) dispatchCallback(updateID int64, cq *gotgbot.CallbackQuery) {
 
 	msg := resolveCallbackMessage(cq.Message)
 	if msg == nil {
-		// Inaccessible message (deleted / too old) — no chat to route to.
-		c.host.Logf("telegram: drop callback update=%d (message inaccessible; auto-acked, cannot route)", updateID)
+		// Inaccessible message (deleted / too old) — no chat to route to. A perm
+		// tap still gets its deferred answer (a notice); anything else was already
+		// bare-acked above.
+		if permTap {
+			c.answerPermTap(updateID, cq.Id, permTapUnroutableText, false)
+		}
+		c.host.Logf("telegram: drop callback update=%d (message inaccessible; answered, cannot route)", updateID)
 		return
 	}
 
@@ -650,7 +684,75 @@ func (c *Channel) dispatchCallback(updateID int64, cq *gotgbot.CallbackQuery) {
 			},
 		},
 	}
+	if permTap {
+		c.emitPermTap(updateID, in, cq.Id)
+		return
+	}
 	c.emitEvent(updateID, in, "callback")
+}
+
+// emitPermTap runs a permission-keyboard tap ("perm:" namespace) through the
+// inbound gate and emits it — emitEvent's contract plus the deferred-ack duty:
+// dispatchCallback skipped the bare auto-ack for perm taps, so every outcome
+// that stops the tap short of the broker's resolvePerm (which owns the answer
+// on the routed path) must answer the callback query here instead. A refused
+// tap stays REFUSED — the verdict is never honored — only the silence goes.
+func (c *Channel) emitPermTap(updateID int64, in *c3types.Inbound, callbackID string) {
+	switch c.host.GateInbound(in) {
+	case channel.GateInboundDrop:
+		// Non-allowlisted sender/chat: the tap must not reach the broker (the
+		// allowlist gate is the security boundary), but unlike a generic gate
+		// drop — where strangers see a dead bot — the tapper is answered with an
+		// explicit refusal: only someone who can already SEE the prompt's
+		// keyboard can tap it, so the alert leaks nothing and turns the
+		// fresh-install "Allow did nothing" trap into an actionable message.
+		// Metadata-only log, as ever.
+		c.host.Logf("telegram: GATE drop update=%d kind=perm_tap chat=%d msg=%d sender=%d",
+			updateID, in.ChatID, in.MessageID, in.Sender.UserID)
+		c.answerPermTap(updateID, callbackID, permTapNotAuthorizedText, true)
+		return
+	case channel.GateInboundPairConsumed:
+		// Unreachable for a callback (no text body to match a pairing code) —
+		// parity with emitEvent. Still answered: no perm-tap branch may be silent.
+		c.host.Logf("telegram: GATE pair-consumed update=%d kind=perm_tap chat=%d (unexpected for an event)",
+			updateID, in.ChatID)
+		c.answerPermTap(updateID, callbackID, permTapNotProcessedText, false)
+		return
+	}
+	c.host.Logf("telegram: inbound update=%d kind=perm_tap chat=%d msg=%d", updateID, in.ChatID, in.MessageID)
+	if !c.host.Emit(in) {
+		// Worker queue full / stopped: the broker will never see this tap, so its
+		// deferred answer must happen here. The pending perm stays live
+		// broker-side — the notice invites a re-tap.
+		c.answerPermTap(updateID, callbackID, permTapNotProcessedText, false)
+	}
+}
+
+// answerPermTap answers a permission tap's callback query with outcome feedback
+// — a toast, or a modal alert for the must-not-miss refusals. Best-effort: a
+// failed answer is logged (metadata only) and the client eventually clears the
+// spinner on its own.
+func (c *Channel) answerPermTap(updateID int64, callbackID, text string, showAlert bool) {
+	if err := c.AnswerCallback(callbackID, text, showAlert); err != nil {
+		c.host.Logf("telegram: perm-tap update=%d answerCallbackQuery failed: %v", updateID, err)
+	}
+}
+
+// AnswerCallback answers an inline-keyboard callback query with optional toast
+// text (empty = bare ack) or a modal alert. This is the broker-facing
+// callbackAnswerer capability (see internal/broker/perm.go): the permission
+// relay uses it to deliver the deferred per-tap outcome for "perm:" keyboards
+// (resolved / not-authorized / expired) after dispatchCallback skipped the
+// early bare ack for that namespace.
+func (c *Channel) AnswerCallback(callbackID, text string, showAlert bool) error {
+	if c.bot == nil {
+		return errors.New("telegram: bot not started")
+	}
+	_, err := c.bot.AnswerCallbackQuery(callbackID, &gotgbot.AnswerCallbackQueryOpts{
+		Text:      text,
+		ShowAlert: showAlert,
+	})
+	return err
 }
 
 // resolveCallbackMessage extracts the accessible *gotgbot.Message from a

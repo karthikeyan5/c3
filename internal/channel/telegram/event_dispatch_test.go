@@ -1,6 +1,9 @@
 package telegram
 
 import (
+	"context"
+	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 
@@ -230,6 +233,182 @@ func TestDispatchCallback_AccessibleSurfaced(t *testing.T) {
 	}
 	if in.ChatID != -100 {
 		t.Errorf("callback should route to the message chat; got %d", in.ChatID)
+	}
+}
+
+// recordingBotClient is a gotgbot.BotClient double that records every Bot API
+// request (method + params) and returns `true` — the wire shape
+// answerCallbackQuery expects. Lets the perm-tap tests assert exactly which
+// callbacks were answered, with what toast text.
+type recordingBotClient struct {
+	mu    sync.Mutex
+	calls []recordedCall
+}
+
+type recordedCall struct {
+	method string
+	params map[string]any
+}
+
+func (r *recordingBotClient) RequestWithContext(_ context.Context, _, method string, params map[string]any, _ *gotgbot.RequestOpts) (json.RawMessage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, recordedCall{method: method, params: params})
+	return json.RawMessage("true"), nil
+}
+
+func (r *recordingBotClient) GetAPIURL(*gotgbot.RequestOpts) string               { return "" }
+func (r *recordingBotClient) FileURL(string, string, *gotgbot.RequestOpts) string { return "" }
+
+func (r *recordingBotClient) callsFor(method string) []recordedCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []recordedCall
+	for _, c := range r.calls {
+		if c.method == method {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// makeChannelWithBot is makeChannelWithPolls plus a live (recorded) bot, so the
+// answerCallbackQuery path actually runs instead of no-opping on a nil bot.
+func makeChannelWithBot(host channel.Host, rc *recordingBotClient) *Channel {
+	c := makeChannelWithPolls(host)
+	c.bot = &gotgbot.Bot{Token: "test", BotClient: rc}
+	return c
+}
+
+// permTapQuery builds an accessible-message callback query carrying `data`.
+func permTapQuery(id, data string, userID int64) *gotgbot.CallbackQuery {
+	return &gotgbot.CallbackQuery{
+		Id:   id,
+		From: gotgbot.User{Id: userID},
+		Data: data,
+		Message: &gotgbot.Message{
+			MessageId: 300,
+			Chat:      gotgbot.Chat{Id: -100},
+		},
+	}
+}
+
+// TestDispatchCallback_PermTap_AckDeferredToBroker: a "perm:" tap that passes
+// the gate must NOT be auto-acked by the channel. A callback query can be
+// answered exactly once, and for a permission tap that single answer is the
+// only user-visible feedback surface Telegram offers — the broker's
+// resolvePerm answers it with the tap's real outcome. An early empty ack here
+// would eat the feedback and reproduce the 2026-06-30 "Allow did nothing" bug.
+func TestDispatchCallback_PermTap_AckDeferredToBroker(t *testing.T) {
+	h := &fakeHost{decision: channel.GateInboundAllow}
+	rc := &recordingBotClient{}
+	c := makeChannelWithBot(h, rc)
+
+	c.dispatchCallback(9, permTapQuery("cb-perm", "perm:allow:abcde", 7))
+
+	if h.emitCount() != 1 {
+		t.Fatalf("a gated-through perm tap must emit; got %d", h.emitCount())
+	}
+	if calls := rc.callsFor("answerCallbackQuery"); len(calls) != 0 {
+		t.Fatalf("the channel must defer the perm-tap ack to the broker; got %d early answers: %+v", len(calls), calls)
+	}
+}
+
+// TestDispatchCallback_PermTap_GateDrop_AnswersNotAuthorized is the DM-variant
+// live-bug regression: a perm tap from a sender the inbound gate refuses
+// (non-allowlisted) must still be REFUSED — but answered with an explicit
+// not-authorized alert instead of dying silently. The verdict is never honored
+// (emit count stays 0); only the silence is removed.
+func TestDispatchCallback_PermTap_GateDrop_AnswersNotAuthorized(t *testing.T) {
+	h := &fakeHost{decision: channel.GateInboundDrop}
+	rc := &recordingBotClient{}
+	c := makeChannelWithBot(h, rc)
+
+	c.dispatchCallback(9, permTapQuery("cb-stranger", "perm:allow:abcde", 99))
+
+	if h.emitCount() != 0 {
+		t.Fatalf("a gate-dropped perm tap must NOT be emitted; got %d", h.emitCount())
+	}
+	calls := rc.callsFor("answerCallbackQuery")
+	if len(calls) != 1 {
+		t.Fatalf("a gate-dropped perm tap must be answered exactly once (silence = the live bug); got %d", len(calls))
+	}
+	text, _ := calls[0].params["text"].(string)
+	if !strings.Contains(text, "Not authorized") {
+		t.Fatalf("gate-drop answer must say not-authorized; got %q", text)
+	}
+	if alert, _ := calls[0].params["show_alert"].(bool); !alert {
+		t.Error("gate-drop answer should be an alert (a plain toast is too easy to miss)")
+	}
+}
+
+// TestDispatchCallback_PermTap_EmitDrop_Answered: when the worker queue refuses
+// the tap (Emit returns false — queue full / route worker gone) the broker will
+// never answer the deferred ack, so the channel must. The pending perm stays
+// live broker-side, so the notice invites a re-tap.
+func TestDispatchCallback_PermTap_EmitDrop_Answered(t *testing.T) {
+	h := &fakeHost{decision: channel.GateInboundAllow, emitDrops: true}
+	rc := &recordingBotClient{}
+	c := makeChannelWithBot(h, rc)
+
+	c.dispatchCallback(9, permTapQuery("cb-full", "perm:deny:abcde", 7))
+
+	calls := rc.callsFor("answerCallbackQuery")
+	if len(calls) != 1 {
+		t.Fatalf("an emit-dropped perm tap must be answered by the channel; got %d", len(calls))
+	}
+	if text, _ := calls[0].params["text"].(string); text == "" {
+		t.Error("emit-drop answer should carry a try-again notice, not a bare ack")
+	}
+}
+
+// TestDispatchCallback_PermTap_Inaccessible_Answered: a perm tap whose message
+// is inaccessible (deleted / too old) cannot be routed, so the channel answers
+// the deferred ack itself — never a spinner, never silence.
+func TestDispatchCallback_PermTap_Inaccessible_Answered(t *testing.T) {
+	h := &fakeHost{decision: channel.GateInboundAllow}
+	rc := &recordingBotClient{}
+	c := makeChannelWithBot(h, rc)
+
+	cq := &gotgbot.CallbackQuery{
+		Id:      "cb-gone",
+		From:    gotgbot.User{Id: 7},
+		Data:    "perm:allow:abcde",
+		Message: gotgbot.InaccessibleMessage{MessageId: 1, Chat: gotgbot.Chat{Id: -100}},
+	}
+	c.dispatchCallback(9, cq)
+
+	if h.emitCount() != 0 {
+		t.Fatalf("an inaccessible perm tap must not be routed; got %d emits", h.emitCount())
+	}
+	calls := rc.callsFor("answerCallbackQuery")
+	if len(calls) != 1 {
+		t.Fatalf("an unroutable perm tap must still be answered; got %d", len(calls))
+	}
+	if text, _ := calls[0].params["text"].(string); text == "" {
+		t.Error("unroutable perm-tap answer should carry a notice")
+	}
+}
+
+// TestDispatchCallback_NonPermTap_AutoAckImmediate pins the unchanged contract
+// for every OTHER callback (ask keyboards, agent-rendered buttons): immediate
+// bare auto-ack (Q-RESULT-2 — no spinner, no agent-in-the-loop), then surfaced.
+func TestDispatchCallback_NonPermTap_AutoAckImmediate(t *testing.T) {
+	h := &fakeHost{decision: channel.GateInboundAllow}
+	rc := &recordingBotClient{}
+	c := makeChannelWithBot(h, rc)
+
+	c.dispatchCallback(9, permTapQuery("cb-ask", "ask:abcde:0", 7))
+
+	if h.emitCount() != 1 {
+		t.Fatalf("a non-perm callback must emit; got %d", h.emitCount())
+	}
+	calls := rc.callsFor("answerCallbackQuery")
+	if len(calls) != 1 {
+		t.Fatalf("a non-perm callback must be auto-acked exactly once; got %d", len(calls))
+	}
+	if text, ok := calls[0].params["text"]; ok && text != "" {
+		t.Errorf("the generic auto-ack must stay bare (no toast); got %v", text)
 	}
 }
 

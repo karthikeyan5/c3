@@ -480,11 +480,20 @@ func (b *Broker) handlePermissionRequest(_ *ipc.Conn, stub *Stub, raw []byte) {
 		t := route.TopicID
 		topicID = &t
 	}
+	text := permPromptText(req.ToolName, req.Preview)
+	// Fresh-install hardening (2026-06-30 live bug): with NO DM-paired operator
+	// the resolvePerm sender-gate refuses EVERY tap, so a bare Allow/Deny
+	// keyboard would be a trap. Say so on the prompt itself; the keyboard still
+	// renders because pairing and then re-tapping works (the pending perm lives
+	// permExpiryTTL).
+	if len(b.Mappings().AllowlistOrEmpty().Users) == 0 {
+		text += "\n\n" + permNoOperatorHint
+	}
 	msgID, err := ch.SendReply(c3types.ReplyArgs{
 		Channel: route.Channel,
 		ChatID:  route.ChatID,
 		TopicID: topicID,
-		Text:    permPromptText(req.ToolName, req.Preview),
+		Text:    text,
 		Buttons: permKeyboard(req.RequestID),
 	})
 	if err != nil {
