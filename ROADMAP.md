@@ -29,7 +29,6 @@ What's next for C3 after v1. Everything here is future or unbuilt; shipped work 
 
 ## Packaging & platform
 
-- Auto-update from GitHub release tags.
 - Drop the development-channels flag once C3 ships through a trusted plugin store.
 - External (non-Go) loadable plugins.
 - Broker-side `/list` and `/route` commands.

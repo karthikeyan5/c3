@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "c3",
-      "description": "C3 — Claude Code Claw. Telegram (multi-channel ready) multiplexer that bridges Claude Code (and Codex) to a single Telegram bot. Per-cwd topic mappings, attach proposal flow, multi-group, voice transcription via STT plugin.",
+      "description": "C3 — command every coding agent you run, from one chat. One self-hosted broker multiplexes every Claude Code and Codex session onto one Telegram bot: a thread per project, tap-to-approve tool calls, voice-note transcription, and a durable queue so no message you send is ever lost.",
       "category": "messaging",
       "license": "MIT",
       "repository": "https://github.com/karthikeyan5/c3",
