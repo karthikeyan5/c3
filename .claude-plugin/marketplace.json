@@ -8,6 +8,8 @@
       "name": "c3",
       "description": "C3 — Claude Code Claw. Telegram (multi-channel ready) multiplexer that bridges Claude Code (and Codex) to a single Telegram bot. Per-cwd topic mappings, attach proposal flow, multi-group, voice transcription via STT plugin.",
       "category": "messaging",
+      "license": "MIT",
+      "repository": "https://github.com/karthikeyan5/c3",
       "source": "./plugins/c3"
     }
   ]
