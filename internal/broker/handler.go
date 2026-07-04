@@ -222,8 +222,16 @@ func (b *Broker) handleRecoverSession(conn *ipc.Conn, stub *Stub, raw []byte) {
 	if cur := stub.CurrentRoute(); cur != nil {
 		// Attach-first: a fresh session already claimed a route (by cwd) before
 		// this recover op arrived. Record that route under the stable id so a
-		// future resume recovers it. No re-claim.
+		// future resume recovers it. No re-claim. This is bookkeeping, not an
+		// auto-re-attach, so it runs regardless of the auto_attach_on_resume gate.
 		b.recordCurrentRouteForStable(stub, *cur)
+	} else if !b.Mappings().AutoAttachOnResumeEnabled() {
+		// Gate (v1 default OFF): the stable id is recorded above via
+		// SetStableSessionID (so a later SIGHUP-enable / attach still works), but
+		// the broker does NOT auto-re-claim the last route. Read live from the
+		// current mappings snapshot, so a SIGHUP config reload flips it without a
+		// restart. One line per resumed session (recover fires exactly once).
+		log.Printf("recover: auto-attach-on-resume DISABLED by config — session=%s not re-attached (set \"auto_attach_on_resume\": true in mappings.json to enable)", req.StableSessionID)
 	} else if key, cnt, ok := b.recoverSession(stub); ok {
 		resp.Recovered = true
 		resp.Channel = key.Channel
