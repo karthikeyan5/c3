@@ -3,10 +3,14 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
+	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -18,8 +22,13 @@ import (
 
 	"golang.org/x/term"
 
+	"github.com/karthikeyan5/c3/internal/broker"
 	"github.com/karthikeyan5/c3/internal/mappings"
+	"github.com/karthikeyan5/c3/internal/spawn"
 )
+
+// telegramChannelName is the mappings.json channel key setup manages.
+const telegramChannelName = "telegram"
 
 // printShimInstallFailure renders the structured failure surface for a
 // failed compulsory claude-shim install. Writes the same block to BOTH
@@ -65,40 +74,119 @@ func printShimInstallFailure(stdout, stderr io.Writer, err error) {
 	_, _ = io.WriteString(stderr, block)
 }
 
-// runSetup is the c3-broker setup subcommand. The flow (2026-05-19,
-// items #4 + #5 of TODO install-feedback):
-//
-//  1. Existing-config check.
-//  2. Educational preamble.
-//  3. Consent gate ("Install C3 for you?"); skippable via C3_NO_PROMPT=1.
-//  4. Bot token (only true prerequisite); validate via Telegram getMe.
-//  5. Kick off `go install ./cmd/...` in a goroutine.
-//  6. Walk user through the 6-step bot + group setup checklist.
-//  7. Collect DM chat id + group name + group chat id.
-//  8. Write mappings.json.
-//  9. Join the background install.
-//  10. promptSTTSetup, host-specific Codex / Claude shim installs.
-//  11. Restart instruction.
-//
-// The goal: the user's reading time during steps 6 covers `go install`'s
-// runtime, so wall-clock setup feels shorter.
+// setupUsage documents the setup phases. The bare invocation is the full
+// interactive flow (secondary path, for a real terminal); the phased
+// subcommands are the building blocks the agent-guided /c3:setup flow
+// drives one step at a time.
+const setupUsage = `c3-broker setup — configure C3.
+
+Usage:
+  c3-broker setup                 Full interactive flow (needs a TTY).
+  c3-broker setup token [TOKEN]   Validate + record the bot token. Reads the
+                                  token from stdin when no argument is given
+                                  (pipe it: printf '%s' "$T" | c3-broker setup token).
+  c3-broker setup pair dm [--code NNNN] [--timeout-sec N] [--id USER_ID]
+                                  Discover + record your Telegram user id: the
+                                  command watches the bot's inbox for the
+                                  4-digit code you send it in a DM. --id skips
+                                  pairing and records the id directly (last resort).
+  c3-broker setup pair group [--code NNNN] [--timeout-sec N] [--name NAME] [--id CHAT_ID]
+                                  Same, for a group: send the code in the group
+                                  and the group's chat id is discovered and
+                                  recorded. --name is the config name for the
+                                  group (default: the group's title, else "main").
+  c3-broker setup stt             Voice-transcription key setup (interactive or
+                                  piped answers).
+  c3-broker setup finish          Host integrations (claude shim / codex MCP),
+                                  broker restart with the new config, and the
+                                  post-setup "what now" summary.
+
+The primary setup experience is /c3:setup inside Claude Code — the agent
+drives these phases and walks you through each step.
+`
+
+// runSetup is the `c3-broker setup` subcommand entry point. Dispatches on
+// the argv following "setup": no args = the full interactive flow; a phase
+// name = one composable step of the agent-guided flow. Parsing os.Args here
+// (rather than in main.go) keeps the whole setup surface in this file.
 func runSetup() error {
+	return runSetupWithArgs(os.Args[2:])
+}
+
+// runSetupWithArgs is runSetup with the argv injected, for tests.
+func runSetupWithArgs(args []string) error {
+	if len(args) == 0 {
+		return runSetupInteractive()
+	}
+	switch args[0] {
+	case "token":
+		return runSetupToken(args[1:])
+	case "pair":
+		return runSetupPair(args[1:])
+	case "stt":
+		return runSetupSTT()
+	case "finish":
+		return runSetupFinish()
+	case "--help", "-h", "help":
+		// WriteString (not fmt.Print) — the usage text contains a literal
+		// printf example that would trip vet's format-directive check.
+		_, _ = os.Stdout.WriteString(setupUsage)
+		return nil
+	default:
+		return fmt.Errorf("unknown setup phase %q\n%s", args[0], setupUsage)
+	}
+}
+
+// runSetupInteractive is the full interactive flow (2026-06-30 rework of the
+// 2026-05-19 original, per the fresh-install UX feedback):
+//
+//  1. Load existing config; derive what is ALREADY configured (#4 — never
+//     re-show a completed step).
+//  2. Educational preamble + consent gate (C3_NO_PROMPT-aware).
+//  3. Bot token — keep a still-valid existing token on enter, else collect
+//     + validate via getMe (with inline @BotFather guidance).
+//  4. Kick off `go install ./cmd/...` in the background.
+//  5. DM pairing (#5) — a 4-digit code sent to the bot discovers and
+//     records the user id; no @userinfobot hunt. Manual id entry survives
+//     only as a last-resort line inside the pairing prompt.
+//  6. Group checklist (privacy/group/Topics/admin — no "create the bot"
+//     step; the token step already covered it) + group pairing (#6): the
+//     code sent in the group discovers the chat id.
+//  7. STT setup (#3 — short copy), host integrations, broker restart with
+//     the new config, and a stand-alone "what now" block (#8/#9/#10).
+func runSetupInteractive() error {
 	mfPath, err := mappings.DefaultPath()
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(mfPath); err == nil {
-		fmt.Printf("Existing config found at %s. Overwrite? [y/N]: ", mfPath)
-		if !readBool(false) {
-			fmt.Println("Aborted.")
-			return nil
-		}
-	}
 
 	r := bufio.NewReader(os.Stdin)
 
-	// 2 + 3: preamble then consent gate. Consent honours C3_NO_PROMPT
-	// so Codex's non-interactive setup path doesn't deadlock.
+	mf, existed, loadErr := loadOrInitMappings(mfPath)
+	if loadErr != nil {
+		// Present but unreadable. Setup is the tool that fixes config, so
+		// start from a fresh skeleton rather than dead-ending — but say so.
+		fmt.Fprintf(os.Stderr, "warning: existing %s is unreadable (%v) — starting from a fresh config\n", mfPath, loadErr)
+		mf = skeletonMappings()
+		existed = false
+	}
+	progress := deriveProgress(mf, defaultSTTEnvPath())
+
+	if existed {
+		fmt.Printf("Existing config found at %s.\n", mfPath)
+		fmt.Println(progress.summaryLine())
+		fmt.Println("Setup keeps what is already configured and only asks for what's missing.")
+		fmt.Println("(To start over from scratch, delete the file first, then re-run setup.)")
+		fmt.Print("Continue? [Y/n]: ")
+		if !readBoolDefault(r, true) {
+			fmt.Println("Aborted.")
+			return nil
+		}
+		fmt.Println()
+	}
+
+	// Preamble then consent gate. Consent honours C3_NO_PROMPT so a
+	// non-interactive driver doesn't deadlock.
 	printPreamble()
 	if !confirmInstall(r) {
 		fmt.Println()
@@ -107,95 +195,77 @@ func runSetup() error {
 	}
 	fmt.Println()
 
-	// 4: bot token ask + validation. Must come before background
-	// install kicks off — the install is meaningless if the user
-	// abandons setup at the token step.
-	fmt.Print("Telegram bot token (from @BotFather): ")
-	token, err := readPassword(r)
+	// Bot token (only true prerequisite); validated via getMe. Must come
+	// before the background install kicks off — the install is meaningless
+	// if the user abandons setup at the token step.
+	token, botUsername, err := promptBotToken(r, progress.Token)
 	if err != nil {
-		return fmt.Errorf("read token: %w", err)
+		return err
 	}
-	fmt.Println() // newline after the silent prompt
-	if token == "" {
-		return errors.New("bot token is required")
+	applyBotToken(mf, token)
+	if err := writeMappingsFile(mfPath, mf); err != nil {
+		return err
 	}
 
-	// Validate via getMe BEFORE doing anything else.
-	username, err := validateBotToken(token)
-	if err != nil {
-		return fmt.Errorf("token validation failed: %w", err)
-	}
-	fmt.Printf("✓ token valid; bot is @%s\n", username)
-	fmt.Println()
-
-	// 5: kick off background `go install ./cmd/...`. The walk through
-	// the bot+group checklist (~2-5 minutes of user reading) should
-	// cover this comfortably; cold rebuild of C3 is ~30s, warm ~5s.
-	//
-	// Cancellable via ctx so a Ctrl-C during the interactive walk
-	// doesn't leave a dangling go subprocess.
+	// Kick off background `go install ./cmd/...`. The pairing waits and the
+	// group checklist (minutes of user activity) cover this comfortably;
+	// cold rebuild of C3 is ~30s, warm ~5s. Cancellable via ctx so a Ctrl-C
+	// during the interactive walk doesn't leave a dangling go subprocess.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	installCh := startBackgroundInstall(ctx)
 
-	// 6: walk through the 6-step manual checklist inline.
-	walkBotGroupChecklist(r)
+	needDM := progress.DMChatID == 0
+	needGroup := progress.GroupChatID == 0
 
-	// 7: collect remaining identifiers (DM chat id, group name, group
-	// chat id). These need the bot+group to exist already, which is
-	// why they come AFTER the walk.
-	fmt.Println()
-	fmt.Print("Your Telegram user id (DM chat id, positive int — ask @userinfobot if unknown): ")
-	dmChatID, err := readInt64(r)
-	if err != nil {
-		return fmt.Errorf("dm chat id: %w", err)
-	}
-
-	fmt.Print("Group name to use as the default for new topics (e.g. \"main\"): ")
-	groupName := readLine(r)
-	if groupName == "" {
-		groupName = "main"
+	// Pairing owns the bot's getUpdates stream, so a running broker (which
+	// long-polls the same stream) must be stopped first — two consumers
+	// steal each other's updates. It is restarted at the end of setup.
+	if needDM || needGroup {
+		if stopped, note := stopBrokerIfRunning(); stopped {
+			fmt.Println(note)
+		} else if note != "" {
+			fmt.Fprintln(os.Stderr, note)
+		}
 	}
 
-	fmt.Printf("Chat id of the %q supergroup (negative int starting with -100): ", groupName)
-	groupChatID, err := readInt64(r)
-	if err != nil {
-		return fmt.Errorf("group chat id: %w", err)
+	if needDM {
+		userID, err := pairDMInteractive(r, token, botUsername)
+		if err != nil {
+			return err
+		}
+		applyDMPair(mf, userID)
+		if err := writeMappingsFile(mfPath, mf); err != nil {
+			return err
+		}
+		fmt.Printf("✓ paired — your Telegram user id is %d (recorded + allowlisted)\n", userID)
+	} else {
+		fmt.Printf("✓ DM already paired: Telegram user id %d\n", progress.DMChatID)
 	}
 
-	// 8: write mappings.json. Do this BEFORE joining the install
-	// goroutine — even if `go install` failed, the user's already-
-	// entered config is worth persisting (they don't want to re-enter
-	// the bot token on retry).
-	mf := &mappings.MappingsFile{
-		SchemaVersion: 1,
-		Channels: map[string]mappings.ChannelConfig{
-			"telegram": {
-				BotToken:     token,
-				DefaultGroup: groupName,
-				Groups: map[string]mappings.GroupConfig{
-					groupName: {ChatID: groupChatID},
-				},
-				DMChatID:     dmChatID,
-				MasterUserID: dmChatID,
-			},
-		},
-		Mappings: map[string]mappings.Mapping{},
-	}
-	if err := os.MkdirAll(filepath.Dir(mfPath), 0o700); err != nil {
-		return fmt.Errorf("mkdir mappings parent: %w", err)
-	}
-	if err := mappings.Write(mfPath, mf); err != nil {
-		return fmt.Errorf("write mappings: %w", err)
+	if needGroup {
+		walkBotGroupChecklist(r)
+		capture, err := pairGroupInteractive(r, token)
+		if err != nil {
+			return err
+		}
+		name := promptGroupName(r, capture.ChatTitle)
+		applyGroupPair(mf, name, capture.ChatID, capture.ChatTitle)
+		if err := writeMappingsFile(mfPath, mf); err != nil {
+			return err
+		}
+		fmt.Printf("✓ paired — group %q has chat_id %d (recorded + allowlisted)\n", name, capture.ChatID)
+	} else {
+		fmt.Printf("✓ group already configured: %q (chat_id %d)\n", progress.GroupName, progress.GroupChatID)
 	}
 
 	fmt.Printf("✓ wrote %s (mode 0600)\n", mfPath)
 
-	// 9: join the background install. Almost always instant after the
-	// chat-id prompts, but if the user was fast we wait visibly.
+	// Join the background install. Almost always instant after the pairing
+	// waits, but if the user was fast we wait visibly.
 	if err := joinBackgroundInstall(installCh); err != nil {
-		// Non-fatal for the rest of the flow — mappings.json is
-		// already written, the user can manually run `/c3:build` or
+		// Non-fatal for the rest of the flow — mappings.json is already
+		// written, the user can manually run `/c3:build` or
 		// `go install ./cmd/...` after. Surface the error and continue.
 		fmt.Fprintf(os.Stderr, "warning: background `go install` failed: %v\n", err)
 		fmt.Fprintln(os.Stderr, "  Run `/c3:build` (Claude) or `go install ./cmd/...` (Codex / plain shell) to retry.")
@@ -203,15 +273,266 @@ func runSetup() error {
 
 	host := DetectHostCLI()
 
-	// 10: optional STT setup (most users want this — voice is the
-	// primary input channel for c3).
-	sttWritten, sttErr := promptSTTSetup(r)
-	if sttErr != nil {
-		// Non-fatal: STT setup is optional. Surface the error and keep
-		// the mappings.json write that already succeeded.
-		fmt.Fprintf(os.Stderr, "warning: STT setup skipped: %v\n", sttErr)
+	// Optional STT setup (most users want this — voice is the primary
+	// input channel for c3). Never re-shown once configured (#4).
+	sttWritten := progress.STTConfigured
+	if progress.STTConfigured {
+		fmt.Printf("✓ STT already configured (%s) — run `c3-broker setup stt` to change keys\n", defaultSTTEnvPath())
+	} else {
+		written, sttErr := promptSTTSetup(r)
+		if sttErr != nil {
+			// Non-fatal: STT setup is optional. Surface the error and keep
+			// the mappings.json writes that already succeeded.
+			fmt.Fprintf(os.Stderr, "warning: STT setup skipped: %v\n", sttErr)
+		}
+		sttWritten = written
 	}
 
+	installHostIntegrations(host)
+
+	// #10 (2026-05-18): under Codex, setup typically runs without a
+	// connected TTY (the agent invokes it programmatically), so the STT
+	// prompts get auto-skipped with empty responses. Tell the user
+	// explicitly when no STT env file was written so they don't end up
+	// with voice messages silently failing.
+	if !sttWritten {
+		sttHint(host)
+	}
+
+	// Bounce the broker so the freshly-written config is what's live.
+	// SIGHUP is NOT enough after a token change — the telegram channel is
+	// initialized at broker start (see /c3:reload-config), so stop + respawn.
+	fmt.Println()
+	restartBrokerForNewConfig()
+
+	fmt.Println()
+	fmt.Println(postSetupWhatNow(host))
+	return nil
+}
+
+// runSetupToken is the `c3-broker setup token` phase: read a bot token from
+// argv or stdin, validate it via getMe, and upsert it into mappings.json.
+// The agent-guided /c3:setup flow drives this step; piping the token via
+// stdin keeps it off the process arg list.
+func runSetupToken(args []string) error {
+	var token string
+	if len(args) > 0 {
+		token = strings.TrimSpace(args[0])
+	} else {
+		data, err := io.ReadAll(io.LimitReader(os.Stdin, 1024))
+		if err != nil {
+			return fmt.Errorf("read token from stdin: %w", err)
+		}
+		token = strings.TrimSpace(string(data))
+	}
+	if token == "" {
+		return errors.New("no token provided — pass it as an argument or pipe it via stdin")
+	}
+	username, err := validateBotToken(token)
+	if err != nil {
+		return fmt.Errorf("token validation failed: %w", err)
+	}
+	mfPath, err := mappings.DefaultPath()
+	if err != nil {
+		return err
+	}
+	mf, _, err := loadOrInitMappings(mfPath)
+	if err != nil {
+		return fmt.Errorf("existing %s is unreadable: %w — fix or delete it, then re-run", mfPath, err)
+	}
+	applyBotToken(mf, token)
+	if err := writeMappingsFile(mfPath, mf); err != nil {
+		return err
+	}
+	fmt.Printf("✓ token valid; bot is @%s\n", username)
+	fmt.Printf("✓ wrote %s (mode 0600)\n", mfPath)
+	fmt.Println("Next: `c3-broker setup pair dm` to discover + record your user id.")
+	return nil
+}
+
+// runSetupPair is the `c3-broker setup pair dm|group` phase. Unlike
+// `c3-broker pair` (which arms a window on the RUNNING broker for adding
+// extra users/groups at runtime), this phase runs while setup owns the
+// bot's getUpdates stream and DISCOVERS the id — the whole point is that
+// the user never has to find a user id or chat id by hand (#5/#6).
+func runSetupPair(args []string) error {
+	usage := errors.New("usage: c3-broker setup pair dm|group [--code NNNN] [--timeout-sec N] [--name NAME] [--id ID]")
+	if len(args) == 0 {
+		return usage
+	}
+	target := args[0]
+	if target != "dm" && target != "group" {
+		return usage
+	}
+
+	fs := flag.NewFlagSet("setup pair", flag.ContinueOnError)
+	code := fs.String("code", "", "4-digit pairing code to watch for (default: generated)")
+	timeoutSec := fs.Int("timeout-sec", 300, "how long to wait for the code before giving up")
+	name := fs.String("name", "", "config name for the paired group (group only; default: the group's title, else \"main\")")
+	directID := fs.Int64("id", 0, "skip pairing and record this id directly (last resort)")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+
+	mfPath, err := mappings.DefaultPath()
+	if err != nil {
+		return err
+	}
+	mf, _, err := loadOrInitMappings(mfPath)
+	if err != nil {
+		return fmt.Errorf("existing %s is unreadable: %w — fix or delete it, then re-run", mfPath, err)
+	}
+	token := mf.Channels[telegramChannelName].BotToken
+	if token == "" && *directID == 0 {
+		return errors.New("no bot token configured yet — run `c3-broker setup token` first")
+	}
+
+	// Last-resort direct entry: record the id without pairing.
+	if *directID != 0 {
+		switch target {
+		case "dm":
+			if *directID <= 0 {
+				return fmt.Errorf("--id %d: a Telegram user id is a positive integer", *directID)
+			}
+			applyDMPair(mf, *directID)
+			if err := writeMappingsFile(mfPath, mf); err != nil {
+				return err
+			}
+			fmt.Printf("✓ recorded user id %d (manual entry) + allowlisted for DM\n", *directID)
+		case "group":
+			if *directID >= 0 {
+				return fmt.Errorf("--id %d: a Telegram group chat id is a negative integer", *directID)
+			}
+			gname := *name
+			if gname == "" {
+				gname = "main"
+			}
+			applyGroupPair(mf, gname, *directID, "")
+			if err := writeMappingsFile(mfPath, mf); err != nil {
+				return err
+			}
+			fmt.Printf("✓ recorded group %q chat_id %d (manual entry) + allowlisted\n", gname, *directID)
+		}
+		return nil
+	}
+
+	pairCode := *code
+	if pairCode == "" {
+		pairCode, err = generatePairCode()
+		if err != nil {
+			return err
+		}
+	} else if !isPairCode(pairCode) {
+		return fmt.Errorf("--code %q: must be exactly 4 digits", pairCode)
+	}
+
+	// Pairing needs exclusive getUpdates access; pause a running broker
+	// for the duration and put it back after (success or failure).
+	stopped, note := stopBrokerIfRunning()
+	if note != "" {
+		fmt.Println(note)
+	}
+	defer func() {
+		if stopped {
+			ensureBrokerUp()
+		}
+	}()
+
+	deadline := time.Now().Add(time.Duration(*timeoutSec) * time.Second)
+	fmt.Printf("PAIRING CODE: %s\n", pairCode)
+
+	switch target {
+	case "dm":
+		fmt.Printf("Send exactly `%s` to your bot in a DM (press START first). Waiting up to %ds...\n", pairCode, *timeoutSec)
+		poller := newPairPoller(token, pairCode, pairTargetDM)
+		capture, err := poller.wait(deadline)
+		if err != nil {
+			return fmt.Errorf("%w — re-run for a fresh code, or record the id directly with `c3-broker setup pair dm --id <user_id>`", err)
+		}
+		applyDMPair(mf, capture.UserID)
+		if err := writeMappingsFile(mfPath, mf); err != nil {
+			return err
+		}
+		fmt.Printf("✓ paired — Telegram user id %d recorded + allowlisted for DM\n", capture.UserID)
+		fmt.Println("Next: `c3-broker setup pair group` to discover + record the group's chat id.")
+	case "group":
+		fmt.Printf("Send exactly `%s` in the group (bot added, Topics on — any member can send it). Waiting up to %ds...\n", pairCode, *timeoutSec)
+		poller := newPairPoller(token, pairCode, pairTargetGroup)
+		capture, err := poller.wait(deadline)
+		if err != nil {
+			return fmt.Errorf("%w — usual causes: bot privacy mode still enabled (@BotFather → /setprivacy → Disable) or bot not in the group. Re-run for a fresh code, or record the id directly with `c3-broker setup pair group --id <chat_id>`", err)
+		}
+		gname := *name
+		if gname == "" {
+			gname = fallbackGroupName(capture.ChatTitle)
+		}
+		applyGroupPair(mf, gname, capture.ChatID, capture.ChatTitle)
+		if err := writeMappingsFile(mfPath, mf); err != nil {
+			return err
+		}
+		fmt.Printf("✓ paired — group %q has chat_id %d (recorded + allowlisted)\n", gname, capture.ChatID)
+		fmt.Println("Next: `c3-broker setup finish` for host integrations + broker restart.")
+	}
+	return nil
+}
+
+// runSetupSTT is the `c3-broker setup stt` phase: the STT key prompts,
+// standalone. Works interactively (TTY) or with piped answers.
+func runSetupSTT() error {
+	r := bufio.NewReader(os.Stdin)
+	written, err := promptSTTSetup(r)
+	if err != nil {
+		return err
+	}
+	if !written {
+		sttHint(DetectHostCLI())
+	}
+	return nil
+}
+
+// runSetupFinish is the `c3-broker setup finish` phase: verify the config,
+// install host integrations, restart the broker so the new config is live,
+// and print the stand-alone post-setup guidance (#8/#10).
+func runSetupFinish() error {
+	mfPath, err := mappings.DefaultPath()
+	if err != nil {
+		return err
+	}
+	mf, err := mappings.Read(mfPath)
+	if err != nil {
+		return fmt.Errorf("no usable config at %s (%v) — run the earlier setup phases first", mfPath, err)
+	}
+	if err := mf.Validate(); err != nil {
+		return fmt.Errorf("config at %s does not validate: %w", mfPath, err)
+	}
+	progress := deriveProgress(mf, defaultSTTEnvPath())
+	if progress.Token == "" {
+		return errors.New("no bot token configured — run `c3-broker setup token` first")
+	}
+	if progress.DMChatID == 0 {
+		fmt.Fprintln(os.Stderr, "warning: no DM pairing recorded — run `c3-broker setup pair dm`")
+	}
+	if progress.GroupChatID == 0 {
+		fmt.Fprintln(os.Stderr, "warning: no group configured — run `c3-broker setup pair group`")
+	}
+
+	host := DetectHostCLI()
+	installHostIntegrations(host)
+	if !progress.STTConfigured {
+		sttHint(host)
+	}
+
+	fmt.Println()
+	restartBrokerForNewConfig()
+
+	fmt.Println()
+	fmt.Println(postSetupWhatNow(host))
+	return nil
+}
+
+// installHostIntegrations runs the host-CLI-specific install steps shared
+// by the interactive flow and `setup finish`.
+func installHostIntegrations(host HostCLI) {
 	// #9 (2026-05-18): when setup is driven from Codex CLI, register the
 	// c3 MCP server into Codex's persistent config so the user doesn't
 	// have to do it by hand. (The `codex` launcher shim already wires up
@@ -249,13 +570,13 @@ func runSetup() error {
 	}
 
 	// #17 (2026-05-18): when setup is driven from Claude Code, install the
-	// claude-shim symlink at ~/.local/bin/claude unconditionally. Karthi's
-	// call: this is COMPULSORY, no prompt, no opt-out — the shim is the
-	// only supported path for getting the dev-channels flag right, and a
-	// failed/skipped install is the misconfiguration item #18 was meant to
-	// catch (now closed as subsumed). Non-fatal if it fails (e.g. a real
-	// `claude` binary already lives at the target path without a sentinel)
-	// — surface a hint so the user can run install manually with --force.
+	// claude-shim symlink at ~/.local/bin/claude unconditionally. This is
+	// COMPULSORY, no prompt, no opt-out — the shim is the only supported
+	// path for getting the dev-channels flag right, and a failed/skipped
+	// install is the misconfiguration item #18 was meant to catch (now
+	// closed as subsumed). Non-fatal if it fails (e.g. a real `claude`
+	// binary already lives at the target path without a sentinel) —
+	// surface a hint so the user can run install manually with --force.
 	if err := maybeInstallClaudeShim(host); err != nil {
 		// Compulsory under HostClaude — a silent skip is the exact
 		// failure mode item #18 was meant to close. Print to BOTH
@@ -264,24 +585,653 @@ func runSetup() error {
 		// Reasoning recorded in the 2026-05-19 code-review pass (item M2).
 		printShimInstallFailure(os.Stdout, os.Stderr, err)
 	}
+}
 
-	// #10 (2026-05-18): under Codex, setup typically runs without a
-	// connected TTY (the agent invokes it programmatically), so the STT
-	// prompts get auto-skipped with empty responses. Tell the user
-	// explicitly when no STT env file was written so they don't end up
-	// with voice messages silently failing.
-	if !sttWritten {
-		sttHint(host)
+// ---------------------------------------------------------------------------
+// Config state: load, progress tracking, upserts
+// ---------------------------------------------------------------------------
+
+// skeletonMappings returns an empty-but-valid v1 mappings file.
+func skeletonMappings() *mappings.MappingsFile {
+	return &mappings.MappingsFile{
+		SchemaVersion: 1,
+		Channels:      map[string]mappings.ChannelConfig{},
+		Mappings:      map[string]mappings.Mapping{},
 	}
+}
 
-	fmt.Println()
-	switch host {
-	case HostCodex:
-		fmt.Println(codexRestartInstruction())
-	default:
-		fmt.Println(claudeRestartInstruction())
+// loadOrInitMappings reads path. A missing file yields a fresh skeleton
+// (existed=false, nil error). A present-but-unreadable file returns
+// (nil, true, err) — callers decide whether to abort (phased commands)
+// or start over (interactive flow).
+func loadOrInitMappings(path string) (*mappings.MappingsFile, bool, error) {
+	mf, err := mappings.Read(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return skeletonMappings(), false, nil
+		}
+		return nil, true, err
+	}
+	if mf.Channels == nil {
+		mf.Channels = map[string]mappings.ChannelConfig{}
+	}
+	if mf.Mappings == nil {
+		mf.Mappings = map[string]mappings.Mapping{}
+	}
+	return mf, true, nil
+}
+
+// setupProgress records which setup steps are already satisfied by the
+// config on disk. This is the substrate for item #4: setup must react to
+// what is already configured and never re-show a completed step.
+type setupProgress struct {
+	Token         string
+	DMChatID      int64
+	GroupName     string
+	GroupChatID   int64
+	STTConfigured bool
+}
+
+// deriveProgress inspects a mappings file + the STT env path and reports
+// what is already configured.
+func deriveProgress(mf *mappings.MappingsFile, sttEnvPath string) setupProgress {
+	var p setupProgress
+	if mf != nil {
+		cc := mf.Channels[telegramChannelName]
+		p.Token = cc.BotToken
+		p.DMChatID = cc.DMChatID
+		// Prefer the default group; otherwise any configured group counts.
+		if cc.DefaultGroup != "" {
+			if g, ok := cc.Groups[cc.DefaultGroup]; ok && g.ChatID != 0 {
+				p.GroupName, p.GroupChatID = cc.DefaultGroup, g.ChatID
+			}
+		}
+		if p.GroupChatID == 0 {
+			for gname, g := range cc.Groups {
+				if g.ChatID != 0 {
+					p.GroupName, p.GroupChatID = gname, g.ChatID
+					break
+				}
+			}
+		}
+	}
+	if st, err := os.Stat(sttEnvPath); err == nil && st.Size() > 0 {
+		p.STTConfigured = true
+	}
+	return p
+}
+
+// summaryLine renders the already-configured overview for the re-run banner.
+func (p setupProgress) summaryLine() string {
+	part := func(label string, done bool) string {
+		if done {
+			return label + " ✓"
+		}
+		return label + " —"
+	}
+	group := "group"
+	if p.GroupName != "" {
+		group = fmt.Sprintf("group %q", p.GroupName)
+	}
+	return "  " + strings.Join([]string{
+		part("bot token", p.Token != ""),
+		part("DM pairing", p.DMChatID != 0),
+		part(group, p.GroupChatID != 0),
+		part("STT keys", p.STTConfigured),
+	}, ", ")
+}
+
+// defaultSTTEnvPath is where promptSTTSetup writes the API keys.
+func defaultSTTEnvPath() string {
+	return filepath.Join(os.Getenv("HOME"), ".claude", "stt.env")
+}
+
+// applyBotToken upserts the bot token, preserving every other field.
+func applyBotToken(mf *mappings.MappingsFile, token string) {
+	cc := mf.Channels[telegramChannelName]
+	cc.BotToken = token
+	mf.Channels[telegramChannelName] = cc
+}
+
+// applyDMPair records the paired operator identity: DM chat id, master
+// user id, and the default-deny allowlist entry — the same allowlist
+// mutation the broker's own DM pairing acceptance performs
+// (internal/broker/pairing.go acceptDMPair), plus the setup-owned
+// identity fields.
+func applyDMPair(mf *mappings.MappingsFile, userID int64) {
+	cc := mf.Channels[telegramChannelName]
+	cc.DMChatID = userID
+	cc.MasterUserID = userID
+	mf.Channels[telegramChannelName] = cc
+	mf.AddAllowedUser(userID)
+}
+
+// applyGroupPair records a discovered group: the groups entry, the
+// default_group (only when unset — a re-run adding a second group must
+// not silently steal the default), and the allowlist entry (mirroring
+// the broker's acceptGroupPair).
+func applyGroupPair(mf *mappings.MappingsFile, name string, chatID int64, title string) {
+	cc := mf.Channels[telegramChannelName]
+	if cc.Groups == nil {
+		cc.Groups = map[string]mappings.GroupConfig{}
+	}
+	cc.Groups[name] = mappings.GroupConfig{ChatID: chatID, Title: title}
+	if cc.DefaultGroup == "" {
+		cc.DefaultGroup = name
+	}
+	mf.Channels[telegramChannelName] = cc
+	mf.AddAllowedGroup(chatID)
+}
+
+// writeMappingsFile persists mf at path (0600, parent 0700).
+func writeMappingsFile(path string, mf *mappings.MappingsFile) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("mkdir mappings parent: %w", err)
+	}
+	if err := mappings.Write(path, mf); err != nil {
+		return fmt.Errorf("write mappings: %w", err)
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Bot token prompt
+// ---------------------------------------------------------------------------
+
+// promptBotToken collects + validates the bot token. When a still-valid
+// token already exists, enter keeps it (#4 — a completed step is offered,
+// not re-imposed). The fresh-ask copy carries the @BotFather walkthrough
+// inline so a user with no bot is never stuck at the prompt.
+func promptBotToken(r *bufio.Reader, existing string) (string, string, error) {
+	if existing != "" {
+		username, err := validateBotToken(existing)
+		if err == nil {
+			fmt.Printf("✓ found existing bot token — bot is @%s\n", username)
+			fmt.Print("Press enter to keep it, or paste a new token: ")
+			replacement, rerr := readPassword(r)
+			fmt.Println()
+			if rerr != nil {
+				return "", "", fmt.Errorf("read token: %w", rerr)
+			}
+			if replacement == "" {
+				return existing, username, nil
+			}
+			return validateProvidedToken(replacement)
+		}
+		fmt.Fprintf(os.Stderr, "warning: existing bot token failed validation (%v) — paste a fresh one\n", err)
+	}
+	fmt.Println("Telegram bot token")
+	fmt.Println("  No bot yet? In Telegram: message @BotFather → /newbot → follow the")
+	fmt.Println("  prompts → copy the HTTP token (the 1234567:abc... string).")
+	fmt.Print("Bot token: ")
+	token, err := readPassword(r)
+	fmt.Println() // newline after the silent prompt
+	if err != nil {
+		return "", "", fmt.Errorf("read token: %w", err)
+	}
+	if token == "" {
+		return "", "", errors.New("bot token is required")
+	}
+	return validateProvidedToken(token)
+}
+
+// validateProvidedToken validates token via getMe and echoes the result.
+func validateProvidedToken(token string) (string, string, error) {
+	username, err := validateBotToken(token)
+	if err != nil {
+		return "", "", fmt.Errorf("token validation failed: %w", err)
+	}
+	fmt.Printf("✓ token valid; bot is @%s\n", username)
+	return token, username, nil
+}
+
+// ---------------------------------------------------------------------------
+// Pairing (setup-side discovery)
+// ---------------------------------------------------------------------------
+
+// pairTarget is which surface a setup pairing watches.
+type pairTarget int
+
+const (
+	// pairTargetDM — watch private chats; capture the sender's user id.
+	pairTargetDM pairTarget = iota
+	// pairTargetGroup — watch group chats; capture the group's chat id
+	// (the sender is incidental — we trust the group, not the member,
+	// same trust model as internal/broker/pairing.go).
+	pairTargetGroup
+)
+
+// pairCapture is the identity discovered by a successful pairing.
+type pairCapture struct {
+	UserID    int64
+	ChatID    int64
+	ChatTitle string
+}
+
+// pairPoller watches the bot's getUpdates stream for a message whose
+// entire (trimmed) text is the 4-digit code, and captures the identity.
+//
+// This is the setup-side twin of the broker's pairing gate
+// (internal/broker/pairing.go): the broker version arms a window on a
+// RUNNING broker via /c3:pair, while this one runs when setup owns the
+// getUpdates stream — which is also the only way to DISCOVER a group's
+// chat id (the broker's group pairing requires the chat id up front).
+type pairPoller struct {
+	base        string // Bot-API base URL; telegramAPIBase() in production
+	token       string
+	code        string
+	target      pairTarget
+	pollTimeout int           // getUpdates long-poll seconds; 0 in tests
+	retryDelay  time.Duration // sleep after a transient fetch error
+	client      *http.Client
+	progress    func(remaining time.Duration) // optional between-poll hook
+}
+
+// newPairPoller returns a production-configured poller.
+func newPairPoller(token, code string, target pairTarget) *pairPoller {
+	return &pairPoller{
+		base:        telegramAPIBase(),
+		token:       token,
+		code:        code,
+		target:      target,
+		pollTimeout: 20,
+		retryDelay:  2 * time.Second,
+		// Client timeout must exceed the long-poll window or every empty
+		// poll would surface as a transient error.
+		client: &http.Client{Timeout: 35 * time.Second},
+	}
+}
+
+// pairUpdate is one getUpdates result element (the subset setup needs).
+type pairUpdate struct {
+	UpdateID int64 `json:"update_id"`
+	Message  *struct {
+		Text string `json:"text"`
+		From *struct {
+			ID int64 `json:"id"`
+		} `json:"from"`
+		Chat struct {
+			ID    int64  `json:"id"`
+			Title string `json:"title"`
+		} `json:"chat"`
+	} `json:"message"`
+}
+
+// fetchPairUpdates calls getUpdates once. fatal=true means retrying cannot
+// help (revoked/invalid token); a non-fatal error is transient — a network
+// blip, a 5xx, or a 409 while a just-stopped broker's long poll drains on
+// Telegram's side.
+func (p *pairPoller) fetchPairUpdates(offset int64) (updates []pairUpdate, fatal bool, err error) {
+	url := fmt.Sprintf("%s/bot%s/getUpdates?timeout=%d&offset=%d", p.base, p.token, p.pollTimeout, offset)
+	resp, err := p.client.Get(url)
+	if err != nil {
+		return nil, false, fmt.Errorf("network: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, false, fmt.Errorf("read body: %w", err)
+	}
+	var parsed struct {
+		OK          bool         `json:"ok"`
+		ErrorCode   int          `json:"error_code"`
+		Description string       `json:"description"`
+		Result      []pairUpdate `json:"result"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, false, fmt.Errorf("parse: %w", err)
+	}
+	if !parsed.OK {
+		switch parsed.ErrorCode {
+		case http.StatusUnauthorized, http.StatusNotFound:
+			return nil, true, fmt.Errorf("telegram rejected the bot token: %s", parsed.Description)
+		case http.StatusConflict:
+			return nil, false, fmt.Errorf("another getUpdates consumer is active (%s) — if a C3 broker or another bot instance is still running, stop it (`pkill -x c3-broker`)", parsed.Description)
+		default:
+			return nil, false, fmt.Errorf("telegram: %s", parsed.Description)
+		}
+	}
+	return parsed.Result, false, nil
+}
+
+// wait polls until the code arrives, the deadline passes, or a fatal
+// error occurs. Telegram keeps a 24h update backlog, so a code the user
+// sent BEFORE the first poll is still captured — the interactive flow's
+// "press enter to start waiting" gate loses nothing.
+func (p *pairPoller) wait(deadline time.Time) (pairCapture, error) {
+	var offset int64
+	var lastTransient string
+	for time.Now().Before(deadline) {
+		updates, fatal, err := p.fetchPairUpdates(offset)
+		if err != nil {
+			if fatal {
+				return pairCapture{}, err
+			}
+			// Transient — retry until the deadline; surface each distinct
+			// cause once so a persistent 409 isn't silent.
+			if err.Error() != lastTransient {
+				fmt.Fprintf(os.Stderr, "  (retrying: %v)\n", err)
+				lastTransient = err.Error()
+			}
+			time.Sleep(p.retryDelay)
+			continue
+		}
+		lastTransient = ""
+		for _, upd := range updates {
+			if upd.UpdateID >= offset {
+				offset = upd.UpdateID + 1
+			}
+			m := upd.Message
+			if m == nil || strings.TrimSpace(m.Text) != p.code {
+				continue
+			}
+			switch p.target {
+			case pairTargetDM:
+				// Positive chat id = private chat (chat id == user id);
+				// same signal internal/broker/pairing.go isPrivateChat uses.
+				if m.Chat.ID > 0 && m.From != nil && m.From.ID > 0 {
+					p.commitOffset(offset)
+					return pairCapture{UserID: m.From.ID, ChatID: m.Chat.ID}, nil
+				}
+			case pairTargetGroup:
+				if m.Chat.ID < 0 {
+					capture := pairCapture{ChatID: m.Chat.ID, ChatTitle: m.Chat.Title}
+					if m.From != nil {
+						capture.UserID = m.From.ID
+					}
+					p.commitOffset(offset)
+					return capture, nil
+				}
+			}
+		}
+		if p.progress != nil {
+			p.progress(time.Until(deadline))
+		}
+	}
+	return pairCapture{}, fmt.Errorf("pairing window expired without receiving code %s", p.code)
+}
+
+// commitOffset advances Telegram's server-side update cursor past the
+// consumed pairing traffic so the broker that starts right after setup
+// doesn't re-read the code message and the /start noise (they'd be
+// gate-dropped anyway, but a clean cursor avoids a stale-update burst
+// on its first poll). Best-effort.
+func (p *pairPoller) commitOffset(offset int64) {
+	url := fmt.Sprintf("%s/bot%s/getUpdates?timeout=0&offset=%d", p.base, p.token, offset)
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return
+	}
+	_ = resp.Body.Close()
+}
+
+// generatePairCode returns a crypto-random 4-digit zero-padded code — the
+// same shape internal/broker/pairing.go generates for /c3:pair, so pairing
+// looks identical to the user in both flows.
+func generatePairCode() (string, error) {
+	n, err := rand.Int(rand.Reader, big.NewInt(10000))
+	if err != nil {
+		return "", fmt.Errorf("pair code: %w", err)
+	}
+	return fmt.Sprintf("%04d", n.Int64()), nil
+}
+
+// isPairCode reports whether s is exactly 4 ASCII digits.
+func isPairCode(s string) bool {
+	if len(s) != 4 {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// pairWaitBudget is how long one interactive pairing attempt waits.
+const pairWaitBudget = 5 * time.Minute
+
+// pairArmPrompt doubles as the last-resort manual entry: pressing enter
+// starts the pairing wait; pasting a numeric id records it directly.
+// This one line is ALL that remains of the manual-id collection path.
+const pairArmPrompt = "Press enter to start waiting (or paste the numeric id directly if you already know it): "
+
+// dmPairIntro is the DM pairing banner shown before the wait.
+func dmPairIntro(botUsername, code string) string {
+	return fmt.Sprintf(`Pair your Telegram account — a code replaces any id hunting
+  1. In Telegram, open a DM with @%s and press START.
+  2. Send exactly this code as a message: %s`, botUsername, code)
+}
+
+// groupPairIntro is the group pairing banner shown before the wait.
+func groupPairIntro(code string) string {
+	return fmt.Sprintf(`Pair the group — C3 discovers the group's chat id from a code
+  In the group (bot added, Topics on), send exactly this code: %s
+  Any member can send it — C3 records the group, not the sender.`, code)
+}
+
+// waitProgressPrinter returns a between-poll hook that prints a throttled
+// "still waiting" line so a long pairing wait doesn't look hung.
+func waitProgressPrinter() func(time.Duration) {
+	last := time.Now()
+	return func(remaining time.Duration) {
+		if time.Since(last) < 45*time.Second {
+			return
+		}
+		last = time.Now()
+		fmt.Printf("  …still waiting (%s left)\n", remaining.Round(time.Second))
+	}
+}
+
+// pairDMInteractive runs the interactive DM pairing loop: show the code,
+// offer the arm-or-direct-entry gate, wait, retry with a fresh code on
+// expiry (3 attempts).
+func pairDMInteractive(r *bufio.Reader, token, botUsername string) (int64, error) {
+	for attempt := 1; attempt <= 3; attempt++ {
+		code, err := generatePairCode()
+		if err != nil {
+			return 0, err
+		}
+		fmt.Println()
+		fmt.Println(dmPairIntro(botUsername, code))
+		fmt.Print(pairArmPrompt)
+		if line := readLine(r); line != "" {
+			id, perr := strconv.ParseInt(line, 10, 64)
+			if perr == nil && id > 0 {
+				return id, nil
+			}
+			fmt.Println("  (not a positive numeric user id — starting the pairing wait instead)")
+		}
+		fmt.Printf("Waiting up to %s for code %s...\n", pairWaitBudget, code)
+		poller := newPairPoller(token, code, pairTargetDM)
+		poller.progress = waitProgressPrinter()
+		capture, err := poller.wait(time.Now().Add(pairWaitBudget))
+		if err == nil {
+			return capture.UserID, nil
+		}
+		fmt.Fprintf(os.Stderr, "pairing attempt %d failed: %v\n", attempt, err)
+		fmt.Println("  Check: did you press START on the bot? Sent the exact 4 digits, nothing else?")
+	}
+	return 0, errors.New("DM pairing did not complete — re-run `c3-broker setup`, or run `c3-broker setup pair dm --id <user_id>`")
+}
+
+// pairGroupInteractive is pairDMInteractive's group twin. The direct-entry
+// gate accepts a negative chat id.
+func pairGroupInteractive(r *bufio.Reader, token string) (pairCapture, error) {
+	for attempt := 1; attempt <= 3; attempt++ {
+		code, err := generatePairCode()
+		if err != nil {
+			return pairCapture{}, err
+		}
+		fmt.Println()
+		fmt.Println(groupPairIntro(code))
+		fmt.Print(pairArmPrompt)
+		if line := readLine(r); line != "" {
+			id, perr := strconv.ParseInt(line, 10, 64)
+			if perr == nil && id < 0 {
+				return pairCapture{ChatID: id}, nil
+			}
+			fmt.Println("  (group chat ids are negative integers — starting the pairing wait instead)")
+		}
+		fmt.Printf("Waiting up to %s for code %s...\n", pairWaitBudget, code)
+		poller := newPairPoller(token, code, pairTargetGroup)
+		poller.progress = waitProgressPrinter()
+		capture, err := poller.wait(time.Now().Add(pairWaitBudget))
+		if err == nil {
+			return capture, nil
+		}
+		fmt.Fprintf(os.Stderr, "pairing attempt %d failed: %v\n", attempt, err)
+		fmt.Println("  Usual causes: bot privacy mode still enabled (@BotFather → /setprivacy →")
+		fmt.Println("  Disable) or the bot isn't actually a member of the group.")
+	}
+	return pairCapture{}, errors.New("group pairing did not complete — re-run `c3-broker setup`, or run `c3-broker setup pair group --id <chat_id>`")
+}
+
+// promptGroupName asks what to call the paired group in config. Default
+// "main" (the convention across docs); the group's Telegram title is shown
+// for orientation when known.
+func promptGroupName(r *bufio.Reader, title string) string {
+	if title != "" {
+		fmt.Printf("Paired Telegram group: %q\n", title)
+	}
+	fmt.Print("Config name for this group (used as the default for new topics) [main]: ")
+	name := readLine(r)
+	if name == "" {
+		return "main"
+	}
+	return name
+}
+
+// fallbackGroupName picks the phased pair-group default name: the group's
+// Telegram title when present, else "main".
+func fallbackGroupName(title string) string {
+	if t := strings.TrimSpace(title); t != "" {
+		return t
+	}
+	return "main"
+}
+
+// ---------------------------------------------------------------------------
+// Broker lifecycle around setup
+// ---------------------------------------------------------------------------
+
+// brokerReachable reports whether a broker answers on the unix socket.
+func brokerReachable() bool {
+	c, err := net.DialTimeout("unix", broker.SocketPath(), 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = c.Close()
+	return true
+}
+
+// stopBrokerIfRunning stops a running broker so setup can own the bot's
+// getUpdates stream during pairing (two consumers steal each other's
+// updates) and so a finished setup can respawn it on the new config.
+// Safe: route claims live in mappings.json + the broker's PID-liveness
+// logic, and adapters auto-respawn a broker, so a bounce loses nothing.
+//
+// Returns whether a broker was stopped plus a human-readable note ("" when
+// there was simply nothing to stop).
+func stopBrokerIfRunning() (bool, string) {
+	if !brokerReachable() {
+		return false, ""
+	}
+	data, err := os.ReadFile(broker.PidFilePath())
+	if err != nil {
+		return false, "note: a broker looks alive but its pid file is unreadable — if pairing never sees your code, run `pkill -x c3-broker` and retry"
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 1 {
+		return false, "note: the broker pid file is malformed — if pairing never sees your code, run `pkill -x c3-broker` and retry"
+	}
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+		return false, fmt.Sprintf("note: could not stop the running broker (pid %d): %v — if pairing never sees your code, stop it manually", pid, err)
+	}
+	// Wait for the process to actually exit — the singleton flock and the
+	// getUpdates long poll are only released then.
+	for i := 0; i < 50; i++ {
+		if syscall.Kill(pid, 0) != nil { // ESRCH — gone
+			return true, "(stopped the running C3 broker so pairing codes come straight to setup; it restarts when setup finishes)"
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return true, fmt.Sprintf("note: broker (pid %d) is slow to exit — pairing may miss messages until it stops", pid)
+}
+
+// ensureBrokerUp spawns a detached broker when none is reachable, then
+// waits briefly for the socket. Safe to call when one is already running
+// (and safe to race an adapter's own spawn — the singleton flock makes
+// every spare exit silently).
+func ensureBrokerUp() {
+	if brokerReachable() {
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		exe = "c3-broker"
+	}
+	if err := spawn.Detached(exec.Command(exe)); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not start the broker: %v — it will auto-start on the next /c3:attach\n", err)
+		return
+	}
+	for i := 0; i < 20; i++ {
+		if brokerReachable() {
+			fmt.Println("✓ broker running with the new config")
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	fmt.Fprintln(os.Stderr, "note: broker spawn requested but the socket isn't up yet — check `c3-broker status` in a moment")
+}
+
+// restartBrokerForNewConfig bounces the broker (stop if running, then
+// ensure one is up) so the config setup just wrote is what's actually
+// live. A SIGHUP reload is NOT sufficient after a token change — the
+// telegram channel is initialized at broker start.
+func restartBrokerForNewConfig() {
+	if stopped, note := stopBrokerIfRunning(); stopped {
+		fmt.Println("Restarting the C3 broker with the new config...")
+	} else if note != "" {
+		fmt.Fprintln(os.Stderr, note)
+	}
+	ensureBrokerUp()
+}
+
+// ---------------------------------------------------------------------------
+// Post-setup guidance
+// ---------------------------------------------------------------------------
+
+// postSetupWhatNow renders the "Setup complete — what now" block. Both
+// paths (agent-guided and bare CLI) end here, so the text must stand alone
+// (#8). The launch command deliberately carries NO --resume (#9 — the user
+// appends it only when they want to resume), and the block walks attach →
+// first message → a 30-second tour (#10).
+func postSetupWhatNow(host HostCLI) string {
+	if host == HostCodex {
+		return `Setup complete — what now
+  1. Restart Codex so the C3 MCP server loads:
+       exit (Ctrl-D), then run: codex
+     (use ` + "`codex resume --last`" + ` only if you want your previous conversation back)
+  2. In the session, use the c3 attach tool to bind this project to a Telegram topic.
+  3. From your phone, send a text or voice note to that topic — it surfaces in the CLI.
+
+  30-second tour: ` + "`c3-broker status`" + ` shows broker health; the c3 topics tool
+  lists topics + claims; voice notes are transcribed automatically once STT
+  keys are configured (` + "`c3-broker setup stt`" + `).`
+	}
+	return `Setup complete — what now
+  1. Launch Claude Code with the C3 channel enabled:
+       claude --dangerously-load-development-channels plugin:c3@c3
+     (append --resume yourself only if you want to pick up a previous session)
+  2. In the session, run /c3:attach to bind this project to a Telegram topic.
+  3. From your phone, send a text or voice note to that topic — it surfaces in the CLI.
+
+  30-second tour: /c3:status shows broker health; /c3:topics lists topics +
+  claims; /c3:pair allowlists another person or group later; voice notes are
+  transcribed automatically once STT keys are configured (` + "`c3-broker setup stt`" + `).`
 }
 
 // installResult carries the outcome of the background `go install`.
@@ -431,46 +1381,33 @@ func isC3SourceDir(dir string) bool {
 	return false
 }
 
-// walkBotGroupChecklist guides the user through the 6-step manual
-// bot + group setup, one step at a time, with a "press enter when
-// done" pause between steps. Mirrors the checklist in docs/INSTALL.md
-// section "Prerequisites" — but inline, so the user reads it in the
-// terminal rather than having to flip to a doc.
-//
-// If stdin is piped (non-interactive), we still print each step but
-// don't pause — the agent driving setup will move on and the human
-// reading the captured output can pause where they need to.
-func walkBotGroupChecklist(r *bufio.Reader) {
-	fmt.Println("Step-by-step: Telegram bot + group setup")
-	fmt.Println()
-	fmt.Println("(Use Telegram Desktop, iOS, Android, or macOS — NOT Telegram Web for")
-	fmt.Println(" the group steps. Web's Topics + admin-rights UIs are incomplete.)")
-	fmt.Println()
-	steps := []struct {
-		title string
-		body  []string
-	}{
-		{
-			"Create the bot (skip if you already did this above)",
-			[]string{
-				"  Message @BotFather → /newbot → pick a display name and a",
-				"  username ending in 'bot'. Copy the HTTP token — that's what",
-				"  you pasted earlier.",
-			},
-		},
+// checklistStep is one entry of the group-preparation walk.
+type checklistStep struct {
+	title string
+	body  []string
+}
+
+// botGroupChecklistSteps is the group-preparation walk. By the time this
+// runs the bot token is already validated, so there is deliberately no
+// "create the bot" step (#4, 2026-06-30 install feedback: never re-show a
+// completed step) — and no manual id collection tail: the ids are
+// discovered by the pairing codes that follow (#5/#6).
+func botGroupChecklistSteps() []checklistStep {
+	return []checklistStep{
 		{
 			"Disable privacy mode",
 			[]string{
-				"  Still in @BotFather: /setprivacy → pick your bot → Disable.",
+				"  In @BotFather: /setprivacy → pick your bot → Disable.",
 				"  Without this, the bot only sees messages that mention or reply",
-				"  to it. Cannot be done over the Bot API.",
+				"  to it — group pairing and topic routing both need it off.",
+				"  Cannot be done over the Bot API.",
 			},
 		},
 		{
 			"Create a Telegram group",
 			[]string{
 				"  A regular group is fine; it auto-promotes to a supergroup",
-				"  when you turn Topics on in step 5.",
+				"  when you turn Topics on in the next-but-one step.",
 			},
 		},
 		{
@@ -482,8 +1419,8 @@ func walkBotGroupChecklist(r *bufio.Reader) {
 		{
 			"Enable Topics in the group",
 			[]string{
-				"  Group settings → Topics → On. Do this BEFORE step 6 — the",
-				"  \"Allow create topics\" admin right only appears once Topics",
+				"  Group settings → Topics → On. Do this BEFORE the admin step —",
+				"  the \"Allow create topics\" admin right only appears once Topics",
 				"  are enabled.",
 			},
 		},
@@ -495,8 +1432,26 @@ func walkBotGroupChecklist(r *bufio.Reader) {
 			},
 		},
 	}
-	// Honor C3_NO_PROMPT in addition to the TTY check so Codex's
-	// non-interactive setup path (which already bypasses the consent
+}
+
+// walkBotGroupChecklist guides the user through the group-preparation
+// steps, one at a time, with a "press enter when done" pause between
+// steps. Mirrors the checklist in docs/INSTALL.md — but inline, so the
+// user reads it in the terminal rather than having to flip to a doc.
+//
+// If stdin is piped (non-interactive), we still print each step but
+// don't pause — the agent driving setup will move on and the human
+// reading the captured output can pause where they need to.
+func walkBotGroupChecklist(r *bufio.Reader) {
+	fmt.Println()
+	fmt.Println("Step-by-step: Telegram group setup")
+	fmt.Println()
+	fmt.Println("(Use Telegram Desktop, iOS, Android, or macOS — NOT Telegram Web for")
+	fmt.Println(" the group steps. Web's Topics + admin-rights UIs are incomplete.)")
+	fmt.Println()
+	steps := botGroupChecklistSteps()
+	// Honor C3_NO_PROMPT in addition to the TTY check so a
+	// non-interactive setup driver (which already bypasses the consent
 	// gate via isNoPromptSet) also skips the step pauses. Without this,
 	// a non-interactive driver that's piping prompts through stdin
 	// gets a TTY-detection negative (good) but a different one if it's
@@ -515,10 +1470,8 @@ func walkBotGroupChecklist(r *bufio.Reader) {
 			fmt.Println()
 		}
 	}
-	fmt.Println("All 6 steps done. Now I need your DM chat id and the group's chat id.")
-	fmt.Println("(DM chat id = your own user id, ask @userinfobot. Group chat id is a")
-	fmt.Println(" negative integer starting with -100 — send any message in the group")
-	fmt.Println(" and the bot will see it, or use @username_to_id_bot.)")
+	fmt.Println("Group ready. Next: a quick pairing code — C3 discovers the group's")
+	fmt.Println("chat id from it automatically, no id hunting needed.")
 }
 
 // sttHint prints a per-host instruction telling the user how to get STT
@@ -526,14 +1479,14 @@ func walkBotGroupChecklist(r *bufio.Reader) {
 // it might not have:
 //   - user said no to "Set up STT?"
 //   - both API-key prompts were empty
-//   - non-interactive caller (Codex agent driving stdin) — silently
-//     skipped the whole branch
+//   - non-interactive caller (agent driving stdin) — silently skipped
+//     the whole branch
 //
 // Under Claude Code, the prompts usually surface fine, so this is brief.
 // Under Codex, we walk the user through the manual file format because
 // the interactive path is unreliable.
 func sttHint(host HostCLI) {
-	envPath := filepath.Join(os.Getenv("HOME"), ".claude", "stt.env")
+	envPath := defaultSTTEnvPath()
 	fmt.Println()
 	if host == HostCodex {
 		fmt.Printf("STT API keys were not wired up. Codex runs setup non-interactively so the\n")
@@ -544,31 +1497,41 @@ func sttHint(host HostCLI) {
 		fmt.Println("  SARVAM_API_KEY=...       # Saaras v3 (https://dashboard.sarvam.ai)")
 		fmt.Println("  ELEVENLABS_API_KEY=...   # optional, ElevenLabs Scribe v2")
 		fmt.Println()
-		fmt.Println("Or rerun `c3-broker setup` in a real terminal (e.g. plain shell, not via")
+		fmt.Println("Or run `c3-broker setup stt` in a real terminal (e.g. plain shell, not via")
 		fmt.Println("the Codex agent) and answer the STT prompts.")
 		return
 	}
 	fmt.Printf("(STT keys not configured — voice messages will surface as `[STT FAILED: ...]`.\n")
-	fmt.Printf(" Rerun `c3-broker setup` and answer the STT prompts, or hand-write %s.)\n", envPath)
+	fmt.Printf(" Run `c3-broker setup stt` any time, or hand-write %s.)\n", envPath)
 }
 
+// sttNotes is the compressed post-write footer (#3: the old section was a
+// wall of text). One line per concept; details live in stt-pkg/README.md.
+const sttNotes = `Notes:
+  • Own STT provider: drop a transcribe() module at
+    plugins/c3/stt/stt-pkg/providers/<name>.py and add it to your --chain.
+  • Mishears? Add terms to ~/.config/c3/stt-vocabulary.txt (one per line;
+    format in plugins/c3/stt/stt-pkg/README.md) — agents will prompt you too.
+  • Long audio (>30s) routing needs ffmpeg/ffprobe from your OS package manager.`
+
 // promptSTTSetup asks the user if they want voice transcription, and if
-// so collects API keys for the bundled provider chain (Gemini via
-// OpenRouter as the default first, Sarvam as fallback). Writes a 0600
-// env file at ~/.claude/stt.env that the broker's STT subprocess
-// inherits.
+// so collects API keys for the bundled provider chain and writes a 0600
+// env file at ~/.claude/stt.env that the broker's STT subprocess inherits.
 //
-// Also tells the user where their personal vocabulary file lives and
-// the standing pattern for adding terms as they encounter STT mistakes.
+// The default chain is Gemini 3 Flash (via OpenRouter) → Sarvam Saaras v3.
+// Gemini 3 Flash (google/gemini-3-flash-preview) is called out because it
+// handles multilingual audio and mid-sentence language switches well.
 //
 // Returns (written, err). written=true iff the env file was created with
 // at least one key. The caller uses this to decide whether to print a
 // post-setup hint reminding the user how to wire keys up manually.
 func promptSTTSetup(r *bufio.Reader) (bool, error) {
 	fmt.Println()
-	fmt.Println("Voice transcription setup (optional)")
-	fmt.Println("c3 ships a provider-chain STT pipeline (Gemini 3 Flash → Sarvam Saaras v3).")
-	fmt.Println("Voice messages from Telegram get transcribed and surfaced to the CLI as text.")
+	fmt.Println("Voice transcription (optional)")
+	fmt.Println("Voice notes from Telegram are transcribed and handed to the CLI as text.")
+	fmt.Println("Default provider chain: Gemini 3 Flash → Sarvam Saaras v3. Gemini 3 Flash")
+	fmt.Println("(google/gemini-3-flash-preview via OpenRouter) handles multilingual audio")
+	fmt.Println("and mid-sentence language switches well.")
 	fmt.Println()
 	fmt.Print("Set up STT? [Y/n]: ")
 	yes := readBoolDefault(r, true)
@@ -577,25 +1540,21 @@ func promptSTTSetup(r *bufio.Reader) (bool, error) {
 		return false, nil
 	}
 
-	envPath := filepath.Join(os.Getenv("HOME"), ".claude", "stt.env")
+	envPath := defaultSTTEnvPath()
 	if err := os.MkdirAll(filepath.Dir(envPath), 0o700); err != nil {
 		return false, fmt.Errorf("mkdir %s: %w", filepath.Dir(envPath), err)
 	}
 
 	fmt.Println()
-	fmt.Println("Provide API keys for at least one provider. Empty = skip that provider.")
-	fmt.Println("  • OpenRouter (Gemini 3 Flash): https://openrouter.ai/keys")
-	fmt.Println("  • Sarvam (Saaras v3, good for Indic languages): https://dashboard.sarvam.ai")
-	fmt.Println()
-
-	fmt.Print("OPENROUTER_API_KEY (leave blank to skip): ")
+	fmt.Println("API keys — at least one; empty skips that provider:")
+	fmt.Print("  OPENROUTER_API_KEY (https://openrouter.ai/keys): ")
 	openrouter, err := readPassword(r)
 	if err != nil {
 		return false, fmt.Errorf("read OPENROUTER_API_KEY: %w", err)
 	}
 	fmt.Println()
 
-	fmt.Print("SARVAM_API_KEY (leave blank to skip): ")
+	fmt.Print("  SARVAM_API_KEY (https://dashboard.sarvam.ai): ")
 	sarvam, err := readPassword(r)
 	if err != nil {
 		return false, fmt.Errorf("read SARVAM_API_KEY: %w", err)
@@ -621,32 +1580,7 @@ func promptSTTSetup(r *bufio.Reader) (bool, error) {
 		return false, fmt.Errorf("write %s: %w", envPath, err)
 	}
 	fmt.Printf("✓ wrote %s (mode 0600)\n", envPath)
-
-	if sarvam != "" {
-		fmt.Println()
-		fmt.Println("STT deps: STT needs only system python3 + ffmpeg (ffprobe);")
-		fmt.Println("  no Python packages, no venv. Install ffmpeg (provides ffprobe)")
-		fmt.Println("  via your OS package manager for long-audio (>30s) routing.")
-	}
-
-	// Tell the user about the vocabulary override path. This is the
-	// "standing instruction" Karthi asked for — agents should learn the
-	// path during setup so they can prompt users to add words when STT
-	// mishears something.
-	vocabPath := filepath.Join(os.Getenv("HOME"), ".config", "c3", "stt-vocabulary.txt")
-	fmt.Println()
-	fmt.Println("Personal STT vocabulary (optional, recommended)")
-	fmt.Printf("If transcription mishears your project / product / personal names, add\n")
-	fmt.Printf("them to %s — one term per line. Format:\n", vocabPath)
-	fmt.Println()
-	fmt.Println("    # context: short description biases providers toward your domain")
-	fmt.Println("    YourProjectName != mishearing1, mishearing2 -- optional note")
-	fmt.Println("    YourName != commonly-misheard-as")
-	fmt.Println()
-	fmt.Println("As you use c3, watch for STT mistakes — those are signals to add terms.")
-	fmt.Println("Agents using c3 are instructed to prompt you to add words when they see")
-	fmt.Println("STT errors that look correctable. See plugins/c3/stt/stt-pkg/README.md")
-	fmt.Println("for the full format.")
+	fmt.Println(sttNotes)
 	return true, nil
 }
 
@@ -664,7 +1598,8 @@ var installClaudeShimFn = runInstallClaudeShim
 //
 // This is the runSetup() Claude-host branch factored into a testable
 // helper. See item #17 in TODO.md: the shim install is COMPULSORY
-// under Claude Code per Karthi 2026-05-18 — no prompt, no opt-out.
+// under Claude Code per the maintainer's 2026-05-18 call — no prompt,
+// no opt-out.
 func maybeInstallClaudeShim(host HostCLI) error {
 	if host != HostClaude {
 		return nil
@@ -686,11 +1621,28 @@ func readBoolDefault(r *bufio.Reader, def bool) bool {
 	}
 }
 
+// telegramAPIBase is the Bot-API base URL setup's own HTTP calls use
+// (getMe validation + pairing getUpdates). Honors the C3_TELEGRAM_API_URL
+// env override the telegram channel also applies (env beats default), so
+// setup works behind a Bot-API reverse proxy too.
+func telegramAPIBase() string {
+	if v := strings.TrimSpace(os.Getenv("C3_TELEGRAM_API_URL")); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return "https://api.telegram.org"
+}
+
 // validateBotToken calls Telegram's getMe and returns the bot's username on
 // success. Errors on 401 (invalid token), network failure, or non-OK
 // responses.
 func validateBotToken(token string) (string, error) {
-	url := "https://api.telegram.org/bot" + token + "/getMe"
+	return validateBotTokenAt(telegramAPIBase(), token)
+}
+
+// validateBotTokenAt is validateBotToken against an explicit base URL
+// (injectable for tests).
+func validateBotTokenAt(base, token string) (string, error) {
+	url := base + "/bot" + token + "/getMe"
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
@@ -732,25 +1684,4 @@ func readPassword(r *bufio.Reader) (string, error) {
 		return strings.TrimSpace(string(b)), nil
 	}
 	return readLine(r), nil
-}
-
-func readBool(def bool) bool {
-	r := bufio.NewReader(os.Stdin)
-	line := readLine(r)
-	switch strings.ToLower(line) {
-	case "y", "yes":
-		return true
-	case "n", "no":
-		return false
-	default:
-		return def
-	}
-}
-
-func readInt64(r *bufio.Reader) (int64, error) {
-	s := readLine(r)
-	if s == "" {
-		return 0, errors.New("empty input")
-	}
-	return strconv.ParseInt(s, 10, 64)
 }

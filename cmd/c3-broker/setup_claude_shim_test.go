@@ -11,7 +11,7 @@ import (
 // Claude-host branch of runSetup() (factored out as maybeInstallClaudeShim
 // for testability) calls into the shim installer with default args. See
 // TODO.md item #17 — under Claude Code, shim install is COMPULSORY at
-// setup time per Karthi 2026-05-18; no prompt, no opt-out.
+// setup time per the maintainer's 2026-05-18 call; no prompt, no opt-out.
 func TestMaybeInstallClaudeShim_ClaudeHostInvokesInstaller(t *testing.T) {
 	called := false
 	var gotArgs []string

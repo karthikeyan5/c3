@@ -35,6 +35,23 @@ func TestPreambleCopy_ContainsKeyConcepts(t *testing.T) {
 	}
 }
 
+// TestPreambleCopy_NoManualIDHunting — the preamble must not send a fresh
+// user hunting for ids (2026-06-30 install feedback #5/#6: pairing codes
+// discover the user id and group chat id; @userinfobot and the manual
+// negative-chat-id copy are gone). It must instead mention the pairing
+// codes so the user knows what's coming.
+func TestPreambleCopy_NoManualIDHunting(t *testing.T) {
+	out := renderPreamble(true)
+	for _, banned := range []string{"userinfobot", "username_to_id_bot", "-100"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("preamble contains banned id-hunting breadcrumb %q", banned)
+		}
+	}
+	if !strings.Contains(out, "pairing") {
+		t.Error("preamble no longer explains the pairing codes — a fresh user won't know how ids get discovered")
+	}
+}
+
 // TestRenderPreamble_DraftMode_RendersMarker asserts the DRAFT footer
 // appears in rendered output whenever draftApproved is false. Acts as
 // a forcing function: someone flipping the const without updating the

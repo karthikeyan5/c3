@@ -12,13 +12,13 @@ import (
 // explicitly approves the copy.
 //
 // When you flip this to true, do the following in the SAME commit:
-//   1. Read through preambleBody below and confirm it reflects the
-//      approved copy (Karthi often tightens lines during review).
-//   2. Verify TestRenderPreamble_ApprovedMode_OmitsMarker passes —
-//      i.e. no stray "DRAFT" or "pending Karthi review" string
-//      survives in preambleBody.
-//   3. Update RESUME.md / TODO.md if either references the DRAFT
-//      state.
+//  1. Read through preambleBody below and confirm it reflects the
+//     approved copy (Karthi often tightens lines during review).
+//  2. Verify TestRenderPreamble_ApprovedMode_OmitsMarker passes —
+//     i.e. no stray "DRAFT" or "pending Karthi review" string
+//     survives in preambleBody.
+//  3. Update RESUME.md / TODO.md if either references the DRAFT
+//     state.
 //
 // Why this is a const rather than a CI grep: c3 is a maintainer-led
 // project, not a multi-contributor codebase. The forcing function is
@@ -66,12 +66,13 @@ What we're about to set up
 What you'll need handy
 
   - A Telegram bot token (the 1234567:abc... string from @BotFather).
-    If you don't have one yet, that's fine — I'll point you at
-    @BotFather and walk through it.
-  - Your own Telegram user id (for DMs from the bot).
-  - A supergroup with Topics on, and its chat id.
+    If you don't have one yet, that's fine — the token step shows the
+    exact @BotFather commands.
+  - Your phone (or any Telegram client). You'll send two short pairing
+    codes — one to the bot, one in the group — and C3 discovers your
+    user id and the group's chat id automatically. No id hunting.
 
-  All three can be set up in the next 5 minutes if you're new to this.
+  All of it fits in the next 5 minutes if you're new to this.
 `
 
 // draftFooter is the footer line appended by renderPreamble when

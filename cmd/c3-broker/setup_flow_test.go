@@ -3,12 +3,18 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/karthikeyan5/c3/internal/mappings"
 )
 
 // TestStartBackgroundInstall_DelegatesToRunFn confirms the goroutine
@@ -85,7 +91,7 @@ func TestStartBackgroundInstall_StartsBeforeJoin_ConcurrentExecution(t *testing.
 
 // TestJoinBackgroundInstall_SuccessQuiet — successful build returns
 // nil error, no panic. (Side effect: prints "✓ binaries built" to
-// stdout; we don't assert on that — Karthi's copy, not load-bearing.)
+// stdout; we don't assert on that — maintainer copy, not load-bearing.)
 func TestJoinBackgroundInstall_SuccessQuiet(t *testing.T) {
 	ch := make(chan installResult, 1)
 	ch <- installResult{duration: 5 * time.Millisecond}
@@ -259,4 +265,557 @@ func findThisRepoRoot(t *testing.T) string {
 	}
 	t.Fatalf("could not locate C3 repo root from test binary; tests need a discoverable go.mod")
 	return ""
+}
+
+// ---------------------------------------------------------------------------
+// Setup phase dispatch
+// ---------------------------------------------------------------------------
+
+// TestRunSetupWithArgs_UnknownPhaseErrors — a typo'd phase must fail loudly
+// with the phase list, not fall through into the interactive flow (which
+// would hang a non-interactive agent driver on stdin).
+func TestRunSetupWithArgs_UnknownPhaseErrors(t *testing.T) {
+	err := runSetupWithArgs([]string{"bogus-phase"})
+	if err == nil {
+		t.Fatal("runSetupWithArgs(bogus-phase) = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "unknown setup phase") {
+		t.Errorf("error %q does not name the unknown phase", err)
+	}
+}
+
+// TestSetupUsage_MentionsAllPhases — the usage text is what an agent (or
+// human) sees on a bad invocation; every phase must be discoverable there.
+func TestSetupUsage_MentionsAllPhases(t *testing.T) {
+	for _, phase := range []string{"setup token", "pair dm", "pair group", "setup stt", "setup finish"} {
+		if !strings.Contains(setupUsage, phase) {
+			t.Errorf("setupUsage missing phase %q", phase)
+		}
+	}
+}
+
+// TestRunSetupPair_RequiresTarget — bare `setup pair` is a usage error.
+func TestRunSetupPair_RequiresTarget(t *testing.T) {
+	if err := runSetupPair(nil); err == nil || !strings.Contains(err.Error(), "usage:") {
+		t.Errorf("runSetupPair(nil) = %v, want usage error", err)
+	}
+	if err := runSetupPair([]string{"channel"}); err == nil || !strings.Contains(err.Error(), "usage:") {
+		t.Errorf("runSetupPair(channel) = %v, want usage error", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Pair codes
+// ---------------------------------------------------------------------------
+
+// TestGeneratePairCode_FourDigits — the code must always be 4 ASCII digits
+// (zero-padded), matching the shape the broker's own pairing gate accepts.
+func TestGeneratePairCode_FourDigits(t *testing.T) {
+	for i := 0; i < 64; i++ {
+		code, err := generatePairCode()
+		if err != nil {
+			t.Fatalf("generatePairCode: %v", err)
+		}
+		if !isPairCode(code) {
+			t.Fatalf("generatePairCode() = %q; want 4 ASCII digits", code)
+		}
+	}
+}
+
+// TestIsPairCode — strict 4-digit match, same contract as the broker gate's
+// codeBody (internal/broker/pairing.go).
+func TestIsPairCode(t *testing.T) {
+	for code, want := range map[string]bool{
+		"0000":  true,
+		"1234":  true,
+		"9999":  true,
+		"123":   false,
+		"12345": false,
+		"12a4":  false,
+		" 1234": false,
+		"":      false,
+	} {
+		if got := isPairCode(code); got != want {
+			t.Errorf("isPairCode(%q) = %v, want %v", code, got, want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// pairPoller against a scripted fake Bot API
+// ---------------------------------------------------------------------------
+
+// fakeBotAPI serves scripted getUpdates JSON bodies in order (the last one
+// repeats once the script is exhausted) and records the offset query param
+// of every call so tests can assert cursor progression.
+type fakeBotAPI struct {
+	t         *testing.T
+	mu        sync.Mutex
+	responses []string
+	calls     int
+	offsets   []string
+}
+
+func (f *fakeBotAPI) handler(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !strings.HasSuffix(r.URL.Path, "/getUpdates") {
+		f.t.Errorf("unexpected path %q", r.URL.Path)
+	}
+	f.offsets = append(f.offsets, r.URL.Query().Get("offset"))
+	idx := f.calls
+	if idx >= len(f.responses) {
+		idx = len(f.responses) - 1
+	}
+	f.calls++
+	_, _ = w.Write([]byte(f.responses[idx]))
+}
+
+// newTestPoller returns a pairPoller aimed at the fake server with
+// test-friendly timings (no long poll, near-instant transient retry).
+func newTestPoller(srvURL, code string, target pairTarget) *pairPoller {
+	return &pairPoller{
+		base:        srvURL,
+		token:       "TESTTOKEN",
+		code:        code,
+		target:      target,
+		pollTimeout: 0,
+		retryDelay:  time.Millisecond,
+		client:      &http.Client{Timeout: 2 * time.Second},
+	}
+}
+
+// TestPairPoller_DMCaptureIgnoresNoiseAndGroups — the DM poller must skip
+// /start noise, wrong codes, and a matching code sent in a GROUP (that's
+// the group flow's business), then capture the DM sender's user id. Also
+// pins offset progression: the second call must ack the first batch, and
+// the post-match commit must ack the consumed match.
+func TestPairPoller_DMCaptureIgnoresNoiseAndGroups(t *testing.T) {
+	fake := &fakeBotAPI{t: t, responses: []string{
+		`{"ok":true,"result":[
+			{"update_id":10,"message":{"text":"/start","from":{"id":777},"chat":{"id":777}}},
+			{"update_id":11,"message":{"text":"9999","from":{"id":777},"chat":{"id":777}}},
+			{"update_id":12,"message":{"text":"1234","from":{"id":555},"chat":{"id":-100200,"title":"Ops"}}}
+		]}`,
+		`{"ok":true,"result":[{"update_id":13,"message":{"text":" 1234 ","from":{"id":777},"chat":{"id":777}}}]}`,
+		`{"ok":true,"result":[]}`,
+	}}
+	srv := httptest.NewServer(http.HandlerFunc(fake.handler))
+	defer srv.Close()
+
+	p := newTestPoller(srv.URL, "1234", pairTargetDM)
+	capture, err := p.wait(time.Now().Add(5 * time.Second))
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if capture.UserID != 777 {
+		t.Errorf("capture.UserID = %d, want 777", capture.UserID)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.offsets) < 3 {
+		t.Fatalf("expected ≥3 getUpdates calls (poll, poll, commit), got %d", len(fake.offsets))
+	}
+	if fake.offsets[0] != "0" || fake.offsets[1] != "13" {
+		t.Errorf("offset progression = %v, want [0 13 ...] (second call must ack the first batch)", fake.offsets)
+	}
+	if last := fake.offsets[len(fake.offsets)-1]; last != "14" {
+		t.Errorf("commit offset = %s, want 14 (must ack the consumed match)", last)
+	}
+}
+
+// TestPairPoller_GroupCaptureIgnoresDMs — the group poller must skip a
+// matching code sent in a DM and capture the group's chat id + title from
+// the in-group match. The sender is incidental (we trust the group).
+func TestPairPoller_GroupCaptureIgnoresDMs(t *testing.T) {
+	fake := &fakeBotAPI{t: t, responses: []string{
+		`{"ok":true,"result":[
+			{"update_id":20,"message":{"text":"4321","from":{"id":777},"chat":{"id":777}}},
+			{"update_id":21,"message":{"text":"4321","from":{"id":555},"chat":{"id":-100987,"title":"Family Ops"}}}
+		]}`,
+		`{"ok":true,"result":[]}`,
+	}}
+	srv := httptest.NewServer(http.HandlerFunc(fake.handler))
+	defer srv.Close()
+
+	p := newTestPoller(srv.URL, "4321", pairTargetGroup)
+	capture, err := p.wait(time.Now().Add(5 * time.Second))
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if capture.ChatID != -100987 {
+		t.Errorf("capture.ChatID = %d, want -100987", capture.ChatID)
+	}
+	if capture.ChatTitle != "Family Ops" {
+		t.Errorf("capture.ChatTitle = %q, want \"Family Ops\"", capture.ChatTitle)
+	}
+}
+
+// TestPairPoller_ExpiresWithoutMatch — an empty stream past the deadline is
+// a clean expiry error, not a hang.
+func TestPairPoller_ExpiresWithoutMatch(t *testing.T) {
+	fake := &fakeBotAPI{t: t, responses: []string{`{"ok":true,"result":[]}`}}
+	srv := httptest.NewServer(http.HandlerFunc(fake.handler))
+	defer srv.Close()
+
+	p := newTestPoller(srv.URL, "1234", pairTargetDM)
+	_, err := p.wait(time.Now().Add(150 * time.Millisecond))
+	if err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Errorf("wait on empty stream = %v, want expiry error", err)
+	}
+}
+
+// TestPairPoller_FatalOnRejectedToken — a 401 from Telegram cannot be fixed
+// by retrying; the poller must bail immediately with a token error instead
+// of burning the whole window.
+func TestPairPoller_FatalOnRejectedToken(t *testing.T) {
+	fake := &fakeBotAPI{t: t, responses: []string{
+		`{"ok":false,"error_code":401,"description":"Unauthorized"}`,
+	}}
+	srv := httptest.NewServer(http.HandlerFunc(fake.handler))
+	defer srv.Close()
+
+	p := newTestPoller(srv.URL, "1234", pairTargetDM)
+	start := time.Now()
+	_, err := p.wait(time.Now().Add(30 * time.Second))
+	if err == nil || !strings.Contains(err.Error(), "token") {
+		t.Errorf("wait on 401 = %v, want fatal token error", err)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Error("fatal 401 took longer than 5s — poller kept retrying a hopeless error")
+	}
+}
+
+// TestPairPoller_TransientErrorsRetry — a transient Telegram error (rate
+// limit, flood control) must be retried, and the match after recovery
+// must still be captured.
+func TestPairPoller_TransientErrorsRetry(t *testing.T) {
+	fake := &fakeBotAPI{t: t, responses: []string{
+		`{"ok":false,"error_code":429,"description":"Too Many Requests"}`,
+		`{"ok":true,"result":[{"update_id":30,"message":{"text":"1234","from":{"id":42},"chat":{"id":42}}}]}`,
+		`{"ok":true,"result":[]}`,
+	}}
+	srv := httptest.NewServer(http.HandlerFunc(fake.handler))
+	defer srv.Close()
+
+	p := newTestPoller(srv.URL, "1234", pairTargetDM)
+	capture, err := p.wait(time.Now().Add(5 * time.Second))
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if capture.UserID != 42 {
+		t.Errorf("capture.UserID = %d, want 42", capture.UserID)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Config upserts
+// ---------------------------------------------------------------------------
+
+// TestApplyBotToken_PreservesOtherFields — the token upsert must not
+// clobber unrelated channel fields (a re-run must never lose topics,
+// groups, or ids the user already has).
+func TestApplyBotToken_PreservesOtherFields(t *testing.T) {
+	mf := skeletonMappings()
+	mf.Channels[telegramChannelName] = mappings.ChannelConfig{
+		BotToken:     "old-token",
+		DefaultGroup: "main",
+		Groups:       map[string]mappings.GroupConfig{"main": {ChatID: -100200}},
+		DMChatID:     777,
+		MasterUserID: 777,
+	}
+	applyBotToken(mf, "new-token")
+	cc := mf.Channels[telegramChannelName]
+	if cc.BotToken != "new-token" {
+		t.Errorf("BotToken = %q, want new-token", cc.BotToken)
+	}
+	if cc.DefaultGroup != "main" || cc.DMChatID != 777 || cc.Groups["main"].ChatID != -100200 {
+		t.Errorf("applyBotToken clobbered unrelated fields: %+v", cc)
+	}
+}
+
+// TestApplyDMPair_SetsIdentityAndAllowlist — a DM pair must record all
+// three: dm_chat_id, master_user_id, and the default-deny allowlist entry
+// (the same mutation the broker's acceptDMPair performs). Idempotent.
+func TestApplyDMPair_SetsIdentityAndAllowlist(t *testing.T) {
+	mf := skeletonMappings()
+	applyDMPair(mf, 777)
+	applyDMPair(mf, 777) // idempotent
+	cc := mf.Channels[telegramChannelName]
+	if cc.DMChatID != 777 || cc.MasterUserID != 777 {
+		t.Errorf("identity fields = dm:%d master:%d, want 777/777", cc.DMChatID, cc.MasterUserID)
+	}
+	if !mf.IsUserAllowed(777) {
+		t.Error("user 777 not allowlisted after applyDMPair")
+	}
+	if got := len(mf.AllowlistOrEmpty().Users); got != 1 {
+		t.Errorf("allowlist.users has %d entries, want 1 (idempotent)", got)
+	}
+}
+
+// TestApplyGroupPair_RecordsGroupDefaultAndAllowlist — a group pair must
+// record the groups entry (+title), claim the default when none is set,
+// and allowlist the chat id (mirroring the broker's acceptGroupPair).
+func TestApplyGroupPair_RecordsGroupDefaultAndAllowlist(t *testing.T) {
+	mf := skeletonMappings()
+	applyGroupPair(mf, "main", -100200, "My Group")
+	cc := mf.Channels[telegramChannelName]
+	if g := cc.Groups["main"]; g.ChatID != -100200 || g.Title != "My Group" {
+		t.Errorf("groups[main] = %+v, want chat -100200 title \"My Group\"", g)
+	}
+	if cc.DefaultGroup != "main" {
+		t.Errorf("DefaultGroup = %q, want main (claimed when unset)", cc.DefaultGroup)
+	}
+	if !mf.IsGroupAllowed(-100200) {
+		t.Error("group -100200 not allowlisted after applyGroupPair")
+	}
+}
+
+// TestApplyGroupPair_DoesNotStealExistingDefault — pairing a SECOND group
+// must not silently re-point default_group at it.
+func TestApplyGroupPair_DoesNotStealExistingDefault(t *testing.T) {
+	mf := skeletonMappings()
+	applyGroupPair(mf, "main", -100200, "")
+	applyGroupPair(mf, "side", -100300, "Side")
+	cc := mf.Channels[telegramChannelName]
+	if cc.DefaultGroup != "main" {
+		t.Errorf("DefaultGroup = %q after second pair, want main", cc.DefaultGroup)
+	}
+	if len(cc.Groups) != 2 {
+		t.Errorf("groups = %d entries, want 2", len(cc.Groups))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Progress tracking (#4 — never re-show a completed step)
+// ---------------------------------------------------------------------------
+
+// TestDeriveProgress_EmptyAndFull — a skeleton reports nothing configured;
+// a populated config reports every step done (preferring default_group).
+func TestDeriveProgress_EmptyAndFull(t *testing.T) {
+	empty := deriveProgress(skeletonMappings(), filepath.Join(t.TempDir(), "absent.env"))
+	if empty.Token != "" || empty.DMChatID != 0 || empty.GroupChatID != 0 || empty.STTConfigured {
+		t.Errorf("deriveProgress(skeleton) = %+v, want zero progress", empty)
+	}
+
+	sttPath := filepath.Join(t.TempDir(), "stt.env")
+	if err := os.WriteFile(sttPath, []byte("OPENROUTER_API_KEY=x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mf := skeletonMappings()
+	mf.Channels[telegramChannelName] = mappings.ChannelConfig{
+		BotToken:     "tok",
+		DefaultGroup: "main",
+		Groups: map[string]mappings.GroupConfig{
+			"side": {ChatID: -100300},
+			"main": {ChatID: -100200},
+		},
+		DMChatID: 777,
+	}
+	full := deriveProgress(mf, sttPath)
+	if full.Token != "tok" || full.DMChatID != 777 || !full.STTConfigured {
+		t.Errorf("deriveProgress(full) = %+v, want token/dm/stt set", full)
+	}
+	if full.GroupName != "main" || full.GroupChatID != -100200 {
+		t.Errorf("deriveProgress preferred %q/%d, want the default group main/-100200", full.GroupName, full.GroupChatID)
+	}
+}
+
+// TestLoadOrInitMappings_MissingYieldsSkeleton — a missing file is a fresh
+// start (not an error); a corrupt file is an error the caller must handle.
+func TestLoadOrInitMappings_MissingYieldsSkeleton(t *testing.T) {
+	mf, existed, err := loadOrInitMappings(filepath.Join(t.TempDir(), "absent.json"))
+	if err != nil || existed {
+		t.Fatalf("loadOrInitMappings(missing) = existed=%v err=%v, want false/nil", existed, err)
+	}
+	if mf == nil || mf.SchemaVersion != 1 || mf.Channels == nil {
+		t.Errorf("skeleton = %+v, want schema 1 with maps allocated", mf)
+	}
+}
+
+func TestLoadOrInitMappings_CorruptReturnsError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mappings.json")
+	if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, existed, err := loadOrInitMappings(path)
+	if err == nil || !existed {
+		t.Errorf("loadOrInitMappings(corrupt) = existed=%v err=%v, want true/error", existed, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Emitted copy guards (#4/#5/#6/#8/#9/#10)
+// ---------------------------------------------------------------------------
+
+// bannedSetupCopy are the manual-id-hunt breadcrumbs that must never appear
+// in any setup-emitted text again: pairing replaced them (maintainer
+// directive, 2026-06-30 install feedback #5/#6).
+var bannedSetupCopy = []string{"userinfobot", "username_to_id_bot", "-100"}
+
+// TestChecklist_NoBotCreationStepAndNoIDHunting — the checklist runs after
+// the token is already validated, so it must not re-show bot creation (#4),
+// and its copy must not send anyone hunting for ids (#5/#6).
+func TestChecklist_NoBotCreationStepAndNoIDHunting(t *testing.T) {
+	var all strings.Builder
+	for _, s := range botGroupChecklistSteps() {
+		all.WriteString(s.title)
+		all.WriteString("\n")
+		all.WriteString(strings.Join(s.body, "\n"))
+		all.WriteString("\n")
+		if strings.Contains(s.title, "Create the bot") {
+			t.Errorf("checklist re-shows the completed bot-creation step: %q", s.title)
+		}
+	}
+	text := all.String()
+	for _, banned := range bannedSetupCopy {
+		if strings.Contains(text, banned) {
+			t.Errorf("checklist copy contains banned id-hunting breadcrumb %q", banned)
+		}
+	}
+	if !strings.Contains(text, "privacy") && !strings.Contains(text, "setprivacy") {
+		t.Error("checklist lost the privacy-mode step — group pairing depends on it")
+	}
+}
+
+// TestPairIntros_ContainCodeAndNoIDHunting — the pairing banners must carry
+// the code (and the bot username for DM) and stay free of id-hunt copy.
+func TestPairIntros_ContainCodeAndNoIDHunting(t *testing.T) {
+	dm := dmPairIntro("my_test_bot", "1234")
+	if !strings.Contains(dm, "1234") || !strings.Contains(dm, "@my_test_bot") {
+		t.Errorf("dmPairIntro missing code or bot username:\n%s", dm)
+	}
+	group := groupPairIntro("5678")
+	if !strings.Contains(group, "5678") {
+		t.Errorf("groupPairIntro missing code:\n%s", group)
+	}
+	for _, text := range []string{dm, group, pairArmPrompt} {
+		for _, banned := range bannedSetupCopy {
+			if strings.Contains(text, banned) {
+				t.Errorf("pairing copy contains banned id-hunting breadcrumb %q in:\n%s", banned, text)
+			}
+		}
+	}
+}
+
+// TestPostSetupWhatNow_Claude_NoDefaultResume — the post-setup block must
+// stand alone (#8): launch command, /c3:attach, send-from-phone. The launch
+// line must NOT default to --resume (#9) — it may only be mentioned as an
+// explicit opt-in — and the 30-second tour must be present (#10).
+func TestPostSetupWhatNow_Claude_NoDefaultResume(t *testing.T) {
+	for _, host := range []HostCLI{HostClaude, HostUnknown} {
+		out := postSetupWhatNow(host)
+		if !strings.Contains(out, "claude --dangerously-load-development-channels plugin:c3@c3") {
+			t.Fatalf("host %v: missing the stand-alone launch command:\n%s", host, out)
+		}
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, "--dangerously-load-development-channels") && strings.Contains(line, "--resume") {
+				t.Errorf("host %v: launch line defaults to --resume: %q", host, line)
+			}
+		}
+		if !strings.Contains(out, "--resume") {
+			t.Errorf("host %v: --resume opt-in note missing entirely", host)
+		}
+		if !strings.Contains(out, "/c3:attach") {
+			t.Errorf("host %v: missing the /c3:attach step", host)
+		}
+		if !strings.Contains(out, "phone") {
+			t.Errorf("host %v: missing the send-from-phone step", host)
+		}
+		if !strings.Contains(out, "/c3:status") || !strings.Contains(out, "/c3:topics") {
+			t.Errorf("host %v: missing the 30-second tour pointers", host)
+		}
+	}
+}
+
+// TestPostSetupWhatNow_Codex — the Codex block must not default the resume
+// variant either, and must still cover attach + phone + tour.
+func TestPostSetupWhatNow_Codex(t *testing.T) {
+	out := postSetupWhatNow(HostCodex)
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "then run:") && strings.Contains(line, "resume") {
+			t.Errorf("codex launch line defaults to resume: %q", line)
+		}
+	}
+	if !strings.Contains(out, "resume --last") {
+		t.Error("codex resume opt-in note missing")
+	}
+	if !strings.Contains(out, "attach") || !strings.Contains(out, "phone") {
+		t.Errorf("codex block missing attach/phone steps:\n%s", out)
+	}
+}
+
+// TestSetupCopy_NoIDHuntingAnywhere — belt and braces across every
+// setup-emitted string constant/builder in one sweep.
+func TestSetupCopy_NoIDHuntingAnywhere(t *testing.T) {
+	texts := []string{
+		dmPairIntro("bot", "0000"),
+		groupPairIntro("0000"),
+		pairArmPrompt,
+		postSetupWhatNow(HostClaude),
+		postSetupWhatNow(HostCodex),
+		sttNotes,
+		setupUsage,
+	}
+	for _, s := range botGroupChecklistSteps() {
+		texts = append(texts, s.title, strings.Join(s.body, "\n"))
+	}
+	for _, text := range texts {
+		for _, banned := range bannedSetupCopy {
+			if strings.Contains(text, banned) {
+				t.Errorf("setup copy contains banned id-hunting breadcrumb %q in:\n%s", banned, text)
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Token validation + API base
+// ---------------------------------------------------------------------------
+
+// TestValidateBotTokenAt — getMe success returns the username; a Telegram
+// error surfaces its description.
+func TestValidateBotTokenAt(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "goodtoken") {
+			fmt.Fprint(w, `{"ok":true,"result":{"username":"my_test_bot"}}`)
+			return
+		}
+		fmt.Fprint(w, `{"ok":false,"description":"Unauthorized"}`)
+	}))
+	defer srv.Close()
+
+	username, err := validateBotTokenAt(srv.URL, "goodtoken")
+	if err != nil || username != "my_test_bot" {
+		t.Errorf("validateBotTokenAt(good) = %q, %v; want my_test_bot, nil", username, err)
+	}
+	if _, err := validateBotTokenAt(srv.URL, "badtoken"); err == nil || !strings.Contains(err.Error(), "Unauthorized") {
+		t.Errorf("validateBotTokenAt(bad) = %v, want Unauthorized error", err)
+	}
+}
+
+// TestTelegramAPIBase_EnvOverride — the env override wins (trailing slash
+// trimmed); unset falls back to the public endpoint. Mirrors the telegram
+// channel's env-beats-file precedence.
+func TestTelegramAPIBase_EnvOverride(t *testing.T) {
+	t.Setenv("C3_TELEGRAM_API_URL", "https://bot-api-proxy.example.com/")
+	if got := telegramAPIBase(); got != "https://bot-api-proxy.example.com" {
+		t.Errorf("telegramAPIBase(override) = %q", got)
+	}
+	t.Setenv("C3_TELEGRAM_API_URL", "")
+	os.Unsetenv("C3_TELEGRAM_API_URL")
+	if got := telegramAPIBase(); got != "https://api.telegram.org" {
+		t.Errorf("telegramAPIBase(default) = %q", got)
+	}
+}
+
+// TestFallbackGroupName — phased pair-group default: title when present,
+// else "main".
+func TestFallbackGroupName(t *testing.T) {
+	if got := fallbackGroupName("Family Ops"); got != "Family Ops" {
+		t.Errorf("fallbackGroupName(title) = %q", got)
+	}
+	if got := fallbackGroupName("  "); got != "main" {
+		t.Errorf("fallbackGroupName(blank) = %q, want main", got)
+	}
 }
