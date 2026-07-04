@@ -239,13 +239,29 @@ func (b *Broker) Channels() []string {
 	return out
 }
 
-// Shutdown drains in-flight work and stops all subsystems in the order
-// required for clean shutdown:
+// defaultShutdownGrace bounds Broker.Shutdown's worker-pool drain. Workers are
+// ctx-cancelled first (no new outbound dispatch; in-flight channel calls unwind),
+// but a worker stuck in a call that doesn't observe ctx cancel — an outbound send
+// bounded only by its own ~20s HTTP timeout, or a voice-readback echo — must not
+// wedge the whole exit. After this budget it is abandoned; the durable queue
+// makes that loss-free, and main's watchdog is the outer backstop.
+const defaultShutdownGrace = 8 * time.Second
+
+// Shutdown drains in-flight work and stops all subsystems, bounding the
+// worker-pool drain to defaultShutdownGrace. See ShutdownWithin for the ordering
+// rationale.
+func (b *Broker) Shutdown() {
+	b.ShutdownWithin(defaultShutdownGrace)
+}
+
+// ShutdownWithin stops all subsystems in the order required for clean shutdown,
+// bounding the worker-pool drain to grace (grace<=0 waits indefinitely):
 //
 //  1. Stop the worker pool so no new outbound tool-calls dispatch.
-//     Workers.Stop() also cancels the per-route worker contexts; any
-//     in-flight dispatchOutbound returns from its channel call (or
-//     drops out of the queue) before the channel is torn down.
+//     StopWithin cancels the per-route worker contexts; any in-flight
+//     dispatchOutbound returns from its channel call (or drops out of the
+//     queue) before the channel is torn down. A worker that can't cancel in
+//     time is abandoned after grace (loss-free — the durable queue redelivers).
 //  2. Stop each channel — by now the worker pool isn't issuing fresh
 //     Telegram calls, so Channel.Stop() can drain whatever's already
 //     in flight (HTTP requests, polling goroutine) without racing new
@@ -258,8 +274,10 @@ func (b *Broker) Channels() []string {
 // while the channel's Stop was tearing down state, producing 20-second
 // hangs on stale request opts timeouts. Addresses code-review-
 // 2026-05-15 MAJOR #5 (daemon.md §1.3 drain order).
-func (b *Broker) Shutdown() {
-	b.Workers.Stop()
+func (b *Broker) ShutdownWithin(grace time.Duration) {
+	if !b.Workers.StopWithin(grace) {
+		log.Printf("broker: worker pool did not drain within %s — proceeding with shutdown (leaked workers exit with the process; durable queue keeps this loss-free)", grace)
+	}
 	b.chMu.Lock()
 	for _, reg := range b.channels {
 		_ = reg.Channel.Stop()
