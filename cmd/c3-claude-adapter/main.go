@@ -111,6 +111,15 @@ func run() error {
 
 	a := newAdapter()
 	a.runCtx = ctx
+	// Detect once whether this host can render channel push notifications. A
+	// flagless launch (typically a --fork-session background job) silently drops
+	// them, so the broker must hold such a session's inbound in the durable queue
+	// rather than let the adapter ack it as delivered. Cheap /proc walk; the
+	// process tree is fixed for the session.
+	a.hostRenderCapable = hostCanRenderChannels()
+	if !a.hostRenderCapable {
+		log.Printf("adapter: host CANNOT render channel pushes (launched without %s naming plugin c3) — inbound will be QUEUED for fetch_queue, not pushed", devChannelsFlag)
+	}
 	if err := a.connectBroker(); err != nil {
 		log.Printf("adapter: exit pid=%d reason=connect-broker err=%v", os.Getpid(), err)
 		return fmt.Errorf("connect broker: %w", err)
@@ -258,6 +267,15 @@ type adapter struct {
 	askRegPending map[string]chan ipc.AskRegisteredMsg
 	askPending    map[string]chan ipc.AskResultMsg
 
+	// hostRenderCapable is whether the launching Claude Code host can render
+	// notifications/claude/channel pushes. Detected once from the /proc ancestor
+	// chain in run() (hostCanRenderChannels). Default TRUE (set in newAdapter) so
+	// an uncertain environment — and unrelated unit tests that never run detection
+	// — keep the normal fast path. Reported to the broker at hello (inverted, as
+	// CannotRenderChannels) and surfaced to the agent in buildInstructions when
+	// false. See render_detect.go for the detection + the blackhole it defends.
+	hostRenderCapable bool
+
 	// Hello-ack response state, captured on connect.
 	helloAck ipc.HelloAckMsg
 
@@ -303,6 +321,10 @@ func newAdapter() *adapter {
 		rtPending:     map[string]chan ipc.RetranscribeResp{},
 		askRegPending: map[string]chan ipc.AskRegisteredMsg{},
 		askPending:    map[string]chan ipc.AskResultMsg{},
+		// Default capable; run() overwrites with the real /proc detection. Keeping
+		// the default TRUE means every unit test that constructs an adapter without
+		// running detection behaves as a normal (renderable) session.
+		hostRenderCapable: true,
 	}
 }
 
@@ -346,6 +368,9 @@ func (a *adapter) hello() error {
 	if err := a.conn.WriteJSON(ipc.HelloMsg{
 		Op: ipc.OpHello, CLI: "claude", PID: os.Getpid(), CWD: cwd,
 		Capabilities: []string{"claude/channel"},
+		// Inverted: set only when we're confident the host drops channel pushes,
+		// so the broker holds our inbound in the queue instead of acking it lost.
+		CannotRenderChannels: !a.hostRenderCapable,
 	}); err != nil {
 		return err
 	}
@@ -1177,7 +1202,23 @@ func (a *adapter) buildInstructions() string {
 	default:
 		head = "C3 connected. Use the `attach` tool to claim a Telegram topic for this session."
 	}
-	return head + permissionContractNote + mode.Combined(a.capsOrDefault())
+	// When the host cannot render channel pushes (flagless launch — the
+	// forked-session blackhole), channel notifications never reach the agent, so
+	// this init-time warning is the reliable way to tell it. The instructions are
+	// returned in the MCP initialize RESULT (a normal JSON-RPC response the CLI
+	// always processes), NOT a channel push, so they render even in the broken
+	// session. The human separately sees the Telegram held-notice.
+	return renderDegradedNote(a.hostRenderCapable) + head + permissionContractNote + mode.Combined(a.capsOrDefault())
+}
+
+// renderDegradedNote returns the leading init-instructions warning for a session
+// whose host silently drops channel push notifications, or "" when the host can
+// render normally (zero change to the capable fast path).
+func renderDegradedNote(canRender bool) string {
+	if canRender {
+		return ""
+	}
+	return "⚠️ Inbound delivery is DEGRADED: this session was launched without the development-channels flag, so incoming Telegram messages CANNOT be pushed into this conversation (the host silently drops them). C3 is holding them in a durable queue instead — call the `fetch_queue` tool to retrieve queued messages (they arrive as a tool result, which renders here). For normal live delivery, relaunch with `--dangerously-load-development-channels plugin:c3@c3`.\n\n"
 }
 
 // permissionContractNote is the security contract carried in the MCP instructions
