@@ -681,6 +681,28 @@ func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound, 
 		holder = nil
 	}
 
+	// Render-incapable holder (forked-session blackhole fix): the holder is a
+	// live, claimed session whose HOST silently drops channel push notifications
+	// (a Claude Code session launched without the development-channels flag —
+	// typically a --fork-session background job; reported at hello via
+	// CannotRenderChannels). Its adapter would ACK the push as delivered, but the
+	// frame is discarded before rendering, so a "delivered" inbound VANISHES.
+	// Treat it exactly like the alive-but-disconnected BOUNCE below: never push
+	// (and thus never mark delivered) — fall through to the durable queue +
+	// held-notice, recoverable via fetch_queue (an MCP tool-result, which DOES
+	// render) and visible to the human as the held count. Do NOT release the
+	// claim: the session legitimately holds the route for OUTBOUND (reply/tools
+	// still work). Gated to NON-events: events are never queued and carry no lost
+	// content, so leaving them on the current push path is zero behavior change
+	// (they'd be dropped by the host anyway, same as today).
+	if claimed && !in.IsEvent() && !holder.CanRenderPush() {
+		log.Printf("deliver HELD chan=%s chat=%d topic=%s msg=%d: holder cli=%s pid=%d cannot render channel push — queuing for fetch_queue — %s",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID,
+			holder.CLI, holder.PID, fallbackSummary(in))
+		claimed = false
+		holder = nil
+	}
+
 	// Holder is alive (kill -0 succeeded) but its conn is nil — the adapter
 	// is between reconnects (D2 / adapter-ipc-1). Previously this DROPPED the
 	// inbound silently ("alive but disconnected"); a message sent during the

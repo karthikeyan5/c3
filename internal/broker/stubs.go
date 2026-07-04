@@ -54,6 +54,16 @@ type Stub struct {
 	// adapter connects. Guarded by stubMu.
 	stubMu sync.Mutex
 	Route  *RouteKey
+	// cannotRender is set from HelloMsg.CannotRenderChannels: the host silently
+	// drops channel push notifications (a Claude Code session launched without the
+	// development-channels flag — typically a --fork-session background job). When
+	// true, forwardOrFallback never marks this holder's durable inbound delivered:
+	// human messages fall through to the queue + held-notice (recoverable via
+	// fetch_queue) while the session keeps its claim for OUTBOUND. Default false
+	// (renderable) so old adapters and the normal fast path are unaffected. Set
+	// once at hello via SetCannotRender; read on the delivery path via
+	// CanRenderPush. Guarded by stubMu.
+	cannotRender bool
 	// stableSessionID is the host CLI's STABLE per-session id (Claude: the
 	// transcript / --resume id), learned from the SessionStart-hook handoff and
 	// delivered to the broker via RecoverSessionReq AFTER hello. The broker keys
@@ -155,6 +165,26 @@ func (s *Stub) StableSessionIDValue() string {
 	s.stubMu.Lock()
 	defer s.stubMu.Unlock()
 	return s.stableSessionID
+}
+
+// SetCannotRender records whether this session's host silently drops channel
+// push notifications (from HelloMsg.CannotRenderChannels). Set once at hello,
+// before the stub is claimable. Guarded by stubMu like SetRoute.
+func (s *Stub) SetCannotRender(v bool) {
+	s.stubMu.Lock()
+	defer s.stubMu.Unlock()
+	s.cannotRender = v
+}
+
+// CanRenderPush reports whether the broker may push channel notifications to this
+// holder (and mark them delivered). False for a host that silently drops them —
+// the forked-session blackhole — in which case inbound is held in the queue
+// instead. Default true (renderable) for old adapters that never reported the
+// flag. Guarded by stubMu.
+func (s *Stub) CanRenderPush() bool {
+	s.stubMu.Lock()
+	defer s.stubMu.Unlock()
+	return !s.cannotRender
 }
 
 // MarkReplied records that this connection has dispatched ≥1 `reply` to its

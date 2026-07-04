@@ -3,11 +3,40 @@ package main
 import (
 	"encoding/json"
 	"net"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/karthikeyan5/c3/internal/ipc"
 )
+
+// The fake-tree tests exercise detectRenderCapable's logic; this grounds the REAL
+// /proc parsers (readProcCmdline / readProcPPID) against this live test process so
+// the production accessors are proven, not just the injected ones. Skipped where
+// /proc is absent (non-Linux).
+func TestRealProcReaders_Smoke(t *testing.T) {
+	if _, err := os.Stat("/proc/self/stat"); err != nil {
+		t.Skip("no /proc on this host")
+	}
+	self := os.Getpid()
+	args, ok := readProcCmdline(self)
+	if !ok || len(args) == 0 {
+		t.Fatalf("readProcCmdline(self) = %v, %v; want a non-empty argv", args, ok)
+	}
+	ppid, ok := readProcPPID(self)
+	if !ok {
+		t.Fatal("readProcPPID(self) not ok")
+	}
+	if ppid != os.Getppid() {
+		t.Errorf("readProcPPID(self) = %d, want os.Getppid() = %d", ppid, os.Getppid())
+	}
+	// End-to-end through the real readers: the test process's ancestry is `go
+	// test`, not a Claude host, so detection must default to capable (true) — never
+	// a false blackhole in a non-Claude environment.
+	if !hostCanRenderChannels() {
+		t.Error("in a non-Claude test process, detection must default to renderable")
+	}
+}
 
 // fakeTree builds procReaders over a synthetic process tree: cmdlines maps a pid
 // to its argv, parents maps a pid to its ppid. A missing pid in cmdlines reads as
