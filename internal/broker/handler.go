@@ -69,6 +69,18 @@ func (b *Broker) HandleConn(nc net.Conn) {
 			hello.CLI, hello.PID, hello.CWD, stub.ConnID)
 	}
 
+	// Record whether this host can render channel pushes (from the adapter's
+	// /proc detection). Set for BOTH new and reconnect stubs so a reconnecting
+	// adapter re-reports it. When it cannot render, forwardOrFallback holds this
+	// holder's inbound in the durable queue instead of acking it lost — the
+	// forked-session blackhole fix. Absent field (old adapter) → false →
+	// renderable, no regression.
+	if hello.CannotRenderChannels {
+		stub.SetCannotRender(true)
+		log.Printf("hello: cli=%s pid=%d conn=%d reports it CANNOT render channel pushes — inbound will be HELD (queue + fetch_queue)",
+			hello.CLI, hello.PID, stub.ConnID)
+	}
+
 	// Defer: mark the stub as disconnected and decide whether to release
 	// its claims based on PID liveness. The "claims preserved while PID
 	// alive" rule covers the common case where the adapter is briefly

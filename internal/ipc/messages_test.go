@@ -2,6 +2,7 @@ package ipc
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/karthikeyan5/c3/internal/c3types"
@@ -25,6 +26,41 @@ func TestHelloMsg_Roundtrip(t *testing.T) {
 	}
 	if out.Op != OpHello || out.CLI != "claude" || out.PID != 12345 {
 		t.Errorf("roundtrip mismatch: %+v", out)
+	}
+}
+
+// The forked-session blackhole fix rides on an additive, omitempty
+// CannotRenderChannels flag with INVERTED sense: absent ⇒ renderable. An old
+// adapter (never sets it) and a capable new adapter both serialize NO field, so
+// a broker decoding either sees false = renderable — the fast-path default.
+func TestHelloMsg_CannotRenderChannels_OmitEmptyDefaultsRenderable(t *testing.T) {
+	// Capable / old adapter: field left false ⇒ must be omitted from the wire.
+	capable := HelloMsg{Op: OpHello, CLI: "claude", PID: 1, CWD: "/x"}
+	raw, err := json.Marshal(capable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(raw); strings.Contains(got, "cannot_render_channels") {
+		t.Errorf("renderable hello must omit cannot_render_channels; got %s", got)
+	}
+	// A hello from an OLD broker/adapter that never knew the field decodes to
+	// false = renderable (no regression).
+	var decoded HelloMsg
+	if err := json.Unmarshal([]byte(`{"op":"hello","cli":"claude","pid":1,"cwd":"/x"}`), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.CannotRenderChannels {
+		t.Error("absent cannot_render_channels must decode to false (renderable)")
+	}
+	// Confident-not-capable adapter: true round-trips.
+	incap := HelloMsg{Op: OpHello, CLI: "claude", PID: 1, CWD: "/x", CannotRenderChannels: true}
+	raw2, _ := json.Marshal(incap)
+	var out HelloMsg
+	if err := json.Unmarshal(raw2, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.CannotRenderChannels {
+		t.Errorf("cannot_render_channels=true must round-trip; got %s", string(raw2))
 	}
 }
 
