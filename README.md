@@ -34,7 +34,7 @@ In any Claude Code session, paste:
 follow https://github.com/karthikeyan5/c3/blob/main/INSTALL.md to install c3
 ```
 
-The agent runs the playbook end-to-end. You'll be asked for a Telegram bot token (from `@BotFather`) and your group/DM chat ids during configuration. The whole install is ~5 minutes.
+The agent runs the playbook end-to-end. You'll be asked for a Telegram bot token (from `@BotFather`) and two short pairing codes — one sent to the bot in a DM, one sent in your group — which discover your user id and the group's chat id automatically, no id hunting. The whole install is ~5 minutes.
 
 See [`INSTALL.md`](INSTALL.md) for the agent script (what the agent reads) and [`docs/INSTALL.md`](docs/INSTALL.md) for the human-readable walkthrough.
 
