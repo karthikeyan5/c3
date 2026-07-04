@@ -110,14 +110,18 @@ func (b *Broker) runUpdateCheck(requestShutdown func()) {
 	if !b.Mappings().AutoUpdateEnabled() {
 		return
 	}
-	b.performAutoUpdate(ctx, requestShutdown)
+	b.performAutoUpdate(requestShutdown)
 }
 
 // performAutoUpdate runs the verify-then-swap self-update, and on success
 // notifies sessions/topics once and requests a graceful restart. On failure the
 // binaries are left untouched (updater guarantees this) and the broker keeps
 // running the old version; the notice stays up so the user can update manually.
-func (b *Broker) performAutoUpdate(ctx context.Context, requestShutdown func()) {
+//
+// The install gets its OWN, longer-timeout context derived from b.ctx (NOT the
+// check's short context) so a slow download isn't cut off — while a broker
+// shutdown still cancels it cleanly.
+func (b *Broker) performAutoUpdate(requestShutdown func()) {
 	log.Printf("update: auto_update ON — installing latest release now")
 	ictx, cancel := context.WithTimeout(b.ctx, updateInstallTimeout)
 	defer cancel()
