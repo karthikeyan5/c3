@@ -118,17 +118,52 @@ func (p *WorkerPool) spawnLocked(key RouteKey) *RouteWorker {
 	return w
 }
 
-// Stop signals all workers to exit and waits for them. It sets stopped under
-// p.mu BEFORE cancel()/wg.Wait() so a concurrent Submit (e.g. a live poll
-// goroutine still routing during Broker.Shutdown) observes stopped and refuses
-// to spawn — guaranteeing no spawnLocked wg.Add(1) can begin after wg.Wait()
-// has started (m2, W1 review).
+// Stop signals all workers to exit and waits for them (unbounded). Retained for
+// tests and any caller that wants a guaranteed full drain.
 func (p *WorkerPool) Stop() {
+	p.StopWithin(0)
+}
+
+// StopWithin signals all workers to exit and waits up to timeout for them
+// (timeout<=0 waits indefinitely, i.e. Stop's behavior). It sets stopped under
+// p.mu BEFORE cancel()/wait so a concurrent Submit (e.g. a live poll goroutine
+// still routing during Broker.Shutdown) observes stopped and refuses to spawn —
+// guaranteeing no spawnLocked wg.Add(1) can begin after wg.Wait() has started
+// (m2, W1 review).
+//
+// Returns true if every worker exited within the budget. A false return means a
+// worker is stuck in a call that doesn't observe ctx cancel (e.g. an outbound
+// send bounded only by its own HTTP timeout, or a readback echo); the caller is
+// expected to be on a hard-exit path where the leaked goroutine dies with the
+// process, and the durable queue makes an abrupt exit loss-free.
+func (p *WorkerPool) StopWithin(timeout time.Duration) bool {
 	p.mu.Lock()
 	p.stopped = true
 	p.mu.Unlock()
 	p.cancel()
-	p.wg.Wait()
+	if timeout <= 0 {
+		p.wg.Wait()
+		return true
+	}
+	return waitGroupTimeout(&p.wg, timeout)
+}
+
+// waitGroupTimeout waits for wg up to timeout, returning true if it completed and
+// false if the timeout elapsed first. On a false return the spawned waiter
+// goroutine outlives the call until wg eventually completes — acceptable only on
+// a process-exit path (shutdown), where a leaked goroutine dies with the process.
+func waitGroupTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // Active returns the number of currently-running workers (diagnostic).

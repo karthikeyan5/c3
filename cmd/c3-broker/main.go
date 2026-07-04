@@ -409,7 +409,51 @@ func runDaemon() (err error) {
 		break
 	}
 
-	srv.Stop()
-	br.Shutdown()
+	// Graceful shutdown with a hard watchdog. srv.Stop() closes the listener AND
+	// every live adapter connection (so the HandleConn read loops parked in a
+	// blocking ReadFrame return); br.Shutdown() drains the worker pool and stops
+	// channels. Both bound their own waits, but as a LAST-RESORT backstop we cap
+	// the whole sequence: if it hasn't finished within shutdownWatchdog, force
+	// exit(0).
+	//
+	// A forced exit is SAFE and loss-free BY DESIGN: the durable inbound queue
+	// persists every accepted message, and the Telegram offset watermark only
+	// advances past a durably-stored update — so an abrupt exit re-delivers at
+	// most the in-flight tail on the next start (dedup bounds it). That is the
+	// same property that has always made `kill -9` the documented recovery. A
+	// bounded forced exit is therefore strictly better than a wedged drain, which
+	// keeps the singleton flock and strands auto-update (the freshly installed
+	// binary cannot start while the old process holds the lock).
+	if !runShutdown(func() { srv.Stop(); br.Shutdown() }, shutdownWatchdog) {
+		log.Printf("c3-broker: graceful shutdown did not complete within %s — forcing exit(0). Loss-free by design: the durable queue + offset watermark redeliver the in-flight tail on restart (same guarantee as kill -9).", shutdownWatchdog)
+		os.Exit(exitOK)
+	}
 	return nil
+}
+
+// shutdownWatchdog is the hard ceiling on graceful shutdown. srv.Stop and
+// br.Shutdown each bound their own waits well under this (5s conn drain + 8s
+// worker drain); this only fires if something wedges past all of them. 15s
+// leaves headroom over the inner budgets while still beating both any human's
+// patience and the Telegram long-poll's ~55s reconnect window, so auto-update's
+// respawn is never stranded behind a still-held singleton flock.
+const shutdownWatchdog = 15 * time.Second
+
+// runShutdown runs shutdown in a goroutine and reports whether it completed
+// within timeout. Factored out of the signal path so the watchdog DECISION is
+// unit-testable without a real os.Exit: a test passes a shutdown func that blocks
+// forever and asserts runShutdown returns false. On a false return the caller
+// (main) force-exits; the leaked goroutine dies with the process.
+func runShutdown(shutdown func(), timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		shutdown()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
