@@ -34,6 +34,9 @@ dist/
 # Internal review notes — not part of the public documentation set.
 docs/.loop/
 
+# Archived done-and-dusted docs — off the public tree, kept in git history.
+junk/
+
 # Local config + secrets (never commit these)
 mappings.json
 mappings.json.bak

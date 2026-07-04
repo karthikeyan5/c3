@@ -65,7 +65,7 @@ From there:
 - **Replying from your phone** — type into the topic's chat. The CLI sees your message as an inbound block.
 - **Voice notes** — record on your phone, send to the topic. The STT plugin transcribes; the CLI sees `[Transcribed voice]: <text>` plus the original voice attachment available for re-download if the transcript is wrong.
 - **Quote-replying** — long-press a CLI message, hit Reply, type. The CLI sees the inbound with `reply_to_message_id`, `reply_to_user`, and `reply_to_text` so it knows which prior message you're answering.
-- **Multi-message bursts** — multiple **text** messages in quick succession are collapsed by the debounce window (default 1500ms). Saves your CLI from getting confused by interleaved partial thoughts. Photo/file **albums** are not assembled as a unit in v0.1 — album siblings arrive as separate inbounds merged only by the debounce window; reliable album handling is a known gap (see RESUME.md FIX #1).
+- **Multi-message bursts** — multiple **text** messages in quick succession are collapsed by the debounce window (default 1500ms). Saves your CLI from getting confused by interleaved partial thoughts. Photo/file **albums** are not assembled as a unit in v1 — album siblings arrive as separate inbounds merged only by the debounce window; reliable album handling is a known gap (see [`ROADMAP.md`](../ROADMAP.md)).
 
 ## Durable inbound queue & backlog
 
@@ -97,12 +97,12 @@ STT failures are usually a transient or down provider, not lost audio. When tran
 
 Type `/status` directly into a Telegram chat (it autocompletes in the `/` menu) to see queue depth and attach state. This is a *Telegram bot command*, distinct from the `/c3:status` CLI slash command — the broker answers it directly and never routes it to an agent.
 
-- **In a topic** → that topic's status, e.g. `📊 arogara · 3 queued (oldest 2h) · no CLI attached · broker up`.
+- **In a topic** → that topic's status, e.g. `📊 myproject · 3 queued (oldest 2h) · no CLI attached · broker up`.
 - **In DM or General** → a global summary across all routes (empty queues omitted), e.g.:
   ```
   📊 Broker up (pid 12345). Active queues:
-  • arogara — 3 (oldest 2h)
-  • proctor — 1 (oldest 10m)
+  • myproject — 3 (oldest 2h)
+  • docs — 1 (oldest 10m)
   1 attached · 1 idle
   ```
 
@@ -142,7 +142,7 @@ $ cd ~/projects/widget
 $ codex
 ```
 
-The `codex` command goes through the C3 launcher, which spawns a Codex app-server, registers the C3 MCP adapter, and launches the visible TUI bound to that app-server. The adapter sees the cwd has a mapping but it's already claimed by Claude Code — so Codex stays unattached and tells you. To take over, `/exit` the Claude session to drop the claim. (`c3-broker release <cwd>` is on the roadmap but stubbed in v0.1.0 — for now, `/exit` the Claude session to drop the claim.) Then `attach` from Codex.
+The `codex` command goes through the C3 launcher, which spawns a Codex app-server, registers the C3 MCP adapter, and launches the visible TUI bound to that app-server. The adapter sees the cwd has a mapping but it's already claimed by Claude Code — so Codex stays unattached and tells you. To take over, `/exit` the Claude session to drop the claim. (`c3-broker release <cwd>` is on the roadmap but stubbed in v1 — for now, `/exit` the Claude session to drop the claim.) Then `attach` from Codex.
 
 If you want Claude and Codex on different topics in the same group, attach Codex to a different topic explicitly: `attach(target="widget-codex")`. The broker creates that as a sibling topic in the group; future Codex sessions in this dir will need the same explicit override (or you switch the dir's default mapping).
 
@@ -184,7 +184,7 @@ tail /tmp/c3-codex-supervisor.log     # last codex launcher invocation (if Codex
 cat /tmp/c3-codex-app-server-$UID.json  # current app-server signature (cwd, topic, adapter path)
 ```
 
-If the socket is missing or the pid file points at a nonexistent process, the next CLI session will spawn a fresh broker. If something looks corrupted, `pkill c3-broker; rm -f "${XDG_RUNTIME_DIR:-/tmp}/c3.sock" /tmp/c3-$UID.sock "${XDG_RUNTIME_DIR:-$HOME/.cache/c3}/c3-broker.pid"` resets the world — do this from a separate terminal, not from inside Claude Code (broker death + adapter recycle = double pain). Operational subcommands: `c3-broker status` prints liveness, `c3-broker topics` lists topics and live claim state, `c3-broker validate` parses mappings.json. After editing `~/.config/c3/mappings.json` by hand, `/c3:reload-config` sends SIGHUP to the running broker so it re-reads the file in-place (live claims preserved, no process churn). (`c3-broker release <cwd>` is wired but stubbed in v0.1.0 — roadmap.)
+If the socket is missing or the pid file points at a nonexistent process, the next CLI session will spawn a fresh broker. If something looks corrupted, `pkill c3-broker; rm -f "${XDG_RUNTIME_DIR:-/tmp}/c3.sock" /tmp/c3-$UID.sock "${XDG_RUNTIME_DIR:-$HOME/.cache/c3}/c3-broker.pid"` resets the world — do this from a separate terminal, not from inside Claude Code (broker death + adapter recycle = double pain). Operational subcommands: `c3-broker status` prints liveness, `c3-broker topics` lists topics and live claim state, `c3-broker validate` parses mappings.json. After editing `~/.config/c3/mappings.json` by hand, `/c3:reload-config` sends SIGHUP to the running broker so it re-reads the file in-place (live claims preserved, no process churn). (`c3-broker release <cwd>` is wired but stubbed in v1 — roadmap.)
 
 ## Privacy and safety
 

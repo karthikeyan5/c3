@@ -22,7 +22,7 @@
 
 ## D005: Project Name — C3 (C-cubed)
 **Date:** 2026-04-15
-**Decision:** Project named C3, standing for Claude Code Claw, pronounced "C-cubed".
+**Decision:** Project named C3, pronounced "C-cubed". The name now reads as **C³ — Command, Control, Communications** (the multiplexer maps 1:1 to that triad; see README). It started life as an initialism for "Claude Code Claw" when the project was a single-instance remote-control; that backstory is retired as C3 grew into a multi-CLI, multi-channel broker.
 
 ## D006: Go for Daemon and MCP Stubs
 **Date:** 2026-04-15
@@ -41,7 +41,7 @@
 
 ## D009: Go implementation landed
 **Date:** 2026-05-09
-**Decision:** The full v3 Go implementation per `docs/specs/2026-05-08-c3-rearch-design.md` is the active C3 codebase. It honors D006 (Go for daemon and stubs) and D008 (official Go MCP SDK), reactivates D007 (pluggable transport — multi-channel from day one in the data model), and adds a plugin extension system the original direction implied but didn't formalize.
+**Decision:** The full v3 Go rearchitecture is the active C3 codebase. It honors D006 (Go for daemon and stubs) and D008 (official Go MCP SDK), reactivates D007 (pluggable transport — multi-channel from day one in the data model), and adds a plugin extension system the original direction implied but didn't formalize.
 
 **Structural choices baked in:**
 - Single Go module. Four binaries: `c3-broker`, `c3-claude-adapter`, `c3-codex-adapter`, `migrate-legacy`.

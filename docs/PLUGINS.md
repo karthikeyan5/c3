@@ -17,17 +17,16 @@ This guide covers compiled-in plugins. The subprocess-plugin protocol is documen
 
 ## Hook points
 
-The broker exposes five hooks. A plugin subscribes to whichever ones it cares about; absent subscriptions are no-ops.
+The broker exposes four wired hooks. A plugin subscribes to whichever ones it cares about; absent subscriptions are no-ops. (Signatures are on `plugin.Host` in `internal/plugin/host.go`.)
 
 | Hook | Signature | Semantics |
 |---|---|---|
-| `OnInbound` | `func(*Inbound) (*Inbound, drop bool)` | Called for every channel-emitted inbound message after debounce/dedup but before routing. Plugins can mutate (e.g. add a transcript), replace, or drop. Plugins are chained by `priority`; the first plugin to set `drop=true` short-circuits. |
-| `OnVoiceReceived` | `func(channel string, voice *VoicePayload) (string, error)` | Called only for channel events flagged as voice. First plugin to return a non-empty string wins; that string becomes the inbound's text. STT lives here. |
-| `OnOutbound` | `func(*Outbound) (*Outbound, drop bool)` | Called before broker hands a reply to its channel. Same chaining semantics as `OnInbound`. |
-| `OnAttach` | `func(*Session, *Mapping)` | Fired after a successful attach claim. Pure observer — return value is ignored. Use for logging, audit trails, custom welcomes. |
+| `OnInbound` | `func(ctx, *Inbound) (*Inbound, drop bool)` | Called for every channel-emitted inbound message after debounce/dedup but before routing. Plugins can mutate (e.g. add a transcript), replace, or drop. Plugins are chained by `priority`; the first plugin to set `drop=true` short-circuits. |
+| `OnVoiceReceived` | `func(ctx, VoicePayload) (string, error)` | Called only for channel events flagged as voice. First plugin to return a non-empty string wins; that string becomes the inbound's text. STT lives here. |
+| `OnAttach` | `func(*Stub, *Mapping)` | Fired after a successful attach claim. Pure observer — return value is ignored. Use for logging, audit trails, custom welcomes. |
 | `RegisterTools` | `func(*ToolRegistry)` | Called once at plugin load. Plugins can register MCP tools that adapters then expose to their CLIs. |
 
-The broker calls hooks synchronously and serially within a single inbound/outbound flow — your plugin code blocks the message until it returns. Keep hot-path work fast (target sub-100ms); offload long work to a goroutine and return the message unchanged or with a placeholder marker the plugin will fill in later.
+The broker calls hooks synchronously and serially within a single inbound flow — your plugin code blocks the message until it returns. Keep hot-path work fast (target sub-100ms); offload long work to a goroutine and return the message unchanged or with a placeholder marker the plugin will fill in later.
 
 ## Skeleton of a compiled-in plugin
 
@@ -50,12 +49,12 @@ type config struct {
 	Greeting string `json:"greeting"`
 }
 
-func Register(host *plugin.Host) error {
+func Register(host plugin.Host) error {
 	cfg, err := loadConfig(host)
 	if err != nil {
 		return fmt.Errorf("%s: load config: %w", Name, err)
 	}
-	host.OnAttach(func(sess *plugin.Session, mapping *plugin.Mapping) {
+	host.OnAttach(func(sess *plugin.Stub, mapping *plugin.Mapping) {
 		host.Logf("%s: %s attached to %s", Name, sess.CLI, mapping.Name)
 	})
 	host.RegisterTools(func(reg *plugin.ToolRegistry) {
@@ -77,7 +76,7 @@ func Register(host *plugin.Host) error {
 	return nil
 }
 
-func loadConfig(host *plugin.Host) (*config, error) {
+func loadConfig(host plugin.Host) (*config, error) {
 	cfg := &config{Greeting: "Hello"}
 	if err := host.Config(Name, cfg); err != nil {
 		return nil, err
@@ -86,18 +85,18 @@ func loadConfig(host *plugin.Host) (*config, error) {
 }
 ```
 
-Then register it in the broker's plugin manifest list (`internal/plugin/registry.go` or equivalent — exact file determined during implementation):
+Then register it in the broker's compiled-in plugin list — the `builtinPlugins` slice in `cmd/c3-broker/main.go` (there is **no** `internal/plugin/registry.go`; that's the real registrar):
 
 ```go
 import "github.com/karthikeyan5/c3/internal/plugin/builtins/example"
 
-var Builtins = []plugin.Registrar{
-	{Name: stt.Name, Register: stt.Register},
-	{Name: example.Name, Register: example.Register},
+var builtinPlugins = []broker.BuiltinPlugin{
+	{Name: stt.Name, Register: func(h plugin.Host) error { return stt.Register(h) }},
+	{Name: example.Name, Register: func(h plugin.Host) error { return example.Register(h) }},
 }
 ```
 
-Rebuild via `/c3:build` (or `make build`) and the new plugin loads on next broker start.
+The broker wires them in at boot via `br.RegisterBuiltinPlugins(builtinPlugins)`. Rebuild via `/c3:build` (or `make build`) and the new plugin loads on next broker start.
 
 ## Configuration
 
@@ -118,7 +117,7 @@ Plugin config lives at `~/.config/c3/mappings.json` under `plugins.<name>`. The 
 Reserved fields:
 
 - `enabled` (bool, default `true`) — when `false`, the host skips the plugin's hook subscriptions entirely. The plugin's `Register` is still called once at boot, so it should not assume `enabled=true` to do work outside of subscriptions.
-- `priority` (int, default `100`) — chained-hook ordering for `OnInbound` / `OnOutbound`. Lower runs first. STT defaults to `10` because transcription should land before any other plugin sees the inbound.
+- `priority` (int, default `100`) — chained-hook ordering for `OnInbound`. Lower runs first. STT defaults to `10` because transcription should land before any other plugin sees the inbound.
 
 Anything else under `plugins.<name>` is yours.
 
@@ -136,12 +135,16 @@ Tool name conventions: prefix with the plugin name (`example_greet`, `stt_retran
 
 The `Handler` function is called with the JSON arguments parsed against your schema. Return value is rendered back to the CLI in the standard MCP `content[].text` shape — strings work; structured returns are JSON-encoded.
 
-For tools that need to send Telegram replies (or interact with another channel), get a handle via `host.Channel(name)`:
+For tools that need to send Telegram replies (or interact with another channel), get a handle via `host.Channel(name)`. Outbound arg/result types live in `internal/c3types`, and `SendReply` returns the sent message id:
 
 ```go
 ch, err := host.Channel("telegram")
 if err == nil {
-    ch.SendReply(plugin.ReplyArgs{ChatID: chatID, Text: "..."})
+    sentID, sendErr := ch.SendReply(c3types.ReplyArgs{ChatID: chatID, Text: "..."})
+    _ = sentID
+    if sendErr != nil {
+        host.Logf("send failed: %v", sendErr)
+    }
 }
 ```
 
@@ -165,6 +168,8 @@ The handler path resolves in exactly this order: `mappings.json:plugins.stt.hand
 Errors don't degrade silently. On any failure the shim returns `[STT FAILED: <reason>]` so the CLI sees the failure explicitly (`handler_missing`, `timeout`, `killed`, `error`, `empty`, `token_unavailable`). The worker also forces `[STT FAILED: no_transcript_plugin]` if no `OnVoiceReceived` plugin produced output at all (defense-in-depth).
 
 The Python pipeline is a deliberate scope choice — STT is the only first-party plugin that uses a non-Go runtime, because the provider chain (and the room for adding new providers without recompiling) is more valuable than language uniformity. New plugins should default to pure Go.
+
+Adding a new STT provider (a `transcribe(audio_path, audio_bytes)` Python file dropped into `providers/`, then named in `--chain`) is documented in [`plugins/c3/stt/stt-pkg/README.md`](../plugins/c3/stt/stt-pkg/README.md) — the provider how-to. Because that's a data-file change to the Python pipeline, it needs **no broker recompile**.
 
 ## External subprocess plugins (v1.x — not yet implemented)
 
@@ -211,12 +216,12 @@ The mock host gives you in-memory channels, a captured log, and helpers to fire 
 
 ## Checklist for new plugins
 
-- [ ] Package under `internal/plugin/builtins/<name>/` (or external manifest + binary)
-- [ ] `Register(host *plugin.Host) error` exported
+- [ ] Package under `internal/plugin/builtins/<name>/`
+- [ ] `Register(host plugin.Host) error` exported
 - [ ] Hook subscriptions deterministic (no goroutines spawned in `Register` that subscribe later)
 - [ ] Config types defined and read via `host.Config`
 - [ ] `enabled`/`priority` honored
 - [ ] Tools (if any) prefix-namespaced with the plugin name
 - [ ] No `fmt.Println` / `os.Stdout.Write` — use `host.Logf`
 - [ ] Tests using `plugin.MockHost`
-- [ ] Registered in `internal/plugin/registry.go` `Builtins` list
+- [ ] Added to the `builtinPlugins` slice in `cmd/c3-broker/main.go`

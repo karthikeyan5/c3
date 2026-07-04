@@ -19,10 +19,32 @@ support.
 | `topics`        | `c3-broker topics` (CLI)          | pure shell    | List every topic in mappings.json + which session (if any) currently claims it.                                       |
 | `build`         | `go install ./cmd/...` (shell)    | pure shell    | Rebuild C3 binaries from the plugin source dir.                                                                       |
 | `setup`         | `c3-broker setup …` (CLI)         | agent-guided / interactive | Configure C3. Primary path: the `/c3:setup` slash command drives the phased subcommands one step at a time — `setup token` (validate via getMe + record), `setup pair dm` / `setup pair group` (code-based id discovery: a 4-digit code sent in Telegram discovers the user id / group chat id — no id hunting), `setup stt`, `setup finish` (host integrations + broker restart). Bare `c3-broker setup` is the full interactive TTY flow (fallback for a plain terminal). Writes mappings.json (mode 0600). |
-| `reload-config` | `pkill -HUP c3-broker`            | pure shell    | Signal the broker to re-read mappings.json. Non-disruptive — no process restart, in-memory pointer swap, live claims preserved. Replaces the old `restart-broker` (which killed the CLI's MCP server as a side effect — see 2026-05-14 RESUME). For binary updates, restart Claude Code instead. |
-| `attach`        | `mcp_attach(expr=…)` (MCP tool)   | LLM dispatch  | Attach this session's adapter to a Telegram topic. Broker parses `expr` and either silent-claims or proposes.          |
-| `detach`        | `mcp_detach()` (MCP tool)         | LLM dispatch  | Release the session's current claim (sends `OpRelease`).                                                              |
-| `release`       | `c3-broker release <cwd>` (CLI)   | pure shell    | **Stubbed in v0.1.0** — intended to drop a route claim by cwd without restarting the broker; returns 'not yet implemented' today; workaround is `/exit` the holding session. |
+| `reload-config` | `pkill -HUP c3-broker`            | pure shell    | Signal the broker to re-read mappings.json. Non-disruptive — no process restart, in-memory pointer swap, live claims preserved. For binary updates, restart Claude Code instead. |
+| `pair`          | `c3-broker pair …` (CLI)          | pure shell    | Arm a Telegram pairing window. A 4-digit code sent from Telegram allowlists the DM `user_id` (`pair dm`) or a group `chat_id` (`pair group <chat_id>`). The setup flow uses this under the hood for id-free discovery. |
+| `ping`          | `c3-broker ping` (CLI)            | pure shell    | Send a one-shot "this is me" message to the attached topic, identifying which CLI session currently owns it. Run in each candidate tab to find the owner before force-stealing. |
+| `sessions`      | `c3-broker sessions` (CLI)        | pure shell    | List every live Claude Code / Codex session the broker tracks — CWD, attached topic, and a "you are here" marker for the calling terminal. |
+| `attach`        | `attach(expr=…)` (MCP tool)       | LLM dispatch  | Attach this session's adapter to a Telegram topic. Broker parses `expr` and either silent-claims or proposes.          |
+| `detach`        | `detach()` (MCP tool)             | LLM dispatch  | Release the session's current claim (sends `OpRelease`). Claude Code only; the Codex adapter has no `detach` tool yet. |
+| `release`       | `c3-broker release <cwd>` (CLI)   | pure shell    | **Stubbed in v1** — intended to drop a route claim by cwd without restarting the broker; returns 'not yet implemented' today; workaround is `/exit` the holding session. |
+
+## MCP tools (agent-invoked)
+
+Beyond `attach` / `detach` / `topics`, the adapters expose a set of message and interaction tools the agent calls directly (no slash wrapper). All are broker-dispatched; the `✓ / —` columns are per-CLI availability.
+
+| Tool                 | Claude | Codex | What it does                                                                 |
+|----------------------|:------:|:-----:|------------------------------------------------------------------------------|
+| `reply`              |   ✓    |   ✓   | Send a markdown reply (text/media/quote-reply/buttons) into the attached topic. |
+| `react`              |   ✓    |   ✓   | Set a single emoji reaction on a message (validated against Telegram's set).  |
+| `edit_message`       |   ✓    |   ✓   | Edit a previously-sent message's text and/or inline keyboard.                 |
+| `poll`               |   ✓    |   ✓   | Send a Telegram poll (regular or quiz; anonymous/multiple/timer options).     |
+| `stop_poll`          |   ✓    |   ✓   | Force-close a bot-sent poll and return its final aggregate tally.             |
+| `download_attachment`|   ✓    |   ✓   | Download an inbound attachment by `file_id` to the local cache.               |
+| `fetch_queue`        |   ✓    |   ✓   | Drain held inbound from the durable queue (`limit` / `"all"`; `ack` peek vs consume). |
+| `retranscribe`       |   ✓    |   ✓   | Re-run the STT chain on saved audio by `file_id`; refresh a queued transcript in place. |
+| `ask`                |   ✓    |   —   | Blocking human question (single/multi-select + Skip) via an inline keyboard.  |
+| `codex_forward`      |   —    |   ✓   | Env-gated debug tool: forward a payload into the Codex app-server (diagnostics). |
+
+Codex is at parity on the message/queue tools and lacks only `ask` (and `detach`, above). The permission relay is likewise Claude Code only.
 
 ## attach — the parser (lives in the broker)
 
@@ -57,15 +79,23 @@ flag set.
 
 ## Per-CLI implementations
 
-| Verb            | Claude Code (slash)                                | Codex                                  |
-|-----------------|----------------------------------------------------|----------------------------------------|
-| `status`        | `plugins/c3/commands/status.md`                    | _todo: codex command_                  |
-| `topics`        | `plugins/c3/commands/topics.md`                    | _todo_                                 |
-| `build`         | `plugins/c3/commands/build.md`                     | _todo_                                 |
-| `setup`         | `plugins/c3/commands/setup.md`                     | _todo_                                 |
-| `reload-config` | `plugins/c3/commands/reload-config.md`             | _todo_                                 |
-| `attach`        | `plugins/c3/commands/attach.md`                    | _todo (codex MCP attach tool exists)_  |
-| `detach`        | `plugins/c3/commands/detach.md`                    | _todo (codex MCP detach tool not yet)_ |
+Claude Code exposes each verb as a plugin slash command under
+`plugins/c3/commands/`. Codex has **no plugin slash-command layer**, so its C3
+surface is the MCP tools (agent-invoked) plus the `c3-broker` subcommands run
+from any shell — the shared broker logic is identical either way.
+
+| Verb            | Claude Code                                     | Codex                                   |
+|-----------------|-------------------------------------------------|-----------------------------------------|
+| `status`        | `/c3:status` (`commands/status.md`)             | `c3-broker status` (shell)              |
+| `topics`        | `/c3:topics` + `topics` MCP tool                | `topics` MCP tool · `c3-broker topics`  |
+| `build`         | `/c3:build` (`commands/build.md`)               | `go install ./cmd/...` (shell)          |
+| `setup`         | `/c3:setup` (`commands/setup.md`)               | `c3-broker setup` (TTY)                 |
+| `reload-config` | `/c3:reload-config`                             | `pkill -HUP c3-broker`                  |
+| `pair`          | `/c3:pair` (`commands/pair.md`)                 | `c3-broker pair …` (shell)              |
+| `ping`          | `/c3:ping` (`commands/ping.md`)                 | `c3-broker ping` (shell)                |
+| `sessions`      | `/c3:sessions` (`commands/sessions.md`)         | `c3-broker sessions` (shell)            |
+| `attach`        | `/c3:attach` + `attach` MCP tool                | `attach` MCP tool                       |
+| `detach`        | `/c3:detach` + `detach` MCP tool                | — (no `detach` tool yet)                |
 
 When adding a new verb:
 1. Implement the shared interface (broker subcommand or MCP tool).
