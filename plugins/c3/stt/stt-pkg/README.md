@@ -90,6 +90,28 @@ def transcribe(audio_path: str, audio_bytes: bytes) -> str:
     return "transcript text"
 ```
 
+`transcribe()` is the only required function. A provider may **optionally**
+add `set_vocabulary()` to receive the shared domain vocabulary — `stt.py`
+calls it (when present) right before each `transcribe()`, so you can bias the
+model toward preferred spellings:
+
+```python
+_VOCAB = {"terms": [], "context": ""}
+
+def set_vocabulary(vocab):
+    """Optional. Receives the domain vocabulary loaded by stt.py.
+
+    vocab is a dict:
+        terms:   list of {"preferred": str, "not": [str], "note": str}
+        context: str — a short description of the domain
+    Adapt it into whatever your API accepts (system prompt, hotwords, a
+    `prompt` parameter, …). See the bundled gemini/sarvam providers for
+    two different adaptations.
+    """
+    global _VOCAB
+    _VOCAB = vocab or {"terms": [], "context": ""}
+```
+
 Then use it:
 ```bash
 python3 stt.py audio.ogg --chain gemini-3-flash-openrouter,your-model-name,sarvam-saaras-v3
