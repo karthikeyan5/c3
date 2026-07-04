@@ -497,3 +497,56 @@ func TestRenderReadback_FewButHugeNotOversized(t *testing.T) {
 			uint16Len(payload), readbackShortMaxU16, band)
 	}
 }
+
+// TestRenderReadback_FewButHuge_NoZeroElision pins the more==0 fallthrough
+// render: a note with fewer than readbackTinyMaxSentences sentences whose
+// DISPLAYED length is past the sendMessage cap gets buildPreview's
+// (all, "", 0) and lands in a rich band. The assembly must then omit the
+// elision line AND the empty tail paragraph — no literal
+// "✂️✂️ 0 more sentences ✂️✂️", no empty <p></p> — in every band, mirroring
+// readbackCaption's `if more > 0` guard, and must still not be oversized.
+func TestRenderReadback_FewButHuge_NoZeroElision(t *testing.T) {
+	one := strings.Repeat("w", 1498) + "." // one ~1499-char sentence
+	cases := []struct {
+		name       string
+		sentences  int
+		wantBand   readbackBand
+		wantMethod string
+	}{
+		// 5 × ~1500 ≈ 7.5k displayed → the 4096 < x ≤ 9000 dead zone.
+		{"deadzone", 5, bandDeadzone, "sendRichMessage"},
+		// 7 × ~1500 ≈ 10.5k displayed → past the 9000 native-collapse margin.
+		{"long", 7, bandLong, "sendRichMessage"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := strings.TrimSpace(strings.Repeat(one+" ", tc.sentences))
+			if n := len(splitSentences(in)); n >= readbackTinyMaxSentences {
+				t.Fatalf("fixture has %d sentences, want fewer than %d (the more==0 path)", n, readbackTinyMaxSentences)
+			}
+			if _, _, more := buildPreview(splitSentences(in)); more != 0 {
+				t.Fatalf("fixture preview more = %d, want 0", more)
+			}
+
+			method, payload, band := renderReadback(in)
+			if band != tc.wantBand || method != tc.wantMethod {
+				t.Fatalf("got method=%q band=%v; want %q/%v", method, band, tc.wantMethod, tc.wantBand)
+			}
+			if strings.Contains(payload, "0 more sentences") {
+				t.Error("payload renders the literal \"0 more sentences\" elision line")
+			}
+			if strings.Contains(payload, "✂️") {
+				t.Error("more==0 payload must carry no elision markers at all")
+			}
+			for _, empty := range []string{"<p></p>", "<i></i>", "<p><i></i></p>"} {
+				if strings.Contains(payload, empty) {
+					t.Errorf("more==0 payload contains an empty element %q (the phantom tail paragraph)", empty)
+				}
+			}
+			// Still within the send budget for its method.
+			if len(payload) > readbackRichMaxBytes {
+				t.Errorf("payload is %d bytes, over the %d rich budget", len(payload), readbackRichMaxBytes)
+			}
+		})
+	}
+}
