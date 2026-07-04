@@ -45,7 +45,7 @@ Delighters — the demo magic, not the headline:
 
 ## Install
 
-C3 builds from source and installs as a Claude Code plugin. In any Claude Code session, paste:
+C3 installs as a Claude Code plugin (marketplace add straight from GitHub) with prebuilt binaries — no toolchain needed; a build-from-source path stays for contributors. In any Claude Code session, paste:
 
 ```
 follow https://github.com/karthikeyan5/c3/blob/main/INSTALL.md to install c3
@@ -63,7 +63,7 @@ To surface inbound Telegram messages, you start Claude Code with a flag:
 claude --dangerously-load-development-channels plugin:c3@c3
 ```
 
-This isn't a C3 hack. Claude Code gates inbound channel notifications from **every** locally-installed channel plugin behind this development flag — it's [Anthropic's own documented preview guardrail](https://code.claude.com/docs/en/channels) for third-party channels that haven't shipped through their marketplace. Without it, the broker still delivers your message, but Claude Code silently drops the `<channel>` block. The install can also drop in a tiny `claude` shim so you never type the flag by hand.
+This isn't a C3 hack. Claude Code gates inbound channel notifications from **every** locally-installed channel plugin behind this development flag — it's [Anthropic's own documented preview guardrail](https://code.claude.com/docs/en/channels) for third-party channels that haven't shipped through their marketplace. Without it, a session can't render inbound live — but it isn't lost either: C3 detects a host that can't render and holds those messages in the durable queue, so they're recoverable once you relaunch with the flag. The install can also drop in a tiny `claude` shim so you never type the flag by hand.
 
 ## How is this different from X?
 

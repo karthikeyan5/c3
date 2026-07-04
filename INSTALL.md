@@ -16,103 +16,87 @@
 
 ---
 
-## 1. Verify Go is installed
+## 1. Add the C3 marketplace and install the plugin
 
-```bash
-go version
-```
+Tell the user to run these in this Claude Code session and confirm when done:
 
-If "command not found": tell the user to install Go ≥1.25 from
-https://go.dev/dl/, then re-run this install. Stop.
-
-If the printed version is older than 1.25: tell the user to upgrade Go
-and re-run. Stop.
-
-## 2. Clone the repo and add as a local marketplace
-
-`/c3:build` needs access to the full Go source tree (`cmd/`, `go.mod`).
-Claude Code's marketplace cache from a remote GitHub source only ships
-the plugin subtree, not the build inputs. So the canonical install is:
-clone the repo first, then point Claude Code at the local clone as a
-marketplace.
-
-Tell the user:
-
-> "Clone the c3 source into a **durable** directory — `/c3:build` compiles
-> from it on every build, so a path that gets auto-cleared (`~/Downloads`,
-> `/tmp`) breaks the marketplace later. Recommended:
->
->     git clone https://github.com/karthikeyan5/c3 ~/.local/share/c3
->
-> (any stable dir works, e.g. `~/code/c3` — just don't move or delete it
-> afterward). Then in this Claude Code session, run these three slash
-> commands and tell me when they're done:
->
->     /plugin marketplace add ~/.local/share/c3
+>     /plugin marketplace add karthikeyan5/c3
 >     /plugin install c3@c3
 >     /reload-plugins
 >
-> Replace `~/.local/share/c3` with wherever you cloned. When
-> `/plugin install` asks for **user** vs **project** scope, choose
+> When `/plugin install` asks for **user** vs **project** scope, choose
 > **user** — that makes C3 available in every Claude Code session, not
-> just this project."
+> just this project.
 
-Wait for the user to confirm completion and capture the clone path
-(we'll need it in step 3).
+(Contributors building from source instead: have them
+`git clone https://github.com/karthikeyan5/c3 ~/.local/share/c3` into a
+durable directory and `/plugin marketplace add ~/.local/share/c3` — a
+GitHub plugin cache doesn't carry the Go source `/c3:build` needs. Capture
+the clone path; you'll need it for the from-source fallback in step 2.)
 
-## 3. Build the binaries
+## 2. Install the binaries
 
-The plugin shipped Go source, not pre-built binaries. After step 2's
-marketplace add, `${CLAUDE_PLUGIN_ROOT}/../..` resolves to the cloned
-repo:
+C3 ships six binaries: `c3-broker`, `c3-claude-adapter`, `c3-codex-adapter`,
+`claude-shim`, `codex`, `migrate-legacy`. Prefer the prebuilt release
+tarball; fall back to building from source only if there's no tarball for
+the user's platform.
+
+**Prebuilt (default).** Download, verify, and install into `~/.local/bin`:
+
+```bash
+VERSION=v1.0.0
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m); [ "$ARCH" = x86_64 ] && ARCH=amd64; [ "$ARCH" = aarch64 ] && ARCH=arm64
+base="https://github.com/karthikeyan5/c3/releases/download/$VERSION"
+curl -fsSL -O "$base/c3_${VERSION}_${OS}_${ARCH}.tar.gz"
+curl -fsSL -O "$base/SHA256SUMS"
+{ sha256sum --ignore-missing -c SHA256SUMS || shasum -a 256 -c SHA256SUMS; }
+mkdir -p ~/.local/bin
+tar xzf "c3_${VERSION}_${OS}_${ARCH}.tar.gz" -C ~/.local/bin \
+  c3-broker c3-claude-adapter c3-codex-adapter claude-shim codex migrate-legacy
+```
+
+If the download 404s (no tarball for this platform), fall through to the
+from-source path.
+
+**From source (fallback).** Requires Go ≥1.25 — run `go version`; if it's
+missing or older than 1.25, tell the user to install/upgrade from
+https://go.dev/dl/ and stop. With the repo cloned + added as a local
+marketplace (step 1's contributor path), locate the source and build:
 
 ```bash
 PLUGIN_ROOT=$(ls -d ~/.claude/plugins/cache/*/c3 2>/dev/null | head -1)
-if [ -z "$PLUGIN_ROOT" ]; then
-  echo "ERROR: c3 plugin not found in ~/.claude/plugins/cache — did step 2 complete?"
-  exit 1
-fi
-SRC_ROOT=$(cd "$PLUGIN_ROOT/../.." && pwd)
-if [ ! -f "$SRC_ROOT/go.mod" ]; then
-  echo "ERROR: no go.mod at $SRC_ROOT — looks like the marketplace points at a remote GitHub source, not a local clone. Go back to step 2 and 'git clone' first, then 'marketplace add' the clone path."
+SRC_ROOT=$(cd "$PLUGIN_ROOT/../.." 2>/dev/null && pwd)
+if [ -z "$SRC_ROOT" ] || [ ! -f "$SRC_ROOT/go.mod" ]; then
+  echo "ERROR: no go.mod found — the marketplace points at a GitHub source (plugin subtree only), not a local clone. Use the prebuilt tarball above, or clone the repo first and 'marketplace add' the clone path."
   exit 1
 fi
 echo "Building from $SRC_ROOT (1–3 minutes on first run)..."
 cd "$SRC_ROOT" && go install ./cmd/...
 ```
 
-Then verify all six binaries are present:
+Go installs to `$GOBIN` (default `$(go env GOPATH)/bin`).
+
+## 3. Verify the binaries are installed
 
 ```bash
-GOBIN_DIR=$(go env GOBIN)
-[ -z "$GOBIN_DIR" ] && GOBIN_DIR=$(go env GOPATH)/bin
-echo "Binaries installed to: $GOBIN_DIR"
 for bin in c3-broker c3-claude-adapter c3-codex-adapter claude-shim codex migrate-legacy; do
-  if [ -x "$GOBIN_DIR/$bin" ]; then
-    echo "  ✓ $bin"
-  else
-    echo "  ✗ $bin (missing)"
-  fi
+  command -v "$bin" >/dev/null && echo "  ✓ $bin" || echo "  ✗ $bin (missing)"
 done
-command -v c3-broker >/dev/null || echo "WARNING: $GOBIN_DIR is not on \$PATH"
+command -v c3-broker >/dev/null || echo "WARNING: the install dir is not on \$PATH"
 ```
 
-Note: a user who already has a separate Codex CLI on PATH will have
-`codex` resolve to that one; the check above passes for either. The
-codex check is "the C3 launcher binary exists in $GOBIN_DIR" — whether
-PATH shadows it is sorted out in the optional codex-shim step below.
+The `codex` binary is the C3 launcher (only used if the user wants Codex
+integration; a separate real Codex on PATH may shadow it — sorted out in the
+optional codex-shim step below). `migrate-legacy` is a one-shot config
+migrator most users never run.
 
-The `codex` binary is the Codex CLI launcher (only used if the user wants
-Codex integration; symlinked into PATH by `install-codex-shim` in the
-optional step below). `migrate-legacy` is a one-shot config migrator from
-the Python-prototype layout — most users never run it.
+If `c3-broker` isn't found, the install dir isn't on `PATH` (`~/.local/bin`
+for prebuilt, `$(go env GOPATH)/bin` for source). Tell the user:
 
-If `c3-broker` isn't on PATH, tell the user:
-
-> "Add `<GOBIN_DIR>` to your `$PATH` by appending this to your shell rc
-> (`~/.zshrc` or `~/.bashrc`):
+> "Append this to your shell rc (`~/.zshrc` or `~/.bashrc`):
 >
->     export PATH=\"<GOBIN_DIR>:$PATH\"
+>     export PATH=\"$HOME/.local/bin:$PATH\"
 >
 > Open a new terminal and re-run this install to verify."
 
@@ -252,8 +236,11 @@ opt-in `systemd --user` unit:
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp docs/systemd/c3-broker.service ~/.config/systemd/user/
-# If your GOBIN isn't ~/go/bin, edit ExecStart= first (go env GOBIN GOPATH).
+# from a clone:  cp docs/systemd/c3-broker.service ~/.config/systemd/user/
+# prebuilt (no clone):
+curl -fsSL -o ~/.config/systemd/user/c3-broker.service \
+  https://raw.githubusercontent.com/karthikeyan5/c3/main/docs/systemd/c3-broker.service
+# Edit ExecStart= to your c3-broker path (e.g. ~/.local/bin/c3-broker) before enabling.
 systemctl --user daemon-reload
 systemctl --user enable --now c3-broker.service
 loginctl enable-linger "$USER"   # keep it running across logout
@@ -276,10 +263,12 @@ Details in `docs/systemd/README.md`.
 >
 >     claude --dangerously-load-development-channels plugin:c3@c3
 >
-> A plain `claude` will work for sending outbound, but **inbound channel
-> notifications get silently dropped** — the broker delivers correctly,
-> but Claude Code rejects channel notifications from plugins not opted-in
-> via this flag (or via the production marketplace flow).
+> A plain `claude` works for sending outbound, but **inbound won't render
+> live** in that session (Claude Code only surfaces channel notifications
+> from plugins opted-in via this flag or the production marketplace flow).
+> It isn't lost, though — C3 detects a session that can't render and holds
+> inbound in the durable queue; relaunch with the flag, or recover with
+> `fetch_queue`.
 >
 > Then in any project directory, run `/c3:attach` and confirm the proposal —
 > the broker will create a Telegram topic named after that directory.

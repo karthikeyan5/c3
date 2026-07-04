@@ -33,6 +33,7 @@ What's next for C3 after v1. Everything here is future or unbuilt; shipped work 
 - Drop the development-channels flag once C3 ships through a trusted plugin store.
 - External (non-Go) loadable plugins.
 - Broker-side `/list` and `/route` commands.
+- Auto-attach on resume enabled by default (after live verification).
 - Monitoring dashboard, persistent message history, STT latency instrumentation.
 
 ## Open design questions

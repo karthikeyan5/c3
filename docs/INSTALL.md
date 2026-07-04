@@ -6,8 +6,8 @@ Set-up steps for someone who has never run C3 before. Five minutes if everything
 
 You need:
 
-- **Go ≥1.25** on your `PATH`. C3 is built from source on first install. `go version` should print `go1.25` or newer. (The `go` directive in `go.mod` pins `1.25.0`; older toolchains will fail the build or silently auto-download 1.25.)
-- **A Telegram bot + group, set up per the checklist below.** Five minutes if you've done it before, ten if not. See [docs/research/2026-05-18-telegram-bot-setup.md](research/2026-05-18-telegram-bot-setup.md) for the "why" on each step.
+- **Prebuilt binaries** (Linux + macOS, amd64/arm64) are attached to each release tag — the default path needs no toolchain. **Go ≥1.25** is only required if you build from source (contributors, or a platform without a prebuilt tarball): `go version` should print `go1.25` or newer. (The `go` directive in `go.mod` pins `1.25.0`; older toolchains will fail the build or silently auto-download 1.25.)
+- **A Telegram bot + group, set up per the checklist below.** Five minutes if you've done it before, ten if not. (Why these steps: the bot needs to read every group message, send into topics, and create/rename/close topics — so it is promoted to admin with **Manage Topics**, and privacy mode is disabled in BotFather as belt-and-braces so it still reads messages even if admin promotion was fumbled.)
 
   Use **Telegram Desktop, iOS, Android, or macOS** for the group-side steps — *not Telegram Web*. Web's Topics-enable and admin-rights UIs are incomplete.
 
@@ -19,33 +19,19 @@ You need:
   6. **Promote the bot to admin** with these rights checked: **Manage Topics**, **Send Messages**, **Delete Messages**, **Pin Messages**. Everything else off.
 - **Your phone (or any Telegram client)** for pairing. Setup discovers your user id and the group's chat id automatically: you send a short code to the bot in DM, and another in the group. No id hunting.
 - **For Codex integration:** Codex CLI installed (typically via `npm install -g @openai/codex` or similar). The C3 launcher will detect it. NVM users: take note — long-running shells hash `codex` to your NVM path, so the install step below symlinks both `~/.local/bin/codex` and the NVM bin path.
-- **For voice transcription (STT plugin):** the shipped first-class STT plugin runs a chained pipeline — **Gemini 3 Flash** (via OpenRouter) with **Sarvam Saaras v3** as the fallback. The plugin lives at `plugins/c3/stt/`; the broker subprocesses `python3` to run it. You need:
+- **For voice transcription (STT plugin):** the shipped first-class STT plugin runs a chained pipeline. **Sarvam Saaras v3 is the working default** — set `SARVAM_API_KEY` and voice notes transcribe out of the box. **Gemini 3 Flash** (via OpenRouter) is an optional first-in-chain provider you can add with your own `OPENROUTER_API_KEY`; the chain tries it first and falls back to Sarvam. The plugin lives at `plugins/c3/stt/`; the broker subprocesses `python3` to run it. You need:
   - `python3` on PATH (3.11+ recommended).
-  - API keys in `~/.claude/stt.env` — `OPENROUTER_API_KEY` for Gemini and `SARVAM_API_KEY` for Sarvam. The pipeline tries Gemini first, falls back to Sarvam if Gemini fails. Setting only one key works; the other provider gets skipped.
+  - API keys in `~/.claude/stt.env` — `SARVAM_API_KEY` for the Sarvam default, and optionally `OPENROUTER_API_KEY` for Gemini. Setting only one key works; the other provider is skipped.
   - No model downloads — both providers are remote APIs.
 
   If you don't need voice, set `mappings.json:plugins.stt.enabled=false` and skip the API keys. You can swap in a custom handler (whisper, local, anything that matches the argv contract) by setting `plugins.stt.handler_path` to your own script — see `docs/PLUGINS.md`.
 
-## Step 1: Clone the repo and install the Claude Code plugin
+## Step 1: Install the Claude Code plugin
 
-`/c3:build` (step 2) needs access to the Go source — `cmd/`, `go.mod`, the
-whole tree. Claude Code's marketplace cache from a remote source only ships
-the plugin subtree, so the install path is: clone the repo first, then point
-Claude Code at the clone as a local marketplace.
-
-```bash
-git clone https://github.com/karthikeyan5/c3 ~/.local/share/c3
-```
-
-Clone into a **durable** location: `/c3:build` compiles from this directory on
-every build, so a path that gets auto-cleared (`~/Downloads`, `/tmp`) will
-break the marketplace later. `~/.local/share/c3` is the recommendation; any
-stable dir works (`~/code/c3`, etc.) — just don't move or delete it afterward.
-
-Then inside Claude Code:
+Add C3's marketplace straight from GitHub and install the plugin:
 
 ```
-/plugin marketplace add ~/.local/share/c3
+/plugin marketplace add karthikeyan5/c3
 /plugin install c3@c3
 /reload-plugins
 ```
@@ -54,24 +40,52 @@ When `/plugin install` prompts for **user** vs **project** scope, choose
 **user** — that makes C3 available in every Claude Code session, not just this
 project.
 
-## Step 2: Build the binaries
+> **Contributors / building from source:** if you want to build the binaries
+> yourself or hack on C3, clone the repo into a **durable** location and add
+> *that clone* as the marketplace instead (the plugin cache from a GitHub add
+> doesn't carry the Go source `/c3:build` needs):
+> ```bash
+> git clone https://github.com/karthikeyan5/c3 ~/.local/share/c3
+> ```
+> then `/plugin marketplace add ~/.local/share/c3`. `/c3:build` compiles from
+> this directory on every build, so pick a stable path (not `~/Downloads` or
+> `/tmp`) and don't move or delete it.
 
-Still inside Claude Code, run:
+## Step 2: Get the binaries onto your PATH
 
-```
-/c3:build
-```
-
-This is a slash command shipped by the plugin. It runs `go install ./cmd/...` from the plugin source dir. Six binaries land in `$GOBIN` (default `~/go/bin/`):
+C3 ships six Go binaries:
 
 - `c3-broker` — the daemon
 - `c3-claude-adapter` — Claude Code MCP server
+- `c3-codex-adapter` — Codex MCP server
 - `claude-shim` — the `claude` wrapper that auto-injects the dev-channels flag (symlinked into PATH by `install-claude-shim`; see Step 4.5)
 - `codex` — the C3 launcher (will replace `which codex`)
-- `c3-codex-adapter` — Codex MCP server
 - `migrate-legacy` — one-shot migrator from a legacy Python-prototype config layout (only relevant if you have such a config)
 
-Confirm `$GOBIN` is on your `PATH`. If `$GOBIN` is unset, Go installs to `$(go env GOPATH)/bin`. Add it:
+**Prebuilt (recommended).** Download the release tarball for your platform,
+verify it, and install the binaries into a directory on your `PATH`:
+
+```bash
+VERSION=v1.0.0
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m); [ "$ARCH" = x86_64 ] && ARCH=amd64; [ "$ARCH" = aarch64 ] && ARCH=arm64
+base="https://github.com/karthikeyan5/c3/releases/download/$VERSION"
+curl -fsSL -O "$base/c3_${VERSION}_${OS}_${ARCH}.tar.gz"
+curl -fsSL -O "$base/SHA256SUMS"
+sha256sum --ignore-missing -c SHA256SUMS      # macOS: shasum -a 256 -c SHA256SUMS
+mkdir -p ~/.local/bin
+tar xzf "c3_${VERSION}_${OS}_${ARCH}.tar.gz" -C ~/.local/bin \
+  c3-broker c3-claude-adapter c3-codex-adapter claude-shim codex migrate-legacy
+```
+
+Confirm the install dir (`~/.local/bin` here) is on your `PATH`.
+
+**From source (contributors, or a platform without a prebuilt tarball).** With
+the repo cloned and added as a local marketplace (Step 1's contributor path),
+run `/c3:build` inside Claude Code — a slash command that runs
+`go install ./cmd/...` and drops the six binaries in `$GOBIN` (default
+`~/go/bin`). Needs Go ≥1.25. Confirm `$GOBIN` (or `$(go env GOPATH)/bin`) is on
+your `PATH`:
 
 ```bash
 export PATH="$(go env GOPATH)/bin:$PATH"
@@ -148,10 +162,13 @@ claude --dangerously-load-development-channels plugin:c3@c3
 ```
 
 The plain `claude` command keeps `allowedChannelPlugins` enabled but
-also gates local-marketplace plugins behind the dev flag (so the c3
-adapter's `notifications/claude/channel` frames get silently dropped).
-The official-marketplace plugin distribution flow doesn't need this
-flag; we do, until c3 is published through Anthropic's marketplace.
+also gates local-marketplace plugins behind the dev flag, so the c3
+adapter's `notifications/claude/channel` frames don't render live in that
+session. As of v1 they're not lost either — C3 detects a session that
+can't render and holds inbound in the durable queue (a held-notice fires
+in the topic; recover with `fetch_queue`); relaunch with the flag for live
+rendering. The official-marketplace plugin distribution flow doesn't need
+this flag; we do, until c3 is published through Anthropic's marketplace.
 
 ## Step 4.5: Install the Claude wrapper
 
@@ -167,10 +184,10 @@ c3-broker install-claude-shim
 
 The shim is a tiny launcher symlinked at `~/.local/bin/claude` that
 transparently adds `--dangerously-load-development-channels plugin:c3@c3`
-to every `claude` invocation. Without it you have to type the long flag
-form by hand on every session start (which the maintainer prefers but
-new users typically forget — leading to the silent-channel-drops failure
-mode #18 was meant to close).
+to every `claude` invocation. Without it you type the long flag form by
+hand on every session start — easy to forget, which is why v1 holds
+flagless inbound in the durable queue instead of dropping it (the shim
+still saves you the missed-live-rendering papercut).
 
 The most common manual-install hiccup is an existing non-shim
 `~/.local/bin/claude` (often from NVM, npm, or a hand-edited symlink to
@@ -216,17 +233,18 @@ If voice messages are working: send a voice note from your phone. After a couple
 
 ## Upgrading
 
-Inside Claude Code:
+Inside Claude Code, refresh the plugin files:
 
 ```
 /plugin marketplace update
 /plugin upgrade c3@c3
-/c3:build
 ```
+
+Then refresh the binaries: **prebuilt** — re-run Step 2's download with the new `VERSION`; **from source** — `/c3:build`. Marketplaces added from GitHub can also auto-update the plugin files at Claude Code startup; that's off by default for third-party marketplaces — toggle it in `/plugin → Marketplaces`. (Auto-update only refreshes plugin files; the binaries still come from the matching release tarball or a rebuild.)
 
 State (`~/.config/c3/mappings.json`) is in XDG, not the plugin cache, so upgrades don't touch it.
 
-For Codex side, re-run `c3-broker install-codex-shim` after `/c3:build` to refresh the symlinks against the new binary.
+For the Codex side, re-run `c3-broker install-codex-shim` after updating the binaries to refresh the symlinks against the new `codex` launcher.
 
 ## Uninstalling
 
@@ -248,9 +266,9 @@ The `~/.config/c3/mappings.json` lives outside both plugins; uninstalling the pl
 
 ## Troubleshooting first-install issues
 
-- **`/c3:build` fails with `command not found: go`** — install Go ≥1.25.
-- **Build succeeds but `c3-broker` not on PATH** — `$GOBIN` isn't on `PATH`. See Step 2.
+- **Building from source fails with `command not found: go`** — install Go ≥1.25, or use the prebuilt tarball instead (Step 2).
+- **Binaries installed but `c3-broker` not on PATH** — the install dir isn't on `PATH` (`~/.local/bin` for prebuilt, `$(go env GOPATH)/bin` for source). See Step 2.
 - **`/c3:setup` says it can't reach Telegram** — check the bot token. Try `curl https://api.telegram.org/bot<TOKEN>/getMe`; should return your bot's info.
 - **Topic creation fails** — the bot isn't an admin with `Manage Topics` in the supergroup. Group settings → Administrators → your bot → toggle "Manage Topics" on.
-- **`which codex` still resolves to NVM** — re-run `c3-broker install-codex-shim`, then `hash -r` (bash/zsh) or open a new terminal. Verify with `readlink $(which codex)`; it should point at `$GOBIN/codex`.
+- **`which codex` still resolves to NVM** — re-run `c3-broker install-codex-shim`, then `hash -r` (bash/zsh) or open a new terminal. Verify with `readlink $(which codex)`; it should point at the C3 `codex` launcher.
 - **Voice transcription doesn't fire** — the broker log surfaces a `[plugin] stt: ...` line per voice message; check `~/.local/state/c3/broker.log`. Common causes: `~/.claude/stt.env` is missing or has no `OPENROUTER_API_KEY` / `SARVAM_API_KEY` (look for `stt: msg=N error ... stderr-tail=...`); `python3` not on the broker's PATH; `mappings.json:plugins.stt.enabled` is `false`. Failing voice messages now surface as `[STT FAILED: <reason>]` in the CLI rather than silent `(voice message)`. If you don't need voice, set `enabled: false`.

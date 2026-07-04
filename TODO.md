@@ -24,7 +24,7 @@ in git.
 - [ ] `ask` live-verify: button tap → choice returns to Claude, in a live Telegram session
 - [ ] Permission-relay live-verify: a real Claude Code permission prompt → approve/deny over Telegram
 - [ ] Forked-session queue-delivery blackhole fix — the adapter must not ack-as-delivered what the host can't render
-- [ ] Auto-attach-on-resume: default OFF unless its two known bugs die quickly
+- [ ] Live-verify auto-attach-on-resume end-to-end (shipped in master, gated by `auto_attach_on_resume` in mappings.json, default OFF), then consider flipping the default
 - [ ] Fix the 2 flaky broker tests (fixture defect, not prod)
 - [ ] `install-claude-shim` existing-symlink clobber fix
 - [ ] Noisy re-poll / dedup-skip fix (if still live)
@@ -42,3 +42,4 @@ in git.
 
 - [ ] Final PII audit before push (standing rule)
 - [ ] Ship WITH the documented `--dangerously-load-development-channels` flag
+- [ ] Every release bumps `plugin.json` `version` — a fixed version string pins the plugin, and Claude Code's auto-update won't ship it to existing users until it's bumped
