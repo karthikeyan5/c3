@@ -9,6 +9,7 @@ import (
 
 	"github.com/karthikeyan5/c3/internal/broker"
 	"github.com/karthikeyan5/c3/internal/mappings"
+	"github.com/karthikeyan5/c3/internal/version"
 )
 
 // runStatus prints a read-only health check.
@@ -23,6 +24,10 @@ func runStatus() error {
 	var b strings.Builder
 	fmt.Fprintln(&b, "C3 broker status")
 	fmt.Fprintln(&b, "================")
+	// Build version of THIS c3-broker binary (the CLI tool). "dev" for an
+	// uninjected local build. The running daemon may differ after a swap-but-not-
+	// yet-restarted update; health.json carries the daemon's own version.
+	fmt.Fprintf(&b, "  version:   %s\n", version.Current())
 
 	// Daemon liveness via pid file + flock probe.
 	pidFile := broker.PidFilePath()

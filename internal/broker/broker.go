@@ -95,6 +95,14 @@ type Broker struct {
 	// sessions PID-match. Injectable so handler tests can supply a synthetic
 	// process tree without a real /proc.
 	sessionPIDResolver func(int) int
+
+	// updateMu guards the always-on "a newer C3 release exists" state, set by the
+	// update checker (update.go) and read by WriteHealthFile (to surface the
+	// status-line notice) and `c3-broker status`. Independent of the auto_update
+	// toggle — the notice fires regardless.
+	updateMu        sync.RWMutex
+	updateAvailable bool
+	latestVersion   string
 }
 
 const defaultWorkerIdle = 60 * time.Second

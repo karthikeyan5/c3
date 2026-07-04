@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/karthikeyan5/c3/internal/version"
 )
 
 // healthFileEntry is the per-channel shape nested under "channels" in
@@ -36,6 +38,15 @@ type healthFile struct {
 	BrokerPID   int                        `json:"broker_pid"`
 	WrittenUnix int64                      `json:"written_unix"`
 	Channels    map[string]healthFileEntry `json:"channels"`
+	// Version is the running broker's build version ("dev" for an uninjected
+	// build). Always present so a reader can show which C3 is running.
+	Version string `json:"version,omitempty"`
+	// UpdateAvailable + LatestVersion are the always-on update notice (R1): set
+	// once the ~6h checker finds a newer stable release, so the status line can
+	// render "c3 update available — /c3:update". Both omitempty, so a reader on
+	// the current version sees a byte-identical file to before this field existed.
+	UpdateAvailable bool   `json:"update_available,omitempty"`
+	LatestVersion   string `json:"latest_version,omitempty"`
 }
 
 // healthRefreshInterval is the slow refresh cadence for the liveness ticker
@@ -70,10 +81,14 @@ func (b *Broker) WriteHealthFile() {
 			Consec:    ev.Consec,
 		}
 	}
+	updateAvail, latest := b.UpdateAvailability()
 	out := healthFile{
-		BrokerPID:   os.Getpid(),
-		WrittenUnix: time.Now().Unix(),
-		Channels:    channels,
+		BrokerPID:       os.Getpid(),
+		WrittenUnix:     time.Now().Unix(),
+		Channels:        channels,
+		Version:         version.Current(),
+		UpdateAvailable: updateAvail,
+		LatestVersion:   latest,
 	}
 	data, err := json.Marshal(out)
 	if err != nil {

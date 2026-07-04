@@ -9,6 +9,8 @@
 //	c3-broker install-codex-shim — install Codex launcher symlinks
 //	c3-broker install-claude-shim — install Claude Code launcher wrapper
 //	c3-broker uninstall-claude-shim — remove the installed Claude Code wrapper
+//	c3-broker update [--check] — install the latest GitHub release (checksum-verified atomic swap)
+//	c3-broker version — print this binary's build version
 //
 // Singleton-per-machine via flock on $XDG_RUNTIME_DIR/c3-broker.pid (or
 // fallback). Spawned by adapters via exec.Command + setsid; runs until its
@@ -129,6 +131,18 @@ func main() {
 			// break the user's session. runSessionHook returns nil unconditionally.
 			_ = runSessionHook()
 			return
+		case "update":
+			if err := runUpdate(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "c3-broker update: %v\n", err)
+				os.Exit(exitFailure)
+			}
+			return
+		case "version", "--version", "-v":
+			if err := runVersion(); err != nil {
+				fmt.Fprintf(os.Stderr, "c3-broker version: %v\n", err)
+				os.Exit(exitFailure)
+			}
+			return
 		case "--help", "-h", "help":
 			fmt.Print(usage)
 			return
@@ -190,6 +204,14 @@ Usage:
                         writes a handoff the adapter reads to auto-attach a
                         resumed session. Never touches the broker socket;
                         always exits 0.
+  c3-broker update [--check]
+                        Update C3 to the latest GitHub release: download the
+                        platform tarball, verify it against SHA256SUMS, and
+                        atomically swap the six binaries in place. --check only
+                        reports current vs latest without installing. Does NOT
+                        stop a running broker (it keeps its old code until it
+                        restarts); prints how to bounce it after installing.
+  c3-broker version     Print this binary's build version ("dev" if unversioned).
   c3-broker --help      This text.
 `
 
@@ -303,6 +325,16 @@ func runDaemon() (err error) {
 	// keyboards, so an ask can't leak or leave a tappable keyboard past the
 	// adapter's answer timeout (FIX-1). Exits on br.Shutdown() (ctx cancel).
 	br.StartAskReaper()
+
+	// Auto-update checker: always-on availability check (surfaces the status-line
+	// notice + log), and — when mappings.auto_update is enabled — self-updates and
+	// requests a graceful restart. requestShutdown posts SIGTERM to ourselves so
+	// the normal signal path below drains (srv.Stop + Shutdown) and exits 0; an
+	// adapter reconnect then auto-spawns the freshly-swapped broker binary. Dev
+	// builds (no injected version) disable the checker. Exits on ctx cancel.
+	br.StartUpdateChecker(func() {
+		_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+	})
 
 	if cc, ok := mf.Channels["telegram"]; ok && cc.BotToken != "" {
 		if err := br.RegisterChannel(telegram.New()); err != nil {
