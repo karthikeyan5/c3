@@ -647,7 +647,7 @@ type PingThisSessionReplyMsg struct {
 // other transient-client requests and for future
 // "match by cwd when PID walk fails" extensions.
 //
-// TODO #19(e) — Karthi 2026-05-19.
+// TODO #19(e) — maintainer 2026-05-19.
 type ListSessionsReq struct {
 	Op  Op     `json:"op"` // = OpListSessions
 	PID int    `json:"pid,omitempty"`

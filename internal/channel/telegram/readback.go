@@ -24,7 +24,7 @@ import (
 //
 // It REUSES the channel's existing senders — sendMessage (TINY/SHORT bands),
 // sendRichMessage via sendRichHTML (LONG/DEADZONE bands), and SendDocument (HUGE
-// band) — and never writes raw HTTP. The FROZEN render format (locked with Karthi
+// band) — and never writes raw HTTP. The FROZEN render format (locked with the maintainer
 // 2026-06-30): a summary preview on top → "Full Transcript" heading → the WHOLE
 // verbatim transcript — a normal message with an expandable blockquote when it
 // fits one message (≤4096 UTF-16), a PLAIN rich message with Telegram's native

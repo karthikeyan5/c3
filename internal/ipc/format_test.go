@@ -31,7 +31,7 @@ func TestFormatAttached_OKDM(t *testing.T) {
 
 // TestFormatAttached_ProposalParity confirms every proposal action the
 // broker can emit is rendered with actionable user-facing text — no
-// "unspecified failure" leakage. Karthi 2026-05-18: "I absolutely need
+// "unspecified failure" leakage. maintainer 2026-05-18: "I absolutely need
 // the flow and the same flow to work in Codex." Both adapters used to
 // implement this in parallel and the codex copy silently dropped two
 // branches; centralising removes that drift surface forever.

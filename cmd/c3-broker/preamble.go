@@ -7,15 +7,15 @@ import (
 )
 
 // draftApproved gates whether the rendered preamble shows the
-// `[DRAFT 2026-05-19 — copy pending Karthi review]` footer. Default
-// false; flip to true ONLY after Karthi reviews preambleBody and
+// `[DRAFT 2026-05-19 — copy pending maintainer review]` footer. Default
+// false; flip to true ONLY after the maintainer reviews preambleBody and
 // explicitly approves the copy.
 //
 // When you flip this to true, do the following in the SAME commit:
 //  1. Read through preambleBody below and confirm it reflects the
-//     approved copy (Karthi often tightens lines during review).
+//     approved copy (reviews often tighten lines during review).
 //  2. Verify TestRenderPreamble_ApprovedMode_OmitsMarker passes —
-//     i.e. no stray "DRAFT" or "pending Karthi review" string
+//     i.e. no stray "DRAFT" or "pending maintainer review" string
 //     survives in preambleBody.
 //  3. Update RESUME.md / TODO.md if either references the DRAFT
 //     state.
@@ -26,7 +26,7 @@ import (
 // paired DraftMode/ApprovedMode tests that pin the rendered output to
 // the const's value. No "you can't change this constant" test — that
 // pattern is hostile when the maintainer is the one approving.
-const draftApproved = true // Karthi approved 2026-05-19
+const draftApproved = true // maintainer approved 2026-05-19
 
 // preambleBody is the educational text shown at the very top of
 // `c3-broker setup` before any prompt. It's the first thing a fresh
@@ -39,7 +39,7 @@ const draftApproved = true // Karthi approved 2026-05-19
 // assert on both modes from one source.
 //
 // Editing guidance:
-//   - Karthi rejects multi-line paragraphs. Keep blocks ≤3 lines.
+//   - the maintainer rejects multi-line paragraphs. Keep blocks ≤3 lines.
 //   - Cover four things only: what C3 does, what's about to happen,
 //     what the user needs handy, and the consent question.
 //   - The TestPreambleCopy_ContainsKeyConcepts test enforces presence
@@ -78,7 +78,7 @@ What you'll need handy
 // draftFooter is the footer line appended by renderPreamble when
 // draftApproved is false. Kept as a separate const so the test suite
 // can assert on its presence/absence without scanning the larger body.
-const draftFooter = "\n[DRAFT 2026-05-19 — copy pending Karthi review]\n"
+const draftFooter = "\n[DRAFT 2026-05-19 — copy pending maintainer review]\n"
 
 // renderPreamble returns the preamble text. When approved is false,
 // the DRAFT footer is appended; otherwise the body is returned as-is.

@@ -261,7 +261,7 @@ func (a *adapter) connectBroker() error {
 // spawnBroker forks a `c3-broker` process detached from our process group
 // so it survives our shutdown. The detached-launch semantics (setsid, no
 // stdio, async reap) live in internal/spawn, shared with the Claude adapter
-// (D7) per Karthi's "every flow must work the same in Codex" principle.
+// (D7) per the maintainer's "every flow must work the same in Codex" principle.
 //
 // Closes report MINOR m3 (2026-05-19).
 func spawnBroker() error {

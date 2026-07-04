@@ -76,7 +76,7 @@ func (mf *MappingsFile) AutoUpdateEnabled() bool {
 // or the chat_id set (group-cleared chats). Populated by the pairing flow;
 // see broker.PairingState and the /c3:pair slash command.
 //
-// Per Karthi's 2026-05-18 design:
+// Per the maintainer's 2026-05-18 design:
 //   - DM pairing allowlists the user_id (DM with that user is now cleared).
 //   - Group pairing allowlists the chat_id (the whole group is cleared;
 //     the user_id who happened to type the code is incidental — we trust

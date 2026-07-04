@@ -199,7 +199,7 @@ func TestCmdlineHasDevChannelForC3(t *testing.T) {
 		{"claude", devChannelsFlag, "--resume"}, // value list ends at next flag
 		{"c3-claude-adapter"},
 		// A stray "c3" that is NOT a dev-channels value must not match.
-		{"claude", "--project", "/home/u/arogara/c3"},
+		{"claude", "--project", "/home/u/projects/app"},
 	}
 	for _, a := range no {
 		if cmdlineHasDevChannelForC3(a) {

@@ -671,7 +671,7 @@ func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound, 
 	// this, every inbound for a dead-holder claim ends with a "holder.Conn
 	// is not *ipc.Conn" log line and silently never reaches anywhere
 	// (including no Telegram fallback). This is the 2026-05-14 regression
-	// Karthi hit immediately after /mcp reconnect.
+	// the maintainer hit immediately after /mcp reconnect.
 	if claimed && !holder.IsAlive() {
 		log.Printf("deliver STALE chan=%s chat=%d topic=%s msg=%d: holder cli=%s pid=%d is dead, releasing claim",
 			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID,

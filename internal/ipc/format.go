@@ -8,7 +8,7 @@ import (
 // FormatAttached renders an AttachedMsg as the user-facing string the
 // agent surfaces verbatim. Shared between the Claude and Codex adapters
 // — the broker's proposal cases must render identically on either side
-// (Karthi 2026-05-18: "every flow must work the same in Codex"), and
+// (maintainer 2026-05-18: "every flow must work the same in Codex"), and
 // inlining the formatter twice was the documented source of the
 // previously-silent codex parity bug where two proposal actions
 // (disambiguate_dm, force_steal) had no codex branch and rendered as

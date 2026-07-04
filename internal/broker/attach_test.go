@@ -496,9 +496,9 @@ func TestWelcomeText_HomeShortened(t *testing.T) {
 	if home == "" {
 		t.Skip("no home dir")
 	}
-	stub := &Stub{CLI: "claude", CWD: filepath.Join(home, "arogara", "c3")}
+	stub := &Stub{CLI: "claude", CWD: filepath.Join(home, "projects", "app")}
 	got := welcomeText(stub, "c3", "")
-	if !strings.Contains(got, "~/arogara/c3") {
+	if !strings.Contains(got, "~/projects/app") {
 		t.Errorf("welcomeText should home-shorten cwd, got %q", got)
 	}
 	if strings.Contains(got, home) {
@@ -517,7 +517,7 @@ func TestWelcomeText_IncludesCLIAndLabel(t *testing.T) {
 }
 
 func TestWelcomeText_NoPID(t *testing.T) {
-	// Karthi explicit feedback 2026-05-14: PID is mechanical clutter,
+	// maintainer feedback 2026-05-14: PID is mechanical clutter,
 	// don't include it.
 	stub := &Stub{CLI: "claude", PID: 12345, CWD: "/tmp/x"}
 	got := welcomeText(stub, "label", "")
@@ -762,7 +762,7 @@ func TestPersistMapping_RecordsSessionAttachmentEvenOnRebindRefusal(t *testing.T
 }
 
 func TestPersistMapping_RebindRefusesToOverwrite(t *testing.T) {
-	// Karthi 2026-05-14: "rebinding should be explicit." persistMapping
+	// maintainer 2026-05-14: "rebinding should be explicit." persistMapping
 	// must NOT silently change a saved cwd → topic mapping. The live
 	// claim is granted upstream in tryClaim; persistMapping's job is
 	// preserving the saved default until the user takes an explicit
@@ -799,7 +799,7 @@ func TestPersistMapping_RebindRefusesToOverwrite(t *testing.T) {
 // ─── welcome firing rules: Replay is the sole suppression signal ───────────
 //
 // History (2026-05-14): an earlier belt-and-suspenders 30-second post-startup
-// recovery window false-positived against a real user attach — Karthi typed
+// recovery window false-positived against a real user attach — maintainer typed
 // `attach` 21 seconds after a broker restart and the welcome never fired.
 // The recovery window was removed. Replay (in AttachReq) is now the
 // authoritative signal that an attach is operational recovery rather than

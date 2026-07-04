@@ -44,7 +44,7 @@ func TestModeProtocol_HasCanonicalKeyPhrases(t *testing.T) {
 
 // TestModeProtocol_HasAnnounceModeAfterAttach guards the rule that the
 // agent must announce its current output mode immediately after every
-// successful attach. TODO #15 (Karthi 2026-05-18): broker does not
+// successful attach. TODO #15 (maintainer 2026-05-18): broker does not
 // persist mode, so the protocol mandates an explicit confirmation so
 // the human knows which surface owns the next reply.
 func TestModeProtocol_HasAnnounceModeAfterAttach(t *testing.T) {

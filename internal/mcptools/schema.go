@@ -1,7 +1,7 @@
 // Package mcptools is the single source of truth for the C3 MCP tool
 // InputSchemas that are shared verbatim between the Claude and Codex adapters.
 //
-// Karthi's standing principle (2026-05-18, TODO #20): anything duplicated
+// the maintainer's standing principle (2026-05-18, TODO #20): anything duplicated
 // between the Claude and Codex adapters must have ONE source of truth. P3 added
 // per-adapter `replyMediaSchema()` / `pollToolSchema()` helpers that were
 // byte-identical copies; P4 collapses them here so the two adapters stay in

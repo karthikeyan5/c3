@@ -128,7 +128,7 @@ func TestDispatch_SetsDispatchedFlag(t *testing.T) {
 // `--resume` re-attach path: after a broker reconnect the adapter
 // must re-send its last successful AttachReq with Replay=true so the
 // broker can re-grant the claim without firing a fresh welcome
-// message. TODO #19(d) — Karthi 2026-05-18.
+// message. TODO #19(d) — maintainer 2026-05-18.
 //
 // We don't need a real broker; net.Pipe gives us an in-memory peer
 // from which we can read the frame the adapter writes.

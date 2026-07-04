@@ -641,7 +641,7 @@ func (b *Broker) sendWelcome(stub *Stub, key RouteKey, label string) {
 	// case where an older adapter binary didn't yet thread the Replay
 	// flag — but in practice it false-positived against legitimate
 	// user-typed attaches that happened to land within 30s of broker
-	// startup (Karthi 2026-05-14: typed `attach` 21s after a broker
+	// startup (maintainer 2026-05-14: typed `attach` 21s after a broker
 	// restart and got no welcome). Replay is the authoritative signal;
 	// trust it.
 	ch, err := b.Channel(key.Channel)
@@ -766,7 +766,7 @@ func recoverWelcomeText(name string, queued int) string {
 // turning every fresh attach into a silent rebind of the parent's default.
 //
 // Rebind guard (TODO.md pre-release UX bug #3, hardened 2026-05-14 per
-// Karthi's "should be rejected" directive): if the resolved cwd already
+// the maintainer's "should be rejected" directive): if the resolved cwd already
 // maps to a *different* topic, the broker refuses to overwrite the
 // saved default. The live claim still proceeds — the user has the
 // session they wanted — but the default-for-next-launch stays put.

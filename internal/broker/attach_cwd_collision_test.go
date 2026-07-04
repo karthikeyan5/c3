@@ -16,7 +16,7 @@ import (
 // different sub-project silently resolves the saved parent→topic mapping
 // and races/steals the topic already held by a live sibling session.
 //
-// The chosen UX (Karthi): when a BARE cwd-default attach resolves to a
+// The chosen UX (maintainer): when a BARE cwd-default attach resolves to a
 // topic ALREADY HELD by a DIFFERENT LIVE session, do NOT silently claim
 // and do NOT show only the raw force_steal y/n prompt. Return a guided
 // AttachStatusCwdDefaultCollision message that names the holder and

@@ -181,7 +181,7 @@ func containsCodexC3Section(s string) bool {
 // prefer otherwise).
 //
 // The header comment carries a version + per-day date marker so a
-// future Karthi (or follow-up agent) can distinguish "this user
+// future the maintainer (or follow-up agent) can distinguish "this user
 // upgraded from v0.1 → v0.2" from "user hand-edited". Stable per-day
 // (UTC) — rerunning setup on the same day produces byte-identical
 // output, which preserves the existing-section idempotency contract

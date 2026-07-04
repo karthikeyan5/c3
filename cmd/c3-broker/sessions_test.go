@@ -46,10 +46,10 @@ func TestRenderSessionsTable_HomeShortenedCWD(t *testing.T) {
 		t.Skip("no home dir")
 	}
 	sessions := []ipc.SessionEntry{
-		{CLI: "claude", PID: 1, CWD: filepath.Join(home, "arogara", "c3")},
+		{CLI: "claude", PID: 1, CWD: filepath.Join(home, "projects", "app")},
 	}
 	got := renderSessionsTable(sessions)
-	if !strings.Contains(got, "~/arogara/c3") {
+	if !strings.Contains(got, "~/projects/app") {
 		t.Errorf("CWD should be home-shortened with ~: %q", got)
 	}
 	if strings.Contains(got, home) {

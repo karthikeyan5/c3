@@ -206,7 +206,7 @@ func TestHandle_ListTopics(t *testing.T) {
 // holder. The trick is feeding a sentinel PID (-1) that isPIDAlive
 // rejects via its `pid <= 0` short-circuit; the defer then takes the
 // dead-PID branch and calls Routes.ReleaseAllByConnID. TODO #19(d) —
-// Karthi 2026-05-18.
+// maintainer 2026-05-18.
 func TestConnDrop_ReleasesClaimWhenPIDDead(t *testing.T) {
 	mf := emptyMappings()
 	mf.Channels["telegram"] = mappings.ChannelConfig{

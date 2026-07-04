@@ -1,7 +1,7 @@
 // Package mode is the single source of truth for the per-session protocol
 // text that c3 surfaces to any agent driving the adapter.
 //
-// Karthi's standing principle (2026-05-18, TODO #20): anything duplicated
+// the maintainer's standing principle (2026-05-18, TODO #20): anything duplicated
 // between Claude and Codex adapters / install paths (protocol text, install
 // instructions, restart commands, tool descriptions, setup-time effects)
 // must have ONE source of truth. Implementation surface can differ
@@ -38,7 +38,7 @@ import (
 // ModeProtocol is the per-session output-mode contract every agent using
 // c3 must honor. Appended to every adapter MCP-initialize instructions
 // variant so the rule travels with the plugin, not with the user's
-// AGENTS.md. Karthi's standing instruction (2026-05-15): make this part
+// AGENTS.md. the maintainer's standing instruction (2026-05-15): make this part
 // of the plugin contract so any agent using c3 understands the protocol
 // without per-user setup.
 const ModeProtocol = "OUTPUT MODE PROTOCOL (per-session, agent-only state — default CLI mode on every fresh session):\n" +

@@ -6,7 +6,7 @@
 // MORNING-REVIEW-2026-05-19.md): an ANSI escape from the adapter, NOT a
 // Claude-Code statusline plugin. Reasons:
 //
-//  1. Works for both Claude Code and Codex with one code path — Karthi's
+//  1. Works for both Claude Code and Codex with one code path — the maintainer's
 //     standing "every flow must work the same in Codex" principle.
 //  2. No settings.json edits — universal OSC-0 escape that xterm,
 //     gnome-terminal, alacritty, kitty, tmux, screen, iTerm2, and

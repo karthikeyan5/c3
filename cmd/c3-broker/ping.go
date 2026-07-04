@@ -19,7 +19,7 @@ import (
 //	c3-broker ping
 //
 // The matching slash command is /c3:ping (plugins/c3/commands/c3-ping.md).
-// TODO #19(b) — Karthi 2026-05-18.
+// TODO #19(b) — maintainer 2026-05-18.
 //
 // Matching is PID-primary (FIX 1, 2026-06-03; FIX 2, 2026-06-04): we pass our
 // best-effort guess at the calling CLI session's PID (walked up the PPID chain

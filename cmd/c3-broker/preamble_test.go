@@ -10,7 +10,7 @@ import (
 // The educational copy MUST mention the load-bearing concepts so a
 // fresh user reads about all four: what C3 does (Telegram + CLI), how
 // it does voice (STT), why we need a group (topics), and the consent
-// gate. If Karthi rewrites the copy in the morning, this test catches
+// gate. If the maintainer rewrites the copy in the morning, this test catches
 // accidentally dropping a concept entirely.
 //
 // Tested against the approved-mode render so the assertion holds in
@@ -61,8 +61,8 @@ func TestRenderPreamble_DraftMode_RendersMarker(t *testing.T) {
 	if !strings.Contains(out, "[DRAFT 2026-05-19") {
 		t.Error("renderPreamble(false) missing [DRAFT 2026-05-19 footer — DRAFT mode must show the marker")
 	}
-	if !strings.Contains(out, "pending Karthi review") {
-		t.Error("renderPreamble(false) missing `pending Karthi review` text — the DRAFT footer must say what's pending")
+	if !strings.Contains(out, "pending maintainer review") {
+		t.Error("renderPreamble(false) missing `pending maintainer review` text — the DRAFT footer must say what's pending")
 	}
 }
 
@@ -75,12 +75,12 @@ func TestRenderPreamble_ApprovedMode_OmitsMarker(t *testing.T) {
 	if strings.Contains(out, "DRAFT") {
 		t.Errorf("renderPreamble(true) contains DRAFT text — approved mode must NOT show the marker; rendered output:\n%s", out)
 	}
-	if strings.Contains(out, "pending Karthi review") {
-		t.Error("renderPreamble(true) contains `pending Karthi review` — approved mode must not show pending-review text")
+	if strings.Contains(out, "pending maintainer review") {
+		t.Error("renderPreamble(true) contains `pending maintainer review` — approved mode must not show pending-review text")
 	}
 }
 
-// TestPreambleCopy_NotTooLong is a soft cap: Karthi explicitly said
+// TestPreambleCopy_NotTooLong is a soft cap: the maintainer explicitly said
 // "don't make it lengthy paragraphs". 80 lines is well under what a
 // typical terminal can show; 200 lines is screen-scroll territory. We
 // alarm at the upper bound — if the copy crosses 120 lines, something
@@ -88,7 +88,7 @@ func TestRenderPreamble_ApprovedMode_OmitsMarker(t *testing.T) {
 func TestPreambleCopy_NotTooLong(t *testing.T) {
 	lines := strings.Count(renderPreamble(draftApproved), "\n")
 	if lines > 120 {
-		t.Errorf("renderPreamble is %d lines — Karthi rejects lengthy paragraphs; tighten before shipping", lines)
+		t.Errorf("renderPreamble is %d lines — maintainer rejects lengthy paragraphs; tighten before shipping", lines)
 	}
 }
 
