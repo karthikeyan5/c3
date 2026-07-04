@@ -239,17 +239,32 @@ func renderReadback(transcript string) (method, payload string, band readbackBan
 	f3 = capUTF16(f3, readbackPreviewPartMaxU16)
 	l3 = capUTF16(l3, readbackPreviewPartMaxU16)
 	header := fmt.Sprintf("🎤 <b>Voice transcript</b> · ~%d words", words)
-	elision := fmt.Sprintf("✂️✂️ %d more sentences ✂️✂️", more)
+
+	// Preview block: f3, plus the elision line + tail ONLY when there is an
+	// elided middle. more == 0 happens on the fallthrough path (fewer than
+	// readbackTinyMaxSentences sentences but DISPLAYED past the sendMessage
+	// cap): buildPreview then returns (all, "", 0), and embedding the elision
+	// unconditionally would render a literal "✂️✂️ 0 more sentences ✂️✂️" plus
+	// an empty tail paragraph. Mirrors readbackCaption's `if more > 0` guard.
+	summaryHTML := htmlEscape(f3)
+	summaryVisible := f3
+	previewHTML := "<p>" + htmlEscape(f3) + "</p>"
+	if more > 0 {
+		elision := fmt.Sprintf("✂️✂️ %d more sentences ✂️✂️", more)
+		summaryHTML += "\n<i>" + elision + "</i>\n" + htmlEscape(l3)
+		summaryVisible += "\n" + elision + "\n" + l3
+		previewHTML += "<p><i>" + elision + "</i></p>" +
+			"<p>" + htmlEscape(l3) + "</p>"
+	}
 
 	// SHORT candidate — summary + heading + the whole transcript in an expandable
 	// blockquote. Measure the DISPLAYED text: tags cost 0, and an escaped entity
 	// costs its single visible char, so we measure the unescaped visible string
 	// (and send the escaped one), exactly as the W4 Python did.
-	shortHTML := header + "\n" + htmlEscape(f3) +
-		"\n<i>" + elision + "</i>\n" + htmlEscape(l3) +
+	shortHTML := header + "\n" + summaryHTML +
 		"\n\n<b>Full Transcript</b>\n<blockquote expandable>" + htmlEscape(full) + "</blockquote>"
-	shortVisible := fmt.Sprintf("🎤 Voice transcript · ~%d words", words) + "\n" + f3 +
-		"\n" + elision + "\n" + l3 + "\n\nFull Transcript\n" + full
+	shortVisible := fmt.Sprintf("🎤 Voice transcript · ~%d words", words) + "\n" + summaryVisible +
+		"\n\nFull Transcript\n" + full
 	shortVisibleU16 := uint16Len(shortVisible)
 	if shortVisibleU16 <= readbackShortMaxU16 {
 		return "sendMessage", shortHTML, bandShort
@@ -263,15 +278,11 @@ func renderReadback(transcript string) (method, payload string, band readbackBan
 	// native "Show More") instead wraps the whole transcript in a searchable
 	// <details> collapse. Budget both on the assembled HTML's UTF-8 BYTE length.
 	richHTML := "<p>" + header + "</p>" +
-		"<p>" + htmlEscape(f3) + "</p>" +
-		"<p><i>" + elision + "</i></p>" +
-		"<p>" + htmlEscape(l3) + "</p>" +
+		previewHTML +
 		"<p><b>Full Transcript</b></p>" +
 		"<p>" + htmlEscape(full) + "</p>"
 	detailsHTML := "<p>" + header + "</p>" +
-		"<p>" + htmlEscape(f3) + "</p>" +
-		"<p><i>" + elision + "</i></p>" +
-		"<p>" + htmlEscape(l3) + "</p>" +
+		previewHTML +
 		"<details><summary><b>📄 Full Transcript</b></summary><p>" + htmlEscape(full) + "</p></details>"
 
 	// DEADZONE — the 4096 < shortVisible ≤ 9000 window renders as a searchable

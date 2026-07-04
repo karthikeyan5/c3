@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -388,8 +389,10 @@ func newTestPoller(srvURL, code string, target pairTarget) *pairPoller {
 // TestPairPoller_DMCaptureIgnoresNoiseAndGroups — the DM poller must skip
 // /start noise, wrong codes, and a matching code sent in a GROUP (that's
 // the group flow's business), then capture the DM sender's user id. Also
-// pins offset progression: the second call must ack the first batch, and
-// the post-match commit must ack the consumed match.
+// pins the loss-freedom contract: the poller NEVER advances the getUpdates
+// offset — not between polls (the second poll re-reads the first batch; the
+// in-memory dedupe absorbs the repeats) and not after a successful match
+// (no commit call) — so no unrelated update is ever confirmed server-side.
 func TestPairPoller_DMCaptureIgnoresNoiseAndGroups(t *testing.T) {
 	fake := &fakeBotAPI{t: t, responses: []string{
 		`{"ok":true,"result":[
@@ -397,7 +400,12 @@ func TestPairPoller_DMCaptureIgnoresNoiseAndGroups(t *testing.T) {
 			{"update_id":11,"message":{"text":"9999","from":{"id":777},"chat":{"id":777}}},
 			{"update_id":12,"message":{"text":"1234","from":{"id":555},"chat":{"id":-100200,"title":"Ops"}}}
 		]}`,
-		`{"ok":true,"result":[{"update_id":13,"message":{"text":" 1234 ","from":{"id":777},"chat":{"id":777}}}]}`,
+		`{"ok":true,"result":[
+			{"update_id":10,"message":{"text":"/start","from":{"id":777},"chat":{"id":777}}},
+			{"update_id":11,"message":{"text":"9999","from":{"id":777},"chat":{"id":777}}},
+			{"update_id":12,"message":{"text":"1234","from":{"id":555},"chat":{"id":-100200,"title":"Ops"}}},
+			{"update_id":13,"message":{"text":" 1234 ","from":{"id":777},"chat":{"id":777}}}
+		]}`,
 		`{"ok":true,"result":[]}`,
 	}}
 	srv := httptest.NewServer(http.HandlerFunc(fake.handler))
@@ -413,14 +421,197 @@ func TestPairPoller_DMCaptureIgnoresNoiseAndGroups(t *testing.T) {
 	}
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
-	if len(fake.offsets) < 3 {
-		t.Fatalf("expected ≥3 getUpdates calls (poll, poll, commit), got %d", len(fake.offsets))
+	if len(fake.offsets) != 2 {
+		t.Fatalf("expected exactly 2 getUpdates calls (poll, poll — and NO post-match commit), got %d: %v", len(fake.offsets), fake.offsets)
 	}
-	if fake.offsets[0] != "0" || fake.offsets[1] != "13" {
-		t.Errorf("offset progression = %v, want [0 13 ...] (second call must ack the first batch)", fake.offsets)
+	for i, off := range fake.offsets {
+		if off != "0" {
+			t.Errorf("call %d used offset %s, want 0 — the poller must never confirm updates", i, off)
+		}
 	}
-	if last := fake.offsets[len(fake.offsets)-1]; last != "14" {
-		t.Errorf("commit offset = %s, want 14 (must ack the consumed match)", last)
+}
+
+// TestPairPoller_NeverConfirmsOnFailure — an expired window over a stream of
+// unrelated updates must leave the getUpdates cursor untouched: the broker's
+// unconfirmed backlog (and any real messages that arrived mid-setup) must be
+// re-fetchable by the restarted broker even when pairing FAILS.
+func TestPairPoller_NeverConfirmsOnFailure(t *testing.T) {
+	fake := &fakeBotAPI{t: t, responses: []string{
+		`{"ok":true,"result":[
+			{"update_id":50,"message":{"text":"an important real message","from":{"id":777},"chat":{"id":777}}},
+			{"update_id":51,"message":{"text":"another one","from":{"id":777},"chat":{"id":777}}}
+		]}`,
+	}}
+	srv := httptest.NewServer(http.HandlerFunc(fake.handler))
+	defer srv.Close()
+
+	p := newTestPoller(srv.URL, "1234", pairTargetDM)
+	_, err := p.wait(time.Now().Add(150 * time.Millisecond))
+	if err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("wait = %v, want expiry error", err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.offsets) == 0 {
+		t.Fatal("no getUpdates calls recorded")
+	}
+	for i, off := range fake.offsets {
+		if off != "0" {
+			t.Errorf("call %d used offset %s, want 0 — failure must not confirm/destroy unrelated updates", i, off)
+		}
+	}
+}
+
+// TestPairPoller_DedupedRepeatsThenMatch — because the poller re-polls with
+// the same offset, every earlier update is re-delivered on every poll. The
+// in-memory dedupe must absorb the repeats (here: a WRONG 4-digit code that
+// would trip the fail-closed cap if re-counted each poll) and still capture
+// the code when it finally arrives on a later poll.
+func TestPairPoller_DedupedRepeatsThenMatch(t *testing.T) {
+	repeated := `{"update_id":60,"message":{"text":"9999","from":{"id":777},"chat":{"id":777}}}`
+	fake := &fakeBotAPI{t: t, responses: []string{
+		`{"ok":true,"result":[` + repeated + `]}`,
+		`{"ok":true,"result":[` + repeated + `]}`,
+		`{"ok":true,"result":[` + repeated + `]}`,
+		`{"ok":true,"result":[` + repeated + `]}`,
+		`{"ok":true,"result":[` + repeated + `]}`,
+		`{"ok":true,"result":[` + repeated + `]}`,
+		`{"ok":true,"result":[` + repeated + `]}`,
+		`{"ok":true,"result":[` + repeated + `]}`,
+		`{"ok":true,"result":[` + repeated + `]}`,
+		`{"ok":true,"result":[` + repeated + `]}`,
+		`{"ok":true,"result":[` + repeated + `]}`,
+		`{"ok":true,"result":[` + repeated + `,
+			{"update_id":61,"message":{"text":"1234","from":{"id":777},"chat":{"id":777}}}]}`,
+	}}
+	srv := httptest.NewServer(http.HandlerFunc(fake.handler))
+	defer srv.Close()
+
+	p := newTestPoller(srv.URL, "1234", pairTargetDM)
+	capture, err := p.wait(time.Now().Add(5 * time.Second))
+	if err != nil {
+		t.Fatalf("wait: %v (a re-counted duplicate wrong code must not trip the fail-closed cap)", err)
+	}
+	if capture.UserID != 777 {
+		t.Errorf("capture.UserID = %d, want 777", capture.UserID)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	for i, off := range fake.offsets {
+		if off != "0" {
+			t.Errorf("call %d used offset %s, want 0", i, off)
+		}
+	}
+}
+
+// TestPairPoller_FullPageSkipLastResort — the ONLY case where the poller may
+// advance the offset (confirming updates server-side): a FULL page
+// (pairPageFull updates) with no code in it, which would otherwise hide every
+// later update forever. It must warn loudly that those updates were skipped.
+func TestPairPoller_FullPageSkipLastResort(t *testing.T) {
+	var page strings.Builder
+	page.WriteString(`{"ok":true,"result":[`)
+	for i := 1; i <= pairPageFull; i++ {
+		if i > 1 {
+			page.WriteString(",")
+		}
+		fmt.Fprintf(&page, `{"update_id":%d,"message":{"text":"noise %d","from":{"id":777},"chat":{"id":777}}}`, i, i)
+	}
+	page.WriteString(`]}`)
+	fake := &fakeBotAPI{t: t, responses: []string{
+		page.String(),
+		fmt.Sprintf(`{"ok":true,"result":[{"update_id":%d,"message":{"text":"1234","from":{"id":777},"chat":{"id":777}}}]}`, pairPageFull+1),
+	}}
+	srv := httptest.NewServer(http.HandlerFunc(fake.handler))
+	defer srv.Close()
+
+	var warnings bytes.Buffer
+	p := newTestPoller(srv.URL, "1234", pairTargetDM)
+	p.warn = &warnings
+	capture, err := p.wait(time.Now().Add(5 * time.Second))
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if capture.UserID != 777 {
+		t.Errorf("capture.UserID = %d, want 777", capture.UserID)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.offsets) < 2 {
+		t.Fatalf("expected ≥2 getUpdates calls, got %d", len(fake.offsets))
+	}
+	if fake.offsets[0] != "0" {
+		t.Errorf("first call offset = %s, want 0", fake.offsets[0])
+	}
+	if want := fmt.Sprintf("%d", pairPageFull+1); fake.offsets[1] != want {
+		t.Errorf("post-full-page offset = %s, want %s (advance past the full page)", fake.offsets[1], want)
+	}
+	if !strings.Contains(warnings.String(), "skipping past them") {
+		t.Errorf("full-page skip produced no warning; warnings = %q", warnings.String())
+	}
+}
+
+// TestPairPoller_TooManyWrongCodesFailsClosed — after pairMaxWrongCodes wrong
+// 4-digit candidates in the watched chat type, the window must abort (fail
+// closed) — even if the right code follows in the same batch — and must not
+// confirm anything.
+func TestPairPoller_TooManyWrongCodesFailsClosed(t *testing.T) {
+	var page strings.Builder
+	page.WriteString(`{"ok":true,"result":[`)
+	for i := 0; i < pairMaxWrongCodes; i++ {
+		if i > 0 {
+			page.WriteString(",")
+		}
+		fmt.Fprintf(&page, `{"update_id":%d,"message":{"text":"%04d","from":{"id":555},"chat":{"id":555}}}`, 70+i, i)
+	}
+	// The right code, one update later — the window must already be closed.
+	fmt.Fprintf(&page, `,{"update_id":%d,"message":{"text":"1234","from":{"id":777},"chat":{"id":777}}}`, 70+pairMaxWrongCodes)
+	page.WriteString(`]}`)
+	fake := &fakeBotAPI{t: t, responses: []string{page.String()}}
+	srv := httptest.NewServer(http.HandlerFunc(fake.handler))
+	defer srv.Close()
+
+	p := newTestPoller(srv.URL, "1234", pairTargetDM)
+	_, err := p.wait(time.Now().Add(5 * time.Second))
+	if err == nil || !strings.Contains(err.Error(), "too many wrong codes") {
+		t.Fatalf("wait = %v, want fail-closed too-many-wrong-codes error", err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	for i, off := range fake.offsets {
+		if off != "0" {
+			t.Errorf("call %d used offset %s, want 0 — fail-closed abort must not confirm updates", i, off)
+		}
+	}
+}
+
+// TestPairPoller_GroupSenderScoping — once an operator allowlist exists,
+// only an allowlisted sender's code completes a GROUP pairing: the same code
+// from a random member must be ignored. Any-sender remains only for the
+// bootstrap case (senderAllowed == nil), covered by
+// TestPairPoller_GroupCaptureIgnoresDMs.
+func TestPairPoller_GroupSenderScoping(t *testing.T) {
+	fake := &fakeBotAPI{t: t, responses: []string{
+		`{"ok":true,"result":[
+			{"update_id":80,"message":{"text":"4321","from":{"id":555},"chat":{"id":-100200,"title":"Ops"}}},
+			{"update_id":81,"message":{"text":"4321","from":{"id":777},"chat":{"id":-100200,"title":"Ops"}}}
+		]}`,
+		`{"ok":true,"result":[]}`,
+	}}
+	srv := httptest.NewServer(http.HandlerFunc(fake.handler))
+	defer srv.Close()
+
+	p := newTestPoller(srv.URL, "4321", pairTargetGroup)
+	p.senderAllowed = func(id int64) bool { return id == 777 }
+	capture, err := p.wait(time.Now().Add(5 * time.Second))
+	if err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	if capture.UserID != 777 {
+		t.Errorf("capture.UserID = %d, want 777 (the allowlisted sender, not the first sender)", capture.UserID)
+	}
+	if capture.ChatID != -100200 {
+		t.Errorf("capture.ChatID = %d, want -100200", capture.ChatID)
 	}
 }
 
@@ -685,11 +876,15 @@ func TestPairIntros_ContainCodeAndNoIDHunting(t *testing.T) {
 	if !strings.Contains(dm, "1234") || !strings.Contains(dm, "@my_test_bot") {
 		t.Errorf("dmPairIntro missing code or bot username:\n%s", dm)
 	}
-	group := groupPairIntro("5678")
+	group := groupPairIntro("5678", false)
 	if !strings.Contains(group, "5678") {
 		t.Errorf("groupPairIntro missing code:\n%s", group)
 	}
-	for _, text := range []string{dm, group, pairArmPrompt} {
+	restricted := groupPairIntro("5678", true)
+	if !strings.Contains(restricted, "5678") || !strings.Contains(restricted, "paired") {
+		t.Errorf("restricted groupPairIntro missing code or the paired-sender instruction:\n%s", restricted)
+	}
+	for _, text := range []string{dm, group, restricted, pairArmPrompt} {
 		for _, banned := range bannedSetupCopy {
 			if strings.Contains(text, banned) {
 				t.Errorf("pairing copy contains banned id-hunting breadcrumb %q in:\n%s", banned, text)
@@ -750,7 +945,8 @@ func TestPostSetupWhatNow_Codex(t *testing.T) {
 func TestSetupCopy_NoIDHuntingAnywhere(t *testing.T) {
 	texts := []string{
 		dmPairIntro("bot", "0000"),
-		groupPairIntro("0000"),
+		groupPairIntro("0000", false),
+		groupPairIntro("0000", true),
 		pairArmPrompt,
 		postSetupWhatNow(HostClaude),
 		postSetupWhatNow(HostCodex),
