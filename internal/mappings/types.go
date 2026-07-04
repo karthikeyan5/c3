@@ -17,6 +17,16 @@ type MappingsFile struct {
 	// was last attached to, powering auto-attach-on-resume. omitempty keeps
 	// pre-feature config files byte-identical until the first session attaches.
 	SessionAttachments map[string]SessionAttachment `json:"session_attachments,omitempty"`
+	// AutoAttachOnResume gates whether a resumed session is automatically
+	// re-attached to its last topic (broker.handleRecoverSession). Absent or
+	// false ⇒ DISABLED, the v1 default: the SessionStart hook still records the
+	// resume handoff, but the broker does not auto-re-claim the last route. Set
+	// true to opt in to the full behavior. A plain bool (not *bool) is correct
+	// here BECAUSE the desired default is the zero value, false — unlike
+	// notifications.invasive / channels.rich_inbound, which default true and so
+	// need a pointer to tell "unset" apart from an explicit false. omitempty
+	// keeps pre-feature and opted-out config files byte-identical.
+	AutoAttachOnResume bool `json:"auto_attach_on_resume,omitempty"`
 }
 
 // NotificationsConfig governs the "invasive" health-notification surfaces
@@ -36,6 +46,13 @@ func (mf *MappingsFile) InvasiveNotifications() bool {
 		return true
 	}
 	return *mf.Notifications.Invasive
+}
+
+// AutoAttachOnResumeEnabled reports whether auto-attach-on-resume is enabled.
+// A nil file or an absent field ⇒ false (the v1 default: the feature is off, so
+// a resumed session stays unattached until it attaches explicitly).
+func (mf *MappingsFile) AutoAttachOnResumeEnabled() bool {
+	return mf != nil && mf.AutoAttachOnResume
 }
 
 // Allowlist enforces default-deny inbound traffic. The channel layer drops
