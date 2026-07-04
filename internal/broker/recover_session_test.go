@@ -38,6 +38,7 @@ func recoverViaPeer(t *testing.T, b *Broker, cwd, stableID string) (*ipc.Conn, f
 
 func TestHandleRecoverSession_NoRouteRecovers(t *testing.T) {
 	mf := mfWithTelegram()
+	mf.AutoAttachOnResume = true                                 // gate ON: recovery fires as it does in production when opted in
 	seedSessionAttachment(mf, "sess-1", time.Now().UTC(), false) // → c3 / 281
 	b := brokerWithChannel(t, mf, &fakeChannel{})
 	defer b.Shutdown()
@@ -65,6 +66,7 @@ func TestHandleRecoverSession_NoRouteRecovers(t *testing.T) {
 func TestHandleRecoverSession_CarriesBacklogPreview(t *testing.T) {
 	t.Setenv("C3_QUEUE_DIR", t.TempDir())
 	mf := mfWithTelegram()
+	mf.AutoAttachOnResume = true                                 // gate ON: recovery fires
 	seedSessionAttachment(mf, "sess-1", time.Now().UTC(), false) // → c3 / 281
 	b := brokerWithChannel(t, mf, &fakeChannel{})
 	defer b.Shutdown()
@@ -91,6 +93,64 @@ func TestHandleRecoverSession_CarriesBacklogPreview(t *testing.T) {
 	}
 	if resp.QueuedSummary[0].MessageID != 1 || resp.QueuedSummary[0].Preview == "" {
 		t.Fatalf("first preview item malformed: %+v", resp.QueuedSummary[0])
+	}
+}
+
+// TestHandleRecoverSession_GateDisabledNoAutoAttach is the v1 default: with
+// auto_attach_on_resume absent/false, a recoverable attachment is NOT auto-
+// re-claimed on resume. The stable id is still recorded (so a later SIGHUP-
+// enable works), but the route stays free.
+func TestHandleRecoverSession_GateDisabledNoAutoAttach(t *testing.T) {
+	mf := mfWithTelegram()                                       // auto_attach_on_resume defaults false
+	seedSessionAttachment(mf, "sess-1", time.Now().UTC(), false) // → c3 / 281
+	b := brokerWithChannel(t, mf, &fakeChannel{})
+	defer b.Shutdown()
+
+	_, done, resp := recoverViaPeer(t, b, "/anywhere", "sess-1")
+	defer done()
+
+	if resp.Recovered {
+		t.Fatalf("gate OFF: resume must NOT auto-attach, got %+v", resp)
+	}
+	tid := int64(281)
+	if _, ok := b.Routes.Holder(MakeRouteKey("telegram", -100, &tid)); ok {
+		t.Fatal("gate OFF: no route must be claimed on resume")
+	}
+	// TestHandleRecoverSession_GateReloadFlips proves the stable id is still
+	// learned under the OFF gate (a later enable recovers the same session).
+}
+
+// TestHandleRecoverSession_GateReloadFlips proves the gate is read LIVE from the
+// current mappings snapshot: a SIGHUP-style SetMappings that turns the gate on
+// makes the very next resume auto-attach, with no broker restart.
+func TestHandleRecoverSession_GateReloadFlips(t *testing.T) {
+	mfOff := mfWithTelegram()                                       // gate OFF
+	seedSessionAttachment(mfOff, "sess-1", time.Now().UTC(), false) // → c3 / 281
+	b := brokerWithChannel(t, mfOff, &fakeChannel{})
+	defer b.Shutdown()
+
+	// First resume under the OFF config: no auto-attach.
+	_, done1, resp1 := recoverViaPeer(t, b, "/a", "sess-1")
+	if resp1.Recovered {
+		t.Fatalf("pre-reload (gate OFF): must not recover, got %+v", resp1)
+	}
+	done1() // drop the first session's conn before the second attaches
+
+	// SIGHUP reload analogue: swap in a config with the gate ON (same route data).
+	mfOn := mfWithTelegram()
+	mfOn.AutoAttachOnResume = true
+	seedSessionAttachment(mfOn, "sess-1", time.Now().UTC(), false)
+	b.SetMappings(mfOn)
+
+	// Second resume of the same session now recovers.
+	_, done2, resp2 := recoverViaPeer(t, b, "/b", "sess-1")
+	defer done2()
+	if !resp2.Recovered || resp2.Name != "c3" {
+		t.Fatalf("post-reload (gate ON): must recover to c3, got %+v", resp2)
+	}
+	tid := int64(281)
+	if _, ok := b.Routes.Holder(MakeRouteKey("telegram", -100, &tid)); !ok {
+		t.Fatal("post-reload: the route must be claimed after recovery")
 	}
 }
 
@@ -164,7 +224,9 @@ func TestHandleRecoverSession_HeldByAnotherLiveSession(t *testing.T) {
 func TestHandleRecoverSession_DualPathRecordsCurrentRoute(t *testing.T) {
 	// Attach-first: the stub already holds a route (claimed by cwd) BEFORE the
 	// recover op arrives. The recover op must NOT re-claim, but must RECORD the
-	// current route under the stable id (dual-path recording).
+	// current route under the stable id (dual-path recording). Uses the DEFAULT
+	// config (auto_attach_on_resume OFF), which also proves the gate does not
+	// suppress this bookkeeping — only the auto-re-claim is gated.
 	mf := mfWithTelegram()
 	b := brokerWithChannel(t, mf, &fakeChannel{})
 	defer b.Shutdown()
@@ -289,6 +351,7 @@ func TestRecoverSession_SkipsRefreshWhenFresh(t *testing.T) {
 
 func TestRecoverSession_DMRoute(t *testing.T) {
 	mf := mfWithTelegram()
+	mf.AutoAttachOnResume = true // gate ON: recovery fires
 	mf.UpsertSessionAttachment("dm-sess", mappings.SessionAttachment{
 		Channel: "telegram", ChatID: 42, TopicID: nil, Name: "dm",
 		LastAttachedAt: time.Now().UTC(),
