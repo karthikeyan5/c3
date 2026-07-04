@@ -57,7 +57,7 @@ That's basically it for daily use. Most flow runs implicitly — the topic auto-
 
 ## Telegram-side workflow
 
-You created a bot with `@BotFather` and got a token. You added the bot as an **admin** with `Manage Topics` permission to a supergroup. You set your `dm_chat_id` to your own user id (positive integer; ask `@userinfobot` if you don't know it).
+You created a bot with `@BotFather` and got a token. You added the bot as an **admin** with `Manage Topics` permission to a supergroup. Setup's pairing step discovered your user id (`dm_chat_id`) and the group's chat id for you — you sent a short code to the bot in DM and another in the group.
 
 From there:
 

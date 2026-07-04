@@ -17,8 +17,7 @@ You need:
   4. **Add your bot** to the group.
   5. **Enable Topics** in group settings. Do this *before* the next step — "Allow create topics" only appears in the admin checklist once Topics are on.
   6. **Promote the bot to admin** with these rights checked: **Manage Topics**, **Send Messages**, **Delete Messages**, **Pin Messages**. Everything else off.
-- **Your Telegram user id** for DMs. Message `@userinfobot` from your phone; it replies with your user id (a positive integer).
-- **The supergroup's chat id.** Send any message in the group; the bot now sees it. Or use `@username_to_id_bot`-style helpers. Group chat ids are negative integers starting with `-100`.
+- **Your phone (or any Telegram client)** for pairing. Setup discovers your user id and the group's chat id automatically: you send a short code to the bot in DM, and another in the group. No id hunting.
 - **For Codex integration:** Codex CLI installed (typically via `npm install -g @openai/codex` or similar). The C3 launcher will detect it. NVM users: take note — long-running shells hash `codex` to your NVM path, so the install step below symlinks both `~/.local/bin/codex` and the NVM bin path.
 - **For voice transcription (STT plugin):** the shipped first-class STT plugin runs a chained pipeline — **Gemini 3 Flash** (via OpenRouter) with **Sarvam Saaras v3** as the fallback. The plugin lives at `plugins/c3/stt/`; the broker subprocesses `python3` to run it. You need:
   - `python3` on PATH (3.11+ recommended).
@@ -91,12 +90,14 @@ Prefer this over the bare terminal. If you're not in a Claude Code session,
 the standalone equivalent is `c3-broker setup` — it collects the same
 `mappings.json` fields, just without the agent walking you through it.
 
-The slash command interactively gathers:
+The guided flow walks through:
 
 - Your bot token (the `1234567:abc...` string).
-- Your DM chat id (positive integer, your own user id).
-- At least one group and its chat id (e.g. `main` → `-1001234567890`). You can add more groups later by editing `~/.config/c3/mappings.json`.
-- (Optional) `master_user_id` for the future access-control feature; default is your DM id.
+- **DM pairing** — you send a short code to the bot in DM; setup discovers and records your user id (`dm_chat_id`, `master_user_id`, and the operator allowlist entry) automatically.
+- **Group pairing** — you send another code in the (Topics-enabled) group; setup discovers and records the group's chat id. You can add more groups later with `/c3:pair` or by editing `~/.config/c3/mappings.json`.
+- (Optional) voice-transcription API keys.
+
+Completed steps are skipped on re-runs.
 
 **Token validation.** Before writing the file, `/c3:setup` calls Telegram's `getMe` with the token. If it 401s (bad token) or times out (no network), the command refuses to write `mappings.json` and prints the actual Telegram error. Re-run `/c3:setup` after fixing the token. This avoids the failure mode where a typo in the token gets silently saved and surfaces only on the next inbound poll.
 

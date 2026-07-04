@@ -242,30 +242,6 @@ func TestCodexConfigPath_FallsBackToHome(t *testing.T) {
 	}
 }
 
-// Restart-instruction sanity — these are user-facing strings, so a
-// regression test guards against accidental edits dropping the
-// dev-channels flag (which is the actual UX problem #8 is fixing).
-
-func TestClaudeRestartInstructionMentionsDevChannelsFlag(t *testing.T) {
-	got := claudeRestartInstruction()
-	if !strings.Contains(got, "--dangerously-load-development-channels") {
-		t.Errorf("claude restart instruction missing dev-channels flag:\n%s", got)
-	}
-	if !strings.Contains(got, "plugin:c3@c3") {
-		t.Errorf("claude restart instruction missing plugin spec:\n%s", got)
-	}
-}
-
-func TestCodexRestartInstructionMentionsCodex(t *testing.T) {
-	got := codexRestartInstruction()
-	if !strings.Contains(strings.ToLower(got), "codex") {
-		t.Errorf("codex restart instruction should reference codex:\n%s", got)
-	}
-	if strings.Contains(got, "claude") {
-		t.Errorf("codex restart instruction shouldn't mention claude:\n%s", got)
-	}
-}
-
 // ensureCodexAgentsMd — AGENTS.md installer covering create / replace /
 // idempotent-rerun / parent-dir-creation paths.
 

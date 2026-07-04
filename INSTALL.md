@@ -7,7 +7,7 @@
 > (or `follow /path/to/local/c3/INSTALL.md` if you've cloned locally)
 >
 > The agent does everything below. You'll only be asked for your Telegram
-> bot token and chat ids during step 4.
+> bot token and two short pairing codes during step 4 — no id hunting.
 
 > **For Claude Code (or any) agent reading this:** you are installing C3 for
 > the user. Execute the numbered steps in order. Surface errors verbatim and
@@ -38,20 +38,24 @@ marketplace.
 
 Tell the user:
 
-> "Pick a directory to keep the c3 source (e.g. `~/src`), then run:
+> "Clone the c3 source into a **durable** directory — `/c3:build` compiles
+> from it on every build, so a path that gets auto-cleared (`~/Downloads`,
+> `/tmp`) breaks the marketplace later. Recommended:
 >
->     mkdir -p ~/src && cd ~/src && git clone https://github.com/karthikeyan5/c3
+>     git clone https://github.com/karthikeyan5/c3 ~/.local/share/c3
 >
-> Then in this Claude Code session, run these three slash commands and
-> tell me when they're done:
+> (any stable dir works, e.g. `~/code/c3` — just don't move or delete it
+> afterward). Then in this Claude Code session, run these three slash
+> commands and tell me when they're done:
 >
->     /plugin marketplace add ~/src/c3
+>     /plugin marketplace add ~/.local/share/c3
 >     /plugin install c3@c3
 >     /reload-plugins
 >
-> Replace `~/src/c3` with wherever you cloned. The `git clone` location
-> is permanent — the plugin's `/c3:build` reads source from there to
-> compile binaries."
+> Replace `~/.local/share/c3` with wherever you cloned. When
+> `/plugin install` asks for **user** vs **project** scope, choose
+> **user** — that makes C3 available in every Claude Code session, not
+> just this project."
 
 Wait for the user to confirm completion and capture the clone path
 (we'll need it in step 3).
@@ -136,22 +140,26 @@ overwrite. On yes, back up the existing file (`cp
 ~/.config/c3/mappings.json ~/.config/c3/mappings.json.broken-$(date
 +%s)`) and continue to interactive setup.
 
-Otherwise, run interactive setup:
+Otherwise, run the guided setup: follow the c3 plugin's `/c3:setup`
+command flow (its driver is `plugins/c3/commands/setup.md` in the clone —
+read it and drive the phased subcommands it describes). In short:
 
-```bash
-c3-broker setup
-```
+1. `printf %s 'THE_TOKEN' | c3-broker setup token` — validates the bot
+   token via Telegram `getMe` BEFORE writing (on 401 or network failure
+   it refuses to write and surfaces the actual error).
+2. `c3-broker setup pair dm --code <4-digit code> --timeout-sec 240` —
+   the user DMs the code to the bot; their user id is discovered and
+   recorded automatically (no `@userinfobot` hunt).
+3. `c3-broker setup pair group --code <fresh code> --name main --timeout-sec 240`
+   — the user sends the code in the (Topics-enabled) group; the group
+   chat id is discovered and recorded automatically (no `-100…` hunt).
+4. `c3-broker setup stt` — optional voice-transcription keys.
+5. `c3-broker setup finish` — host integration + broker restart + a
+   stand-alone "what now" summary to relay to the user.
 
-This prompts on stdin for:
-- Telegram bot token (from `@BotFather`)
-- DM chat id (the user's Telegram user id; positive int — `@userinfobot` provides it)
-- Default group name (e.g. "main")
-- That group's chat id (negative `-100…`)
-
-It validates the token via Telegram `getMe` BEFORE writing. On 401 or
-network failure it refuses to write and surfaces the actual error.
-
-Tell the user to follow the interactive prompts.
+Completed steps are skipped automatically on re-runs. (Bare
+`c3-broker setup` remains the interactive fallback for a plain terminal
+without an agent — it walks the same token → pairing → STT flow on a TTY.)
 
 ### Speech-to-text (voice notes) — Python deps
 
@@ -281,7 +289,7 @@ Details in `docs/systemd/README.md`.
 >   `/c3:detach`         — release the current claim
 >   `/c3:topics`         — list known topics + claim state
 >   `/c3:status`         — broker health check
->   `/c3:setup`          — re-run interactive setup (overwrites config)
+>   `/c3:setup`          — re-run guided setup (skips completed steps)
 >   `/c3:build`          — rebuild binaries after `git pull` in the source dir
 >   `/c3:reload-config`  — broker re-reads mappings.json (SIGHUP, no restart)
 >
@@ -294,6 +302,6 @@ End.
 ## Manual install (without an agent)
 
 The same steps run by hand work fine — copy each shell block above into a
-terminal. The only interactive step is `c3-broker setup` which prompts on
-stdin. See [`docs/INSTALL.md`](docs/INSTALL.md) for a more verbose
-human-targeted version.
+terminal. The only interactive step is `c3-broker setup` (a TTY flow that
+walks token → pairing codes → STT). See [`docs/INSTALL.md`](docs/INSTALL.md)
+for a more verbose human-targeted version.

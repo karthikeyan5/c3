@@ -79,29 +79,6 @@ func DetectHostCLI() HostCLI {
 	return HostClaude
 }
 
-// claudeRestartInstruction returns the human-facing line printed after
-// setup when the host CLI is Claude Code. Mirrors CLAUDE.md's launch
-// command — the user MUST pass the dev-channels flag for inbound channel
-// notifications to surface.
-func claudeRestartInstruction() string {
-	return "Restart your Claude Code session for the broker to pick up the new config:\n" +
-		"  /exit  (or Ctrl-D), then:\n" +
-		"  claude --dangerously-load-development-channels plugin:c3@c3 --resume"
-}
-
-// codexRestartInstruction returns the human-facing line printed after
-// setup when the host CLI is Codex.
-//
-// Codex's interactive session reads the MCP server list at startup, so a
-// freshly-registered `c3_codex` server needs the session restarted.
-// `codex resume --last` mirrors `claude --resume` semantically — pick up
-// the most recent conversation.
-func codexRestartInstruction() string {
-	return "Restart your Codex session for the broker (and the newly-registered C3 MCP server) to take effect:\n" +
-		"  exit Codex (Ctrl-D), then:\n" +
-		"  codex resume --last   (or just `codex` for a fresh session)"
-}
-
 // ensureCodexMCPRegistration writes a [mcp_servers.c3_codex] block into
 // $CODEX_HOME/config.toml (defaults to ~/.codex/config.toml) if no such
 // section is already present. Idempotent: presence is detected by a line
