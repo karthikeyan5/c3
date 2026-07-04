@@ -654,7 +654,7 @@ func TestResolveAttachCWD_SubdirNotADirectory(t *testing.T) {
 }
 
 func TestResolveAttachCWD_SubdirMissingFallsBack(t *testing.T) {
-	// User launched in `~/arogara` and attached to a topic with no matching
+	// User launched in a workspace root and attached to a topic with no matching
 	// subdir. Best-effort fallback: persist the launch dir; conflict guard
 	// in persistMapping will warn if this collides.
 	root := t.TempDir()

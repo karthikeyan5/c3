@@ -7,9 +7,9 @@ import (
 
 func TestRouteKeyFile_TopicAndDM(t *testing.T) {
 	tid := int64(914)
-	withTopic := RouteKey{Channel: "telegram", ChatID: -1003990699908, TopicID: &tid}.File()
-	if withTopic != "telegram__-1003990699908__914" {
-		t.Errorf("topic file = %q, want telegram__-1003990699908__914", withTopic)
+	withTopic := RouteKey{Channel: "telegram", ChatID: -1001234567890, TopicID: &tid}.File()
+	if withTopic != "telegram__-1001234567890__914" {
+		t.Errorf("topic file = %q, want telegram__-1001234567890__914", withTopic)
 	}
 	dm := RouteKey{Channel: "telegram", ChatID: 12345, TopicID: nil}.File()
 	if dm != "telegram__12345__none" {
