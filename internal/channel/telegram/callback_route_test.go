@@ -126,6 +126,53 @@ func TestDispatchCallback_NonTopicMessage_RoutesViaWireParse(t *testing.T) {
 	}
 }
 
+// TestDispatchCallback_PermTapGateDrop_AnsweredViaWireParse drives the full
+// wire-decode path for the 2026-06-30 live bug: a permission-keyboard Allow tap
+// ("perm:allow:<id>") from a sender the inbound gate refuses. The verdict must
+// NOT be honored (no emit), but the tap must be answered with an explicit
+// not-authorized notice — before the fix the channel spent the query's single
+// answer on a bare auto-ack and the drop was invisible ("Allow did nothing").
+func TestDispatchCallback_PermTapGateDrop_AnsweredViaWireParse(t *testing.T) {
+	h := &fakeHost{decision: channel.GateInboundDrop}
+	rc := &recordingBotClient{}
+	c := makeChannelWithBot(h, rc)
+
+	raw := []byte(`[{
+		"update_id": 483747729,
+		"callback_query": {
+			"id": "cbq-perm",
+			"from": {"id": 8, "is_bot": false, "first_name": "Sam"},
+			"chat_instance": "-987654321",
+			"data": "perm:allow:abcde",
+			"message": {
+				"message_id": 210,
+				"date": 1719500002,
+				"chat": {"id": -1001234567890, "type": "supergroup", "title": "C3"},
+				"message_thread_id": 98,
+				"is_topic_message": true,
+				"from": {"id": 111, "is_bot": true, "first_name": "bot"},
+				"text": "🔐 Permission: Bash"
+			}
+		}
+	}]`)
+
+	c.dispatchRaw(t, raw)
+
+	if h.emitCount() != 0 {
+		t.Fatalf("a gate-dropped perm tap must never be emitted (verdicts only from allowlisted senders); got %d", h.emitCount())
+	}
+	calls := rc.callsFor("answerCallbackQuery")
+	if len(calls) != 1 {
+		t.Fatalf("the refused tap must be answered exactly once (silent drop reproduced); got %d", len(calls))
+	}
+	if id, _ := calls[0].params["callback_query_id"].(string); id != "cbq-perm" {
+		t.Errorf("answered wrong query id %q, want cbq-perm", id)
+	}
+	if text, _ := calls[0].params["text"].(string); text == "" {
+		t.Error("the refused tap's answer must carry a not-authorized notice, not a bare ack")
+	}
+}
+
 // TestDispatchCallback_InaccessibleMessage_DroppedViaWireParse covers the
 // genuinely-inaccessible variant decoded from the wire (date==0 per the Bot API):
 // gotgbot resolves it to a gotgbot.InaccessibleMessage value with no usable chat,

@@ -38,7 +38,29 @@ const (
 // requestID (5 letters [a-km-z]) carries no colon, so the FIRST colon after the
 // prefix separates the verb from the id. Matches the reference Telegram plugin's
 // `perm:more|allow|deny:<id>` shape.
+//
+// The telegram channel mirrors this constant (permTapDataPrefix, internal/
+// channel/telegram/poll.go) to defer the callback ack of this namespace to
+// resolvePerm — keep the two in lockstep.
 const permCallbackPrefix = "perm:"
+
+// Per-tap outcome feedback for the refusal branches of resolvePerm, delivered
+// via answerPermCallback (the channel deferred the "perm:" ack to us, so each
+// branch MUST answer or the tap dies silently — the 2026-06-30 live bug).
+// Short (Telegram caps answer text at 200 chars) and content-free — they never
+// echo the prompt body.
+const (
+	permAnswerNotAuthorizedText = "⛔ Not authorized — only a DM-paired C3 operator can answer a permission prompt. Tap ignored."
+	permAnswerGoneText          = "⌛ This permission prompt is no longer active — already answered or expired."
+	permAnswerWrongRouteText    = "⚠️ This prompt belongs to a different chat/topic — tap not processed."
+)
+
+// permNoOperatorHint is appended to a relayed prompt when NO user is DM-paired
+// yet: with an empty operator set resolvePerm's sender-gate refuses every tap,
+// so a bare Allow/Deny keyboard is a trap (the 2026-06-30 fresh-install bug).
+// The keyboard still renders — the pending perm lives permExpiryTTL, so pairing
+// and then re-tapping works.
+const permNoOperatorHint = "⚠️ No operator is DM-paired yet — Allow/Deny taps will be refused. Run /c3:pair, DM the code to this bot, then tap again."
 
 // pendingPerm is one relayed, not-yet-resolved permission prompt awaiting a tap.
 // Registered BEFORE the keyboard is sent (the fast-tap race) and removed
@@ -200,8 +222,14 @@ func parsePermCallback(data string) (requestID, behavior string, ok bool) {
 // authorized operator — in which case the caller (flushEvent) must SUPPRESS the
 // generic event (the tap was the verdict, not a fresh <channel> event). It
 // returns false for a non-perm payload, an unknown/already-resolved id, a route
-// mismatch, OR a non-operator tap — the channel already auto-acked the callback
-// either way, so Telegram stops spinning regardless.
+// mismatch, OR a non-operator tap.
+//
+// DEFERRED ACK (2026-06-30 live-bug fix): the telegram channel does NOT auto-ack
+// "perm:" callbacks — a callback query is answerable exactly once, and that one
+// answer is the tap's only feedback surface, so it must carry the real outcome.
+// Every branch below therefore answers the callback via answerPermCallback
+// (resolved → verdict toast; refused → explicit notice). A perm tap must never
+// again do visibly nothing.
 //
 // SENDER-GATE (Security §): inbound callbacks already pass host.GateInbound
 // (allowlist) before reaching the broker, but for a permission approval — higher
@@ -221,30 +249,70 @@ func (b *Broker) resolvePerm(route RouteKey, cb *c3types.CallbackEvent) bool {
 	}
 	requestID, behavior, ok := parsePermCallback(cb.Data)
 	if !ok {
+		// Malformed payload inside the perm namespace — nothing meaningful to say,
+		// but the deferred ack must still be spent (bare) or the button spins.
+		b.answerPermCallback(route, cb.CallbackID, "", false)
 		return false
 	}
 	// Sender-gate BEFORE take, so a non-operator tap leaves the pending perm live.
 	if !b.Mappings().IsUserAllowed(cb.Actor.UserID) {
 		log.Printf("perm GATE-DROP chan=%s chat=%d topic=%s id=%s actor=%d: non-operator tap ignored",
 			route.Channel, route.ChatID, TopicKeyStr(route), requestID, cb.Actor.UserID)
+		// Refused, but never silently: an alert (not a toast) — this is the branch
+		// that made the 2026-06-30 fresh install look like "Allow did nothing".
+		b.answerPermCallback(route, cb.CallbackID, permAnswerNotAuthorizedText, true)
 		return false
 	}
 	p, ok := b.Perms.take(requestID)
 	if !ok {
-		// Unknown / already-resolved / expired. Already auto-acked; fall through.
+		// Unknown / already-resolved / expired.
+		b.answerPermCallback(route, cb.CallbackID, permAnswerGoneText, false)
 		return false
 	}
 	if p.route != route {
 		// Tap arrived on a different route than the prompt was sent to — re-register
 		// and fall through (mirrors resolveAskDone's defensive re-register).
 		b.Perms.register(p)
+		b.answerPermCallback(route, cb.CallbackID, permAnswerWrongRouteText, false)
 		return false
 	}
 	b.deliverPermVerdict(route, requestID, behavior)
+	b.answerPermCallback(route, cb.CallbackID, permOutcomeText(p.toolName, behavior), false)
 	b.editPermMessage(route, requestID, p.messageID, permOutcomeText(p.toolName, behavior), [][]c3types.Button{})
 	log.Printf("perm RESOLVED chan=%s chat=%d topic=%s id=%s tool=%s behavior=%s actor=%d",
 		route.Channel, route.ChatID, TopicKeyStr(route), requestID, p.toolName, behavior, cb.Actor.UserID)
 	return true
+}
+
+// callbackAnswerer is the OPTIONAL channel capability behind the deferred
+// perm-tap ack. The telegram channel implements it (AnswerCallback,
+// internal/channel/telegram/poll.go) and skips its bare auto-ack for the
+// "perm:" callback namespace so resolvePerm can spend the query's single
+// answer on the tap's real outcome.
+type callbackAnswerer interface {
+	AnswerCallback(callbackID, text string, showAlert bool) error
+}
+
+// answerPermCallback delivers per-tap outcome feedback for a relayed permission
+// prompt via the route channel's optional callbackAnswerer capability.
+// Best-effort: a missing capability or a failed answer never blocks or undoes a
+// verdict — worst case the operator's client clears the spinner on its own.
+func (b *Broker) answerPermCallback(route RouteKey, callbackID, text string, showAlert bool) {
+	if callbackID == "" {
+		return
+	}
+	ch, err := b.Channel(route.Channel)
+	if err != nil {
+		return
+	}
+	ca, ok := ch.(callbackAnswerer)
+	if !ok {
+		return
+	}
+	if err := ca.AnswerCallback(callbackID, text, showAlert); err != nil {
+		log.Printf("perm answer FAIL chan=%s chat=%d topic=%s: %v",
+			route.Channel, route.ChatID, TopicKeyStr(route), err)
+	}
 }
 
 // deliverPermVerdict pushes an OpPermissionVerdict to the route holder's conn —

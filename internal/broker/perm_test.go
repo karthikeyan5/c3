@@ -4,26 +4,73 @@ import (
 	"encoding/json"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/karthikeyan5/c3/internal/c3types"
 	"github.com/karthikeyan5/c3/internal/ipc"
+	"github.com/karthikeyan5/c3/internal/mappings"
 )
 
 const testOperatorUID = int64(42857190)
 
+// answeredCallback records one AnswerCallback the broker delivered through the
+// channel — the per-tap outcome feedback (toast/alert) for a deferred perm ack.
+type answeredCallback struct {
+	CallbackID string
+	Text       string
+	ShowAlert  bool
+}
+
+// permFakeChannel is fakeChannel plus the OPTIONAL callbackAnswerer capability,
+// so perm tests can assert that EVERY tap outcome answers the callback query
+// (the telegram channel defers the ack of "perm:" taps to the broker).
+type permFakeChannel struct {
+	fakeChannel
+	ansMu   sync.Mutex
+	answers []answeredCallback
+}
+
+func (f *permFakeChannel) AnswerCallback(callbackID, text string, showAlert bool) error {
+	f.ansMu.Lock()
+	defer f.ansMu.Unlock()
+	f.answers = append(f.answers, answeredCallback{callbackID, text, showAlert})
+	return nil
+}
+
+func (f *permFakeChannel) answersSnapshot() []answeredCallback {
+	f.ansMu.Lock()
+	defer f.ansMu.Unlock()
+	out := make([]answeredCallback, len(f.answers))
+	copy(out, f.answers)
+	return out
+}
+
+// brokerWithPermChannel mirrors brokerWithChannel but registers the
+// AnswerCallback-capable fake (the embedded fakeChannel would otherwise be
+// registered by value-of-interface and lose the method set).
+func brokerWithPermChannel(t *testing.T, mf *mappings.MappingsFile, fc *permFakeChannel) *Broker {
+	t.Helper()
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	b := New(mf)
+	b.chMu.Lock()
+	b.channels[fc.Name()] = &channelRegistration{Channel: fc}
+	b.chMu.Unlock()
+	return b
+}
+
 // permBrokerWithOperator builds a broker whose allowlist clears testOperatorUID
 // as a DM operator (the sender-gate set for permission relay), plus a holder
 // stub claiming `key` whose conn is the broker side of a pipe. Returns the
-// broker, the fakeChannel, and the agent-side conn (the test reads pushed
+// broker, the permFakeChannel, and the agent-side conn (the test reads pushed
 // verdicts from it).
-func permBrokerWithOperator(t *testing.T, key RouteKey) (*Broker, *fakeChannel, *ipc.Conn) {
+func permBrokerWithOperator(t *testing.T, key RouteKey) (*Broker, *permFakeChannel, *ipc.Conn) {
 	t.Helper()
 	mf := mfWithTelegram()
 	mf.AddAllowedUser(testOperatorUID)
-	fc := &fakeChannel{caps: &c3types.Capabilities{Channel: "telegram", InlineKeyboards: true}}
-	b := brokerWithChannel(t, mf, fc)
+	fc := &permFakeChannel{fakeChannel: fakeChannel{caps: &c3types.Capabilities{Channel: "telegram", InlineKeyboards: true}}}
+	b := brokerWithPermChannel(t, mf, fc)
 
 	agentSide, brokerSide := net.Pipe()
 	t.Cleanup(func() { _ = agentSide.Close(); _ = brokerSide.Close() })
@@ -193,6 +240,162 @@ func TestResolvePerm_NonOperatorIgnored(t *testing.T) {
 	}
 }
 
+// TestResolvePerm_NonOperatorTap_AnswersNotAuthorized is the 2026-06-30 live-bug
+// regression (fresh install, group-paired only, so the tapper is NOT in the
+// DM-cleared operator set): the Allow tap must still be REFUSED (security
+// property — verdicts only from allowlisted operators), but it must never again
+// be a silent no-op. The telegram channel defers the "perm:" ack to the broker,
+// so resolvePerm must answer the callback with an explicit not-authorized
+// alert while leaving the pending perm live for the real operator.
+func TestResolvePerm_NonOperatorTap_AnswersNotAuthorized(t *testing.T) {
+	key := RouteKey{Channel: "telegram", ChatID: 42, HasTopic: false}
+	b, fc, _ := permBrokerWithOperator(t, key)
+	defer b.Shutdown()
+
+	b.Perms.register(&pendingPerm{requestID: "fghij", route: key, toolName: "Bash", messageID: 11})
+
+	const intruderUID = int64(99999999)
+	if b.resolvePerm(key, &c3types.CallbackEvent{
+		CallbackID: "cbq-intruder", Data: "perm:allow:fghij", MessageID: 11,
+		Actor: c3types.Sender{UserID: intruderUID},
+	}) {
+		t.Fatal("a non-operator tap must NOT be honored")
+	}
+	if !b.Perms.has("fghij") {
+		t.Fatal("a non-operator tap must leave the pending perm live")
+	}
+	answers := fc.answersSnapshot()
+	if len(answers) != 1 {
+		t.Fatalf("a non-operator tap must answer the deferred callback exactly once (silent drop = the live bug); got %d answers", len(answers))
+	}
+	if answers[0].CallbackID != "cbq-intruder" {
+		t.Fatalf("answered wrong callback id %q, want cbq-intruder", answers[0].CallbackID)
+	}
+	if !strings.Contains(answers[0].Text, "Not authorized") {
+		t.Fatalf("not-authorized feedback must say so; got %q", answers[0].Text)
+	}
+	if !answers[0].ShowAlert {
+		t.Fatal("not-authorized feedback should be an alert (a toast is too easy to miss)")
+	}
+}
+
+// TestResolvePerm_TapOutcomes_AllAnswered pins the full deferred-ack contract:
+// resolved (allow), unknown/expired id, wrong route, and a malformed payload in
+// the perm namespace each answer the callback — no branch may leave a tap
+// unanswered (the channel skipped its auto-ack for every "perm:" tap).
+func TestResolvePerm_TapOutcomes_AllAnswered(t *testing.T) {
+	key := RouteKey{Channel: "telegram", ChatID: 42, HasTopic: false}
+	other := RouteKey{Channel: "telegram", ChatID: -100, TopicID: 281, HasTopic: true}
+	b, fc, agentConn := permBrokerWithOperator(t, key)
+	defer b.Shutdown()
+
+	// Drain holder pushes so verdict writes never block the resolution under test.
+	go func() {
+		for {
+			if _, err := agentConn.ReadFrame(); err != nil {
+				return
+			}
+		}
+	}()
+
+	op := c3types.Sender{UserID: testOperatorUID}
+
+	// 1. Unknown / already-resolved id → "no longer active".
+	if b.resolvePerm(key, &c3types.CallbackEvent{CallbackID: "cb-unknown", Data: "perm:allow:zzzzz", Actor: op}) {
+		t.Fatal("unknown id must not resolve")
+	}
+	// 2. Malformed payload inside the perm namespace → answered (bare ack).
+	if b.resolvePerm(key, &c3types.CallbackEvent{CallbackID: "cb-malformed", Data: "perm:bogus:abcde", Actor: op}) {
+		t.Fatal("malformed perm payload must not resolve")
+	}
+	// 3. Wrong route → answered, perm re-registered.
+	b.Perms.register(&pendingPerm{requestID: "klmno", route: other, toolName: "Bash", messageID: 12})
+	if b.resolvePerm(key, &c3types.CallbackEvent{CallbackID: "cb-wrongroute", Data: "perm:allow:klmno", Actor: op}) {
+		t.Fatal("wrong-route tap must not resolve")
+	}
+	if !b.Perms.has("klmno") {
+		t.Fatal("wrong-route tap must re-register the perm")
+	}
+	// 4. Operator allow → resolved with a verdict toast.
+	b.Perms.register(&pendingPerm{requestID: "pqrst", route: key, toolName: "Bash", messageID: 13})
+	if !b.resolvePerm(key, &c3types.CallbackEvent{CallbackID: "cb-allow", Data: "perm:allow:pqrst", MessageID: 13, Actor: op}) {
+		t.Fatal("operator allow tap must resolve")
+	}
+
+	answers := fc.answersSnapshot()
+	if len(answers) != 4 {
+		t.Fatalf("every perm-tap outcome must answer the callback; got %d answers: %+v", len(answers), answers)
+	}
+	byID := map[string]answeredCallback{}
+	for _, a := range answers {
+		byID[a.CallbackID] = a
+	}
+	if a := byID["cb-unknown"]; !strings.Contains(a.Text, "no longer active") {
+		t.Errorf("unknown-id answer should say the prompt is gone; got %q", a.Text)
+	}
+	if _, ok := byID["cb-malformed"]; !ok {
+		t.Error("malformed perm payload must still be answered (bare ack)")
+	}
+	if a := byID["cb-wrongroute"]; a.Text == "" {
+		t.Error("wrong-route answer should carry a notice")
+	}
+	if a := byID["cb-allow"]; !strings.Contains(a.Text, "Allowed") {
+		t.Errorf("allow answer should confirm the verdict; got %q", a.Text)
+	}
+}
+
+// TestHandlePermissionRequest_NoOperatorHint covers the fresh-install prompt
+// hardening: with an EMPTY DM-cleared operator set NO tap can ever pass the
+// resolvePerm sender-gate, so the relayed prompt must say so (instead of
+// rendering Allow/Deny buttons that silently do nothing). With an operator
+// paired, no hint appears.
+func TestHandlePermissionRequest_NoOperatorHint(t *testing.T) {
+	key := RouteKey{Channel: "telegram", ChatID: 42, HasTopic: false}
+
+	// No allowlisted users → hint present.
+	mf := mfWithTelegram()
+	fc := &fakeChannel{caps: &c3types.Capabilities{Channel: "telegram", InlineKeyboards: true}}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+	stub := b.Stubs.Register("claude", 1, "/work", nil)
+	if _, ok := b.Routes.Claim(key, stub); !ok {
+		t.Fatal("claim failed")
+	}
+	stub.SetRoute(&key)
+	b.handlePermissionRequest(nil, stub, mustMarshalJSON(t, ipc.PermissionReq{
+		Op: ipc.OpPermissionRequest, RequestID: "abcde", ToolName: "Bash",
+	}))
+	replies := fc.sendRepliesSnapshot()
+	if len(replies) != 1 {
+		t.Fatalf("expected 1 prompt send; got %d", len(replies))
+	}
+	if !strings.Contains(replies[0].Text, "No operator is DM-paired") {
+		t.Fatalf("empty operator set must surface the pairing hint on the prompt; got %q", replies[0].Text)
+	}
+
+	// Operator paired → no hint.
+	mf2 := mfWithTelegram()
+	mf2.AddAllowedUser(testOperatorUID)
+	fc2 := &fakeChannel{caps: &c3types.Capabilities{Channel: "telegram", InlineKeyboards: true}}
+	b2 := brokerWithChannel(t, mf2, fc2)
+	defer b2.Shutdown()
+	stub2 := b2.Stubs.Register("claude", 2, "/work", nil)
+	if _, ok := b2.Routes.Claim(key, stub2); !ok {
+		t.Fatal("claim failed")
+	}
+	stub2.SetRoute(&key)
+	b2.handlePermissionRequest(nil, stub2, mustMarshalJSON(t, ipc.PermissionReq{
+		Op: ipc.OpPermissionRequest, RequestID: "bcdef", ToolName: "Bash",
+	}))
+	replies2 := fc2.sendRepliesSnapshot()
+	if len(replies2) != 1 {
+		t.Fatalf("expected 1 prompt send; got %d", len(replies2))
+	}
+	if strings.Contains(replies2[0].Text, "No operator is DM-paired") {
+		t.Fatalf("with a paired operator the hint must NOT appear; got %q", replies2[0].Text)
+	}
+}
+
 // TestPermRegistry_ExpiresStale drives the perm reaper: a pendingPerm older than
 // permExpiryTTL is removed by sweepExpiredPerms, which best-effort clears its
 // live keyboard; a fresh perm survives.
@@ -320,10 +523,10 @@ func mustMarshalJSON(t *testing.T, v any) []byte {
 // TestParsePermCallback covers the callback_data parser.
 func TestParsePermCallback(t *testing.T) {
 	cases := []struct {
-		data     string
-		wantID   string
-		wantBeh  string
-		wantOK   bool
+		data    string
+		wantID  string
+		wantBeh string
+		wantOK  bool
 	}{
 		{"perm:allow:abcde", "abcde", "allow", true},
 		{"perm:deny:abcde", "abcde", "deny", true},
