@@ -15,6 +15,7 @@ func (mf *MappingsFile) Clone() *MappingsFile {
 	out := &MappingsFile{
 		SchemaVersion:      mf.SchemaVersion,
 		AutoAttachOnResume: mf.AutoAttachOnResume,
+		AutoUpdate:         mf.AutoUpdate,
 	}
 	if mf.Channels != nil {
 		out.Channels = make(map[string]ChannelConfig, len(mf.Channels))
