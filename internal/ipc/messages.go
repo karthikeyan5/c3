@@ -207,6 +207,24 @@ type HelloMsg struct {
 	PID          int      `json:"pid"`
 	CWD          string   `json:"cwd"`
 	Capabilities []string `json:"capabilities,omitempty"`
+
+	// CannotRenderChannels marks a session whose HOST cannot render channel push
+	// notifications — a Claude Code session launched WITHOUT the
+	// development-channels flag for this plugin (typically a --fork-session
+	// background job). Such a host silently DROPS notifications/claude/channel
+	// frames before rendering, so an inbound the adapter "delivered" and acked
+	// would vanish (the forked-session blackhole). When set, the broker never
+	// marks this holder's inbound delivered: durable human messages fall through
+	// to the queue + held-notice (recoverable via fetch_queue, an MCP tool-result
+	// that DOES render), while the session keeps its claim for OUTBOUND.
+	//
+	// Inverted sense on purpose: absent/false = renderable. The adapter sets true
+	// ONLY when it is confident it cannot render (see the adapter's
+	// hostCanRenderChannels detection). Additive + omitempty keeps old adapters
+	// (field absent → broker reads renderable → today's behavior) and old brokers
+	// (unknown field ignored) compatible; the fix engages only new-adapter↔
+	// new-broker, matching the single-host-lockstep note above.
+	CannotRenderChannels bool `json:"cannot_render_channels,omitempty"`
 }
 
 // RecoverSessionReq is the adapter → broker request to re-attach a resumed
