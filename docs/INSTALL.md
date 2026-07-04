@@ -35,19 +35,25 @@ the plugin subtree, so the install path is: clone the repo first, then point
 Claude Code at the clone as a local marketplace.
 
 ```bash
-mkdir -p ~/src && cd ~/src && git clone https://github.com/karthikeyan5/c3
+git clone https://github.com/karthikeyan5/c3 ~/.local/share/c3
 ```
+
+Clone into a **durable** location: `/c3:build` compiles from this directory on
+every build, so a path that gets auto-cleared (`~/Downloads`, `/tmp`) will
+break the marketplace later. `~/.local/share/c3` is the recommendation; any
+stable dir works (`~/code/c3`, etc.) — just don't move or delete it afterward.
 
 Then inside Claude Code:
 
 ```
-/plugin marketplace add ~/src/c3
+/plugin marketplace add ~/.local/share/c3
 /plugin install c3@c3
 /reload-plugins
 ```
 
-The clone location is permanent — `/c3:build` reads source from there to
-compile, so don't move or delete it.
+When `/plugin install` prompts for **user** vs **project** scope, choose
+**user** — that makes C3 available in every Claude Code session, not just this
+project.
 
 ## Step 2: Build the binaries
 
@@ -74,9 +80,16 @@ export PATH="$(go env GOPATH)/bin:$PATH"
 
 ## Step 3: Configure C3
 
+Run setup **inside Claude Code** so the agent can guide you through the whole
+flow — bot token, Telegram pairing, and STT keys:
+
 ```
 /c3:setup
 ```
+
+Prefer this over the bare terminal. If you're not in a Claude Code session,
+the standalone equivalent is `c3-broker setup` — it collects the same
+`mappings.json` fields, just without the agent walking you through it.
 
 The slash command interactively gathers:
 
@@ -227,8 +240,8 @@ rm -rf ~/.config/c3                              # CONFIG; remove only if you do
 rm -f $(go env GOBIN)/c3-* $(go env GOBIN)/codex $(go env GOBIN)/migrate-legacy 2>/dev/null   # binaries
 ```
 
-Optionally also remove the source clone (`rm -rf ~/src/c3` or wherever
-you cloned in step 1).
+Optionally also remove the source clone (`rm -rf ~/.local/share/c3` or
+wherever you cloned in step 1).
 
 The `~/.config/c3/mappings.json` lives outside both plugins; uninstalling the plugins doesn't touch it. Decide separately whether to keep it (you might reinstall later).
 
