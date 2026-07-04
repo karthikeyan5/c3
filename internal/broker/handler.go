@@ -58,6 +58,14 @@ func (b *Broker) HandleConn(nc net.Conn) {
 		if sid := existing.StableSessionIDValue(); sid != "" {
 			stub.SetStableSessionID(sid)
 		}
+		// Apply the render-capability flag BEFORE the claims transfer: the moment
+		// the claim moves to this fresh stub the delivery path consults it, and
+		// setting the flag only in the shared block below would leave a window
+		// where one inbound could still take the push path into a host that
+		// can't render. Idempotent with the shared block below.
+		if hello.CannotRenderChannels {
+			stub.SetCannotRender(true)
+		}
 		// Unregister the OLD stub (now superseded) and transfer its claims.
 		b.Stubs.Unregister(oldConnID)
 		b.Routes.TransferAllByConnID(oldConnID, stub)

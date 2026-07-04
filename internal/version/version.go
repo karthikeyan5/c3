@@ -38,7 +38,10 @@ func Current() string {
 // update checker is disabled: there is no release identity to compare against, so
 // it would either nag forever or update to something it can't reason about.
 func IsDev() bool {
-	return Version == ""
+	// Belt-and-braces via IsDevString: a build system that injects the literal
+	// "dev" (instead of leaving Version empty) must still count as a dev build,
+	// or the update checker would arm itself with a version it can't compare.
+	return IsDevString(Version)
 }
 
 // IsDevString reports whether an arbitrary version string denotes a dev build

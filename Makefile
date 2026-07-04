@@ -2,13 +2,18 @@
 
 BIN_DIR := bin
 DIST_DIR := dist
-# Release version: pass VERSION=v1.0.0 explicitly, or fall back to git describe.
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+# Release version: pass VERSION=v1.0.0 explicitly (the release workflow does), or
+# fall back to git describe ONLY when the checkout sits exactly on a tag. Any
+# other source build stays an uninjected dev build — a pseudo-version like
+# v1.0.0-5-gSHA would sort as a prerelease OLDER than the latest release, arming
+# the update checker with a false "update available" that /c3:update would then
+# DOWNGRADE. Dev builds disable the checker entirely (version.IsDev).
+VERSION ?= $(shell git describe --tags --exact-match 2>/dev/null)
 PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 # Inject the build version so a binary knows its own release identity (the
 # auto-updater compares it against the latest GitHub release). Kept in sync with
-# scripts/package.sh's VERSIONPKG.
-VERSION_LDFLAGS := -X github.com/karthikeyan5/c3/internal/version.Version=$(VERSION)
+# scripts/package.sh's VERSIONPKG. Empty VERSION ⇒ no injection ⇒ dev build.
+VERSION_LDFLAGS := $(if $(VERSION),-X github.com/karthikeyan5/c3/internal/version.Version=$(VERSION),)
 
 build:
 	@mkdir -p $(BIN_DIR)
