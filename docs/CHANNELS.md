@@ -150,6 +150,9 @@ The broker writes the ambient connectivity state to `$XDG_STATE_HOME/c3/health.j
 {
   "broker_pid": 12345,
   "written_unix": 1718722725,
+  "version": "v1.0.0",
+  "update_available": true,
+  "latest_version": "v1.1.0",
   "channels": {
     "telegram": {
       "state": "down",
@@ -164,6 +167,8 @@ The broker writes the ambient connectivity state to `$XDG_STATE_HOME/c3/health.j
 
 - `broker_pid` — `os.Getpid()` of the writing broker.
 - `written_unix` — unix seconds, **refreshed on every write**: edge-driven writes (UP↔DOWN) *and* a slow 45-second refresh ticker that runs regardless of edges. So while the broker is alive, `written_unix` stays current.
+- `version` — the running broker's build version (`"dev"` for an uninjected local build).
+- `update_available` / `latest_version` — **omitted** while the broker is on the current stable release; set once the ~6h update check finds a newer release, so the status line can render `c3 update available — /c3:update`. Independent of the `auto_update` toggle (the notice always fires). See "Updating C3" in [`USAGE.md`](USAGE.md).
 - `channels` — map of channel name → per-channel entry (`state` is `"up"`/`"down"`; `since_unix`/`since_hhmm`/`reason`/`consec` describe the current state). At boot it is `{}` (no outage asserted), so a crash never leaves a stale per-channel `down`.
 
 **Why the wrapper exists (broker-dead detection):** previously the top level was a flat `{"<channel>": {...}}` map written only on health edges + startup. When the **broker process** died, the file froze at its last value (usually `up`), so a status line showed green while C3 was completely dead. A reader now treats **`broker_pid` not alive** (e.g. `kill(pid, 0)` fails) **OR** `now - written_unix > 90s` (2× the 45s refresh interval) as **broker-down/unknown**, regardless of the per-channel `state`. The bash status-line reader reads `.channels.telegram.state` and `.channels.telegram.since_hhmm`, and additionally checks `broker_pid`/`written_unix` for liveness.

@@ -186,6 +186,51 @@ cat /tmp/c3-codex-app-server-$UID.json  # current app-server signature (cwd, top
 
 If the socket is missing or the pid file points at a nonexistent process, the next CLI session will spawn a fresh broker. If something looks corrupted, `pkill c3-broker; rm -f "${XDG_RUNTIME_DIR:-/tmp}/c3.sock" /tmp/c3-$UID.sock "${XDG_RUNTIME_DIR:-$HOME/.cache/c3}/c3-broker.pid"` resets the world — do this from a separate terminal, not from inside Claude Code (broker death + adapter recycle = double pain). Operational subcommands: `c3-broker status` prints liveness, `c3-broker topics` lists topics and live claim state, `c3-broker validate` parses mappings.json. After editing `~/.config/c3/mappings.json` by hand, `/c3:reload-config` sends SIGHUP to the running broker so it re-reads the file in-place (live claims preserved, no process churn). (`c3-broker release <cwd>` is wired but stubbed in v1 — roadmap.)
 
+## Updating C3
+
+C3 keeps itself current from its GitHub releases. There are three surfaces:
+
+**The always-on notice.** The broker checks for a newer release shortly after it
+starts and every ~6 hours after that. When one exists it surfaces `c3 update
+available — /c3:update` in the ambient status line (via `health.json`) and logs a
+line to `broker.log`. This is not gated by any toggle — you always find out an
+update is available. (A build with no embedded version — one you compiled from
+source rather than installed from a release — reports `dev` and never checks; it
+has no release identity to compare against.)
+
+**Manual update (one command).** Run `/c3:update` in Claude Code, or `c3-broker
+update` from any shell. It queries the latest release, downloads the tarball for
+your platform, verifies it against the release's `SHA256SUMS`, and atomically
+swaps the six binaries in place — the running binaries are never touched until
+the download is verified, and on any failure the old binaries are left exactly as
+they were. `c3-broker update --check` reports current-vs-latest without installing.
+
+The swap is on disk only: the **running broker keeps its old code until it
+restarts**. From a separate terminal, `kill -TERM <pid>` (the command prints the
+pid) bounces it — adapters reconnect with backoff and re-spawn the new broker,
+replaying their attach, so live sessions recover on their own. Don't bounce the
+broker from inside Claude Code (that recycles this session's MCP adapter); quit
+and relaunch instead, and the next adapter spawn brings up the new binary.
+
+**Automatic update (opt-in).** Set `"auto_update": true` in `mappings.json`
+(default off) and the broker installs a newer release **itself** when its ~6h
+check finds one, then does the most restartless restart available: it drains
+in-flight work, posts a one-time "c3 updated to vX — broker restarting, sessions
+reconnect automatically" notice to your attached topics and CLI sessions, and
+exits cleanly. Because adapters already survive a broker bounce (exponential-
+backoff reconnect + replay-last-attach, and a reconnect auto-spawns the broker
+binary), the new broker comes up on its own and sessions reattach — no manual
+step. Under **systemd** (`Restart=always`, see `docs/systemd/`) the unit restarts
+it; without systemd the next adapter reconnect spawns it.
+
+C3 only updates its own **binaries**. The plugin files (these slash commands,
+hooks) update through Claude Code's marketplace — run `/plugin` and update the c3
+marketplace when it offers a newer version.
+
+Security notes: downloads are HTTPS-only and checksum-verification is mandatory;
+C3 never downgrades and never installs a prerelease automatically. There is no
+release-signature check in v1 (checksum-only) — that's future work.
+
 ## Privacy and safety
 
 - The bot token is in `mappings.json` at mode 600. Treat it like a password.
