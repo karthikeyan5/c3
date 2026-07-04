@@ -177,6 +177,11 @@ func (c *Channel) pollLoop() {
 	}
 	backoff := baseBackoff
 
+	// lastInflightRefetchLogged throttles the "re-poll skip" log to once per
+	// distinct frontier update_id — see logDedupSkip. Poll-loop-local: the loop is
+	// single-goroutine, so no lock is needed.
+	var lastInflightRefetchLogged int64
+
 	// Component 2: persist the offset "periodically AND on shutdown". The loop
 	// already saves per successful batch (the periodic half); this defer covers the
 	// shutdown half — on ANY loop exit (ctx cancelled / return) write the highest
@@ -409,7 +414,7 @@ func (c *Channel) pollLoop() {
 				c.offTrk.Register(u.UpdateId)
 			}
 			if c.dedup != nil && c.dedup.SeenOrAdd(&u) {
-				c.host.Logf("telegram: dedup skip update=%d (recent duplicate)", u.UpdateId)
+				lastInflightRefetchLogged = c.logDedupSkip(u.UpdateId, lastInflightRefetchLogged)
 				// A dedup-skip is NOT a persist. With offTrk, this is either a
 				// genuine Telegram redelivery of an already-committed update (id
 				// <= committed ⇒ Register/MarkDone are no-ops) OR an in-flight
@@ -958,6 +963,37 @@ func (c *Channel) markUpdateDone(updateID int64) {
 	if c.offTrk != nil {
 		c.offTrk.MarkDone(updateID)
 	}
+}
+
+// logDedupSkip emits the appropriate log line for a dedup-skipped update and
+// returns the updated throttle cursor (the last in-flight frontier id logged).
+//
+// The persisted-offset tracker deliberately keeps the getUpdates offset at
+// Committed()+1 — never past an un-persisted update — so a crash at the frontier
+// is loss-free: Telegram redelivers the un-acked update. A consequence is that
+// EVERY poll re-draws any update whose durable persist is still in flight (a slow
+// voice → STT can hold the frontier for up to sttFlushTimeout), and the dedup map
+// skips each redraw. That is expected — NOT a "recent duplicate" — so logging it
+// every ~1s (pollIdleBackoff) is misleading spam (the ROADMAP re-poll/dedup-skip
+// live regression, 2026-06-27). An in-flight re-fetch (id still > Committed()) is
+// therefore logged at most ONCE per distinct frontier id: enough to make a
+// genuinely wedged (never-marked-done) update visible without flooding the log,
+// while a normal STT window logs a single line and goes quiet. A GENUINE
+// redelivery of an already-committed update (id <= Committed() — rare: a real
+// Telegram glitch, or a post-restart redraw against a seeded offset) keeps its
+// per-occurrence "recent duplicate" line, since those are worth seeing.
+//
+// This changes ONLY the logging; the dedup + offset semantics are untouched, so
+// the loss-free guarantee is preserved.
+func (c *Channel) logDedupSkip(id, lastInflightLogged int64) int64 {
+	if c.offTrk != nil && id > c.offTrk.Committed() {
+		if id != lastInflightLogged {
+			c.host.Logf("telegram: re-poll skip update=%d — still awaiting durable persist; offset holds at the un-acked frontier (loss-free by design)", id)
+		}
+		return id
+	}
+	c.host.Logf("telegram: dedup skip update=%d (recent duplicate)", id)
+	return lastInflightLogged
 }
 
 // topicPtrFromThread converts a gotgbot message_thread_id (0 = none) into the
