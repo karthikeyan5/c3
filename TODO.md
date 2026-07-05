@@ -20,18 +20,29 @@ in git.
 
 ## Release gates
 
-- [ ] Fresh-machine install validation (public-push blocker)
-- [ ] `ask` live-verify: button tap → choice returns to Claude, in a live Telegram session
+Done in the build (merged to master, green under `go test -race ./...`):
+
+- [x] Forked-session queue-delivery blackhole fix — the adapter no longer acks-as-delivered what the host can't render; render-incapable inbound is held in the durable queue with a held-notice, claim preserved for outbound
+- [x] Fixed the 2 flaky broker tests (fixture defect, not prod)
+- [x] `install-claude-shim` existing-file/symlink clobber handling (idempotent; `--force` to overwrite a non-shim binary)
+- [x] Noisy re-poll / dedup-skip: root-caused as a loss-free frontier redraw; backoff + logging fix landed (deferred wedge-trigger tracked in `docs/.loop/repoll-diagnosis`)
+- [x] Codex policy 3-state error messaging: wired (codex adapter forwarder)
+
+Open — need a live human tap (run these in a real Telegram session before the tag):
+
+- [ ] `ask` live-verify: button tap → choice returns to Claude
 - [ ] Permission-relay live-verify: a real Claude Code permission prompt → approve/deny over Telegram
-- [ ] Forked-session queue-delivery blackhole fix — the adapter must not ack-as-delivered what the host can't render
-- [ ] Live-verify auto-attach-on-resume end-to-end (shipped in master, gated by `auto_attach_on_resume` in mappings.json, default OFF), then consider flipping the default
-- [ ] Fix the 2 flaky broker tests (fixture defect, not prod)
-- [ ] `install-claude-shim` existing-symlink clobber fix
-- [ ] Noisy re-poll / dedup-skip fix (if still live)
-- [ ] STT gemini provider: revive with a key, or redocument on the Sarvam default
-- [ ] Codex policy 3-state error messaging: confirm wired
-- [ ] `release <cwd>`: print the `/exit` workaround (the full IPC op is v2)
 - [ ] Smoke-test visual tails (expandable show-more; inline-button callback)
+
+Open — post-first-tag (binaries only exist once the release workflow runs on a tag):
+
+- [ ] Fresh-machine install validation (public-push blocker)
+
+Open — minor / deferred:
+
+- [ ] Live-verify auto-attach-on-resume end-to-end (shipped in master, gated by `auto_attach_on_resume` in mappings.json, default OFF), then consider flipping the default
+- [ ] STT gemini provider: revive with a key, or redocument on the Sarvam default
+- [ ] `release <cwd>`: print the `/exit` workaround (the full IPC op is v2)
 
 ## Packaging
 

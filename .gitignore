@@ -30,6 +30,7 @@ dist/
 *~
 .vscode/
 .idea/
+.claude/
 
 # Internal review notes — not part of the public documentation set.
 docs/.loop/
