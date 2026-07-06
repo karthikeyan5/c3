@@ -1,10 +1,117 @@
 package telegram
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/PaulSonOfLars/gotgbot/v2"
 )
+
+// rbTGErr builds a Telegram API error with the given HTTP code, for exercising
+// the readback retry classification.
+func rbTGErr(code int) error {
+	return &gotgbot.TelegramError{Code: code, Description: "test"}
+}
+
+// TestIsRetryableSendErr pins the retry classification used by the readback
+// send: transient (network/5xx) and 429 are retryable; permanent (4xx other
+// than 429) and nil are not.
+func TestIsRetryableSendErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"5xx transient", rbTGErr(500), true},
+		{"429 rate-limited", rbTGErr(429), true},
+		{"400 permanent", rbTGErr(400), false},
+		{"403 permanent", rbTGErr(403), false},
+		{"nil", nil, false},
+		{"plain network error", errors.New("dial tcp: connection refused"), true},
+	}
+	for _, tc := range cases {
+		if got := isRetryableSendErr(tc.err); got != tc.want {
+			t.Errorf("%s: isRetryableSendErr=%v want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestRetryReadbackSend_TransientThenSuccess: a transient blip is retried and the
+// echo IS delivered — the exact silent-drop this fix closes (a dogfood tester saw
+// transcripts vanish from the chat during transient telegram-fetch-DOWN windows).
+func TestRetryReadbackSend_TransientThenSuccess(t *testing.T) {
+	c := &Channel{host: &fakeHost{}, ctx: context.Background()}
+	calls := 0
+	id, err := c.retryReadbackSend(func() (int64, error) {
+		calls++
+		if calls < 2 {
+			return 0, rbTGErr(500)
+		}
+		return 42, nil
+	})
+	if err != nil {
+		t.Fatalf("want success after transient retry, got %v", err)
+	}
+	if id != 42 || calls != 2 {
+		t.Fatalf("id=%d calls=%d, want id=42 calls=2 (one retry)", id, calls)
+	}
+}
+
+// TestRetryReadbackSend_PermanentNoRetry: a permanent error (e.g. chat-not-found)
+// returns immediately — no wasted retries against a deterministic failure.
+func TestRetryReadbackSend_PermanentNoRetry(t *testing.T) {
+	c := &Channel{host: &fakeHost{}, ctx: context.Background()}
+	calls := 0
+	_, err := c.retryReadbackSend(func() (int64, error) {
+		calls++
+		return 0, rbTGErr(400)
+	})
+	if err == nil {
+		t.Fatal("want permanent error returned")
+	}
+	if calls != 1 {
+		t.Fatalf("calls=%d, want 1 (no retry on permanent)", calls)
+	}
+}
+
+// TestRetryReadbackSend_ExhaustsAndGivesUp: a persistently-down wire gives up
+// after the bounded attempt count and returns the last error (non-fatal upstream).
+func TestRetryReadbackSend_ExhaustsAndGivesUp(t *testing.T) {
+	c := &Channel{host: &fakeHost{}, ctx: context.Background()}
+	calls := 0
+	_, err := c.retryReadbackSend(func() (int64, error) {
+		calls++
+		return 0, rbTGErr(500)
+	})
+	if err == nil {
+		t.Fatal("want error after exhausting retries")
+	}
+	if calls != readbackRetryMaxAttempts {
+		t.Fatalf("calls=%d, want %d", calls, readbackRetryMaxAttempts)
+	}
+}
+
+// TestRetryReadbackSend_CtxCancelAborts: a cancelled channel context aborts the
+// backoff wait promptly instead of sleeping out the whole budget.
+func TestRetryReadbackSend_CtxCancelAborts(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	c := &Channel{host: &fakeHost{}, ctx: ctx}
+	calls := 0
+	_, err := c.retryReadbackSend(func() (int64, error) {
+		calls++
+		return 0, rbTGErr(500)
+	})
+	if err == nil {
+		t.Fatal("want ctx error on cancel")
+	}
+	if calls != 1 {
+		t.Fatalf("calls=%d, want 1 (aborted at first backoff)", calls)
+	}
+}
 
 // rbSentenceDoc builds an ASCII transcript (u16 == byte len == rune count) of
 // roughly target chars made of uniquely-tagged sentences "S0 wwww.". Returns

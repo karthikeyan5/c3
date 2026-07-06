@@ -6,6 +6,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf16"
 	"unicode/utf8"
 
@@ -340,47 +341,135 @@ func readbackCaption(transcript string) string {
 	return caption
 }
 
+// Readback outbound-retry budget. A transient outbound blip (network/timeout/
+// 5xx, or a 429) must not silently DROP the transcript echo — that echo is the
+// sender's only confirmation of what the agent received. We retry the whole send
+// a few times with short exponential backoff, bounded so a persistently-down
+// wire gives up within a couple of seconds rather than stalling the worker's
+// synchronous flush loop. Format/permanent errors are NOT retried here — they
+// either cascade to a smaller format (inside sendReadbackOnce) or fail fast.
+const (
+	readbackRetryMaxAttempts = 3                      // 1 initial try + 2 retries
+	readbackRetryBaseBackoff = 400 * time.Millisecond // doubles each retry
+	readbackRetryMaxBackoff  = 3 * time.Second        // per-wait cap (also caps a 429 retry_after)
+)
+
+// isRetryableSendErr reports whether a send error is worth retrying the SAME
+// send: a transient network/5xx condition or a 429. These clear on their own.
+// It is deliberately FALSE for permanent errors (chat-not-found, blocked,
+// 401/403) and format/parse errors — retrying an identical send won't help
+// those, and in the cascade a smaller format is the right move, not a retry.
+func isRetryableSendErr(err error) bool {
+	class, _ := classifyError(err)
+	return class == errClassTransient || class == errClassRateLimited
+}
+
 // SendReadback echoes a voice transcript back to the source chat as ONE Telegram
 // message in the frozen readback format. It reuses the channel's existing
 // senders (no raw HTTP) and is the optional interface the broker reaches after
 // STT succeeds (worker.flushInbounds). Returns the sent message_id.
 //
-// Failure cascade (each step best-effort; non-fatal at the caller): a send error
-// in TINY/SHORT/LONG/DEADZONE → retry as the .txt document (HUGE) → retry a short
-// plain notice → return the error. The transcript is NEVER truncated or summarized.
+// Resilience (fixes a silent-drop): sendReadbackOnce degrades TINY/SHORT/LONG/
+// DEADZONE → .txt document → short notice ONLY on FORMAT/permanent errors — a
+// smaller message can't help when the wire is down. A TRANSIENT error (network/
+// timeout/5xx/429) short-circuits that cascade and bubbles here, where we retry
+// the whole send with bounded backoff. Only a persistently-unhealthy outbound
+// path makes us give up — loudly logged, still non-fatal upstream (the agent
+// already has the transcript; only the chat echo is lost). The transcript is
+// NEVER truncated or summarized.
 func (c *Channel) SendReadback(args c3types.ReadbackArgs) (int64, error) {
 	if c.bot == nil {
 		return 0, errors.New("telegram: channel not started")
 	}
+	return c.retryReadbackSend(func() (int64, error) { return c.sendReadbackOnce(args) })
+}
+
+// retryReadbackSend runs send with bounded exponential backoff, retrying ONLY
+// retryable (transient/429) failures. A deterministic failure (permanent/format)
+// returns immediately; exhausting the retries returns the last error after a
+// loud log. Aborts promptly if the channel context is cancelled. send is a seam
+// so the retry policy is unit-testable without a live bot.
+func (c *Channel) retryReadbackSend(send func() (int64, error)) (int64, error) {
+	backoff := readbackRetryBaseBackoff
+	var lastErr error
+	for attempt := 1; attempt <= readbackRetryMaxAttempts; attempt++ {
+		id, err := send()
+		if err == nil {
+			return id, nil
+		}
+		lastErr = err
+		class, retryAfter := classifyError(err)
+		if class != errClassTransient && class != errClassRateLimited {
+			return 0, err // deterministic — retrying won't help
+		}
+		if attempt == readbackRetryMaxAttempts {
+			break
+		}
+		wait := backoff
+		if class == errClassRateLimited && retryAfter > 0 {
+			wait = time.Duration(retryAfter) * time.Second
+		}
+		if wait > readbackRetryMaxBackoff {
+			wait = readbackRetryMaxBackoff
+		}
+		c.host.Logf("telegram: readback attempt %d/%d failed, retrying in %v: %v",
+			attempt, readbackRetryMaxAttempts, wait, err)
+		select {
+		case <-time.After(wait):
+		case <-c.ctx.Done():
+			return 0, c.ctx.Err()
+		}
+		backoff *= 2
+	}
+	c.host.Logf("telegram: readback PERMANENTLY dropped after %d transient-failed attempts "+
+		"(transcript echo lost; agent already has the text): %v", readbackRetryMaxAttempts, lastErr)
+	return 0, lastErr
+}
+
+// sendReadbackOnce performs a single readback send: render the band, send it,
+// and — ONLY on a format/permanent error — degrade to the .txt document, then a
+// short notice. A retryable (transient/429) error short-circuits the cascade and
+// is returned to SendReadback's retry loop, because a smaller format won't send
+// on a wire that's down.
+func (c *Channel) sendReadbackOnce(args c3types.ReadbackArgs) (int64, error) {
 	method, payload, band := renderReadback(args.Transcript)
 
 	switch band {
 	case bandTiny, bandShort:
-		if id, err := c.sendReadbackMessage(args, payload); err == nil {
+		id, err := c.sendReadbackMessage(args, payload)
+		if err == nil {
 			return id, nil
-		} else {
-			c.host.Logf("telegram: readback %s (%s) failed, falling back to .txt document: %v", band, method, err)
 		}
+		if isRetryableSendErr(err) {
+			return 0, err
+		}
+		c.host.Logf("telegram: readback %s (%s) format error, falling back to .txt document: %v", band, method, err)
 	case bandLong, bandDeadzone:
-		if id, err := c.sendRichHTML(args.ChatID, payload, args.TopicID, args.ReplyTo); err == nil {
+		id, err := c.sendRichHTML(args.ChatID, payload, args.TopicID, args.ReplyTo)
+		if err == nil {
 			return id, nil
-		} else {
-			c.host.Logf("telegram: readback %s (%s) failed, falling back to .txt document: %v", band, method, err)
 		}
+		if isRetryableSendErr(err) {
+			return 0, err
+		}
+		c.host.Logf("telegram: readback %s (%s) format error, falling back to .txt document: %v", band, method, err)
 	case bandHuge:
 		// Falls straight through to the document path below.
 	}
 
-	// HUGE band, or a TINY/SHORT/LONG/DEADZONE send error → the whole verbatim
+	// HUGE band, or a TINY/SHORT/LONG/DEADZONE FORMAT error → the whole verbatim
 	// transcript as a .txt document, captioned with the summary preview.
-	if id, err := c.sendReadbackDocument(args, readbackCaption(args.Transcript)); err == nil {
+	id, err := c.sendReadbackDocument(args, readbackCaption(args.Transcript))
+	if err == nil {
 		return id, nil
-	} else {
-		c.host.Logf("telegram: readback .txt document failed, falling back to a short notice: %v", err)
 	}
+	if isRetryableSendErr(err) {
+		return 0, err
+	}
+	c.host.Logf("telegram: readback .txt document format error, falling back to a short notice: %v", err)
 
-	// Document failed → a short plain notice (last best-effort).
-	id, err := c.sendReadbackNotice(args)
+	// Document failed on format too → a short plain notice (last best-effort).
+	id, err = c.sendReadbackNotice(args)
 	if err != nil {
 		c.host.Logf("telegram: readback short notice failed (giving up, non-fatal upstream): %v", err)
 		return 0, err
