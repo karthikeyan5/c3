@@ -39,6 +39,29 @@ func TestIsRetryableSendErr(t *testing.T) {
 	}
 }
 
+// TestIsRetryableSendErr_WrappedErrors pins that classification survives %w
+// wrapping. The real send path (readback.go's sendReadback* helpers) returns
+// errors wrapped with fmt.Errorf("...: %w", err), and classifyError relies on
+// errors.As to reach the underlying *gotgbot.TelegramError. A future %w->%v
+// slip in any wrapper would silently misclassify (e.g. a wrapped 500 would stop
+// being retried) and no BARE-error test would catch it — these do.
+func TestIsRetryableSendErr_WrappedErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"wrapped 400 permanent", fmt.Errorf("telegram: readback sendMessage: %w", rbTGErr(400)), false},
+		{"wrapped 500 transient", fmt.Errorf("telegram: readback sendMessage: %w", rbTGErr(500)), true},
+		{"doubly-wrapped 429", fmt.Errorf("outer: %w", fmt.Errorf("inner: %w", rbTGErr(429))), true},
+	}
+	for _, tc := range cases {
+		if got := isRetryableSendErr(tc.err); got != tc.want {
+			t.Errorf("%s: isRetryableSendErr=%v want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 // TestRetryReadbackSend_TransientThenSuccess: a transient blip is retried and the
 // echo IS delivered — the exact silent-drop this fix closes (a dogfood tester saw
 // transcripts vanish from the chat during transient telegram-fetch-DOWN windows).

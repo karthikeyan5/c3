@@ -56,16 +56,58 @@ def _parse_max_volume_db(ffmpeg_stderr: str):
     """Parse ffmpeg volumedetect's 'max_volume: <N> dB' out of its stderr.
 
     Returns the float dB value, or None when the field is absent/unparseable
-    (so the caller fails OPEN and skips the gate). Pure — no I/O."""
+    (so the caller fails OPEN and skips the gate). Also matches the infinite
+    floor some ffmpeg builds report for pure silence: '-inf dB' -> float('-inf')
+    (< any threshold, so gated as silent — fail CLOSED for real silence) and the
+    (harmless, loud) '+inf' -> float('inf'). Pure — no I/O."""
     if not ffmpeg_stderr:
         return None
-    m = re.search(r"max_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", ffmpeg_stderr)
+    m = re.search(r"max_volume:\s*(-?(?:\d+(?:\.\d+)?|inf))\s*dB", ffmpeg_stderr)
     if not m:
         return None
     try:
         return float(m.group(1))
     except ValueError:
         return None
+
+def _parse_n_samples(ffmpeg_stderr: str):
+    """Parse ffmpeg volumedetect's 'n_samples: <N>' out of its stderr.
+
+    Returns the int sample count, or None when the field is absent/unparseable.
+    Used to detect a COMPLETED-but-empty decode (n_samples: 0), which emits NO
+    max_volume line at all yet is unambiguously silent. Pure — no I/O."""
+    if not ffmpeg_stderr:
+        return None
+    m = re.search(r"n_samples:\s*(\d+)", ffmpeg_stderr)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+def _resolve_measured_db(ffmpeg_stderr: str, ffmpeg_stdout: str):
+    """Decide the measured peak dB from ffmpeg's output text. Pure — no I/O.
+
+    Split out of _measure_max_volume_db so the decode-outcome logic is unit-
+    testable without shelling out to ffmpeg. Returns:
+      * the finite/inf max_volume dB when volumedetect reported one;
+      * float('-inf') for a completed-but-empty decode (n_samples: 0 and NO
+        max_volume line) — unambiguously silent, so gate it rather than fail
+        open; and
+      * None when there is no volumedetect summary at all (ffmpeg missing/
+        errored / unparseable) — the caller then FAILS OPEN so a broken
+        measurement never blocks real speech."""
+    db = _parse_max_volume_db(ffmpeg_stderr or "")
+    if db is None:
+        db = _parse_max_volume_db(ffmpeg_stdout or "")
+    if db is None:
+        # No max_volume anywhere. Only treat as silent if the decode COMPLETED
+        # with zero samples; otherwise stay None (fail open).
+        combined = (ffmpeg_stderr or "") + "\n" + (ffmpeg_stdout or "")
+        if _parse_n_samples(combined) == 0:
+            return float("-inf")
+    return db
 
 def _is_effectively_silent(max_volume_db: float, threshold_db: float) -> bool:
     """True when peak loudness is below the threshold (i.e. no real speech).
@@ -97,11 +139,10 @@ def _measure_max_volume_db(audio_path):
         return None
     # volumedetect writes its summary to stderr; parse there (fall back to
     # stdout defensively in case a build routes it differently). Note: 0.0 dB is
-    # a legitimate value, so test for None explicitly rather than truthiness.
-    db = _parse_max_volume_db(result.stderr or "")
-    if db is None:
-        db = _parse_max_volume_db(result.stdout or "")
-    return db
+    # a legitimate value, so _resolve_measured_db tests for None explicitly
+    # rather than truthiness, handles the '-inf' silence floor, and maps a
+    # completed-but-empty decode (n_samples: 0) to -inf (silent).
+    return _resolve_measured_db(result.stderr or "", result.stdout or "")
 
 # --- Domain vocabulary ---
 # Shared across all providers. Each provider adapts this into its own format

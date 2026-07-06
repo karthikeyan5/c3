@@ -45,6 +45,24 @@ SPEECH_STDERR = """\
 [Parsed_volumedetect_0 @ 0x561122334455] histogram_3db: 12
 """
 
+# Some ffmpeg builds floor pure silence at -inf instead of a finite ~ -91 dB.
+INF_SILENCE_STDERR = """\
+[Parsed_volumedetect_0 @ 0x1] n_samples: 144000
+[Parsed_volumedetect_0 @ 0x1] mean_volume: -inf dB
+[Parsed_volumedetect_0 @ 0x1] max_volume: -inf dB
+"""
+
+# A COMPLETED but EMPTY decode: volumedetect reports zero samples and emits NO
+# max_volume line at all. Unambiguously silent — must be gated, not failed open.
+EMPTY_DECODE_STDERR = """\
+ffmpeg version 8.1.2 Copyright (c) 2000-2024 the FFmpeg developers
+Input #0, ogg, from '/home/user/.claude/channels/telegram/inbox/1720000000-zzz.oga':
+  Duration: 00:00:00.00, start: 0.000000, bitrate: N/A
+Output #0, null, to 'pipe:':
+size=N/A time=00:00:00.00 bitrate=N/A speed=  0x
+[Parsed_volumedetect_0 @ 0x55e8f3a2b400] n_samples: 0
+"""
+
 
 def test_parse_max_volume_db():
     # Parses a real multi-line silence sample.
@@ -57,12 +75,47 @@ def test_parse_max_volume_db():
     # A positive dB value (rare, but volumedetect can report it) parses.
     assert stt._parse_max_volume_db(
         "[Parsed_volumedetect_0 @ 0x1] max_volume: 1.5 dB") == 1.5
+    # The -inf silence floor some ffmpeg builds emit -> float('-inf').
+    assert stt._parse_max_volume_db(
+        "[Parsed_volumedetect_0 @ 0x1] max_volume: -inf dB") == float("-inf")
+    assert stt._parse_max_volume_db(INF_SILENCE_STDERR) == float("-inf")
+    # A (harmless, loud) +inf -> float('inf'), NOT None.
+    assert stt._parse_max_volume_db(
+        "[Parsed_volumedetect_0 @ 0x1] max_volume: inf dB") == float("inf")
     # Unparseable / absent field -> None (caller then fails open).
     assert stt._parse_max_volume_db("this has no volume line at all") is None
     assert stt._parse_max_volume_db("mean_volume: -20.0 dB\n") is None  # no max_volume
     assert stt._parse_max_volume_db("") is None
     assert stt._parse_max_volume_db(None) is None
     print("PASS test_parse_max_volume_db")
+
+
+def test_parse_n_samples():
+    assert stt._parse_n_samples(SILENCE_STDERR) == 144000
+    assert stt._parse_n_samples(EMPTY_DECODE_STDERR) == 0
+    # Absent / unparseable / empty -> None.
+    assert stt._parse_n_samples("no samples reported here") is None
+    assert stt._parse_n_samples("") is None
+    assert stt._parse_n_samples(None) is None
+    print("PASS test_parse_n_samples")
+
+
+def test_resolve_measured_db():
+    # Finite silence and speech pass straight through.
+    assert stt._resolve_measured_db(SILENCE_STDERR, "") == -91.0
+    assert stt._resolve_measured_db(SPEECH_STDERR, "") == -3.1
+    # The -inf silence floor is preserved (gated, not failed open).
+    assert stt._resolve_measured_db(INF_SILENCE_STDERR, "") == float("-inf")
+    assert stt._resolve_measured_db(
+        "[Parsed_volumedetect_0 @ 0x1] max_volume: -inf dB", "") == float("-inf")
+    # Completed-but-empty decode (n_samples: 0, NO max_volume) -> measured silent.
+    assert stt._resolve_measured_db(EMPTY_DECODE_STDERR, "") == float("-inf")
+    # Defensive stdout fallback: max_volume routed to stdout still parses.
+    assert stt._resolve_measured_db("", SPEECH_STDERR) == -3.1
+    # Genuine measurement failure (no summary at all) -> None => FAIL OPEN.
+    assert stt._resolve_measured_db("ffmpeg: some error, no summary", "") is None
+    assert stt._resolve_measured_db("", "") is None
+    print("PASS test_resolve_measured_db")
 
 
 def test_is_effectively_silent():
@@ -77,6 +130,9 @@ def test_is_effectively_silent():
     assert stt._is_effectively_silent(-50.01, -50.0) is True
     # Loud 0.0 dB peak -> not silent.
     assert stt._is_effectively_silent(0.0, default) is False
+    # -inf floor (some ffmpeg builds) -> silent; +inf (loud) -> not silent.
+    assert stt._is_effectively_silent(float("-inf"), -50.0) is True
+    assert stt._is_effectively_silent(float("inf"), -50.0) is False
     print("PASS test_is_effectively_silent")
 
 
@@ -135,6 +191,8 @@ def test_end_to_end_decision():
 def main():
     tests = [
         test_parse_max_volume_db,
+        test_parse_n_samples,
+        test_resolve_measured_db,
         test_is_effectively_silent,
         test_resolve_silence_threshold_db,
         test_end_to_end_decision,
