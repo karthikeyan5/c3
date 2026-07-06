@@ -395,11 +395,20 @@ func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inboun
 				in.Text = sttFailureText(in, "no_transcript")
 			}
 			// Voice-transcript readback echo (moved out of the Python STT handler).
-			// ADDITIVE + NON-FATAL: it is a SEND, so it can never affect the
+			// ADDITIVE + NON-FATAL: it is a SEND, so it must NEVER affect the
 			// agent-surface in.Text set above, inbound delivery, persistence, or
-			// loss-freedom. Synchronous in the loop (the worker already blocks on
-			// STT for seconds; this preserves per-voice ordering).
-			w.echoReadback(in, transcript)
+			// loss-freedom. The echo now RETRIES on transient outbound failure
+			// (readback.go), which can block for seconds (a 429 burst → seconds per
+			// note). Running it inline on this route worker's serial goroutine would
+			// stall persistence + delivery of THIS and later notes — breaking the
+			// invariant above. So dispatch it DETACHED, bounded by the channel
+			// context + the send's own retry budget. It reads a shallow COPY of the
+			// inbound so it can't race the persistence loop's later use of `in` (and
+			// so a recycled `in` can't corrupt the in-flight echo). The transcript
+			// already reached the agent, so slight cross-note reordering of this
+			// best-effort courtesy echo under a burst is acceptable.
+			inCopy := *in
+			go w.echoReadback(&inCopy, transcript)
 		}
 	}
 

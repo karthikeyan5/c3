@@ -713,6 +713,46 @@ func (r *readbackRecorderChannel) readbackSnapshot() []c3types.ReadbackArgs {
 	return out
 }
 
+// waitReadbacks polls until at least n readbacks are recorded, or fails after a
+// timeout. The echo now fires from a DETACHED goroutine (flushInbounds dispatches
+// echoReadback with `go` so a retrying send can't stall the worker's serial
+// loop), so tests must wait for it rather than read synchronously.
+func (r *readbackRecorderChannel) waitReadbacks(t *testing.T, n int) []c3types.ReadbackArgs {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		rbs := r.readbackSnapshot()
+		if len(rbs) >= n {
+			return rbs
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("want >= %d SendReadback, got %d after 2s", n, len(rbs))
+			return rbs
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// waitReplyContaining polls the recorder's SendReply calls until one contains
+// substr, or fails after a timeout. Same rationale as waitReadbacks: the failure
+// notice is now sent from the detached echo goroutine.
+func (r *readbackRecorderChannel) waitReplyContaining(t *testing.T, substr string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		for _, rp := range r.sendRepliesSnapshot() {
+			if strings.Contains(rp.Text, substr) {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("never saw a SendReply containing %q within 2s", substr)
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 func registerReadbackChannel(b *Broker, rc *readbackRecorderChannel) {
 	b.chMu.Lock()
 	b.channels[rc.Name()] = &channelRegistration{Channel: rc}
@@ -744,7 +784,7 @@ func TestFlushInbounds_ReadbackOnSuccess(t *testing.T) {
 	}
 	w.flushInbounds(context.Background(), []*c3types.Inbound{in})
 
-	rbs := rc.readbackSnapshot()
+	rbs := rc.waitReadbacks(t, 1)
 	if len(rbs) != 1 {
 		t.Fatalf("want exactly 1 SendReadback on success, got %d", len(rbs))
 	}
@@ -788,6 +828,9 @@ func TestFlushInbounds_ReadbackFailureNotice(t *testing.T) {
 	}
 	w.flushInbounds(context.Background(), []*c3types.Inbound{in})
 
+	// The failure notice is sent from the detached echo goroutine now — wait
+	// for it, then assert (no readback on STT failure).
+	rc.waitReplyContaining(t, "Couldn't transcribe that voice note")
 	if n := len(rc.readbackSnapshot()); n != 0 {
 		t.Fatalf("want 0 SendReadback on STT failure, got %d", n)
 	}
