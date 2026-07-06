@@ -21,12 +21,19 @@ def set_vocabulary(vocab):
     _VOCAB = vocab or {"terms": [], "context": ""}
 
 def _get_prompt():
-    """Build a prompt string from vocabulary for Sarvam's prompt parameter."""
+    """Build a prompt string from vocabulary for Sarvam's prompt parameter.
+
+    Spelling hint ONLY — we pass the domain terms so Saaras spells them
+    correctly when they occur, but deliberately DROP the free-text context
+    narrative. As a prompt bias, a topic sentence ("Technical discussion about
+    DevOps...") primes the model toward that topic and can seed a hallucinated
+    transcript on silent/unclear audio — the same failure the Gemini provider's
+    anti-fabrication rules address. Terms alone don't narrate a topic.
+    """
     if not _VOCAB.get("terms"):
         return None
-    context = _VOCAB.get("context", "")
     terms = ", ".join(t["preferred"] for t in _VOCAB["terms"])
-    return f"{context} Key terms: {terms}" if context else f"Key terms: {terms}"
+    return f"Key terms: {terms}"
 
 # --- Load API key ---
 _SARVAM_KEY = None

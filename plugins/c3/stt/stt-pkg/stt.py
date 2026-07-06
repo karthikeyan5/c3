@@ -20,10 +20,88 @@ To add a new provider:
 Stdout: clean transcript only
 Stderr: retry/fallback/error logging
 """
-import sys, os, importlib.util, argparse, time, json
+import sys, os, importlib.util, argparse, time, json, re, subprocess
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROVIDERS_DIR = os.path.join(SCRIPT_DIR, "providers")
+
+# --- Energy / silence gate ---
+# An LLM-based STT provider (Gemini 3 Flash via OpenRouter) will confabulate a
+# fluent, ENTIRELY-INVENTED transcript when handed silent/near-silent audio —
+# even with explicit anti-fabrication + <<NO_SPEECH>> rules in its system prompt
+# (confirmed by live test: pure digital silence -> a full fabricated lecture).
+# Prompt-level rules do NOT stop it. The only reliable defense is to NOT send
+# effectively-silent audio to any provider. We measure peak loudness with
+# ffmpeg's volumedetect filter and, if it's below the threshold, gate out.
+#
+# volumedetect reports peak amplitude on stderr as e.g. "max_volume: -91.0 dB".
+# Pure digital silence measures ~ -91 dB; real speech peaks far higher (roughly
+# -30 to -3 dB), so a simple energy threshold cleanly separates them.
+SILENCE_MAX_DB_DEFAULT = -50.0
+
+def _resolve_silence_threshold_db(default_db=SILENCE_MAX_DB_DEFAULT):
+    """Resolve the max_volume threshold (dB) below which audio counts as silent.
+
+    Reads $C3_STT_SILENCE_MAX_DB; falls back to `default_db` when unset, blank,
+    or unparseable. Never raises — a bad env value must not break transcription."""
+    raw = os.environ.get("C3_STT_SILENCE_MAX_DB")
+    if raw is None or not raw.strip():
+        return default_db
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return default_db
+
+def _parse_max_volume_db(ffmpeg_stderr: str):
+    """Parse ffmpeg volumedetect's 'max_volume: <N> dB' out of its stderr.
+
+    Returns the float dB value, or None when the field is absent/unparseable
+    (so the caller fails OPEN and skips the gate). Pure — no I/O."""
+    if not ffmpeg_stderr:
+        return None
+    m = re.search(r"max_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", ffmpeg_stderr)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+def _is_effectively_silent(max_volume_db: float, threshold_db: float) -> bool:
+    """True when peak loudness is below the threshold (i.e. no real speech).
+
+    Boundary: exactly AT the threshold is NOT silent — we bias toward attempting
+    transcription (fail toward doing the work) so only clearly-silent audio is
+    gated. Pure — no I/O."""
+    return max_volume_db < threshold_db
+
+def _measure_max_volume_db(audio_path):
+    """Measure peak loudness (dB) of an audio file via ffmpeg volumedetect.
+
+    Thin subprocess wrapper: runs
+      ffmpeg -hide_banner -i <path> -af volumedetect -f null -
+    (volumedetect prints its summary to stderr) and parses out max_volume.
+
+    Returns the float dB peak, or None if ffmpeg is missing, times out, or the
+    output can't be parsed. Callers treat None as 'measurement unavailable' and
+    FAIL OPEN (skip the gate) — a broken measurement must never block real
+    speech. Mirrors sarvam-saaras-v3.py:_get_duration's shell-out-to-ffprobe
+    style (stdlib subprocess only, no third-party deps)."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-i", audio_path,
+             "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception:
+        return None
+    # volumedetect writes its summary to stderr; parse there (fall back to
+    # stdout defensively in case a build routes it differently). Note: 0.0 dB is
+    # a legitimate value, so test for None explicitly rather than truthiness.
+    db = _parse_max_volume_db(result.stderr or "")
+    if db is None:
+        db = _parse_max_volume_db(result.stdout or "")
+    return db
 
 # --- Domain vocabulary ---
 # Shared across all providers. Each provider adapts this into its own format
@@ -139,6 +217,32 @@ def main():
 
     with open(audio_path, "rb") as f:
         audio_bytes = f.read()
+
+    # ── Energy / silence gate (anti-fabrication) ─────────────────────────────
+    # BEFORE any provider runs: if the audio is effectively silent, do NOT hand
+    # it to the LLM (it would confabulate a fabricated transcript — see the
+    # module header). Exit exactly like the all-providers-failed path below
+    # (empty stdout, exit 1) so the Go shim's graceful [STT FAILED] path is
+    # unchanged — no new stdout contract. FAIL OPEN on any measurement problem
+    # (ffmpeg missing, unparseable output, timeout): skip the gate and fall
+    # through to the normal chain so real speech is never blocked by a broken
+    # measurement.
+    threshold_db = _resolve_silence_threshold_db()
+    max_volume_db = _measure_max_volume_db(audio_path)
+    if max_volume_db is None:
+        print("[stt] silence gate skipped: could not measure loudness "
+              "(ffmpeg missing/failed or unparseable output); proceeding to providers",
+              file=sys.stderr)
+    elif _is_effectively_silent(max_volume_db, threshold_db):
+        print(f"[stt] gated: audio effectively silent "
+              f"(max_volume={max_volume_db}dB < {threshold_db}dB); no speech to transcribe",
+              file=sys.stderr)
+        # Same terminal contract as "all providers failed": nothing on stdout,
+        # non-zero exit -> Go shim surfaces the graceful "[STT FAILED]" notice.
+        sys.exit(1)
+    else:
+        print(f"[stt] loudness ok (max_volume={max_volume_db}dB >= {threshold_db}dB)",
+              file=sys.stderr)
 
     chain = [name.strip() for name in args.chain.split(",") if name.strip()]
     if not chain:

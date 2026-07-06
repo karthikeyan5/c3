@@ -25,13 +25,25 @@ def _get_key():
             pass
     return _OR_KEY
 
-# --- System prompt (V7) ---
+# The exact token the model is told to emit when there is no intelligible
+# speech. transcribe() maps it (and an empty response) to None so the chain
+# falls through to a graceful "couldn't transcribe" instead of a fabrication.
+NO_SPEECH = "<<NO_SPEECH>>"
+
+# --- System prompt (V8) ---
+# V8 (2026-07-06): added explicit NO-SPEECH + anti-fabrication rules. An earlier
+# version, given near-silent/short audio plus the domain vocabulary below, would
+# confabulate a fluent (entirely invented) DevOps lecture — because nothing told
+# it that "no clear speech" is a valid, expected outcome. It now must emit
+# NO_SPEECH rather than guess.
 SYSTEM_PROMPT = """You are a transcription engine. You output ONLY the transcript of the audio — nothing else.
 
 Rules:
 - Transcribe exactly what is spoken. Never add words that were not spoken.
 - If the audio contains 3 words, output 3 words. Match output length to actual speech.
-- Translate all non-English speech to English inline.
+- If the audio has NO intelligible speech — it is silent, empty, only background noise or music, too short, or too unclear to make out — output exactly <<NO_SPEECH>> and nothing else. A wrong guess is far worse than <<NO_SPEECH>>.
+- Never fabricate. Do NOT produce fluent, plausible-sounding content that was not actually spoken. If you are unsure, output only the words you are genuinely confident you heard, or <<NO_SPEECH>>. Do not let the domain vocabulary steer you toward inventing technical content.
+- Translate all non-English speech to English inline. Speech is often code-mixed (e.g. Tamil or Hindi interleaved with English) — handle code-switching naturally.
 - Remove filler words (uh, um, like, you know).
 - Use [Language] tags when the speaker switches language: [Tamil], [Hindi], [English].
 - Use [emotion] tags for notable tone shifts: [frustrated], [laughing].
@@ -52,7 +64,7 @@ def _build_vocab_prompt():
     """Build vocabulary prompt section from shared vocabulary."""
     if not _VOCAB.get("terms"):
         return ""
-    lines = ["\n\nDomain vocabulary (prefer these spellings when the audio matches):"]
+    lines = ["\n\nSpelling reference — these terms MAY occur. Apply the preferred spelling ONLY when you actually hear that word. This is a spelling guide, NOT a topic hint: never introduce, prefer, or steer toward any of these words unless it is clearly spoken:"]
     for t in _VOCAB["terms"]:
         preferred = t["preferred"]
         nots = t.get("not", [])
@@ -79,6 +91,7 @@ def transcribe(audio_path: str, audio_bytes: bytes) -> str:
 
     payload = json.dumps({
         "model": "google/gemini-3-flash-preview",
+        "temperature": 0,
         "messages": [
             {"role": "system", "content": full_prompt},
             {"role": "user", "content": [
@@ -100,4 +113,18 @@ def transcribe(audio_path: str, audio_bytes: bytes) -> str:
     with urllib.request.urlopen(req, timeout=90) as resp:
         result = json.loads(resp.read())
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+        if _is_no_speech(content):
+            return None
         return content.strip() if content.strip() else None
+
+
+def _is_no_speech(text: str) -> bool:
+    """True when the model reported no intelligible speech (the NO_SPEECH
+    sentinel, possibly wrapped in quotes/backticks/punctuation) or returned
+    nothing. Mapping this to None lets the chain fall through to the next
+    provider and ultimately to a graceful 'couldn't transcribe' rather than a
+    hallucinated transcript."""
+    if not text or not text.strip():
+        return True
+    residue = text.replace(NO_SPEECH, "").strip().strip("`\"'.() \n\t")
+    return residue == ""
