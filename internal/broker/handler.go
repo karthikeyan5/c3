@@ -559,6 +559,15 @@ func (b *Broker) handleListTopics(conn *ipc.Conn) {
 func (b *Broker) handleListClaims(conn *ipc.Conn) {
 	resp := ipc.ClaimsListMsg{Op: ipc.OpClaimsList}
 	for _, e := range b.Routes.Snapshot() {
+		if !e.Stub.IsAlive() {
+			// Dead holder (disconnected AND PID gone): reap it and omit it so
+			// `c3-broker status` never renders a ghost claim. An alive-but-
+			// disconnected holder (brief reconnect window) still shows, labelled
+			// as disconnected by the renderer. Snapshot returns a copy, so
+			// Releasing during iteration is safe.
+			b.Routes.Release(e.Key, e.Stub.ConnID)
+			continue
+		}
 		entry := ipc.ClaimEntry{
 			Channel:   e.Key.Channel,
 			ChatID:    e.Key.ChatID,

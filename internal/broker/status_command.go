@@ -51,8 +51,18 @@ func (b *Broker) statusForTopic(channelName string, chatID int64, topicID *int64
 		}
 	}
 	attached := "no CLI attached"
-	if _, held := b.Routes.Holder(key); held {
-		attached = "CLI attached"
+	if h, held := b.Routes.Holder(key); held {
+		if h.IsAlive() {
+			attached = "CLI attached"
+		} else {
+			// Dead reference: the holder's adapter is gone (disconnected AND its
+			// PID is no longer in the OS process table). Verify liveness at READ
+			// time and reap the stale claim on the spot so the status we print is
+			// honest instead of trusting a cached map entry that only gets swept
+			// lazily on the next inbound. Release is connID-guarded, so a live
+			// re-claim landing between Holder and here is never clobbered.
+			b.Routes.Release(key, h.ConnID)
+		}
 	}
 	return fmt.Sprintf("📊 %s · %d queued%s · %s · broker up", name, pending, oldestSuffix(oldest), attached)
 }
@@ -103,6 +113,9 @@ func (b *Broker) sessionCounts() (attached, idle int) {
 	for _, s := range b.Stubs.Snapshot() {
 		if s.CLI == "c3-broker-cli" {
 			continue
+		}
+		if !s.IsAlive() {
+			continue // dead session (disconnected + PID gone): count it as neither
 		}
 		if s.CurrentRoute() != nil {
 			attached++
