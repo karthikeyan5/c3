@@ -195,6 +195,63 @@ func TestFlushInbounds_VoiceSTTTimeout_FallsBackToPlaceholder(t *testing.T) {
 	}
 }
 
+// Regression for the common STT-failure path: the STT builtin signals failure by
+// returning a NON-EMPTY "[STT FAILED: <reason> — see <path>]" marker (not an
+// empty string). Before the fix that marker took the transcript!="" branch and
+// reached the agent verbatim — it names the log but NOT the file_id or the
+// retranscribe tool. The fix routes the marker through sttFailureText, so the
+// agent sees the rich, self-documenting recovery text with the parsed reason and
+// never the raw marker.
+func TestFlushInbounds_VoiceSTTFailureMarkerBecomesRichText(t *testing.T) {
+	t.Setenv("C3_QUEUE_DIR", t.TempDir())
+	b := New(&mappings.MappingsFile{SchemaVersion: 1})
+	defer b.Shutdown()
+
+	// STT builtin's real failure signal: a non-empty marker, not "".
+	b.Plugins.OnVoiceReceived(func(ctx context.Context, p c3types.VoicePayload) (string, error) {
+		return "[STT FAILED: token_unavailable — see /var/log/c3/broker.log]", nil
+	})
+
+	w := newRouteWorker(context.Background(), RouteKey{Channel: "telegram", ChatID: -100}, time.Hour, b)
+	defer w.Stop()
+
+	in := &c3types.Inbound{
+		Channel: "telegram", ChatID: -100, MessageID: 46,
+		Attachments: []c3types.Attachment{{Kind: "voice", FileID: "MARKERFILE", MIME: "audio/ogg", Size: 1000}},
+	}
+	w.flushInbounds(context.Background(), []*c3types.Inbound{in})
+
+	for _, want := range []string{"transcription failed", "MARKERFILE", "download_attachment", "retranscribe", "token_unavailable"} {
+		if !strings.Contains(in.Text, want) {
+			t.Errorf("marker→rich text missing %q; got %q", want, in.Text)
+		}
+	}
+	if strings.Contains(in.Text, "[STT FAILED:") {
+		t.Errorf("agent-facing text still contains the raw failure marker; got %q", in.Text)
+	}
+}
+
+func TestSTTFailureReason(t *testing.T) {
+	cases := []struct {
+		name       string
+		transcript string
+		want       string
+	}{
+		{"empty", "", "no_transcript"},
+		{"marker with hint", "[STT FAILED: token_unavailable — see /var/log/c3/broker.log]", "token_unavailable"},
+		{"marker without hint", "[STT FAILED: timeout]", "timeout"},
+		{"garbage", "not a marker at all", "stt_failed"},
+		{"empty reason", "[STT FAILED: ]", "stt_failed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sttFailureReason(tc.transcript); got != tc.want {
+				t.Errorf("sttFailureReason(%q) = %q, want %q", tc.transcript, got, tc.want)
+			}
+		})
+	}
+}
+
 // Regression test for 2026-05-14: after /mcp reconnect, Claude Code killed
 // the old adapter; the broker kept the now-stale claim "while pid alive"
 // and every inbound failed with `holder.Conn is not *ipc.Conn` because the
@@ -817,7 +874,9 @@ func TestFlushInbounds_ReadbackOnSuccess(t *testing.T) {
 
 // TestFlushInbounds_ReadbackFailureNotice: an STT failure marker drives NO
 // SendReadback but DOES send the human "couldn't transcribe" notice via the
-// channel's normal SendReply. The agent-surface marker (in.Text) is unchanged.
+// channel's normal SendReply. The agent-surface text (in.Text) is the RICH
+// sttFailureText recovery message (the raw marker is routed through it), not the
+// verbatim "[STT FAILED:" marker.
 func TestFlushInbounds_ReadbackFailureNotice(t *testing.T) {
 	t.Setenv("C3_QUEUE_DIR", t.TempDir())
 	b := New(&mappings.MappingsFile{SchemaVersion: 1})
@@ -856,8 +915,16 @@ func TestFlushInbounds_ReadbackFailureNotice(t *testing.T) {
 	if !sawNotice {
 		t.Error("STT failure must send the human 'couldn't transcribe' notice via SendReply")
 	}
-	if !strings.Contains(in.Text, "[STT FAILED: timeout") {
-		t.Errorf("agent-surface marker changed: in.Text=%q", in.Text)
+	// The agent-surface text is now the RICH recovery message (the marker is
+	// routed through sttFailureText), carrying the parsed reason — NOT the raw
+	// "[STT FAILED:" marker, which named only the log, not the file_id/retranscribe.
+	if strings.Contains(in.Text, "[STT FAILED:") {
+		t.Errorf("agent-surface text should not carry the raw marker: in.Text=%q", in.Text)
+	}
+	for _, want := range []string{"transcription failed", "timeout", "VF", "retranscribe"} {
+		if !strings.Contains(in.Text, want) {
+			t.Errorf("agent-surface rich text missing %q: in.Text=%q", want, in.Text)
+		}
 	}
 }
 

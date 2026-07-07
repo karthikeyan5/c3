@@ -402,14 +402,18 @@ func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inboun
 			transcript := w.broker.Plugins.FireOnVoiceReceived(sttCtx, payload)
 			cancel()
 			switch {
-			case transcript != "":
+			case transcript != "" && !isSTTFailureMarker(transcript):
 				in.Text = w.sttPrefix(in.Channel) + transcript
 			case in.Text == "":
 				// Self-documenting failure: the text the AGENT sees becomes a
 				// recovery instruction (it names the file_id + how to fetch /
 				// retry), not a dead end. The audio is durably queued and
-				// recoverable; the user never re-forwards.
-				in.Text = sttFailureText(in, "no_transcript")
+				// recoverable; the user never re-forwards. This fires on BOTH the
+				// empty-transcript path (no STT plugin / timeout) AND a non-empty
+				// "[STT FAILED: <reason>]" marker from the builtin — the marker
+				// only names the log, so we replace it with the rich text and
+				// surface the parsed <reason> via sttFailureReason.
+				in.Text = sttFailureText(in, sttFailureReason(transcript))
 			}
 			// Voice-transcript readback echo (moved out of the Python STT handler).
 			// ADDITIVE + NON-FATAL: it is a SEND, so it must NEVER affect the
@@ -555,8 +559,39 @@ func sttFailureText(in *c3types.Inbound, reason string) string {
 		mime = "audio"
 	}
 	dur = "duration unknown"
-	return fmt.Sprintf("⚠️ [voice transcription failed: %s] The audio is saved and recoverable — the user does not need to resend. Call download_attachment with file_id=%q (%s, %s) to retrieve it, or retranscribe with the same file_id to re-run transcription. Provider traceback: %s",
+	return fmt.Sprintf("⚠️ [voice transcription failed: %s] The audio is saved and recoverable — the user does not need to resend. Call download_attachment with file_id=%q (%s, %s) to retrieve it, or retranscribe with the same file_id to re-run transcription. Try retranscribe ONCE; if it still fails, ask the sender to resend or type it out — do not retry repeatedly. Provider traceback: %s",
 		reason, fileID, mime, dur, LogPath())
+}
+
+// sttFailureReason extracts the failure reason to surface in sttFailureText. An
+// empty transcript (no STT plugin, or a timeout) means STT never produced a
+// marker, so the reason is "no_transcript". Otherwise the transcript is the
+// builtin's "[STT FAILED: <reason> — see <path>]" marker (see
+// stt.sttFailureMarker) and we parse the <reason> token out of it: the text
+// between "[STT FAILED: " and the following " — " (or the closing "]" if the
+// hint is absent). If parsing yields nothing usable, fall back to "stt_failed".
+// Dependency-free (strings only) to keep worker.go free of the stt import.
+func sttFailureReason(transcript string) string {
+	if transcript == "" {
+		return "no_transcript"
+	}
+	const prefix = "[STT FAILED: "
+	rest, ok := strings.CutPrefix(transcript, prefix)
+	if !ok {
+		return "stt_failed"
+	}
+	// Cut at the log-hint separator first, then the closing bracket, so a marker
+	// with or without the "(see <path>)" hint both parse to the bare reason.
+	if i := strings.Index(rest, " — "); i >= 0 {
+		rest = rest[:i]
+	} else if i := strings.IndexByte(rest, ']'); i >= 0 {
+		rest = rest[:i]
+	}
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return "stt_failed"
+	}
+	return rest
 }
 
 // isSTTFailureMarker reports whether a transcript is the STT builtin's failure
