@@ -696,9 +696,19 @@ type readbackRecorderChannel struct {
 	*fakeChannel
 	rbMu      sync.Mutex
 	readbacks []c3types.ReadbackArgs
+	// beforeRecord, when non-nil, runs at the TOP of SendReadback BEFORE the
+	// readback is recorded and WITHOUT holding rbMu — so a Phase-3 ordering test
+	// can inject a per-echo delay or blocking handshake without the recorder's own
+	// mutex serializing the sends (which would mask a reordering bug). Set once
+	// before any flush, read only from the echo goroutines. nil keeps the original
+	// immediate-record behavior for every existing test.
+	beforeRecord func(c3types.ReadbackArgs)
 }
 
 func (r *readbackRecorderChannel) SendReadback(a c3types.ReadbackArgs) (int64, error) {
+	if r.beforeRecord != nil {
+		r.beforeRecord(a)
+	}
 	r.rbMu.Lock()
 	defer r.rbMu.Unlock()
 	r.readbacks = append(r.readbacks, a)
@@ -848,5 +858,126 @@ func TestFlushInbounds_ReadbackFailureNotice(t *testing.T) {
 	}
 	if !strings.Contains(in.Text, "[STT FAILED: timeout") {
 		t.Errorf("agent-surface marker changed: in.Text=%q", in.Text)
+	}
+}
+
+// TestFlushInbounds_EchoOrderingChained: two voice notes in ONE topic where the
+// FIRST echo's send is DELAYED (simulates a transient/429 backoff) and the
+// SECOND's is immediate. The Phase-3 chain must keep the courtesy echoes in
+// arrival order — the second must NOT post before the first. Without the chain (a
+// bare detached `go`) the fast second echo would record first and this fails.
+func TestFlushInbounds_EchoOrderingChained(t *testing.T) {
+	t.Setenv("C3_QUEUE_DIR", t.TempDir())
+	b := New(&mappings.MappingsFile{SchemaVersion: 1})
+	defer b.Shutdown()
+
+	rc := &readbackRecorderChannel{fakeChannel: &fakeChannel{}}
+	// Delay ONLY the first note's send. The delay runs BEFORE rbMu is taken, so it
+	// cannot serialize the second send via the recorder's own lock — only the
+	// echo chain can preserve order.
+	rc.beforeRecord = func(a c3types.ReadbackArgs) {
+		if a.Transcript == "first" {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	registerReadbackChannel(b, rc)
+	b.Plugins.OnVoiceReceived(func(ctx context.Context, p c3types.VoicePayload) (string, error) {
+		if p.MessageID == 1 {
+			return "first", nil
+		}
+		return "second", nil
+	})
+
+	w := newRouteWorker(context.Background(), RouteKey{Channel: "telegram", ChatID: -100}, time.Hour, b)
+	defer w.Stop()
+
+	voice := []c3types.Attachment{{Kind: "voice", FileID: "VF"}}
+	in1 := &c3types.Inbound{Channel: "telegram", ChatID: -100, MessageID: 1, Attachments: voice}
+	in2 := &c3types.Inbound{Channel: "telegram", ChatID: -100, MessageID: 2, Attachments: voice}
+
+	// flushInbounds runs on the serial run goroutine in production; calling it
+	// twice in sequence here mirrors that exactly and sets the chain in arrival
+	// order (in1 then in2). This also exercises ordering ACROSS batches.
+	w.flushInbounds(context.Background(), []*c3types.Inbound{in1})
+	w.flushInbounds(context.Background(), []*c3types.Inbound{in2})
+
+	rbs := rc.waitReadbacks(t, 2)
+	if len(rbs) < 2 {
+		t.Fatalf("want >= 2 readbacks, got %d", len(rbs))
+	}
+	if rbs[0].Transcript != "first" || rbs[1].Transcript != "second" {
+		t.Fatalf("echo order violated: got %q then %q; want \"first\" then \"second\" — chain must preserve per-topic arrival order",
+			rbs[0].Transcript, rbs[1].Transcript)
+	}
+}
+
+// TestFlushInbounds_EchoChainCtxCancel: cancel the run-loop ctx while a SECOND
+// echo is parked waiting on the FIRST echo's chain link. The parked echo must
+// take the ctx.Done() branch and exit PROMPTLY (closing its own link) instead of
+// deadlocking behind the still-running first echo — and the first echo, once
+// unblocked, must also finish (no goroutine leak on shutdown).
+func TestFlushInbounds_EchoChainCtxCancel(t *testing.T) {
+	t.Setenv("C3_QUEUE_DIR", t.TempDir())
+	b := New(&mappings.MappingsFile{SchemaVersion: 1})
+	defer b.Shutdown()
+
+	echo1Entered := make(chan struct{})
+	releaseEcho1 := make(chan struct{})
+	rc := &readbackRecorderChannel{fakeChannel: &fakeChannel{}}
+	rc.beforeRecord = func(a c3types.ReadbackArgs) {
+		if a.Transcript == "first" {
+			close(echo1Entered) // echo1 is now inside its send; mine1 still open
+			<-releaseEcho1      // hold it there so echo2 stays parked on <-prev
+		}
+	}
+	registerReadbackChannel(b, rc)
+	b.Plugins.OnVoiceReceived(func(ctx context.Context, p c3types.VoicePayload) (string, error) {
+		if p.MessageID == 1 {
+			return "first", nil
+		}
+		return "second", nil
+	})
+
+	w := newRouteWorker(context.Background(), RouteKey{Channel: "telegram", ChatID: -100}, time.Hour, b)
+	defer w.Stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	voice := []c3types.Attachment{{Kind: "voice", FileID: "VF"}}
+	in1 := &c3types.Inbound{Channel: "telegram", ChatID: -100, MessageID: 1, Attachments: voice}
+	in2 := &c3types.Inbound{Channel: "telegram", ChatID: -100, MessageID: 2, Attachments: voice}
+
+	// Echo #1: prev is the pre-closed head, so it runs immediately, enters its
+	// (blocked) send, and holds mine1 open. w.prevEchoDone is read only on this
+	// test goroutine (the same one that calls flushInbounds), so it's race-free.
+	w.flushInbounds(ctx, []*c3types.Inbound{in1})
+	mine1 := w.prevEchoDone
+	<-echo1Entered // echo1 now stuck in send; mine1 not yet closed
+
+	// Echo #2: prev = mine1 (open), so it PARKS on <-prev while also watching ctx.
+	w.flushInbounds(ctx, []*c3types.Inbound{in2})
+	mine2 := w.prevEchoDone
+
+	// Cancel mid-chain: echo2 is parked on <-prev. It MUST take ctx.Done() and
+	// exit promptly (close mine2) rather than wait for the blocked echo1.
+	cancel()
+	select {
+	case <-mine2:
+		// echo2 exited + closed its link → prompt, no deadlock.
+	case <-time.After(2 * time.Second):
+		t.Fatal("echo2 parked on <-prev did not exit within 2s of ctx cancel — chain deadlocked/leaked on shutdown")
+	}
+
+	// echo2 aborted BEFORE sending; echo1 is still blocked in its send, so nothing
+	// has been recorded yet.
+	if got := rc.readbackSnapshot(); len(got) != 0 {
+		t.Fatalf("echo2 should abort before sending on ctx cancel; got %d readback(s): %+v", len(got), got)
+	}
+
+	// Release echo1 and confirm it too finishes (closes mine1) — no leak.
+	close(releaseEcho1)
+	select {
+	case <-mine1:
+	case <-time.After(2 * time.Second):
+		t.Fatal("echo1 did not finish after release — goroutine leaked")
 	}
 }

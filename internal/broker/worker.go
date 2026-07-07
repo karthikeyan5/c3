@@ -156,6 +156,18 @@ type RouteWorker struct {
 	// can produce (spec: "dedupe by message_id"). Bounded FIFO; touched only from
 	// the worker's single run goroutine (flushInbounds), so it needs no lock.
 	dedup *deliveredDedup
+
+	// prevEchoDone chains the per-topic voice-readback echoes so they post in
+	// strict arrival order (spec Phase 3 — the maintainer: "processed one by one"). The
+	// echo is dispatched off the critical path (a retrying send can back off for
+	// seconds), and a bare `go` would let a later note's fast echo overtake an
+	// earlier note whose send is backing off. Each echo now waits on the previous
+	// echo's done-channel before sending. This field is the tail of that chain:
+	// read+written ONLY on the serial run goroutine (flushInbounds), so the swap is
+	// race-free; each spawned goroutine only reads its captured `prev` and closes
+	// its own `mine`. Initialized PRE-CLOSED in newRouteWorker so the first echo's
+	// `<-prev` proceeds immediately (a nil channel would block forever).
+	prevEchoDone chan struct{}
 }
 
 // debounceWindow / debounceMax defaults from spec §7.3 + §6.
@@ -194,6 +206,11 @@ func newRouteWorker(parent context.Context, key RouteKey, idle time.Duration, br
 		// full-queue recovery replay is fully covered by the dedup window.
 		dedup: newDeliveredDedup(2048),
 	}
+	// Pre-close the echo chain's head so the FIRST readback echo's `<-prev`
+	// proceeds immediately instead of blocking forever on a nil channel
+	// (spec Phase 3 / CRITIQUE FOLD #7).
+	w.prevEchoDone = make(chan struct{})
+	close(w.prevEchoDone)
 	go w.run(ctx)
 	return w
 }
@@ -397,18 +414,51 @@ func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inboun
 			// Voice-transcript readback echo (moved out of the Python STT handler).
 			// ADDITIVE + NON-FATAL: it is a SEND, so it must NEVER affect the
 			// agent-surface in.Text set above, inbound delivery, persistence, or
-			// loss-freedom. The echo now RETRIES on transient outbound failure
-			// (readback.go), which can block for seconds (a 429 burst → seconds per
+			// loss-freedom. The echo RETRIES on transient outbound failure
+			// (readback.go), which can block for seconds (a 429 burst → up to ~6s per
 			// note). Running it inline on this route worker's serial goroutine would
 			// stall persistence + delivery of THIS and later notes — breaking the
-			// invariant above. So dispatch it DETACHED, bounded by the channel
-			// context + the send's own retry budget. It reads a shallow COPY of the
-			// inbound so it can't race the persistence loop's later use of `in` (and
-			// so a recycled `in` can't corrupt the in-flight echo). The transcript
-			// already reached the agent, so slight cross-note reordering of this
-			// best-effort courtesy echo under a burst is acceptable.
+			// invariant above. So dispatch it off the critical path.
+			//
+			// Ordering (spec Phase 3 — the maintainer: "processed one by one"): a bare `go`
+			// would let a SECOND note's fast echo overtake a FIRST note whose send is
+			// backing off, posting the courtesy echoes out of arrival order. Instead
+			// we CHAIN them: each echo waits on the previous echo's done-channel
+			// before sending, so within one topic they post strictly FIFO. Ordering
+			// carries ACROSS batches because prevEchoDone is a worker field. The chain
+			// link is read+written ONLY here on the serial run goroutine, so the swap
+			// is race-free; each spawned goroutine only reads its captured `prev` and
+			// closes its own `mine`. The worker's inbound persistence/delivery path
+			// still never blocks on echo retries — run only does a non-blocking
+			// pointer swap + `go`, exactly as before.
+			//
+			// It reads a shallow COPY of the inbound so it can't race the persistence
+			// loop's later use of `in` (and so a recycled `in` can't corrupt the
+			// in-flight echo). ctx is the run-loop context (worker.go run/flushInbounds
+			// params); on shutdown w.cancel() cancels it, each parked echo aborts fast
+			// via the select and STILL closes `mine`, so the chain drains without
+			// deadlock and no echo goroutine leaks.
+			//
+			// Cross-worker gap (spec CRITIQUE FOLD #6 — benign, documented not fixed):
+			// prevEchoDone orders echoes only within one worker's lifetime. A worker
+			// idle-evicts after defaultWorkerIdle (60s, broker.go) when no jobs arrive;
+			// a detached echo's max backoff is ~6s (readback.go: 3 attempts, ≤3s cap
+			// each), so a pending echo always finishes long before eviction and a
+			// respawned worker's fresh chain never races a still-running prior echo —
+			// the gap is unreachable in practice.
+			prev := w.prevEchoDone
+			mine := make(chan struct{})
+			w.prevEchoDone = mine
 			inCopy := *in
-			go w.echoReadback(&inCopy, transcript)
+			go func(in *c3types.Inbound, transcript string, prev, mine chan struct{}) {
+				defer close(mine) // always advance the chain, even on abort
+				select {
+				case <-prev: // wait for the previous echo to finish → FIFO
+				case <-ctx.Done():
+					return // shutdown: drop; close(mine) unblocks the next
+				}
+				w.echoReadback(in, transcript) // ctx-aware retry aborts fast on shutdown
+			}(&inCopy, transcript, prev, mine)
 		}
 	}
 
