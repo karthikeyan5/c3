@@ -30,15 +30,14 @@ type fakeChannel struct {
 	validateErr     error
 	sendReplyErr    error
 	// editMessages drives Capabilities().EditMessages so a test can opt into
-	// the edit-in-place held-reply path (BUG #3). Default false preserves the
-	// original cooldown-gated fallback behavior for every existing test.
+	// the edit-capable held-notice path. Default false preserves the
+	// cooldown-gated fallback behavior for every existing test.
 	editMessages bool
 	// replyReturnID is the message id SendReply returns (0 by default, matching
-	// the original behavior). A non-zero value lets the held-reply tracker
-	// remember the sent message so later holds EDIT it instead of re-sending.
+	// the original behavior).
 	replyReturnID int64
-	// editErr, when set, makes EditMessage fail so a test can exercise the
-	// "tracked message uneditable → resend" fallback.
+	// editErr, when set, makes EditMessage return an error so a test can exercise
+	// an edit failure.
 	editErr error
 	// caps optionally overrides the channel capability manifest. nil keeps the
 	// historical default (Channel="telegram" + EditMessages from the field above)
