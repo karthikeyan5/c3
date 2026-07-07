@@ -9,20 +9,20 @@ import (
 	"github.com/karthikeyan5/c3/internal/c3types"
 )
 
-// newWiredChannel builds a Channel with the inbound machine, the outbound
-// machine, and the combiner all wired (deterministic shared clock) plus a
-// fakeHost to capture NotifyHealth edges — the production wiring, unlike the
-// bare-struct legacy-path tests in health_wiring_test.go.
+// newWiredChannel builds a Channel with the inbound machine and the combiner
+// (which OWNS the outbound machine) all wired on one deterministic shared clock,
+// plus a fakeHost to capture NotifyHealth edges — the production wiring, unlike
+// the bare-struct legacy-path tests in health_wiring_test.go. The combiner
+// constructs its own outbound-health machine (reach.out) sharing clk.now.
 func newWiredChannel() (*Channel, *fakeHost) {
 	h := &fakeHost{}
 	clk := &fakeClock{t: time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)}
 	c := &Channel{
-		host:      h,
-		cfg:       Config{},
-		ctx:       context.Background(),
-		health:    newFetchHealthWithClock(clk.now),
-		outHealth: newOutboundHealthWithClock(clk.now),
-		reach:     newReachabilityWithClock(clk.now),
+		host:   h,
+		cfg:    Config{},
+		ctx:    context.Background(),
+		health: newFetchHealthWithClock(clk.now),
+		reach:  newReachabilityWithClock(clk.now),
 	}
 	return c, h
 }
@@ -105,7 +105,12 @@ func TestReachability_CombinedEdges(t *testing.T) {
 	if !fire || ev.State != c3types.HealthStateDown || ev.Reason != "inbound unreachable" || ev.Consec != 3 || ev.Channel != Name {
 		t.Fatalf("first inbound-down edge = (%v, %+v), want fire DOWN reason='inbound unreachable' consec=3 channel=telegram", fire, ev)
 	}
-	if fire, _ := r.recordOutbound(true, 2); fire {
+	// Outbound now goes down (2 failure events, downAfter=2) while combined is
+	// already DOWN → the machine flips down but no combined edge fires.
+	if fire, _ := r.outboundFailure("x"); fire {
+		t.Fatal("outbound failure while already combined-DOWN must NOT fire")
+	}
+	if fire, _ := r.outboundFailure("x"); fire {
 		t.Fatal("outbound going down while already combined-DOWN must NOT fire")
 	}
 	// Inbound recovers → wire-proof clears outbound too → combined UP edge fires.
@@ -120,11 +125,17 @@ func TestReachability_CombinedEdges(t *testing.T) {
 func TestReachability_OutboundOnlyDownRecovers(t *testing.T) {
 	clk := &fakeClock{t: time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)}
 	r := newReachabilityWithClock(clk.now)
-	fire, ev := r.recordOutbound(true, 2)
-	if !fire || ev.State != c3types.HealthStateDown || ev.Reason != "outbound send failing" {
-		t.Fatalf("outbound-down edge = (%v, %+v), want fire DOWN reason='outbound send failing'", fire, ev)
+	// First failure event: machine still up (downAfter=2), no combined edge.
+	if fire, _ := r.outboundFailure("x"); fire {
+		t.Fatal("first outbound failure must not fire (downAfter=2)")
 	}
-	fire, ev = r.recordOutbound(false, 0)
+	// Second failure event: machine flips down → combined DOWN edge, consec=2.
+	fire, ev := r.outboundFailure("x")
+	if !fire || ev.State != c3types.HealthStateDown || ev.Reason != "outbound send failing" || ev.Consec != 2 {
+		t.Fatalf("outbound-down edge = (%v, %+v), want fire DOWN reason='outbound send failing' consec=2", fire, ev)
+	}
+	// Success recovers → combined UP edge (last sub clears).
+	fire, ev = r.outboundSuccess()
 	if !fire || ev.State != c3types.HealthStateUp {
 		t.Fatalf("outbound-recovery edge = (%v, %+v), want fire UP", fire, ev)
 	}
@@ -210,7 +221,7 @@ func TestReach_429AndPermanentDoNotDriveOutboundDown(t *testing.T) {
 	if n := len(h.healthEvents()); n != 0 {
 		t.Fatalf("429/permanent sends must never drive outbound DOWN; calls=%d, want 0", n)
 	}
-	if down, consec, _, _, _ := c.outHealth.snapshot(); down || consec != 0 {
+	if down, consec, _, _, _ := c.reach.out.snapshot(); down || consec != 0 {
 		t.Fatalf("429/permanent must not touch the outbound machine; down=%v consec=%d", down, consec)
 	}
 }
@@ -230,7 +241,7 @@ func TestReach_CtxCancelReadbackGiveUp_NoOutboundDown(t *testing.T) {
 	if n := len(h.healthEvents()); n != 0 {
 		t.Fatalf("ctx-cancel give-up must not drive outbound DOWN; calls=%d, want 0", n)
 	}
-	if down, consec, _, _, _ := c.outHealth.snapshot(); down || consec != 0 {
+	if down, consec, _, _, _ := c.reach.out.snapshot(); down || consec != 0 {
 		t.Fatalf("ctx-cancel must not touch the outbound machine; down=%v consec=%d", down, consec)
 	}
 }
@@ -259,36 +270,49 @@ func TestReach_SingleTelegramEntryCombinedState(t *testing.T) {
 
 // --- concurrency (run under -race) -------------------------------------------
 
-// The combiner mutex must serialize concurrent recordInbound/recordOutbound with
-// no data race and no deadlock, and leave a consistent final state.
+// The single combiner mutex must serialize concurrent recordInbound /
+// outboundFailure / outboundSuccess with no data race and no deadlock, and leave
+// BOTH the combined invariant AND the single-source-of-truth invariant intact:
+// combinedDown == inboundDown||outboundDown AND outboundDown == out.down.
 func TestReachability_ConcurrentRecords_NoRace(t *testing.T) {
 	r := newReachability()
 	var wg sync.WaitGroup
 	for i := 0; i < 200; i++ {
 		wg.Add(2)
 		go func(n int) { defer wg.Done(); r.recordInbound(n%2 == 0, n) }(i)
-		go func(n int) { defer wg.Done(); r.recordOutbound(n%3 == 0, n) }(i)
+		go func(n int) {
+			defer wg.Done()
+			if n%3 == 0 {
+				r.outboundFailure("x")
+			} else {
+				r.outboundSuccess()
+			}
+		}(i)
 	}
 	wg.Wait()
 	r.mu.Lock()
-	consistent := r.combinedDown == (r.inboundDown || r.outboundDown)
+	combinedOK := r.combinedDown == (r.inboundDown || r.outboundDown)
+	sotOK := r.outboundDown == r.out.down
 	r.mu.Unlock()
-	if !consistent {
+	if !combinedOK {
 		t.Fatal("combinedDown inconsistent with inboundDown||outboundDown after concurrent records")
+	}
+	if !sotOK {
+		t.Fatal("outboundDown diverged from out.down after concurrent records (single-source-of-truth violated)")
 	}
 }
 
-// The real call shapes — inbound edges (fetchHealth-lock → combiner-lock),
-// outbound failures (outHealth-lock → combiner-lock), and outbound successes —
-// driven concurrently as production does, must be race- and deadlock-free
-// (sub-machine lock taken first, then the combiner lock; never nested).
+// The real call shapes — inbound edges (fetchHealth-lock → combiner-lock) and
+// outbound feeds (combiner-lock, machine owned) — driven concurrently as
+// production does, must be race- and deadlock-free (the inbound sub-machine lock
+// is taken/released BEFORE r.mu; the outbound machine has no lock of its own and
+// is only ever touched under r.mu; never nested).
 func TestReach_ChannelConcurrentFeeds_NoRace(t *testing.T) {
 	c := &Channel{
-		host:      &fakeHost{},
-		ctx:       context.Background(),
-		health:    newFetchHealth(),
-		outHealth: newOutboundHealth(),
-		reach:     newReachability(),
+		host:   &fakeHost{},
+		ctx:    context.Background(),
+		health: newFetchHealth(),
+		reach:  newReachability(),
 	}
 	var wg sync.WaitGroup
 	for i := 0; i < 100; i++ {
@@ -298,4 +322,58 @@ func TestReach_ChannelConcurrentFeeds_NoRace(t *testing.T) {
 		go func() { defer wg.Done(); c.recordOutboundSuccess() }()
 	}
 	wg.Wait()
+}
+
+// REST-STATE-CONSISTENCY (mandatory regression, run under -race -count high):
+// hammer, from many goroutines on a WIRED channel, the three real production
+// drivers — transient outbound failures (feedOutboundFailure), outbound successes
+// (recordOutboundSuccess), and inbound recovery/failure edges (reportHealth) —
+// then, after quiescence, assert under r.mu that the two authoritative invariants
+// HOLD: combinedDown == inboundDown||outboundDown AND outboundDown == out.down.
+//
+// This is the direct regression for the two-lock divergence bugs: on the pre-fix
+// code (outboundHealth.down under its own mutex + reachability.outboundDown under
+// r.mu, combiner derived from the transition) an interleaving leaves the two
+// booleans diverged AT REST (F1 wedge) and this assertion FAILS. On the single-
+// lock fix every outbound op sets outboundDown = out.down under r.mu, so they can
+// never diverge and this PASSES.
+func TestReach_RestStateConsistency_NoDivergence(t *testing.T) {
+	c, _ := newWiredChannel()
+	// Deterministic clock in newWiredChannel keeps timing out of it; the point is
+	// the interleaving of state writes, not wall-clock timing.
+	var wg sync.WaitGroup
+	const workers = 24
+	const iters = 400
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				switch (id + i) % 4 {
+				case 0:
+					c.feedOutboundFailure(rbTGErr(500), "stress transient")
+				case 1:
+					c.recordOutboundSuccess()
+				case 2:
+					c.reportHealth(c.health.RecordFailure("stress inbound"))
+				case 3:
+					c.reportHealth(c.health.RecordSuccess())
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	// Assert the invariants at rest, under the single lock that owns ALL of this
+	// state (r.mu covers inboundDown, outboundDown, combinedDown, AND r.out).
+	c.reach.mu.Lock()
+	combinedOK := c.reach.combinedDown == (c.reach.inboundDown || c.reach.outboundDown)
+	sotOK := c.reach.outboundDown == c.reach.out.down
+	inDown, outDown, comb, machDown := c.reach.inboundDown, c.reach.outboundDown, c.reach.combinedDown, c.reach.out.down
+	c.reach.mu.Unlock()
+	if !combinedOK {
+		t.Fatalf("combined invariant violated at rest: combinedDown=%v want inboundDown(%v)||outboundDown(%v)", comb, inDown, outDown)
+	}
+	if !sotOK {
+		t.Fatalf("single-source-of-truth violated at rest: outboundDown=%v but out.down=%v (the two-lock divergence bug)", outDown, machDown)
+	}
 }

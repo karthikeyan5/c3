@@ -1,7 +1,6 @@
 package telegram
 
 import (
-	"sync"
 	"time"
 )
 
@@ -10,6 +9,16 @@ import (
 // there is NO silence watchdog, because outbound is event-driven — it only has
 // an opinion when we actually try to send. A quiet night with no sends says
 // nothing about outbound reachability, so silence is never a signal here.
+//
+// NOT internally synchronized — the reachability combiner owns this instance and
+// calls every method while holding reach.mu. This is the single-lock, single-
+// source-of-truth fix (2026-07-07): outbound down-state used to live in TWO
+// booleans (this machine's `down` under its own mutex + reachability.outboundDown
+// under r.mu) updated non-atomically across two locks, which let them diverge
+// permanently (a stuck-DOWN wedge, and a masked outage). By removing this mutex
+// and having the combiner drive every op under r.mu, the machine op + the
+// combiner recompute are ATOMIC and reachability.outboundDown is always set
+// `= out.down` (authoritative), so the two can never diverge.
 //
 // downAfter is measured in distinct FAILURE EVENTS, not raw attempts: a readback
 // give-up is ALREADY 3 retried attempts collapsed into one give-up event, while
@@ -23,7 +32,6 @@ import (
 // caller fires the combined notification EXACTLY ONCE per edge — never while
 // already DOWN, never on a repeated success while already UP.
 type outboundHealth struct {
-	mu          sync.Mutex
 	down        bool
 	consecFails int
 	since       time.Time // when the current state was entered
@@ -38,13 +46,9 @@ type outboundHealth struct {
 // doc for the rationale behind 2.
 const defaultOutboundDownAfter = 2
 
-// newOutboundHealth returns an outbound-health machine on the wall clock,
-// starting UP.
-func newOutboundHealth() *outboundHealth {
-	return newOutboundHealthWithClock(time.Now)
-}
-
-// newOutboundHealthWithClock is the test seam — inject a deterministic clock.
+// newOutboundHealthWithClock constructs an outbound-health machine on the given
+// clock, starting UP. The reachability combiner OWNS the instance and shares its
+// own clock (see newReachabilityWithClock); tests inject a deterministic clock.
 func newOutboundHealthWithClock(now func() time.Time) *outboundHealth {
 	return &outboundHealth{
 		since:     now(),
@@ -58,8 +62,6 @@ func newOutboundHealthWithClock(now func() time.Time) *outboundHealth {
 // by the caller. Returns healthWentDown only on the UP→DOWN edge; further
 // failures while DOWN return healthNoChange (de-spam).
 func (o *outboundHealth) RecordFailure(reason string) healthTransition {
-	o.mu.Lock()
-	defer o.mu.Unlock()
 	o.consecFails++
 	o.lastReason = reason
 	if o.down {
@@ -77,8 +79,6 @@ func (o *outboundHealth) RecordFailure(reason string) healthTransition {
 // currently DOWN, returns healthRecovered (the first success wins recovery — no
 // debounce). A success while UP is healthNoChange.
 func (o *outboundHealth) RecordSuccess() healthTransition {
-	o.mu.Lock()
-	defer o.mu.Unlock()
 	o.consecFails = 0
 	if o.down {
 		o.down = false
@@ -96,8 +96,6 @@ func (o *outboundHealth) RecordSuccess() healthTransition {
 // waiting for a send to confirm. It NEVER fires a notification itself — the
 // combiner owns the combined edge.
 func (o *outboundHealth) ForceReset() {
-	o.mu.Lock()
-	defer o.mu.Unlock()
 	o.down = false
 	o.consecFails = 0
 	o.lastReason = ""
@@ -105,10 +103,9 @@ func (o *outboundHealth) ForceReset() {
 }
 
 // snapshot returns the current state for building a combined HealthEvent /
-// logging. Caller holds no lock; this takes it.
+// logging. NOT internally synchronized — the caller must hold reach.mu (the
+// combiner owns this instance; see the type doc).
 func (o *outboundHealth) snapshot() (down bool, consec int, since time.Time, reason string, downFor time.Duration) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
 	df := time.Duration(0)
 	if o.down {
 		df = o.now().Sub(o.since)

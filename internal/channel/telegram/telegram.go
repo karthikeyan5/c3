@@ -161,17 +161,15 @@ type Channel struct {
 	// ONE telegram status-line entry.
 	health *fetchHealth
 
-	// outHealth is the outbound analogue of health: "can we SEND to Telegram
-	// after retries?". Fed at exactly two failure sites (SendReply transient
-	// error + readback give-up) and the shared success hook — never the
-	// per-attempt recordOutboundErr (see outboundhealth.go / feedOutboundFailure).
-	outHealth *outboundHealth
-
-	// reach combines health (inbound) + outHealth (outbound) into the single
+	// reach combines health (inbound) with the outbound-health machine it OWNS
+	// (reach.out — "can we SEND to Telegram after retries?") into the single
 	// telegram reachability state that reaches host.NotifyHealth. It is the ONLY
 	// place NotifyHealth is fired for this channel, so inbound-down and
-	// outbound-down for one root cause produce ONE notification, not two. See
-	// reachability.go.
+	// outbound-down for one root cause produce ONE notification, not two. The
+	// combiner owns the outbound machine (single lock, single source of truth —
+	// see reachability.go); outbound is fed at exactly two failure sites (SendReply
+	// transient error + readback give-up) and the shared success hook, never the
+	// per-attempt recordOutboundErr (see feedOutboundFailure).
 	reach *reachability
 
 	// pollDone is closed when pollLoop returns. pollLoop now exits ONLY on
@@ -319,8 +317,7 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 	c.host = host
 	c.authBrk = newAuthBreaker(auth401Threshold)
 	c.health = newFetchHealth()
-	c.outHealth = newOutboundHealth()
-	c.reach = newReachability()
+	c.reach = newReachability() // constructs its own owned outbound-health machine
 	c.dedup = newUpdateDedup(2000, 5*time.Minute)
 	c.rate = newRateLimiter()
 	c.sentPolls = newSentPollMap(2000)
@@ -471,27 +468,26 @@ func (c *Channel) reportHealth(tr healthTransition) {
 		c.notifyInboundDirect(tr)
 		return
 	}
-	// Combiner path (production): map the inbound edge to a down-bool and let the
-	// reachability combiner decide whether the COMBINED telegram state flipped.
-	_, consec, _, reason, _, lastSuccess := c.health.snapshot()
-	switch tr {
-	case healthWentDown:
+	// Combiner path (production): pass fetchHealth's FRESH AUTHORITATIVE down-bool
+	// (snapshot().down) — NOT a bool derived from the transition edge — to the
+	// combiner, so the last writer always reconciles inbound state and no stale
+	// edge can wedge it. The combiner recomputes the COMBINED telegram state and
+	// fires only on the combined edge. On recovery the wire-proof outbound reset
+	// now lives INSIDE recordInbound (atomic under r.mu), so there is no separate
+	// ForceReset call here.
+	down, consec, _, reason, _, lastSuccess := c.health.snapshot()
+	// Key the log to the AUTHORITATIVE `down`, not the transition, for honesty: a
+	// concurrent edge could have flipped the machine back by the time we snapshot,
+	// and we must never log "DOWN" for a machine that reads up (or vice versa).
+	if down {
 		c.host.Logf("telegram: INBOUND fetch DOWN — cannot reach Telegram to fetch updates (consec=%d, reason=%s).",
 			consec, reason)
-		if fire, ev := c.reach.recordInbound(true, consec); fire {
-			c.fireCombined(ev)
-		}
-	case healthRecovered:
+	} else {
 		c.host.Logf("telegram: INBOUND fetch RECOVERED — Telegram reachable again (last success %s).",
 			lastSuccess.Format("15:04:05"))
-		// Wire-proof: a healthy getUpdates proves the wire+token work, so reset
-		// the outbound machine (ForceReset takes ITS OWN lock, released before we
-		// enter the combiner lock — sequential, non-nested). recordInbound(false)
-		// also clears the combiner's outboundDown bool.
-		c.outHealth.ForceReset()
-		if fire, ev := c.reach.recordInbound(false, consec); fire {
-			c.fireCombined(ev)
-		}
+	}
+	if fire, ev := c.reach.recordInbound(down, consec); fire {
+		c.fireCombined(ev)
 	}
 }
 
@@ -521,48 +517,26 @@ func (c *Channel) notifyInboundDirect(tr healthTransition) {
 	c.host.NotifyHealth(ev)
 }
 
-// reportOutbound routes an outbound-health transition through the SAME combiner,
-// firing host.NotifyHealth ONLY when the COMBINED telegram reachability state
-// flips. Symmetric to reportHealth's combiner path; healthNoChange is a no-op.
-// Runs on the route-worker goroutine (SendReply) and detached echo goroutines
-// (readback) — the combiner mutex serializes it against inbound updates.
-func (c *Channel) reportOutbound(tr healthTransition) {
-	if tr == healthNoChange || c.reach == nil || c.outHealth == nil {
-		return
-	}
-	_, consec, _, reason, _ := c.outHealth.snapshot()
-	switch tr {
-	case healthWentDown:
-		c.host.Logf("telegram: OUTBOUND sends failing after retries (consec=%d, reason=%s).",
-			consec, reason)
-		if fire, ev := c.reach.recordOutbound(true, consec); fire {
-			c.fireCombined(ev)
-		}
-	case healthRecovered:
-		c.host.Logf("telegram: OUTBOUND sends succeeding again.")
-		if fire, ev := c.reach.recordOutbound(false, consec); fire {
-			c.fireCombined(ev)
-		}
-	}
-}
-
-// feedOutboundFailure feeds ONE outbound failure EVENT into the outbound-health
-// machine, but ONLY for a genuine transient (network/timeout/5xx) failure. A
-// permanent error (401/403/4xx — the token breaker's job), a format error, and
-// a 429 rate-limit (a reachable server pushing back, mirroring inbound's 429
-// handling) are NOT outbound-DOWN signals and are skipped. It is called at
-// EXACTLY two sites — the SendReply text error path and the readback give-up —
-// NEVER inside the shared per-attempt recordOutboundErr (CRITIQUE FOLD #2: that
-// would multi-count a single give-up's retries and defeat the downAfter
-// debounce).
+// feedOutboundFailure feeds ONE outbound failure EVENT into the combiner-owned
+// outbound-health machine, but ONLY for a genuine transient (network/timeout/5xx)
+// failure. A permanent error (401/403/4xx — the token breaker's job), a format
+// error, and a 429 rate-limit (a reachable server pushing back, mirroring
+// inbound's 429 handling) are NOT outbound-DOWN signals and are skipped. It is
+// called at EXACTLY two sites — the SendReply text error path and the readback
+// give-up — NEVER inside the shared per-attempt recordOutboundErr (CRITIQUE FOLD
+// #2: that would multi-count a single give-up's retries and defeat the downAfter
+// debounce). The combiner drives the machine + recompute atomically under r.mu,
+// firing host.NotifyHealth only on the COMBINED edge.
 func (c *Channel) feedOutboundFailure(err error, reason string) {
-	if c.outHealth == nil || c.reach == nil || err == nil {
+	if c.reach == nil || err == nil {
 		return
 	}
 	if class, _ := classifyError(err); class != errClassTransient {
 		return
 	}
-	c.reportOutbound(c.outHealth.RecordFailure(reason))
+	if fire, ev := c.reach.outboundFailure(reason); fire {
+		c.fireCombined(ev)
+	}
 }
 
 // fireCombined logs the combined telegram reachability edge and fans it out via

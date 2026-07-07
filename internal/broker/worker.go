@@ -451,7 +451,13 @@ func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inboun
 			w.prevEchoDone = mine
 			inCopy := *in
 			go func(in *c3types.Inbound, transcript string, prev, mine chan struct{}) {
-				defer close(mine) // always advance the chain, even on abort
+				// Deferred LIFO: close(mine) is registered FIRST so it runs LAST —
+				// the chain always advances even if the readback path panics.
+				// recoverGoroutine is registered SECOND so it runs FIRST, recovering
+				// a panic (which in any goroutine would otherwise crash the whole
+				// broker) before close(mine) unblocks the next echo.
+				defer close(mine)
+				defer recoverGoroutine("echoReadback")
 				select {
 				case <-prev: // wait for the previous echo to finish → FIFO
 				case <-ctx.Done():

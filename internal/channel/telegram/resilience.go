@@ -367,7 +367,9 @@ func (c *Channel) recordOutboundSuccess() {
 	if c.authBrk != nil {
 		c.authBrk.RecordSuccess()
 	}
-	if c.outHealth != nil && c.reach != nil {
-		c.reportOutbound(c.outHealth.RecordSuccess())
+	if c.reach != nil {
+		if fire, ev := c.reach.outboundSuccess(); fire {
+			c.fireCombined(ev)
+		}
 	}
 }
