@@ -50,6 +50,7 @@ type NotificationsConfig struct {
 
 // InvasiveNotifications reports whether invasive health notifications (desktop
 // popup + CLI fallback) are enabled. Absent config ⇒ true (preserve behavior).
+// retained; health no longer uses invasive notifications
 func (mf *MappingsFile) InvasiveNotifications() bool {
 	if mf == nil || mf.Notifications == nil || mf.Notifications.Invasive == nil {
 		return true

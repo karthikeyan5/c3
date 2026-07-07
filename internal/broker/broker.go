@@ -79,6 +79,7 @@ type Broker struct {
 	// Snapshotted once at broker start (the launching shell carries the desktop
 	// session env). One of the out-of-band health sinks; never blocks/crashes.
 	// An interface so tests can inject a fake (real impl: *desktopNotifier).
+	// desktop notifications removed 2026-07-07 per maintainer; retained dormant, health surfaces only on the status line
 	desktopNotifier healthNotifier
 
 	// healthMu guards lastHealth — the most recent HealthEvent per channel,
@@ -120,7 +121,7 @@ func New(mf *mappings.MappingsFile) *Broker {
 		ctx:                ctx,
 		cancel:             cancel,
 		channels:           map[string]*channelRegistration{},
-		desktopNotifier:    newDesktopNotifier(),
+		desktopNotifier:    newDesktopNotifier(), // desktop notifications removed 2026-07-07 per maintainer; retained dormant, health surfaces only on the status line
 		lastHealth:         map[string]c3types.HealthEvent{},
 		sessionPIDResolver: proctree.CLISessionPID,
 	}

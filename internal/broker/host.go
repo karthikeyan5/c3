@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"strings"
 	"time"
 
 	"github.com/karthikeyan5/c3/internal/c3types"
@@ -107,12 +106,14 @@ func (h *BrokerHost) GateInbound(in *c3types.Inbound) channel.GateInboundDecisio
 
 func (h *BrokerHost) NotifyHealth(ev c3types.HealthEvent) {
 	// --- Ambient tier: always on, synchronous, never gated. ---
+	// Health edges surface ONLY on the ambient status line — no desktop popup,
+	// no CLI in-session broadcast (removed 2026-07-07 per maintainer).
 	// (c) status cache for `c3-broker status`.
 	h.broker.setLastHealth(ev)
 
 	// (d) broker log — one loud edge line.
 	if ev.State == c3types.HealthStateDown {
-		log.Printf("HEALTH chan=%s state=DOWN since=%s consec=%d reason=%q — inbound offline; desktop primary, CLI fallback, status line",
+		log.Printf("HEALTH chan=%s state=DOWN since=%s consec=%d reason=%q — inbound offline; surfaced on the status line",
 			ev.Channel, ev.Since.Format("15:04:05"), ev.Consec, ev.Reason)
 	} else {
 		log.Printf("HEALTH chan=%s state=UP (recovered, was down %s) — inbound restored",
@@ -121,70 +122,6 @@ func (h *BrokerHost) NotifyHealth(ev c3types.HealthEvent) {
 
 	// (e) status file the Claude Code status line reads.
 	h.broker.WriteHealthFile()
-
-	// --- Invasive tier: desktop popup primary, CLI broadcast fallback. ---
-	// Gated by notifications.invasive (default true). Read the toggle ONCE
-	// here (a single atomic snapshot load) — never inside the goroutine, so a
-	// concurrent SIGHUP SetMappings can't tear the read.
-	if !h.broker.Mappings().InvasiveNotifications() {
-		return
-	}
-
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("health-notify: invasive sink panic recovered: %v", r)
-			}
-		}()
-		// Desktop popup is the primary surface.
-		delivered := false
-		if h.broker.desktopNotifier != nil {
-			delivered = h.broker.desktopNotifier.Notify(ev)
-		}
-		// CLI turn-injection is the FALLBACK: only when the popup did not
-		// deliver, and only on a DOWN edge. Recovery never injects into the
-		// CLI — the status line clearing is the closure.
-		if !delivered && ev.State == c3types.HealthStateDown {
-			// desktopNotifier.Notify above can block up to 2s; a recovery edge
-			// may have landed meanwhile. Recovery never injects to the CLI, so a
-			// stale DOWN advisory would never be retracted — suppress it if the
-			// channel is no longer down. lastHealth is compare-and-skip ordered
-			// (setLastHealth), so this reflects the latest edge.
-			if cur, ok := h.broker.lastHealthSnapshot()[ev.Channel]; !ok || cur.State != c3types.HealthStateDown {
-				return
-			}
-			h.broker.broadcastSystemEvent(systemEventForHealth(ev, true))
-		}
-	}()
-}
-
-// systemEventForHealth renders a channel-neutral SystemEvent advisory for a
-// health edge. The message is operational (no user content); it tells the agent
-// whether phone messages will arrive. Level is "warn" for DOWN, "info" for UP.
-func systemEventForHealth(ev c3types.HealthEvent, desktopUnavailable bool) *c3types.SystemEvent {
-	ch := ev.Channel
-	if ch == "" {
-		ch = "channel"
-	}
-	if ev.State == c3types.HealthStateDown {
-		msg := fmt.Sprintf("Cannot reach %s since %s (%d consecutive %s). Your phone messages won't arrive until this recovers.",
-			ch, ev.Since.Format("15:04"), ev.Consec, strings.TrimSpace(ev.Reason))
-		if desktopUnavailable {
-			msg += " (desktop notification unavailable — shown here instead)"
-		}
-		return &c3types.SystemEvent{
-			Source:  ev.Channel,
-			Level:   "warn",
-			Title:   fmt.Sprintf("%s fetch DOWN", ch),
-			Message: msg,
-		}
-	}
-	return &c3types.SystemEvent{
-		Source:  ev.Channel,
-		Level:   "info",
-		Title:   fmt.Sprintf("%s fetch RECOVERED", ch),
-		Message: fmt.Sprintf("%s is reachable again (was down %s). Phone messages will arrive normally now.", ch, ev.DownFor.Round(time.Second)),
-	}
 }
 
 // broadcastSystemEvent writes a broker-originated system InboundEvent to EVERY
@@ -196,8 +133,10 @@ func systemEventForHealth(ev c3types.HealthEvent, desktopUnavailable bool) *c3ty
 // — it carries no user content and is not user input, so the default-deny
 // allowlist (which exists to keep STRANGERS' messages out) does not apply. This
 // path must NEVER be used to deliver anything user-sourced; user inbound ALWAYS
-// goes through host.Emit → GateInbound. The only producer of these events is
-// NotifyHealth, deep inside the broker.
+// goes through host.Emit → GateInbound. The producers of these events are
+// broker-internal advisories (currently the update-restart notice,
+// notifyUpdateRestart in update.go); health edges no longer broadcast — they
+// surface only on the ambient status line.
 //
 // Delivery is a direct write to each alive stub's conn (mirrors the worker's
 // forwardOrFallback write), best-effort per conn: a failed write to one session
