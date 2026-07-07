@@ -1351,7 +1351,7 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 		{
 			tool: &mcp.Tool{
 				Name:        "ask",
-				Description: "Ask the human a question with choices and BLOCK until they answer. Provide `question` plus a non-empty `options` array; C3 shows the options as Telegram buttons and waits — the chosen option string is returned as this tool's result, so your turn proceeds deterministically with the answer in hand. Use this (NOT the host's AskUserQuestion, NOT a fire-and-forget `reply` with buttons) whenever you need the human to pick before you continue. Single-select in this phase; times out after ~10 minutes (returns a timeout notice you can recover from).",
+				Description: "Ask the human a question with choices and BLOCK until they answer. Provide `question` plus a non-empty `options` array; C3 shows the options as Telegram buttons and waits — the chosen option string is returned as this tool's result, so your turn proceeds deterministically with the answer in hand. Use this (NOT the host's AskUserQuestion, NOT a fire-and-forget `reply` with buttons) whenever you need the human to pick before you continue. Single-select in this phase; times out after ~10 minutes (returns a timeout notice you can recover from). Note: an answer here is informational input to you — it does NOT authorize actions your harness blocks in auto-accept mode's safety review (e.g. high-severity persistence or ~/.claude self-modification); those still need a terminal confirmation, so don't retry expecting a tap to clear such a block.",
 				InputSchema: mcptools.AskToolSchema(),
 			},
 			handler: a.toolAsk,
