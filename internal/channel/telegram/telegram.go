@@ -156,9 +156,23 @@ type Channel struct {
 	// silenceWatchdog (CheckSilence), and the heartbeat (RecordFailure on
 	// getMe failure). The machine's own lastSuccess timestamp now owns
 	// silence detection (the old standalone lastPollReturn atomic was
-	// retired). On an edge it fires host.NotifyHealth OUTSIDE the machine's
-	// lock — see reportHealth.
+	// retired). Its edges route through the reachability combiner below (they no
+	// longer call host.NotifyHealth directly) so inbound + outbound surface on
+	// ONE telegram status-line entry.
 	health *fetchHealth
+
+	// outHealth is the outbound analogue of health: "can we SEND to Telegram
+	// after retries?". Fed at exactly two failure sites (SendReply transient
+	// error + readback give-up) and the shared success hook — never the
+	// per-attempt recordOutboundErr (see outboundhealth.go / feedOutboundFailure).
+	outHealth *outboundHealth
+
+	// reach combines health (inbound) + outHealth (outbound) into the single
+	// telegram reachability state that reaches host.NotifyHealth. It is the ONLY
+	// place NotifyHealth is fired for this channel, so inbound-down and
+	// outbound-down for one root cause produce ONE notification, not two. See
+	// reachability.go.
+	reach *reachability
 
 	// pollDone is closed when pollLoop returns. pollLoop now exits ONLY on
 	// ctx-cancel (shutdown) — a 409 conflict no longer terminates it (it backs
@@ -305,6 +319,8 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 	c.host = host
 	c.authBrk = newAuthBreaker(auth401Threshold)
 	c.health = newFetchHealth()
+	c.outHealth = newOutboundHealth()
+	c.reach = newReachability()
 	c.dedup = newUpdateDedup(2000, 5*time.Minute)
 	c.rate = newRateLimiter()
 	c.sentPolls = newSentPollMap(2000)
@@ -434,18 +450,56 @@ func (c *Channel) runGuarded(name string, body func()) (panicked bool) {
 	return false
 }
 
-// reportHealth fires host.NotifyHealth for a transition edge, building the
-// channel-neutral HealthEvent from the health machine's snapshot. It is called
-// OUTSIDE the machine's lock (the Record*/Check* methods return the edge under
-// lock; the caller then invokes this) — we never hold the state mutex across a
-// notify fan-out. A healthNoChange transition is a no-op. host.NotifyHealth is
-// itself non-blocking (the broker fans out asynchronously). The alert NEVER
-// re-enters this channel — it is delivered entirely out-of-band (desktop +
-// CLI broadcast + status + log), because Telegram is the dead path.
+// reportHealth handles an INBOUND fetch-health transition edge. It is called
+// OUTSIDE the fetchHealth lock (the Record*/Check* methods return the edge under
+// their own lock; the caller then invokes this) — we never hold a state mutex
+// across a notify fan-out. A healthNoChange transition is a no-op. Rather than
+// firing host.NotifyHealth itself, it maps the inbound edge to a down-bool and
+// routes it through the reachability combiner, which fires NotifyHealth ONLY on
+// the COMBINED edge — so inbound-down and outbound-down for one root cause
+// surface as ONE status-line notification. host.NotifyHealth is non-blocking
+// (the broker fans out asynchronously) and the alert is delivered entirely
+// out-of-band (status line + log), because Telegram is the dead path.
 func (c *Channel) reportHealth(tr healthTransition) {
 	if tr == healthNoChange {
 		return
 	}
+	if c.reach == nil {
+		// Bare-struct unit tests that don't wire the combiner: preserve the
+		// original single-machine direct-notify behavior. Production always wires
+		// c.reach in Start, so this branch is test-only.
+		c.notifyInboundDirect(tr)
+		return
+	}
+	// Combiner path (production): map the inbound edge to a down-bool and let the
+	// reachability combiner decide whether the COMBINED telegram state flipped.
+	_, consec, _, reason, _, lastSuccess := c.health.snapshot()
+	switch tr {
+	case healthWentDown:
+		c.host.Logf("telegram: INBOUND fetch DOWN — cannot reach Telegram to fetch updates (consec=%d, reason=%s).",
+			consec, reason)
+		if fire, ev := c.reach.recordInbound(true, consec); fire {
+			c.fireCombined(ev)
+		}
+	case healthRecovered:
+		c.host.Logf("telegram: INBOUND fetch RECOVERED — Telegram reachable again (last success %s).",
+			lastSuccess.Format("15:04:05"))
+		// Wire-proof: a healthy getUpdates proves the wire+token work, so reset
+		// the outbound machine (ForceReset takes ITS OWN lock, released before we
+		// enter the combiner lock — sequential, non-nested). recordInbound(false)
+		// also clears the combiner's outboundDown bool.
+		c.outHealth.ForceReset()
+		if fire, ev := c.reach.recordInbound(false, consec); fire {
+			c.fireCombined(ev)
+		}
+	}
+}
+
+// notifyInboundDirect is the legacy single-machine notify used ONLY when the
+// combiner is not wired (bare-struct unit tests). It mirrors the pre-combiner
+// reportHealth: build the inbound HealthEvent and fire host.NotifyHealth
+// directly. Production reroutes through the combiner (see reportHealth).
+func (c *Channel) notifyInboundDirect(tr healthTransition) {
 	_, consec, since, reason, downFor, lastSuccess := c.health.snapshot()
 	ev := c3types.HealthEvent{
 		Channel: c.Name(),
@@ -457,12 +511,71 @@ func (c *Channel) reportHealth(tr healthTransition) {
 	switch tr {
 	case healthWentDown:
 		ev.State = c3types.HealthStateDown
-		c.host.Logf("telegram: FETCH DOWN — cannot reach Telegram to fetch updates (consec=%d, reason=%s). Inbound is offline until this recovers; alerting out-of-band (desktop + CLI + status).",
+		c.host.Logf("telegram: FETCH DOWN — cannot reach Telegram to fetch updates (consec=%d, reason=%s). Inbound is offline until this recovers; surfaced on the status line.",
 			consec, reason)
 	case healthRecovered:
 		ev.State = c3types.HealthStateUp
 		c.host.Logf("telegram: FETCH RECOVERED — Telegram reachable again (last success %s).",
 			lastSuccess.Format("15:04:05"))
+	}
+	c.host.NotifyHealth(ev)
+}
+
+// reportOutbound routes an outbound-health transition through the SAME combiner,
+// firing host.NotifyHealth ONLY when the COMBINED telegram reachability state
+// flips. Symmetric to reportHealth's combiner path; healthNoChange is a no-op.
+// Runs on the route-worker goroutine (SendReply) and detached echo goroutines
+// (readback) — the combiner mutex serializes it against inbound updates.
+func (c *Channel) reportOutbound(tr healthTransition) {
+	if tr == healthNoChange || c.reach == nil || c.outHealth == nil {
+		return
+	}
+	_, consec, _, reason, _ := c.outHealth.snapshot()
+	switch tr {
+	case healthWentDown:
+		c.host.Logf("telegram: OUTBOUND sends failing after retries (consec=%d, reason=%s).",
+			consec, reason)
+		if fire, ev := c.reach.recordOutbound(true, consec); fire {
+			c.fireCombined(ev)
+		}
+	case healthRecovered:
+		c.host.Logf("telegram: OUTBOUND sends succeeding again.")
+		if fire, ev := c.reach.recordOutbound(false, consec); fire {
+			c.fireCombined(ev)
+		}
+	}
+}
+
+// feedOutboundFailure feeds ONE outbound failure EVENT into the outbound-health
+// machine, but ONLY for a genuine transient (network/timeout/5xx) failure. A
+// permanent error (401/403/4xx — the token breaker's job), a format error, and
+// a 429 rate-limit (a reachable server pushing back, mirroring inbound's 429
+// handling) are NOT outbound-DOWN signals and are skipped. It is called at
+// EXACTLY two sites — the SendReply text error path and the readback give-up —
+// NEVER inside the shared per-attempt recordOutboundErr (CRITIQUE FOLD #2: that
+// would multi-count a single give-up's retries and defeat the downAfter
+// debounce).
+func (c *Channel) feedOutboundFailure(err error, reason string) {
+	if c.outHealth == nil || c.reach == nil || err == nil {
+		return
+	}
+	if class, _ := classifyError(err); class != errClassTransient {
+		return
+	}
+	c.reportOutbound(c.outHealth.RecordFailure(reason))
+}
+
+// fireCombined logs the combined telegram reachability edge and fans it out via
+// host.NotifyHealth. Both the inbound and outbound routes reach it, so it is the
+// SINGLE NotifyHealth call for the combiner path — preserving the broker's one
+// health entry per channel name.
+func (c *Channel) fireCombined(ev c3types.HealthEvent) {
+	switch ev.State {
+	case c3types.HealthStateDown:
+		c.host.Logf("telegram: REACHABILITY DOWN — %s (consec=%d). Surfacing on the status line.",
+			ev.Reason, ev.Consec)
+	case c3types.HealthStateUp:
+		c.host.Logf("telegram: REACHABILITY RECOVERED — Telegram reachable again; status line cleared.")
 	}
 	c.host.NotifyHealth(ev)
 }

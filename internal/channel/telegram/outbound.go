@@ -119,6 +119,11 @@ func (c *Channel) SendReply(args c3types.ReplyArgs) (int64, error) {
 	}
 	if err != nil {
 		c.recordOutboundErr(err)
+		// Outbound-health feed site #1 (CRITIQUE FOLD #2): a single un-retried
+		// SendReply failure. feedOutboundFailure counts it ONLY if it is a genuine
+		// transient (not permanent / format / 429). This is NOT inside the shared
+		// recordOutboundErr, which fires per-attempt and would multi-count.
+		c.feedOutboundFailure(err, "SendReply transient send error")
 		return 0, fmt.Errorf("telegram: SendMessage: %w", err)
 	}
 	c.recordOutboundSuccess()

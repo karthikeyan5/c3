@@ -423,6 +423,13 @@ func (c *Channel) retryReadbackSend(send func() (int64, error)) (int64, error) {
 	}
 	c.host.Logf("telegram: readback PERMANENTLY dropped after %d transient-failed attempts "+
 		"(transcript echo lost; agent already has the text): %v", readbackRetryMaxAttempts, lastErr)
+	// Outbound-health feed site #2 (CRITIQUE FOLD #2 + #4): a readback give-up is
+	// ONE failure event (already 3 retried attempts). feedOutboundFailure counts
+	// it ONLY if lastErr is a genuine transient — a pure-429 exhaustion (429s are
+	// retried by retryReadbackSend) must NOT drive outbound-DOWN, since 429 = a
+	// reachable server pushing back. The ctx-cancel early return above (normal
+	// shutdown) never reaches here.
+	c.feedOutboundFailure(lastErr, "readback send exhausted retries")
 	return 0, lastErr
 }
 

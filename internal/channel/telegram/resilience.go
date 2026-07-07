@@ -359,9 +359,15 @@ func (c *Channel) recordOutboundErr(err error) {
 }
 
 // recordOutboundSuccess clears the auth breaker. Any successful API call is
-// proof the token still works.
+// proof the token still works. It ALSO drives the outbound-health machine's
+// success (through the combiner, so it fires a RECOVERED notification only on
+// the combined edge). Feeding SUCCESS via this shared hook is safe (CRITIQUE
+// FOLD #2) — only the FAILURE feed must avoid the shared per-attempt path.
 func (c *Channel) recordOutboundSuccess() {
 	if c.authBrk != nil {
 		c.authBrk.RecordSuccess()
+	}
+	if c.outHealth != nil && c.reach != nil {
+		c.reportOutbound(c.outHealth.RecordSuccess())
 	}
 }
