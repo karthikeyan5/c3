@@ -64,12 +64,14 @@ const permNoOperatorHint = "⚠️ No operator is DM-paired yet — Allow/Deny t
 
 // pendingPerm is one relayed, not-yet-resolved permission prompt awaiting a tap.
 // Registered BEFORE the keyboard is sent (the fast-tap race) and removed
-// atomically on resolution (resolve-once). toolName is kept so the outcome edit
-// can name the tool ("🔐 <tool>: ✅ Allowed").
+// atomically on resolution (resolve-once). toolName + preview are kept so the
+// resolve/expiry edit can RETAIN the original request context (what was asked)
+// and append a timestamped verdict line, rather than collapsing the message.
 type pendingPerm struct {
 	requestID string
 	route     RouteKey
 	toolName  string
+	preview   string
 	messageID int64
 
 	// createdAt is when the perm was registered, stamped by register. The reaper
@@ -278,7 +280,7 @@ func (b *Broker) resolvePerm(route RouteKey, cb *c3types.CallbackEvent) bool {
 	}
 	b.deliverPermVerdict(route, requestID, behavior)
 	b.answerPermCallback(route, cb.CallbackID, permOutcomeText(p.toolName, behavior), false)
-	b.editPermMessage(route, requestID, p.messageID, permOutcomeText(p.toolName, behavior), [][]c3types.Button{})
+	b.editPermMessage(route, requestID, p.messageID, permResolvedText(p.toolName, p.preview, behavior, time.Now()), [][]c3types.Button{})
 	log.Printf("perm RESOLVED chan=%s chat=%d topic=%s id=%s tool=%s behavior=%s actor=%d",
 		route.Channel, route.ChatID, TopicKeyStr(route), requestID, p.toolName, behavior, cb.Actor.UserID)
 	return true
@@ -359,7 +361,7 @@ func (b *Broker) registerPerm(p *pendingPerm) bool {
 	if evicted != nil {
 		log.Printf("perm EVICTED chan=%s chat=%d topic=%s id=%s reason=cap(max=%d) — clearing keyboard",
 			evicted.route.Channel, evicted.route.ChatID, TopicKeyStr(evicted.route), evicted.requestID, maxPendingPerms)
-		b.editPermMessage(evicted.route, evicted.requestID, evicted.messageID, permExpiredText(evicted.toolName), [][]c3types.Button{})
+		b.editPermMessage(evicted.route, evicted.requestID, evicted.messageID, permExpiredText(evicted.toolName, evicted.preview, time.Now()), [][]c3types.Button{})
 	}
 	return ok
 }
@@ -379,7 +381,7 @@ func (b *Broker) sweepExpiredPerms() {
 	for _, p := range expired {
 		log.Printf("perm EXPIRED chan=%s chat=%d topic=%s id=%s reason=ttl",
 			p.route.Channel, p.route.ChatID, TopicKeyStr(p.route), p.requestID)
-		b.editPermMessage(p.route, p.requestID, p.messageID, permExpiredText(p.toolName), [][]c3types.Button{})
+		b.editPermMessage(p.route, p.requestID, p.messageID, permExpiredText(p.toolName, p.preview, time.Now()), [][]c3types.Button{})
 	}
 }
 
@@ -394,8 +396,9 @@ func permPromptText(tool, preview string) string {
 	return head + "\n\n" + preview
 }
 
-// permOutcomeText renders the post-verdict body recorded on the message after the
-// keyboard clears: "🔐 <tool>: ✅ Allowed" / "❌ Denied".
+// permOutcomeText renders the short per-tap toast answered back to the tapper's
+// client (answerPermCallback): "🔐 <tool>: ✅ Allowed" / "❌ Denied". This is the
+// tiny callback-answer popup, NOT the durable message body — see permResolvedText.
 func permOutcomeText(tool, behavior string) string {
 	verdict := "✅ Allowed"
 	if behavior == "deny" {
@@ -407,12 +410,22 @@ func permOutcomeText(tool, behavior string) string {
 	return "🔐 " + tool + ": " + verdict
 }
 
-// permExpiredText renders the post-expiry/eviction body so the Telegram view
-// records that nothing was captured after the keyboard clears.
-func permExpiredText(tool string) string {
-	const notice = "⌛ Permission expired — no verdict recorded"
-	if strings.TrimSpace(tool) == "" {
-		return notice
+// permResolvedText renders the DURABLE post-verdict body edited onto the message
+// after the keyboard clears. It RETAINS the original request context (tool + input
+// preview, via permPromptText) and appends a timestamped verdict line, so the chat
+// keeps a record of what was permitted and when. at is stamped concisely in local
+// time (HH:MM) — glanceable, not a full timestamp.
+func permResolvedText(tool, preview, behavior string, at time.Time) string {
+	verdict := "✅ Allowed"
+	if behavior == "deny" {
+		verdict = "❌ Denied"
 	}
-	return "🔐 " + tool + "\n\n" + notice
+	return permPromptText(tool, preview) + "\n\n" + verdict + " · " + at.Format("15:04")
+}
+
+// permExpiredText renders the DURABLE post-expiry/eviction body. It RETAINS the
+// original request context (tool + input preview) and appends a timestamped expiry
+// line, so an expired prompt still records what it was and when it lapsed.
+func permExpiredText(tool, preview string, at time.Time) string {
+	return permPromptText(tool, preview) + "\n\n⌛ Expired · " + at.Format("15:04")
 }

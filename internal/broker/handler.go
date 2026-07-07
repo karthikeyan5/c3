@@ -497,7 +497,7 @@ func (b *Broker) handlePermissionRequest(_ *ipc.Conn, stub *Stub, raw []byte) {
 
 	// Register BEFORE the send so a fast operator tap (before the sendMessage
 	// round-trip returns) still finds a live perm to resolve.
-	p := &pendingPerm{requestID: req.RequestID, route: *route, toolName: req.ToolName}
+	p := &pendingPerm{requestID: req.RequestID, route: *route, toolName: req.ToolName, preview: req.Preview}
 	if !b.registerPerm(p) {
 		log.Printf("perm DROP id=%s: request id collision", req.RequestID)
 		return

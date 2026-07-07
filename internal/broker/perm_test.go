@@ -93,7 +93,7 @@ func TestResolvePerm_AllowDeny(t *testing.T) {
 	b, fc, agentConn := permBrokerWithOperator(t, key)
 	defer b.Shutdown()
 
-	b.Perms.register(&pendingPerm{requestID: "abcde", route: key, toolName: "Bash", messageID: 77})
+	b.Perms.register(&pendingPerm{requestID: "abcde", route: key, toolName: "Bash", preview: "rm -rf /tmp/x", messageID: 77})
 
 	// A non-perm callback must NOT resolve a perm (generic event path proceeds).
 	if b.resolvePerm(key, &c3types.CallbackEvent{Data: "ask:abcde:0", Actor: c3types.Sender{UserID: testOperatorUID}}) {
@@ -157,6 +157,11 @@ func TestResolvePerm_AllowDeny(t *testing.T) {
 	}
 	if !strings.Contains(edits[0].Text, "Allowed") {
 		t.Fatalf("resolve edit body should record the verdict; got %q", edits[0].Text)
+	}
+	// The edited body must RETAIN the request context (tool + input preview) so the
+	// chat keeps a durable record of what was permitted — not collapse to a bare verdict.
+	if !strings.Contains(edits[0].Text, "Bash") || !strings.Contains(edits[0].Text, "rm -rf /tmp/x") {
+		t.Fatalf("resolve edit body should retain the tool + preview; got %q", edits[0].Text)
 	}
 
 	// A second (stale) tap for the already-resolved perm must NOT resolve.
@@ -542,5 +547,40 @@ func TestParsePermCallback(t *testing.T) {
 			t.Errorf("parsePermCallback(%q) = (%q,%q,%v); want (%q,%q,%v)",
 				c.data, id, beh, ok, c.wantID, c.wantBeh, c.wantOK)
 		}
+	}
+}
+
+// TestPermResolvedText pins the durable post-verdict body: it must RETAIN the
+// request context (tool + input preview) AND append a timestamped verdict line, so
+// the chat keeps a record of what was permitted and when — for both allow and deny.
+func TestPermResolvedText(t *testing.T) {
+	at := time.Date(2026, 7, 7, 15, 4, 0, 0, time.UTC)
+	allowed := permResolvedText("Bash", "rm -rf /tmp/x", "allow", at)
+	if !strings.Contains(allowed, "Bash") || !strings.Contains(allowed, "rm -rf /tmp/x") {
+		t.Errorf("resolved body must retain tool + preview; got %q", allowed)
+	}
+	if !strings.Contains(allowed, "✅ Allowed") || !strings.Contains(allowed, "15:04") {
+		t.Errorf("resolved body must append the verdict + timestamp; got %q", allowed)
+	}
+	denied := permResolvedText("Write", "/etc/hosts", "deny", at)
+	if !strings.Contains(denied, "Write") || !strings.Contains(denied, "/etc/hosts") {
+		t.Errorf("resolved body must retain tool + preview; got %q", denied)
+	}
+	if !strings.Contains(denied, "❌ Denied") || !strings.Contains(denied, "15:04") {
+		t.Errorf("resolved body must append the verdict + timestamp; got %q", denied)
+	}
+}
+
+// TestPermExpiredText pins the durable post-expiry/eviction body: it must RETAIN
+// the request context (tool + input preview) AND append a timestamped expiry line,
+// so an expired prompt still records what it was and when it lapsed.
+func TestPermExpiredText(t *testing.T) {
+	at := time.Date(2026, 7, 7, 15, 4, 0, 0, time.UTC)
+	body := permExpiredText("Bash", "rm -rf /tmp/x", at)
+	if !strings.Contains(body, "Bash") || !strings.Contains(body, "rm -rf /tmp/x") {
+		t.Errorf("expired body must retain tool + preview; got %q", body)
+	}
+	if !strings.Contains(body, "Expired") || !strings.Contains(body, "15:04") {
+		t.Errorf("expired body must append the expiry marker + timestamp; got %q", body)
 	}
 }
