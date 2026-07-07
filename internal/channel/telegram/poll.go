@@ -615,6 +615,15 @@ const (
 	permTapUnroutableText    = "⚠️ This permission prompt is no longer accessible — tap not processed."
 )
 
+// callbackAckToastText is the confirmation toast for a NON-permission callback
+// tap (an ask-tool selection or a hand-rolled reply(buttons=…) button). The
+// bare empty-opts ack only cleared the loading spinner and showed nothing, so
+// the tap had no immediate confirmation — this brief non-alert toast is that
+// feedback, mirroring how the perm path carries its outcome Text in its own ack
+// (see AnswerCallback). Accurate for every non-perm kind, and truthful even on
+// the rare inaccessible-message drop path: we DID receive the tap.
+const callbackAckToastText = "✅ Received"
+
 // dispatchCallback auto-acks an inline-keyboard callback (Q-RESULT-2: no
 // "loading…" spinner, no agent-in-the-loop for the ack) and THEN surfaces it as
 // a callback InboundEvent. P7 wires outbound keyboards that make these
@@ -655,7 +664,11 @@ func (c *Channel) dispatchCallback(updateID int64, cq *gotgbot.CallbackQuery) {
 	// taps are the exception: their single answer is deferred to the outcome
 	// (see the EXCEPTION note above).
 	if !permTap && c.bot != nil {
-		if _, err := c.bot.AnswerCallbackQuery(cq.Id, &gotgbot.AnswerCallbackQueryOpts{}); err != nil {
+		// Carry a confirmation toast, not a bare empty ack: the empty ack cleared
+		// the spinner but showed nothing, so this toast is the tap's only
+		// immediate feedback. ShowAlert stays false — a lightweight toast, not a
+		// modal (see callbackAckToastText).
+		if _, err := c.bot.AnswerCallbackQuery(cq.Id, &gotgbot.AnswerCallbackQueryOpts{Text: callbackAckToastText}); err != nil {
 			c.host.Logf("telegram: callback update=%d answerCallbackQuery failed: %v", updateID, err)
 		}
 	}
@@ -664,7 +677,7 @@ func (c *Channel) dispatchCallback(updateID int64, cq *gotgbot.CallbackQuery) {
 	if msg == nil {
 		// Inaccessible message (deleted / too old) — no chat to route to. A perm
 		// tap still gets its deferred answer (a notice); anything else was already
-		// bare-acked above.
+		// acked above (with the confirmation toast).
 		if permTap {
 			c.answerPermTap(updateID, cq.Id, permTapUnroutableText, false)
 		}

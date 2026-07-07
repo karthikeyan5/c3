@@ -390,9 +390,13 @@ func TestDispatchCallback_PermTap_Inaccessible_Answered(t *testing.T) {
 	}
 }
 
-// TestDispatchCallback_NonPermTap_AutoAckImmediate pins the unchanged contract
-// for every OTHER callback (ask keyboards, agent-rendered buttons): immediate
-// bare auto-ack (Q-RESULT-2 — no spinner, no agent-in-the-loop), then surfaced.
+// TestDispatchCallback_NonPermTap_AutoAckImmediate pins the contract for every
+// OTHER callback (ask keyboards, agent-rendered reply buttons): immediate
+// auto-ack (Q-RESULT-2 — no spinner, no agent-in-the-loop), then surfaced. The
+// ack now carries a brief confirmation toast instead of empty opts — the empty
+// ack cleared the spinner but showed nothing, leaving a non-perm tap with no
+// immediate feedback. It stays a lightweight toast (ShowAlert false), never a
+// modal alert.
 func TestDispatchCallback_NonPermTap_AutoAckImmediate(t *testing.T) {
 	h := &fakeHost{decision: channel.GateInboundAllow}
 	rc := &recordingBotClient{}
@@ -407,8 +411,17 @@ func TestDispatchCallback_NonPermTap_AutoAckImmediate(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("a non-perm callback must be auto-acked exactly once; got %d", len(calls))
 	}
-	if text, ok := calls[0].params["text"]; ok && text != "" {
-		t.Errorf("the generic auto-ack must stay bare (no toast); got %v", text)
+	text, _ := calls[0].params["text"].(string)
+	if text == "" {
+		t.Error("the non-perm auto-ack must carry a confirmation toast, not a bare ack")
+	}
+	if text != callbackAckToastText {
+		t.Errorf("the confirmation toast must be callbackAckToastText %q; got %q", callbackAckToastText, text)
+	}
+	// ShowAlert stays false → gotgbot omits show_alert entirely (a lightweight
+	// toast, not a modal). Its presence would mean we surfaced an alert.
+	if _, ok := calls[0].params["show_alert"]; ok {
+		t.Error("the confirmation toast must stay a lightweight toast (ShowAlert false), not a modal alert")
 	}
 }
 
