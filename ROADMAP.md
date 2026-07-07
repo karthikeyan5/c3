@@ -34,6 +34,7 @@ What's next for C3 after v1. Everything here is future or unbuilt; shipped work 
 - Broker-side `/list` and `/route` commands.
 - Auto-attach on resume enabled by default (after live verification).
 - Monitoring dashboard, persistent message history, STT latency instrumentation.
+- Async-dispatch more non-critical broker sends (as the voice-readback echo already does), preserving strict per-topic ordering.
 
 ## Open design questions
 
