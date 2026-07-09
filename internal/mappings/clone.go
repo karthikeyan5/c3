@@ -13,9 +13,12 @@ func (mf *MappingsFile) Clone() *MappingsFile {
 		return nil
 	}
 	out := &MappingsFile{
-		SchemaVersion:      mf.SchemaVersion,
-		AutoAttachOnResume: mf.AutoAttachOnResume,
-		AutoUpdate:         mf.AutoUpdate,
+		SchemaVersion: mf.SchemaVersion,
+		AutoUpdate:    mf.AutoUpdate,
+	}
+	if mf.AutoAttachOnResume != nil { // deep-copy the pointer per the Clone contract (cf. Invasive below)
+		v := *mf.AutoAttachOnResume
+		out.AutoAttachOnResume = &v
 	}
 	if mf.Channels != nil {
 		out.Channels = make(map[string]ChannelConfig, len(mf.Channels))

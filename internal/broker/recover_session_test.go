@@ -36,9 +36,12 @@ func recoverViaPeer(t *testing.T, b *Broker, cwd, stableID string) (*ipc.Conn, f
 	return peer, done, resp
 }
 
+// boolPtr returns a *bool for the auto_attach_on_resume gate (nil ⇒ default ON).
+func boolPtr(b bool) *bool { return &b }
+
 func TestHandleRecoverSession_NoRouteRecovers(t *testing.T) {
 	mf := mfWithTelegram()
-	mf.AutoAttachOnResume = true                                 // gate ON: recovery fires as it does in production when opted in
+	mf.AutoAttachOnResume = boolPtr(true)                        // gate ON: recovery fires as it does in production when opted in
 	seedSessionAttachment(mf, "sess-1", time.Now().UTC(), false) // → c3 / 281
 	b := brokerWithChannel(t, mf, &fakeChannel{})
 	defer b.Shutdown()
@@ -66,7 +69,7 @@ func TestHandleRecoverSession_NoRouteRecovers(t *testing.T) {
 func TestHandleRecoverSession_CarriesBacklogPreview(t *testing.T) {
 	t.Setenv("C3_QUEUE_DIR", t.TempDir())
 	mf := mfWithTelegram()
-	mf.AutoAttachOnResume = true                                 // gate ON: recovery fires
+	mf.AutoAttachOnResume = boolPtr(true)                        // gate ON: recovery fires
 	seedSessionAttachment(mf, "sess-1", time.Now().UTC(), false) // → c3 / 281
 	b := brokerWithChannel(t, mf, &fakeChannel{})
 	defer b.Shutdown()
@@ -96,12 +99,14 @@ func TestHandleRecoverSession_CarriesBacklogPreview(t *testing.T) {
 	}
 }
 
-// TestHandleRecoverSession_GateDisabledNoAutoAttach is the v1 default: with
-// auto_attach_on_resume absent/false, a recoverable attachment is NOT auto-
+// TestHandleRecoverSession_GateDisabledNoAutoAttach covers the opt-out: with
+// auto_attach_on_resume explicitly false, a recoverable attachment is NOT auto-
 // re-claimed on resume. The stable id is still recorded (so a later SIGHUP-
-// enable works), but the route stays free.
+// enable works), but the route stays free. (Post-redesign the default is ON, so
+// disabling now requires an explicit false — an absent field means enabled.)
 func TestHandleRecoverSession_GateDisabledNoAutoAttach(t *testing.T) {
-	mf := mfWithTelegram()                                       // auto_attach_on_resume defaults false
+	mf := mfWithTelegram()
+	mf.AutoAttachOnResume = boolPtr(false)                       // gate explicitly OFF (default is now ON)
 	seedSessionAttachment(mf, "sess-1", time.Now().UTC(), false) // → c3 / 281
 	b := brokerWithChannel(t, mf, &fakeChannel{})
 	defer b.Shutdown()
@@ -124,7 +129,8 @@ func TestHandleRecoverSession_GateDisabledNoAutoAttach(t *testing.T) {
 // current mappings snapshot: a SIGHUP-style SetMappings that turns the gate on
 // makes the very next resume auto-attach, with no broker restart.
 func TestHandleRecoverSession_GateReloadFlips(t *testing.T) {
-	mfOff := mfWithTelegram()                                       // gate OFF
+	mfOff := mfWithTelegram()
+	mfOff.AutoAttachOnResume = boolPtr(false)                       // gate explicitly OFF (default is now ON)
 	seedSessionAttachment(mfOff, "sess-1", time.Now().UTC(), false) // → c3 / 281
 	b := brokerWithChannel(t, mfOff, &fakeChannel{})
 	defer b.Shutdown()
@@ -138,7 +144,7 @@ func TestHandleRecoverSession_GateReloadFlips(t *testing.T) {
 
 	// SIGHUP reload analogue: swap in a config with the gate ON (same route data).
 	mfOn := mfWithTelegram()
-	mfOn.AutoAttachOnResume = true
+	mfOn.AutoAttachOnResume = boolPtr(true)
 	seedSessionAttachment(mfOn, "sess-1", time.Now().UTC(), false)
 	b.SetMappings(mfOn)
 
@@ -225,8 +231,8 @@ func TestHandleRecoverSession_DualPathRecordsCurrentRoute(t *testing.T) {
 	// Attach-first: the stub already holds a route (claimed by cwd) BEFORE the
 	// recover op arrives. The recover op must NOT re-claim, but must RECORD the
 	// current route under the stable id (dual-path recording). Uses the DEFAULT
-	// config (auto_attach_on_resume OFF), which also proves the gate does not
-	// suppress this bookkeeping — only the auto-re-claim is gated.
+	// config, proving the record-only branch runs regardless of the gate — the
+	// cur!=nil path is gate-independent, only the auto-re-claim is gated.
 	mf := mfWithTelegram()
 	b := brokerWithChannel(t, mf, &fakeChannel{})
 	defer b.Shutdown()
@@ -351,7 +357,7 @@ func TestRecoverSession_SkipsRefreshWhenFresh(t *testing.T) {
 
 func TestRecoverSession_DMRoute(t *testing.T) {
 	mf := mfWithTelegram()
-	mf.AutoAttachOnResume = true // gate ON: recovery fires
+	mf.AutoAttachOnResume = boolPtr(true) // gate ON: recovery fires
 	mf.UpsertSessionAttachment("dm-sess", mappings.SessionAttachment{
 		Channel: "telegram", ChatID: 42, TopicID: nil, Name: "dm",
 		LastAttachedAt: time.Now().UTC(),

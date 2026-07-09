@@ -18,23 +18,25 @@ type MappingsFile struct {
 	// pre-feature config files byte-identical until the first session attaches.
 	SessionAttachments map[string]SessionAttachment `json:"session_attachments,omitempty"`
 	// AutoAttachOnResume gates whether a resumed session is automatically
-	// re-attached to its last topic (broker.handleRecoverSession). Absent or
-	// false ⇒ DISABLED, the v1 default: the SessionStart hook still records the
-	// resume handoff, but the broker does not auto-re-claim the last route. Set
-	// true to opt in to the full behavior. A plain bool (not *bool) is correct
-	// here BECAUSE the desired default is the zero value, false — unlike
-	// notifications.invasive / channels.rich_inbound, which default true and so
-	// need a pointer to tell "unset" apart from an explicit false. omitempty
-	// keeps pre-feature and opted-out config files byte-identical.
-	AutoAttachOnResume bool `json:"auto_attach_on_resume,omitempty"`
+	// re-attached to its last topic (broker.handleRecoverSession). nil/absent ⇒
+	// ENABLED (the redesign default: a resume re-claims the session's OWN route,
+	// which is safe by construction). Explicit false ⇒ DISABLED: the SessionStart
+	// hook still records the resume handoff, but the broker does not auto-re-claim
+	// the last route. A *bool (not a plain bool) is required to tell "unset"
+	// (default-on) apart from an explicit false — the same pointer trick as
+	// notifications.invasive / channels.rich_inbound, which also default true.
+	// omitempty keeps pre-feature (nil) and default-on config files byte-identical.
+	AutoAttachOnResume *bool `json:"auto_attach_on_resume,omitempty"`
 	// AutoUpdate gates whether the broker installs a newer C3 release ITSELF when
 	// its ~6h check finds one (downloads + checksum-verifies + atomic-swaps the
 	// binaries, then drains and exits so adapters reconnect onto the new broker).
 	// Absent or false ⇒ DISABLED, the v1 default: the always-on "update available"
 	// notice (status line + log) STILL fires — only the self-install is opt-in.
-	// A plain bool (not *bool) is correct here for the same reason as
-	// AutoAttachOnResume: the desired default IS the zero value, false. omitempty
-	// keeps pre-feature and opted-out config files byte-identical.
+	// A plain bool (not *bool) is correct here BECAUSE the desired default IS the
+	// zero value, false — unlike auto_attach_on_resume / notifications.invasive /
+	// channels.rich_inbound, which default true and so need a pointer to tell
+	// "unset" apart from an explicit false. omitempty keeps pre-feature and
+	// opted-out config files byte-identical.
 	AutoUpdate bool `json:"auto_update,omitempty"`
 }
 
@@ -59,10 +61,11 @@ func (mf *MappingsFile) InvasiveNotifications() bool {
 }
 
 // AutoAttachOnResumeEnabled reports whether auto-attach-on-resume is enabled.
-// A nil file or an absent field ⇒ false (the v1 default: the feature is off, so
-// a resumed session stays unattached until it attaches explicitly).
+// An absent field (nil pointer) ⇒ true (the redesign default: a resume re-claims
+// the session's own route). Only an explicit false disables it. A nil file ⇒
+// false (defensive — no config, nothing to recover).
 func (mf *MappingsFile) AutoAttachOnResumeEnabled() bool {
-	return mf != nil && mf.AutoAttachOnResume
+	return mf != nil && (mf.AutoAttachOnResume == nil || *mf.AutoAttachOnResume)
 }
 
 // AutoUpdateEnabled reports whether broker-driven self-update is enabled. A nil
