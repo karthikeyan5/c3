@@ -54,6 +54,21 @@ type Stub struct {
 	// adapter connects. Guarded by stubMu.
 	stubMu sync.Mutex
 	Route  *RouteKey
+	// routeConfirmed records that the CURRENT claim (Route) was set by a
+	// LEGITIMATE claim site — an explicit/own-recover attach through tryClaim or
+	// recoverSession — as opposed to any future code path that might bind a route
+	// without a real claim. The two destructive consume paths (handleFetchQueue's
+	// Ack=true fetch and handleInboundDelivered's live-push ack) refuse to consume
+	// unless this is set, so a silent-bind regression can never drain a queue the
+	// session didn't choose. It is a property of the current claim, not the
+	// connection: SetRoute(nil) (detach/release) clears it, re-arming the tripwire.
+	// Honest scope (spec §5): every legitimate claim sets it via MarkRouteConfirmed,
+	// so today it is always true on a live claim — this is fail-closed insurance
+	// against a future regression, NOT a cure for a misbehaving LLM courier (§8).
+	// Deliberately NOT set inside SetRoute(&key): binding a route and CONFIRMING it
+	// are separate acts, so a future silent SetRoute leaves the tripwire armed.
+	// Guarded by stubMu.
+	routeConfirmed bool
 	// cannotRender is set from HelloMsg.CannotRenderChannels: the host silently
 	// drops channel push notifications (a Claude Code session launched without the
 	// development-channels flag — typically a --fork-session background job). When
@@ -138,16 +153,40 @@ func isPIDAlive(pid int) bool {
 	return err != syscall.ESRCH
 }
 
-// SetRoute atomically sets the stub's current claim.
+// SetRoute atomically sets the stub's current claim. Clearing the route
+// (key==nil, e.g. handleRelease's detach) also clears routeConfirmed — "confirmed"
+// is a property of the CURRENT claim, so a release re-arms the destructive-consume
+// tripwire. Setting a non-nil route deliberately does NOT set routeConfirmed:
+// binding and confirming are separate acts (see MarkRouteConfirmed), so a future
+// code path that binds a route without a legitimate claim stays fail-closed.
 func (s *Stub) SetRoute(key *RouteKey) {
 	s.stubMu.Lock()
 	defer s.stubMu.Unlock()
 	if key == nil {
 		s.Route = nil
+		s.routeConfirmed = false
 		return
 	}
 	k := *key
 	s.Route = &k
+}
+
+// MarkRouteConfirmed records that the stub's current route was set by a legitimate
+// claim (tryClaim / recoverSession). Called immediately after SetRoute(&key) at
+// those two sites. Cleared by SetRoute(nil). See the routeConfirmed field doc for
+// why this is separate from SetRoute. Guarded by stubMu.
+func (s *Stub) MarkRouteConfirmed() {
+	s.stubMu.Lock()
+	defer s.stubMu.Unlock()
+	s.routeConfirmed = true
+}
+
+// RouteConfirmed reports whether the current claim was set by a legitimate claim
+// site. The destructive consume paths gate on this. Guarded by stubMu.
+func (s *Stub) RouteConfirmed() bool {
+	s.stubMu.Lock()
+	defer s.stubMu.Unlock()
+	return s.routeConfirmed
 }
 
 // SetStableSessionID records the host CLI's stable per-session id, learned from

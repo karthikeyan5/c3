@@ -30,6 +30,7 @@ func TestHandleFetchQueue_ConsumesOldest(t *testing.T) {
 	// assertions below fail.
 	stub := claimedHolder(t, b, key)
 	stub.SetRoute(&key)
+	stub.MarkRouteConfirmed() // destructive Ack=true fetch requires a confirmed claim (§5 tripwire)
 
 	agentSide, brokerSide := newConnPair(t)
 	_ = brokerSide
@@ -272,6 +273,7 @@ func TestHandleInboundDelivered_MergedBatchConsumesAllCovered(t *testing.T) {
 	// setup needed.
 	stub := claimedHolder(t, b, key)
 	stub.SetRoute(&key)
+	stub.MarkRouteConfirmed() // live-push ack consume requires a confirmed claim (§5 tripwire)
 
 	// A merged push of 3 lines, acked once with Count=3.
 	raw, _ := json.Marshal(ipc.InboundDeliveredMsg{Op: ipc.OpInboundDelivered, UpdateID: 3, OK: true, Count: 3})
@@ -392,6 +394,7 @@ func TestHandleFetchQueue_AckTrue_NoTimeoutBlocksUntilWorker(t *testing.T) {
 	}
 	stub := claimedHolder(t, b, key)
 	stub.SetRoute(&key)
+	stub.MarkRouteConfirmed() // destructive Ack=true fetch requires a confirmed claim (§5 tripwire)
 
 	// Park the route's single worker on the blocking reply so the Ack=true fetch
 	// queued behind it is not serviced until we release the worker.

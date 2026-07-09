@@ -188,6 +188,12 @@ type adapter struct {
 	// rememberAttach/replayLastAttach machinery.
 	amu        sync.Mutex
 	lastAttach *ipc.AttachReq
+	// attachedTopic is the human-readable name of the currently-attached topic
+	// (attached.Name at attach time). Read when rendering the backlog / pending-fetch
+	// nudges so a human can see WHICH topic a fetch_queue would drain — a stale/wrong
+	// advertisement is then distinguishable rather than an anonymous "N pending"
+	// (spec §5). Empty when unattached. Guarded by amu. Mirrors the Claude adapter.
+	attachedTopic string
 
 	// dispatched is set the first time the SDK routes a method through the
 	// receiving middleware — i.e. Codex has sent at least one MCP frame.
@@ -470,6 +476,22 @@ func (a *adapter) rememberAttach(req ipc.AttachReq) {
 	a.lastAttach = &cp
 }
 
+// setAttachedTopic records the human-readable name of the currently-attached
+// topic for the fetch_queue nudges (spec §5). Mirrors the Claude adapter.
+func (a *adapter) setAttachedTopic(name string) {
+	a.amu.Lock()
+	defer a.amu.Unlock()
+	a.attachedTopic = name
+}
+
+// currentTopicName returns the currently-attached topic name (empty when
+// unattached), read on the push/fetch paths to name the fetch_queue nudge.
+func (a *adapter) currentTopicName() string {
+	a.amu.Lock()
+	defer a.amu.Unlock()
+	return a.attachedTopic
+}
+
 // isBareAttachReq reports whether an attach request carried no explicit target
 // (no Target, Name, TopicID, or Create — Codex has no Expr arg). Mirrors the
 // Claude adapter.
@@ -564,8 +586,15 @@ func (a *adapter) handleInbound(raw []byte) {
 	// consumer racing the forward's ack → over-consume → silent loss. In notify-only
 	// mode (forwarding disabled) the nudge is the only delivery signal, so it stays.
 	if a.transport != nil && !codexForwardingAllowed() {
+		// Name the topic (§5) so a stale/wrong nudge is human-distinguishable.
+		route := a.currentTopicName()
+		notice := "c3: new Telegram message"
+		if route != "" {
+			notice += fmt.Sprintf(" for topic %q", route)
+		}
+		notice += " — call `fetch_queue` to read it. " + pendingNudge(pendingCount, route)
 		if err := a.transport.Notify(context.Background(), "notifications/message", map[string]any{
-			"data": "c3: new Telegram message — call `fetch_queue` to read it. " + pendingNudge(pendingCount),
+			"data": notice,
 		}); err != nil {
 			// D4 (adapter-ipc-4): the broker already DURABLY QUEUED this inbound
 			// before pushing it to us, so the content is never lost — it stays in
@@ -748,8 +777,13 @@ func (a *adapter) latchForwardBlocked(reason string) {
 	if a.transport == nil {
 		return
 	}
+	// Name the topic (§5) so a stale/wrong nudge is human-distinguishable.
+	target := "pending Telegram messages"
+	if route := a.currentTopicName(); route != "" {
+		target = fmt.Sprintf("pending Telegram messages for topic %q", route)
+	}
 	if err := a.transport.Notify(context.Background(), "notifications/message", map[string]any{
-		"data": "c3: live message forwarding interrupted (" + reason + ") — call `fetch_queue` to read pending Telegram messages.",
+		"data": "c3: live message forwarding interrupted (" + reason + ") — call `fetch_queue` to read " + target + ".",
 	}); err != nil {
 		log.Printf("codex forwardBlocked recovery nudge FAIL (%s): %v — content durably queued; call fetch_queue to drain", reason, err)
 	}
@@ -1118,6 +1152,8 @@ func (a *adapter) toolAttach(ctx context.Context, req *mcp.CallToolRequest) (*mc
 			// fresh-broker replay re-binds explicitly. Parity with the Claude
 			// adapter's toolAttach.
 			a.rememberAttach(resolvedAttachReq(attachReq, attached))
+			// Track the resolved topic name for the fetch_queue nudges (§5).
+			a.setAttachedTopic(attached.Name)
 			// Side-effect surface: OSC-0 title-bar escape to stderr
 			// for the currently-attached topic. Closes TODO #19(a).
 			// Cross-CLI parity with the Claude adapter; same gates
@@ -1129,7 +1165,7 @@ func (a *adapter) toolAttach(ctx context.Context, req *mcp.CallToolRequest) (*mc
 		// has held inbound, tell the agent to call fetch_queue. Handles the
 		// broker's degraded count-only case (QueuedCount>0 with empty
 		// QueuedSummary) gracefully. Parity with the Claude adapter.
-		if summary := renderBacklogSummary(attached.QueuedCount, attached.QueuedSummary); summary != "" {
+		if summary := renderBacklogSummary(attached.QueuedCount, attached.QueuedSummary, attached.Name); summary != "" {
 			text += "\n\n" + summary
 		}
 		return toolTextResult(text), nil
@@ -1239,7 +1275,7 @@ func (a *adapter) toolFetchQueue(ctx context.Context, req *mcp.CallToolRequest) 
 		if resp.Err != "" {
 			return toolErrorResult(resp.Err), nil
 		}
-		return toolTextResult(renderFetchedMessages(resp.Messages, resp.Remaining)), nil
+		return toolTextResult(renderFetchedMessages(resp.Messages, resp.Remaining, a.currentTopicName())), nil
 	}
 }
 
@@ -1327,12 +1363,16 @@ func (a *adapter) dispatchRetranscribeResult(raw []byte) {
 // hint so the agent knows to drain, just without per-item previews. Byte-
 // identical to the Claude adapter's renderBacklogSummary (Go has no cross-
 // main-package sharing).
-func renderBacklogSummary(count int, items []ipc.QueuedItem) string {
+func renderBacklogSummary(count int, items []ipc.QueuedItem, route string) string {
 	if count <= 0 {
 		return ""
 	}
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "📨 %d message(s) were held while no session was attached. Call `fetch_queue` (limit:3 or \"all\") to retrieve them.", count)
+	if route != "" {
+		fmt.Fprintf(&sb, "📨 %d message(s) for topic %q were held while no session was attached. Call `fetch_queue` (limit:3 or \"all\") to retrieve them.", count, route)
+	} else {
+		fmt.Fprintf(&sb, "📨 %d message(s) were held while no session was attached. Call `fetch_queue` (limit:3 or \"all\") to retrieve them.", count)
+	}
 	for _, it := range items {
 		preview := it.Preview
 		if preview == "" {
@@ -1346,11 +1386,16 @@ func renderBacklogSummary(count int, items []ipc.QueuedItem) string {
 	return sb.String()
 }
 
-// pendingNudge returns a "(N pending — call fetch_queue)" suffix, or "" when
-// nothing is pending. Byte-identical to the Claude adapter's pendingNudge.
-func pendingNudge(n int) string {
+// pendingNudge returns a "(N pending for topic "X" — call fetch_queue)" suffix, or
+// "" when nothing is pending. Naming the topic (spec §5) makes a stale/wrong
+// advertisement human-distinguishable; route=="" falls back to the name-less form.
+// Byte-identical to the Claude adapter's pendingNudge.
+func pendingNudge(n int, route string) string {
 	if n <= 0 {
 		return ""
+	}
+	if route != "" {
+		return fmt.Sprintf("(%d pending for topic %q — call `fetch_queue`)", n, route)
 	}
 	return fmt.Sprintf("(%d pending — call `fetch_queue`)", n)
 }
@@ -1359,7 +1404,7 @@ func pendingNudge(n int) string {
 // per message with full content + each attachment's file_id/mime/size/name so
 // the agent can act on backlog voice/media (download_attachment / retranscribe).
 // Byte-identical to the Claude adapter's renderFetchedMessages.
-func renderFetchedMessages(msgs []c3types.Inbound, remaining int) string {
+func renderFetchedMessages(msgs []c3types.Inbound, remaining int, route string) string {
 	if len(msgs) == 0 {
 		return "c3 queue is empty"
 	}
@@ -1369,7 +1414,7 @@ func renderFetchedMessages(msgs []c3types.Inbound, remaining int) string {
 	}
 	out := strings.Join(blocks, "\n\n")
 	if remaining > 0 {
-		out += "\n\n" + pendingNudge(remaining)
+		out += "\n\n" + pendingNudge(remaining, route)
 	}
 	return out
 }

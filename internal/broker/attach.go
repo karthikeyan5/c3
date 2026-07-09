@@ -833,6 +833,9 @@ func (b *Broker) tryClaim(conn *ipc.Conn, stub *Stub, key RouteKey, label string
 		b.Routes.Release(*old, stub.ConnID)
 	}
 	stub.SetRoute(&key)
+	// This is a legitimate, human-driven explicit/steal claim — confirm the route so
+	// the destructive consume paths (spec §5 tripwire) will service it.
+	stub.MarkRouteConfirmed()
 	if isFresh {
 		go b.sendWelcome(stub, key, label)
 	}
@@ -1042,6 +1045,9 @@ func (b *Broker) recoverSession(stub *Stub) (RouteKey, int, []ipc.QueuedItem, bo
 		return RouteKey{}, 0, nil, false
 	}
 	stub.SetRoute(&key)
+	// The session re-claiming its OWN recorded route is a legitimate claim — confirm
+	// it so the destructive consume paths (spec §5 tripwire) will service it.
+	stub.MarkRouteConfirmed()
 	// SINGLE live peek: return the count AND the preview from ONE backlogSummary
 	// job so they always describe the same queue snapshot. Callers (the automatic
 	// handleRecoverSession and the manual attachBare path (ii)) consume both from

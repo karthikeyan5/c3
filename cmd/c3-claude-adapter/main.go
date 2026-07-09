@@ -289,6 +289,12 @@ type adapter struct {
 	// if the user hasn't attached yet (or detached).
 	amu        sync.Mutex
 	lastAttach *ipc.AttachReq
+	// attachedTopic is the human-readable name of the currently-attached topic
+	// (attached.Name / resp.Name at attach time). Read when rendering the backlog
+	// and pending-fetch nudges so a human can see WHICH topic a fetch_queue would
+	// drain — a stale/wrong advertisement is then distinguishable rather than an
+	// anonymous "N pending" (spec §5). Empty when unattached. Guarded by amu.
+	attachedTopic string
 
 	// firstInbound triggers a one-shot wire dump of the first
 	// notifications/claude/channel frame for live debugging.
@@ -568,6 +574,22 @@ func (a *adapter) rememberAttach(req ipc.AttachReq) {
 	a.lastAttach = &cp
 }
 
+// setAttachedTopic records the human-readable name of the currently-attached
+// topic for the fetch_queue nudges (spec §5). Empty string clears it on detach.
+func (a *adapter) setAttachedTopic(name string) {
+	a.amu.Lock()
+	defer a.amu.Unlock()
+	a.attachedTopic = name
+}
+
+// currentTopicName returns the currently-attached topic name (empty when
+// unattached), read on the push/fetch paths to name the fetch_queue nudge.
+func (a *adapter) currentTopicName() string {
+	a.amu.Lock()
+	defer a.amu.Unlock()
+	return a.attachedTopic
+}
+
 // isBareAttachReq reports whether an attach request carried no explicit target
 // (no name-bearing Expr, Target, Name, TopicID, or Create). A bare attach that
 // the broker resolves via its idempotent-already-attached branch or the
@@ -699,7 +721,7 @@ func (a *adapter) handleInbound(ctx context.Context, raw []byte) {
 	// "(N pending — call fetch_queue)" suffix so a stuck backlog item surfaces on
 	// THIS successful push, not only at the next re-attach.
 	if s, ok := frame["content"].(string); ok {
-		frame["content"] = decoratePushContent(s, in.Pending)
+		frame["content"] = decoratePushContent(s, in.Pending, a.currentTopicName())
 	}
 
 	// One-shot wire dump for diagnosing "broker delivers but CLI silent" —
@@ -786,12 +808,16 @@ func inboundContentSummary(in *c3types.Inbound) string {
 // The broker may report count>0 with an EMPTY items slice (it degrades to
 // count-only when Peek fails) — this still renders the count line + fetch_queue
 // hint so the agent knows to drain, just without per-item previews.
-func renderBacklogSummary(count int, items []ipc.QueuedItem) string {
+func renderBacklogSummary(count int, items []ipc.QueuedItem, route string) string {
 	if count <= 0 {
 		return ""
 	}
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "📨 %d message(s) were held while no session was attached. Call `fetch_queue` (limit:3 or \"all\") to retrieve them.", count)
+	if route != "" {
+		fmt.Fprintf(&sb, "📨 %d message(s) for topic %q were held while no session was attached. Call `fetch_queue` (limit:3 or \"all\") to retrieve them.", count, route)
+	} else {
+		fmt.Fprintf(&sb, "📨 %d message(s) were held while no session was attached. Call `fetch_queue` (limit:3 or \"all\") to retrieve them.", count)
+	}
 	for _, it := range items {
 		preview := it.Preview
 		if preview == "" {
@@ -805,12 +831,17 @@ func renderBacklogSummary(count int, items []ipc.QueuedItem) string {
 	return sb.String()
 }
 
-// pendingNudge returns a "(N pending — call fetch_queue)" suffix, or "" when
-// nothing is pending. Appended to pushes + the attach summary so Claude can
-// always recover even after a failed push.
-func pendingNudge(n int) string {
+// pendingNudge returns a "(N pending for topic "X" — call fetch_queue)" suffix,
+// or "" when nothing is pending. Appended to pushes + the attach summary so Claude
+// can always recover even after a failed push. Naming the topic (spec §5) makes a
+// stale/wrong advertisement human-distinguishable; route=="" falls back to the
+// name-less form for callers without a known topic.
+func pendingNudge(n int, route string) string {
 	if n <= 0 {
 		return ""
+	}
+	if route != "" {
+		return fmt.Sprintf("(%d pending for topic %q — call `fetch_queue`)", n, route)
 	}
 	return fmt.Sprintf("(%d pending — call `fetch_queue`)", n)
 }
@@ -819,8 +850,8 @@ func pendingNudge(n int) string {
 // the broker reports remaining backlog. Pure + unit-testable. (spec Component 3
 // — the push half of the recovery net: a stuck backlog item surfaces on the next
 // successful push, not only at the next re-attach.)
-func decoratePushContent(content string, pending int) string {
-	if nudge := pendingNudge(pending); nudge != "" {
+func decoratePushContent(content string, pending int, route string) string {
+	if nudge := pendingNudge(pending, route); nudge != "" {
 		return content + "\n\n" + nudge
 	}
 	return content
@@ -829,7 +860,7 @@ func decoratePushContent(content string, pending int) string {
 // renderFetchedMessages turns pulled inbound into agent-readable text, one block
 // per message with full content + each attachment's file_id/mime/size/name so
 // the agent can act on backlog voice/media (download_attachment / retranscribe).
-func renderFetchedMessages(msgs []c3types.Inbound, remaining int) string {
+func renderFetchedMessages(msgs []c3types.Inbound, remaining int, route string) string {
 	if len(msgs) == 0 {
 		return "c3 queue is empty"
 	}
@@ -839,7 +870,7 @@ func renderFetchedMessages(msgs []c3types.Inbound, remaining int) string {
 	}
 	out := strings.Join(blocks, "\n\n")
 	if remaining > 0 {
-		out += "\n\n" + pendingNudge(remaining)
+		out += "\n\n" + pendingNudge(remaining, route)
 	}
 	return out
 }
@@ -1561,6 +1592,8 @@ func (a *adapter) toolAttach(ctx context.Context, req *mcp.CallToolRequest) (*mc
 			// §3d1: remember the RESOLVED identity for a bare attach so a
 			// post-broker-restart replay re-binds the same topic explicitly.
 			a.rememberAttach(resolvedAttachReq(attachReq, attached))
+			// Track the resolved topic name for the fetch_queue nudges (§5).
+			a.setAttachedTopic(attached.Name)
 			// Side-effect surface: write OSC-0 title-bar escape to
 			// stderr so the user's terminal-emulator title reflects
 			// the currently-attached topic. Closes TODO #19(a).
@@ -1577,7 +1610,7 @@ func (a *adapter) toolAttach(ctx context.Context, req *mcp.CallToolRequest) (*mc
 		// gracefully when the broker reports QueuedCount>0 with an EMPTY
 		// QueuedSummary (count-only fallback when Peek failed): the agent still
 		// gets the count + a fetch_queue hint.
-		if summary := renderBacklogSummary(attached.QueuedCount, attached.QueuedSummary); summary != "" {
+		if summary := renderBacklogSummary(attached.QueuedCount, attached.QueuedSummary, attached.Name); summary != "" {
 			text += "\n\n" + summary
 		}
 		return toolTextResult(text), nil
@@ -1598,6 +1631,7 @@ func (a *adapter) toolDetach(_ context.Context, _ *mcp.CallToolRequest) (*mcp.Ca
 	}
 	a.amu.Lock()
 	a.lastAttach = nil
+	a.attachedTopic = ""
 	a.amu.Unlock()
 	// Restore the terminal-emulator's default title — see
 	// EmitAttach call-site comment in toolAttach for context.
@@ -1755,7 +1789,7 @@ func (a *adapter) toolFetchQueue(ctx context.Context, req *mcp.CallToolRequest) 
 		if resp.Err != "" {
 			return toolErrorResult(resp.Err), nil
 		}
-		return toolTextResult(renderFetchedMessages(resp.Messages, resp.Remaining)), nil
+		return toolTextResult(renderFetchedMessages(resp.Messages, resp.Remaining, a.currentTopicName())), nil
 	}
 }
 
@@ -1968,6 +2002,8 @@ func (a *adapter) fireRecover(ctx context.Context, entry sessionhandoff.Entry) {
 		a.rememberAttach(ipc.AttachReq{
 			Op: ipc.OpAttach, CWD: entry.CWD, Name: resp.Name, Group: resp.Group,
 		})
+		// Track the recovered topic name for the fetch_queue nudges (§5).
+		a.setAttachedTopic(resp.Name)
 		log.Printf("recover-session: auto-attached to %q (queued=%d)", resp.Name, resp.QueuedCount)
 		if text := renderRecoverNotice(resp); text != "" {
 			// Defer rather than emit now: this may run in the resume idle gap,

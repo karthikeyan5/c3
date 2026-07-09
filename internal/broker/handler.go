@@ -207,7 +207,7 @@ func (b *Broker) buildHelloAck(hello ipc.HelloMsg, stub *Stub) ipc.HelloAckMsg {
 // the feature). Conn-drop releases claims directly via Routes.ReleaseAllByConnID.
 func (b *Broker) handleRelease(stub *Stub) {
 	b.Routes.ReleaseAllByConnID(stub.ConnID)
-	stub.SetRoute(nil)
+	stub.SetRoute(nil) // also clears routeConfirmed — a detach re-arms the §5 consume tripwire
 	if sid := stub.StableSessionIDValue(); sid != "" {
 		b.mutateMappings(func(mf *mappings.MappingsFile) {
 			mf.TombstoneSessionAttachment(sid)

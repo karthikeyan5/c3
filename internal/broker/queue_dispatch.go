@@ -47,6 +47,15 @@ func (b *Broker) handleFetchQueue(conn *ipc.Conn, stub *Stub, raw []byte) {
 		_ = conn.WriteJSON(ipc.FetchQueueResp{Op: ipc.OpFetchQueueResult, ID: req.ID, Err: "fetch_queue before attach: no route claimed"})
 		return
 	}
+	// Spec §5 tripwire: refuse the DESTRUCTIVE (Ack=true) consume unless the current
+	// claim was set by a legitimate claim site (MarkRouteConfirmed). Every real
+	// attach/own-recover confirms the route, so this never trips a legitimate flow —
+	// it is fail-closed insurance so a future silent-bind regression cannot drain a
+	// queue. The non-destructive peek (Ack=false) is unaffected: it consumes nothing.
+	if req.Ack && !stub.RouteConfirmed() {
+		_ = conn.WriteJSON(ipc.FetchQueueResp{Op: ipc.OpFetchQueueResult, ID: req.ID, Err: "fetch_queue(ack=true) refused: route not confirmed by an explicit claim"})
+		return
+	}
 	resultCh := make(chan FetchResult, 1)
 	job := Job{Kind: JobFetch, Fetch: &FetchJob{Limit: req.Limit, All: req.All, Ack: req.Ack, ResultCh: resultCh}}
 	if !b.Workers.Submit(*route, job) {
@@ -219,6 +228,14 @@ func (b *Broker) handleInboundDelivered(stub *Stub, raw []byte) {
 	// no job worth dispatching (handleConsume would skip it anyway).
 	if msg.Count < 1 {
 		log.Printf("inbound_delivered update=%d count=%d — nothing to consume (event / zero-covered ack)", msg.UpdateID, msg.Count)
+		return
+	}
+	// Spec §5 tripwire (SAME guard as the fetch Ack=true path): this live-push ack is
+	// the OTHER destructive consume path, so gate it on a confirmed claim too —
+	// guarding only fetch would leave the ack-consume drainable off an unconfirmed
+	// route. Fail-closed insurance; a legitimate holder always has a confirmed route.
+	if !stub.RouteConfirmed() {
+		log.Printf("inbound_delivered update=%d count=%d — route not confirmed by an explicit claim; consume DROPPED (§5 tripwire, Count lines remain as backlog)", msg.UpdateID, msg.Count)
 		return
 	}
 	// ALSO (whole-branch review): surface a dropped consume like the sibling
