@@ -32,8 +32,11 @@ func FormatAttached(a *AttachedMsg) string {
 	if a.NeedsConfirmation && a.Proposal != nil {
 		switch a.Proposal.Action {
 		case "create":
-			return fmt.Sprintf("No mapping for this directory. I'd create a new topic %q in the %q group. To proceed, call attach(create=true). To use an existing topic instead, call attach(topic_id=<n>).",
-				a.Proposal.Name, a.Proposal.Group)
+			// The confirm command carries the name explicitly: a bare
+			// attach(create=true) no longer works (the cwd-basename backfill
+			// was deleted with the silent-claim redesign — spec §2).
+			return fmt.Sprintf("No mapping for this directory. I'd create a new topic %q in the %q group. To proceed, call attach(name=%q, create=true). To use an existing topic instead, call attach(topic_id=<n>).",
+				a.Proposal.Name, a.Proposal.Group, a.Proposal.Name)
 		case "use_existing_other_group":
 			alt := ""
 			if a.Proposal.Alternative != nil {

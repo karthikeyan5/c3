@@ -5,8 +5,9 @@
 //
 //  1. On stdin: accept JSON-RPC 2.0 requests from Codex (initialize, tools/list,
 //     tools/call, ping, notifications/initialized).
-//  2. On the broker socket: connect, send hello (with C3_ATTACH_NAME if the
-//     launcher set it), listen for inbound / tool_result / topics_list frames.
+//  2. On the broker socket: connect, send hello, listen for inbound /
+//     tool_result / topics_list frames. The session starts UNATTACHED —
+//     attaching is explicit (a bare attach shows a picker).
 //  3. For tools/call: route adapter-local tools (`attach`, `topics`,
 //     `fetch_queue`, `retranscribe`, `codex_forward`) directly; forward all
 //     other tools to the broker. Backlog is read on demand via `fetch_queue`
@@ -23,7 +24,9 @@
 //
 // Spec §4.4.5 env contract from launcher → adapter:
 //
-//	C3_ATTACH_NAME              topic name inferred from cwd
+//	C3_ATTACH_NAME              topic name inferred from cwd (vestigial — the
+//	                            adapter no longer auto-attaches; bare attach
+//	                            shows a picker)
 //	C3_CODEX_REMOTE_BRIDGE      "1" iff launcher started us; gates forwarding
 //	C3_CODEX_CWD                absolute cwd; used for thread/list filtering
 //	C3_CODEX_APP_SERVER_WS      ws://host:port of the Codex app-server
@@ -96,10 +99,11 @@ func run() error {
 		return fmt.Errorf("hello: %w", err)
 	}
 
-	// Auto-attach if the launcher set C3_ATTACH_NAME.
-	if name := os.Getenv("C3_ATTACH_NAME"); name != "" {
-		go a.autoAttach(name)
-	}
+	// No startup auto-attach: a Codex session starts UNATTACHED and attaches
+	// explicitly (a bare attach shows a picker). The old cwd-inferred
+	// C3_ATTACH_NAME auto-attach was a silent cwd-guess bind — the exact
+	// mis-target class this redesign closes (spec §2). The launcher still sets
+	// C3_ATTACH_NAME, but the adapter no longer consumes it (vestigial).
 
 	srv := a.buildMCPServer()
 	a.transport = newLogNotifyTransport(&mcp.StdioTransport{})
@@ -289,43 +293,6 @@ func (a *adapter) hello() error {
 	}
 	a.helloAck = ack
 	return nil
-}
-
-// autoAttach is fired in a goroutine when the launcher provided C3_ATTACH_NAME
-// via env. Sends an attach to the broker; broker either silently claims (if
-// the topic exists in the default group) or returns a proposal that the agent
-// can act on via the `attach` tool.
-//
-// D6 (adapter-ipc-7): this is FIRE-AND-FORGET. It deliberately does NOT
-// register a waiter in the shared pending["attached"] slot. Previously both
-// autoAttach and the `attach` tool registered under the same fixed key, so a
-// startup race (auto-attach in flight when the agent calls `attach`) could
-// strand one waiter or mis-route the AttachedMsg to the wrong one. AttachedMsg
-// carries no correlation id (unlike tool_result, which echoes ToolCallReq.ID),
-// so the two cannot be disambiguated by id without a broker protocol change.
-// Since autoAttach never needs the response value (the result is reflected in
-// helloAck on the next reconnect), we simply don't claim the slot — only the
-// `attach` tool registers a waiter, eliminating the collision. The AttachedMsg
-// is absorbed harmlessly by dispatchAttached (no waiter → no-op). We still
-// remember the attach so D3 replay re-claims the route after a broker restart.
-func (a *adapter) autoAttach(name string) {
-	cwd := os.Getenv("C3_CODEX_CWD")
-	if cwd == "" {
-		cwd, _ = os.Getwd()
-	}
-	conn := a.currentConn()
-	if conn == nil {
-		log.Printf("auto-attach skipped: broker not yet connected")
-		return
-	}
-	req := ipc.AttachReq{Op: ipc.OpAttach, CWD: cwd, Name: name}
-	if err := conn.WriteJSON(req); err != nil {
-		log.Printf("auto-attach write failed: %v", err)
-		return
-	}
-	// Record for D3 replay so a broker restart re-claims this auto-attached
-	// route even though the session never called the `attach` tool.
-	a.rememberAttach(req)
 }
 
 func (a *adapter) currentConn() *ipc.Conn {

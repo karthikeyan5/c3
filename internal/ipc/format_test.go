@@ -50,7 +50,11 @@ func TestFormatAttached_ProposalParity(t *testing.T) {
 					Action: "create", Name: "my-feature", Group: "dev",
 				},
 			},
-			want: []string{"call attach(create=true)", "attach(topic_id=<n>)"},
+			// The confirm command must carry the name explicitly — a bare
+			// attach(create=true) no longer works (cwd-basename backfill deleted,
+			// spec §2). The name is inside attach(name="…", create=true).
+			want:    []string{`attach(name="my-feature", create=true)`, "attach(topic_id=<n>)"},
+			wantNot: []string{"call attach(create=true)"},
 		},
 		{
 			name: "use_existing_other_group",
@@ -172,11 +176,11 @@ func TestFormatAttached_CwdDefaultCollision(t *testing.T) {
 	got := FormatAttached(msg)
 	for _, w := range []string{
 		"/home/user/projects", // the colliding cwd
-		"c3",                   // the resolved topic name
-		"claude",               // holder cli
-		"9823",                 // holder pid
-		"attach",               // generic guidance verb
-		"steal",                // force escape hatch (re-attach by name + confirm)
+		"c3",                  // the resolved topic name
+		"claude",              // holder cli
+		"9823",                // holder pid
+		"attach",              // generic guidance verb
+		"steal",               // force escape hatch (re-attach by name + confirm)
 	} {
 		if !strings.Contains(got, w) {
 			t.Errorf("FormatAttached(cwd_default_collision) missing %q in %q", w, got)

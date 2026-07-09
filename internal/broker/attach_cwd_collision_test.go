@@ -3,7 +3,6 @@ package broker
 import (
 	"encoding/json"
 	"os"
-	"strings"
 	"testing"
 
 	"github.com/karthikeyan5/c3/internal/ipc"
@@ -38,23 +37,19 @@ func collisionSetup(t *testing.T, launchCWD string) (*Broker, *fakeChannel) {
 	return b, fc
 }
 
-// TestAttach_CwdDefault_HeldByDifferentLiveSession_WarnsCollision is the
-// core RED test: a bare attach whose saved mapping resolves to a topic a
-// DIFFERENT live session already holds must return OK:false with
-// Status==cwd_default_collision and a message naming the holder, plus the
-// two escape hatches. Before the fix this hit the raw force_steal proposal.
-func TestAttach_CwdDefault_HeldByDifferentLiveSession_WarnsCollision(t *testing.T) {
+// TestAttach_CwdDefault_HeldByDifferentLiveSession_ShowsPicker is the flipped
+// SYMPTOM-3 test: post-redesign a bare attach NEVER consults the saved cwd→topic
+// mapping (PATH A deleted, spec §2). So even when the cwd-mapped topic is held by
+// a different live session, a bare attach returns a pick_topic proposal and makes
+// NO claim / no steal — the picker is how the user chooses. The old
+// cwd_default_collision status is now dormant (never emitted).
+func TestAttach_CwdDefault_HeldByDifferentLiveSession_ShowsPicker(t *testing.T) {
 	const launch = "/home/user/projects"
 	b, _ := collisionSetup(t, launch)
 	defer b.Shutdown()
 
-	// FIRST live session claims topic c3 directly. Register it WITH a
-	// non-nil conn so Stub.IsAlive() reports true via IsConnected() — the
-	// synthetic PID 9823 is not a real process on this machine, so a nil
-	// conn would fall through to isPIDAlive(9823)==false and the collision
-	// would never fire. The non-nil conn keeps the holder unambiguously
-	// live while still pinning PID 9823 for the holder-identity assertions
-	// below.
+	// FIRST live session claims topic c3 directly (non-nil conn → IsAlive true;
+	// PID 9823 is synthetic and not a live process here).
 	holder := b.Stubs.Register("claude", 9823, launch, struct{}{})
 	tid := int64(281)
 	key := MakeRouteKey("telegram", -100, &tid)
@@ -62,8 +57,8 @@ func TestAttach_CwdDefault_HeldByDifferentLiveSession_WarnsCollision(t *testing.
 		t.Fatal("holder's initial claim should succeed")
 	}
 
-	// SECOND session: bare cwd-default attach (no Name) from the SAME
-	// launch dir → saved mapping resolves to c3, which holder owns.
+	// SECOND session: bare attach from the SAME launch dir. The saved cwd map
+	// is no longer consulted → picker, never a claim/steal of the held topic.
 	peer, done := peerPair(t, b)
 	defer done()
 	helloAck(t, peer, launch)
@@ -80,41 +75,26 @@ func TestAttach_CwdDefault_HeldByDifferentLiveSession_WarnsCollision(t *testing.
 	}
 
 	if ack.OK {
-		t.Fatalf("cwd-default attach to a held topic must NOT succeed; got OK with Name=%q", ack.Name)
+		t.Fatalf("bare attach must NOT silently claim; got OK with Name=%q", ack.Name)
 	}
-	if ack.Status != ipc.AttachStatusCwdDefaultCollision {
-		t.Fatalf("Status=%q want %q (got Proposal=%+v Err=%q)",
-			ack.Status, ipc.AttachStatusCwdDefaultCollision, ack.Proposal, ack.Err)
+	if ack.Proposal == nil || ack.Proposal.Action != "pick_topic" {
+		t.Fatalf("bare attach must return a pick_topic proposal; got Status=%q Proposal=%+v Err=%q",
+			ack.Status, ack.Proposal, ack.Err)
 	}
-	// The raw force_steal proposal must NOT be what's surfaced here — the
-	// whole point is to replace it with the guided message.
-	if ack.Proposal != nil && ack.Proposal.Action == "force_steal" {
-		t.Errorf("cwd-default collision must NOT surface the raw force_steal proposal")
+	if ack.Status == ipc.AttachStatusCwdDefaultCollision {
+		t.Error("cwd_default_collision status is dormant post-redesign; must not be emitted")
 	}
-	// Fields the formatter needs.
-	if ack.Name != "c3" {
-		t.Errorf("collision Name=%q want c3 (the resolved topic)", ack.Name)
-	}
-	if ack.Holder == nil || ack.Holder.PID != 9823 || ack.Holder.CLI != "claude" {
-		t.Errorf("collision Holder=%+v want claude pid 9823", ack.Holder)
-	}
-	// Err carries the guided text with the holder + both suggestions.
-	for _, w := range []string{"c3", "9823", "claude", "steal"} {
-		if !strings.Contains(ack.Err, w) {
-			t.Errorf("collision Err missing %q: %q", w, ack.Err)
-		}
-	}
-	if !strings.Contains(strings.ToLower(ack.Err), "name") {
-		t.Errorf("collision Err should suggest attach-by-name: %q", ack.Err)
+	// The held topic must keep its original holder — no steal, no transfer.
+	if h, ok := b.Routes.Holder(key); !ok || h.PID != 9823 {
+		t.Errorf("held topic c3 must stay with holder pid 9823; got holder=%+v held=%v", h, ok)
 	}
 }
 
-// TestAttach_CwdDefault_TopicFree_ClaimsNormally is the no-regression
-// guard: when the cwd-default-resolved topic is FREE (no live holder),
-// the bare attach claims it normally — Status==ok, no collision warning.
-// The accepted residual "wrong but free" case stays silent (attach-by-name
-// is the documented tool; there is no signal to detect "wrong project").
-func TestAttach_CwdDefault_TopicFree_ClaimsNormally(t *testing.T) {
+// TestAttach_CwdDefault_TopicFree_ShowsPicker is the flipped incident test:
+// pre-redesign a bare attach silently claimed the FREE saved-mapping topic (the
+// exact silent mis-target class). Post-redesign a bare attach shows the picker
+// and claims NOTHING — the cwd map only ever seeds a suggestion (Phase 2).
+func TestAttach_CwdDefault_TopicFree_ShowsPicker(t *testing.T) {
 	const launch = "/home/user/projects"
 	b, _ := collisionSetup(t, launch)
 	defer b.Shutdown()
@@ -130,17 +110,17 @@ func TestAttach_CwdDefault_TopicFree_ClaimsNormally(t *testing.T) {
 	var ack ipc.AttachedMsg
 	_ = json.Unmarshal(raw, &ack)
 
-	if !ack.OK {
-		t.Fatalf("cwd-default attach to a FREE topic must claim normally; got Err=%q Status=%q", ack.Err, ack.Status)
+	if ack.OK {
+		t.Fatalf("bare attach to a free cwd-mapped topic must NOT silently claim; got OK Name=%q", ack.Name)
 	}
-	if ack.Status != ipc.AttachStatusOK {
-		t.Errorf("Status=%q want %q", ack.Status, ipc.AttachStatusOK)
+	if ack.Proposal == nil || ack.Proposal.Action != "pick_topic" {
+		t.Fatalf("bare attach must return a pick_topic proposal; got Status=%q Proposal=%+v Err=%q",
+			ack.Status, ack.Proposal, ack.Err)
 	}
-	if ack.Status == ipc.AttachStatusCwdDefaultCollision {
-		t.Error("free topic must NOT warn collision")
-	}
-	if ack.Name != "c3" {
-		t.Errorf("Name=%q want c3", ack.Name)
+	// The topic must remain unclaimed — the picker never binds.
+	tid := int64(281)
+	if h, ok := b.Routes.Holder(MakeRouteKey("telegram", -100, &tid)); ok {
+		t.Errorf("free topic must stay UNCLAIMED after a picker response; got holder=%+v", h)
 	}
 }
 
@@ -243,43 +223,69 @@ func TestAttach_ExplicitName_HeldTopic_StillForceSteal(t *testing.T) {
 	}
 }
 
-// TestAttach_CwdDefault_HeldBySameLogicalSession_NoWarn covers the
-// reconnect/self case: if the cwd-default-resolved topic is held by the
-// SAME logical session (same CLI+PID+CWD), the caller IS the holder — a
-// re-attach, not a collision. Must claim (transfer) normally, no warning.
-func TestAttach_CwdDefault_HeldBySameLogicalSession_NoWarn(t *testing.T) {
+// TestAttachBare_AlreadyAttached_IdempotentOK reworks the former
+// HeldBySameLogicalSession_NoWarn test for the redesign: a bare attach from a
+// session that is ALREADY attached takes attachBare's idempotent guard —
+// CurrentRoute != nil → report that route (OK=true) with the resolved Name, no
+// re-claim, no picker. The resolved Name is load-bearing: FormatAttached renders
+// it and the adapter's replay-remember records it.
+func TestAttachBare_AlreadyAttached_IdempotentOK(t *testing.T) {
 	const launch = "/home/user/projects"
 	b, _ := collisionSetup(t, launch)
 	defer b.Shutdown()
 
-	// The holder is the SAME logical session that will re-attach: same
-	// CLI+PID+CWD. We register it and claim, then drive an attach over a
-	// peer conn whose hello carries the SAME identity (claude / PID / cwd).
-	// helloAck() uses CLI="claude", PID=1, so make the holder match that.
-	holder := b.Stubs.Register("claude", 1, launch, nil)
-	tid := int64(281)
-	key := MakeRouteKey("telegram", -100, &tid)
-	if !b.tryClaim(nil, holder, key, "c3", false, false) {
-		t.Fatal("holder claim should succeed")
-	}
-
 	peer, done := peerPair(t, b)
 	defer done()
-	helloAck(t, peer, launch) // CLI=claude, PID=1, CWD=launch → same logical session
+	helloAck(t, peer, launch)
+
+	// First, an EXPLICIT attach to c3 sets this session's route.
+	if err := peer.WriteJSON(ipc.AttachReq{Op: ipc.OpAttach, CWD: launch, Name: "c3"}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := peer.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first ipc.AttachedMsg
+	if err := json.Unmarshal(raw, &first); err != nil {
+		t.Fatal(err)
+	}
+	if !first.OK || first.Name != "c3" {
+		t.Fatalf("explicit attach c3 should succeed; got %+v", first)
+	}
+
+	tid := int64(281)
+	key := MakeRouteKey("telegram", -100, &tid)
+	holder, held := b.Routes.Holder(key)
+	if !held {
+		t.Fatal("precondition: c3 must be claimed after the explicit attach")
+	}
+
+	// Now a BARE attach → idempotent already-attached OK, no re-claim.
 	if err := peer.WriteJSON(ipc.AttachReq{Op: ipc.OpAttach, CWD: launch}); err != nil {
 		t.Fatal(err)
 	}
-	raw, _ := peer.ReadFrame()
+	raw, err = peer.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
 	var ack ipc.AttachedMsg
-	_ = json.Unmarshal(raw, &ack)
+	if err := json.Unmarshal(raw, &ack); err != nil {
+		t.Fatal(err)
+	}
 
-	if ack.Status == ipc.AttachStatusCwdDefaultCollision {
-		t.Fatalf("same-logical-session re-attach must NOT warn collision; got Err=%q", ack.Err)
-	}
 	if !ack.OK {
-		t.Fatalf("same-logical-session re-attach should claim (transfer); got Err=%q Status=%q", ack.Err, ack.Status)
+		t.Fatalf("bare attach while already attached must be idempotent OK; got Err=%q Status=%q Proposal=%+v",
+			ack.Err, ack.Status, ack.Proposal)
 	}
-	if ack.Name != "c3" {
-		t.Errorf("Name=%q want c3", ack.Name)
+	if ack.NeedsConfirmation || ack.Proposal != nil {
+		t.Errorf("idempotent bare attach must not propose a picker; got Proposal=%+v", ack.Proposal)
+	}
+	if ack.Name != "c3" || ack.TopicID == nil || *ack.TopicID != 281 {
+		t.Errorf("idempotent response must carry the resolved route; got Name=%q TopicID=%v", ack.Name, ack.TopicID)
+	}
+	// Same holder, same conn — no re-claim, no transfer.
+	if h2, ok := b.Routes.Holder(key); !ok || h2.ConnID != holder.ConnID {
+		t.Errorf("idempotent bare attach must not re-claim; holder changed from conn=%d to %+v", holder.ConnID, h2)
 	}
 }

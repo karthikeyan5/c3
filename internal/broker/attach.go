@@ -27,9 +27,13 @@ import (
 //     b. args.TopicID != nil → validate via channel.ValidateTopic + claim by
 //     id; register topic in mappings.json:channels.<name>.topics with a
 //     placeholder name if not already present; persist cwd mapping.
-//     c. args.Name != "" or inferred from basename(cwd) → search topic
+//     c. args.Name != "" (or args.Create) → attachByName: search the topic
 //     registry. If found in default group → claim. If found in another
 //     group → propose disambiguation. If found nowhere → propose creation.
+//     d. Otherwise (BARE — no name/target/topic_id/create) → attachBare:
+//     idempotent guard → the session's OWN recover (the only silent path)
+//     → picker. A bare attach never synthesizes a name from cwd nor
+//     silently claims a saved cwd→topic mapping (spec §1-§2).
 //  4. On args.Create == true → call channel.CreateTopic, register topic,
 //     claim, persist mapping.
 func (b *Broker) handleAttach(conn *ipc.Conn, stub *Stub, raw []byte) {
@@ -87,19 +91,115 @@ func (b *Broker) handleAttach(conn *ipc.Conn, stub *Stub, raw []byte) {
 	case req.TopicID != nil:
 		b.attachByTopicID(conn, stub, chanName, *req.TopicID, req.Group, req.Steal, req.Replay)
 	default:
-		// Pass through the user-supplied name as-is. attachByName will
-		// backfill from cwd basename only AFTER the saved-mapping check,
-		// so an empty name doesn't get treated as "explicit override" of
-		// the saved cwd mapping.
-		if req.Name == "" && req.CWD == "" {
-			_ = conn.WriteJSON(ipc.AttachedMsg{
-				Op: ipc.OpAttached, OK: false,
-				Err: "attach: provide cwd, name, target, or topic_id",
-			})
+		// Explicit name (or create=true) → attachByName (path (i)): the user
+		// typed a name, so an exact bind is inherently safe. A BARE attach (no
+		// name, no create) → attachBare: idempotent guard → the session's OWN
+		// recover (the only silent path) → picker. A bare attach NEVER
+		// synthesizes a name from cwd nor silently claims a saved cwd→topic
+		// mapping — that silent mis-target was the incident this redesign
+		// closes (spec §1-§2). Empty cwd is fine: it falls to the picker, not
+		// an error.
+		if req.Name != "" || req.Create {
+			b.attachByName(conn, stub, chanName, req.Name, req.CWD, req.Group, req.Create, req.Steal, req.Replay)
 			return
 		}
-		b.attachByName(conn, stub, chanName, req.Name, req.CWD, req.Group, req.Create, req.Steal, req.Replay)
+		b.attachBare(conn, stub, chanName, req.CWD, req.Group, req.Steal, req.Replay)
 	}
+}
+
+// attachBare handles a BARE attach — no explicit name, target, topic_id, or
+// create. It is the ONLY path that can silently claim, and even that is
+// restricted to the session's OWN previously-recorded route. Resolution order
+// (spec §1):
+//
+//  1. Idempotent: the stub is already attached (CurrentRoute != nil) → report
+//     that route, no re-claim, no re-peek. The response carries the resolved
+//     Channel/ChatID/TopicID/Name so FormatAttached can render it (and the
+//     adapter's replay-remember can record the resolved identity).
+//  2. Own recover — the ONLY silent claim in the system: a recoverable
+//     session_attachment for the stub's STABLE session id → silently re-claim
+//     it. Ungated (a manual bare attach is user-initiated; the auto-resume gate
+//     governs only the automatic handleRecoverSession path). recoverSession
+//     re-claims the session's OWN route only — a mis-target is impossible by
+//     construction.
+//  3. Otherwise → picker: NEVER claims. cwd only SEEDS a suggestion (Phase 2).
+//     Phase 1 emits the minimal pick_topic proposal; the ranked suggestion list
+//     and its host-neutral formatter case land in Phase 2.
+//
+// cwd/group/steal/replay are threaded for the Phase-2 picker; Phase 1 reads only
+// the stub's own state.
+func (b *Broker) attachBare(conn *ipc.Conn, stub *Stub, chanName, cwd, group string, steal, replay bool) {
+	// (i) Already attached — idempotent OK, no re-claim, no re-peek.
+	if cur := stub.CurrentRoute(); cur != nil {
+		name, groupName := "dm", ""
+		var topicID *int64
+		if cur.HasTopic {
+			t := cur.TopicID
+			topicID = &t
+			if tp, ok := b.Mappings().LookupTopicByID(cur.Channel, cur.ChatID, cur.TopicID); ok {
+				name = tp.Name
+				groupName = tp.Group
+			} else {
+				name = fmt.Sprintf("topic-%d", cur.TopicID)
+			}
+		}
+		_ = conn.WriteJSON(ipc.AttachedMsg{
+			Op: ipc.OpAttached, OK: true,
+			Status:  ipc.AttachStatusOK,
+			Channel: cur.Channel, ChatID: cur.ChatID, TopicID: topicID,
+			Name: name, Group: groupName,
+			Capabilities: b.capsForChannel(cur.Channel),
+		})
+		return
+	}
+
+	// (ii) Own recover — the ONLY silent claim. Ungated: a manual bare attach
+	// re-claims the session's own recorded route even for a user who disabled
+	// the AUTOMATIC auto-attach-on-resume gate. recoverSession sets the route
+	// and peeks the count; withBacklog re-peeks for the preview — an interim,
+	// non-destructive double peek (Phase 3 widens recoverSession to return the
+	// preview and drops this second peek).
+	if key, _, ok := b.recoverSession(stub); ok {
+		name, groupName := "dm", ""
+		if sa, ok := b.Mappings().LookupSessionAttachment(stub.StableSessionIDValue()); ok {
+			name = sa.Name
+			groupName = sa.Group
+		}
+		if name == "" {
+			if key.HasTopic {
+				if tp, ok := b.Mappings().LookupTopicByID(key.Channel, key.ChatID, key.TopicID); ok {
+					name = tp.Name
+					groupName = tp.Group
+				} else {
+					name = fmt.Sprintf("topic-%d", key.TopicID)
+				}
+			} else {
+				name = "dm"
+			}
+		}
+		var topicID *int64
+		if key.HasTopic {
+			t := key.TopicID
+			topicID = &t
+		}
+		_ = conn.WriteJSON(b.withBacklog(key, ipc.AttachedMsg{
+			Op: ipc.OpAttached, OK: true,
+			Status:  ipc.AttachStatusOK,
+			Channel: key.Channel, ChatID: key.ChatID, TopicID: topicID,
+			Name: name, Group: groupName,
+			Capabilities: b.capsForChannel(key.Channel),
+		}))
+		return
+	}
+
+	// (iii) Picker — NEVER claims. Phase 1 placeholder: the minimal pick_topic
+	// proposal with no suggestions. Phase 2 adds buildPickTopic (cwd-seeded,
+	// ranked suggestions) and the host-neutral FormatAttached "pick_topic" case.
+	_ = conn.WriteJSON(ipc.AttachedMsg{
+		Op: ipc.OpAttached, OK: false,
+		NeedsConfirmation: true,
+		Proposal:          &ipc.Proposal{Action: "pick_topic", Channel: chanName},
+	})
 }
 
 // applyExprToAttachReq parses the user-supplied freeform argument string and
@@ -291,16 +391,16 @@ func (b *Broker) attachByTopicID(conn *ipc.Conn, stub *Stub, chanName string, to
 	}))
 }
 
-// attachByName runs the full search flow per spec §5.2-§5.4:
+// attachByName runs the explicit-name search flow per spec §5.2-§5.4. It is
+// reached ONLY for an explicit name (or create=true) — a bare attach with no
+// name routes to attachBare, which never synthesizes a name from cwd nor
+// consults the saved cwd→topic mapping (the silent mis-target class this
+// redesign closes; spec §1-§2). Steps:
 //
-//  1. If args.CWD has a saved mapping AND no explicit name was provided
-//     (or the explicit name matches the saved mapping's name) → silent
-//     claim of the saved route. The user can OVERRIDE the saved mapping
-//     by passing an explicit name that differs.
-//  2. Else search default group for `name` → if found, claim it.
-//  3. Else search all groups → if found in non-default, propose
+//  1. Search default group for `name` → if found, claim it.
+//  2. Else search all groups → if found in non-default, propose
 //     disambiguation (action="use_existing_other_group").
-//  4. Else propose creation in default group (action="create").
+//  3. Else propose creation in default group (action="create").
 //
 // On any "propose" outcome the response carries needs_confirmation=true and
 // a Proposal payload; the agent re-calls attach with create=true to confirm.
@@ -312,76 +412,6 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 		return
 	}
 
-	// 1. Saved mapping wins — but only if the user didn't explicitly ask
-	// for a different topic. 2026-05-09: a stale cwd-mapping made
-	// `attach name=c3` silently bind to topic-948 instead of c3, because
-	// the saved mapping pointed at 948. Honor explicit name now.
-	//
-	// Note `name` is the USER-SUPPLIED name here — empty if not provided.
-	// We backfill from cwd basename after this block so an empty name
-	// is treated as "no explicit choice" rather than "explicit choice
-	// equal to cwd basename".
-	if cwd != "" {
-		if m, ok := b.Mappings().LookupByCwd(cwd); ok && m.Channel == chanName {
-			explicitOverride := name != "" && name != m.Name
-			if !explicitOverride {
-				tid := m.TopicID
-				tidPtr := &tid
-				if tid == 0 {
-					tidPtr = nil
-				}
-				key := MakeRouteKey(chanName, m.ChatID, tidPtr)
-
-				// SYMPTOM-3 (2026-06-04): cwd-default collision warning.
-				// This branch is reached for a BARE `/c3:attach` (name=="")
-				// resolving the saved cwd→topic mapping. Multiple `claude`
-				// instances launched from the same parent dir report
-				// identical cwds, so this mapping is ambiguous. If the
-				// resolved topic is already held by a DIFFERENT live session,
-				// silently claiming (or showing only the raw force_steal
-				// prompt) hides that the user probably meant another topic.
-				// Surface a guided collision message instead.
-				//
-				// Gated on name=="" (truly bare): an EXPLICIT name — even one
-				// equal to the saved mapping's name — is the user asking for
-				// THAT topic, and must keep the normal force_steal flow
-				// (steal=true bypasses, so a confirmed re-invoke is honored).
-				if name == "" && !steal {
-					if holder, collides := b.heldByDifferentLiveSession(key, stub); collides {
-						_ = conn.WriteJSON(ipc.AttachedMsg{
-							Op: ipc.OpAttached, OK: false,
-							Status:  ipc.AttachStatusCwdDefaultCollision,
-							Channel: chanName, ChatID: m.ChatID, TopicID: tidPtr,
-							Name:  m.Name,
-							Group: m.Group,
-							CWD:   cwd,
-							Holder: &ipc.Holder{
-								CLI: holder.CLI, PID: holder.PID, CWD: holder.CWD,
-							},
-							Err: fmt.Sprintf(
-								"cwd %s maps to topic %q, already held by %s pid %d (a different session); attach by name to pick another topic, or re-invoke with steal=true",
-								cwd, m.Name, holder.CLI, holder.PID),
-						})
-						return
-					}
-				}
-
-				if !b.tryClaim(conn, stub, key, m.Name, steal, replay) {
-					return
-				}
-				b.persistMapping(stub, chanName, m.ChatID, m.TopicID, m.Name, m.Group)
-				_ = conn.WriteJSON(b.withBacklog(key, ipc.AttachedMsg{
-					Op: ipc.OpAttached, OK: true,
-					Status:  ipc.AttachStatusOK,
-					Channel: chanName, ChatID: m.ChatID, TopicID: tidPtr,
-					Name: m.Name, Group: m.Group,
-					Capabilities: b.capsForChannel(chanName),
-				}))
-				return
-			}
-		}
-	}
-
 	gName, gCfg, ok := b.resolveGroup(cc, groupName)
 	if !ok {
 		_ = conn.WriteJSON(ipc.AttachedMsg{Op: ipc.OpAttached, OK: false,
@@ -389,19 +419,17 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 		return
 	}
 
-	// Backfill name from cwd basename if still empty (steps 2-4 need a name
-	// to search/propose). At this point either no saved mapping was found,
-	// or the user explicitly differs from saved.
-	if name == "" && cwd != "" {
-		name = filepath.Base(cwd)
-	}
+	// A bare attach never reaches here (it routes to attachBare), so name is
+	// always the user-supplied explicit name. The old cwd-basename backfill is
+	// deleted: a bare create=true now correctly errors rather than synthesizing
+	// a name (the picker / explicit name is the tool for choosing a topic).
 	if name == "" {
 		_ = conn.WriteJSON(ipc.AttachedMsg{Op: ipc.OpAttached, OK: false,
 			Err: "attach: provide cwd, name, target, or topic_id"})
 		return
 	}
 
-	// 2. Default-group search.
+	// 1. Default-group search.
 	if tp, ok := b.Mappings().LookupTopicInDefaultGroup(chanName, name); ok && tp.Group == gName {
 		// In the default group already — silent claim.
 		tid := tp.TopicID
@@ -420,7 +448,7 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 		return
 	}
 
-	// 3. Cross-group search.
+	// 2. Cross-group search.
 	allHits := b.Mappings().LookupTopicAcrossGroups(chanName, name)
 	otherGroupHits := allHits[:0:0]
 	for _, h := range allHits {
@@ -451,7 +479,7 @@ func (b *Broker) attachByName(conn *ipc.Conn, stub *Stub, chanName, name, cwd, g
 		return
 	}
 
-	// 4. Propose or perform creation.
+	// 3. Propose or perform creation.
 	if !create {
 		_ = conn.WriteJSON(ipc.AttachedMsg{
 			Op: ipc.OpAttached, OK: false,

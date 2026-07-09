@@ -49,73 +49,11 @@ func TestRecoverBroker_CtxCancelStopsLoop(t *testing.T) {
 // code the Claude adapter has run in production since the reconnect-forever
 // upgrade.
 
-// TestAutoAttach_DoesNotRegisterPendingSlot guards the D6 (adapter-ipc-7)
-// correlation fix: autoAttach must NOT register the shared pending["attached"]
-// slot, so it can never collide with / strand the `attach` tool's waiter. We
-// give the adapter a live (piped) broker conn, run autoAttach, drain the
-// written frame, and assert the pending map stayed empty the whole time.
-func TestAutoAttach_DoesNotRegisterPendingSlot(t *testing.T) {
-	a := newAdapter()
-	cliEnd, brokerEnd := net.Pipe()
-	defer cliEnd.Close()
-	defer brokerEnd.Close()
-
-	a.bmu.Lock()
-	a.conn = ipc.NewConn(cliEnd)
-	a.bmu.Unlock()
-
-	// Reader on the broker end so the adapter's WriteJSON doesn't block on the
-	// synchronous pipe.
-	read := make(chan []byte, 1)
-	go func() {
-		bc := ipc.NewConn(brokerEnd)
-		raw, err := bc.ReadFrame()
-		if err == nil {
-			read <- raw
-		} else {
-			read <- nil
-		}
-	}()
-
-	a.autoAttach("my-topic")
-
-	// The attach frame must have been written...
-	select {
-	case raw := <-read:
-		if raw == nil {
-			t.Fatal("autoAttach did not write an attach frame")
-		}
-		var req ipc.AttachReq
-		if err := json.Unmarshal(raw, &req); err != nil {
-			t.Fatalf("attach frame unmarshal: %v", err)
-		}
-		if req.Op != ipc.OpAttach || req.Name != "my-topic" {
-			t.Fatalf("unexpected attach frame: %+v", req)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for autoAttach frame")
-	}
-
-	// ...and crucially, autoAttach must NOT have claimed the shared slot.
-	a.pmu.Lock()
-	_, claimed := a.pending["attached"]
-	n := len(a.pending)
-	a.pmu.Unlock()
-	if claimed {
-		t.Error("autoAttach must NOT register pending[\"attached\"] (D6 collision)")
-	}
-	if n != 0 {
-		t.Errorf("autoAttach must leave the pending map empty; got %d entries", n)
-	}
-
-	// And it must remember the attach for D3 replay.
-	a.amu.Lock()
-	last := a.lastAttach
-	a.amu.Unlock()
-	if last == nil || last.Name != "my-topic" {
-		t.Errorf("autoAttach must rememberAttach for D3 replay; got %+v", last)
-	}
-}
+// NOTE: the former TestAutoAttach_DoesNotRegisterPendingSlot was removed with
+// the startup auto-attach itself (spec §2 Phase 1). A Codex session no longer
+// silently binds a cwd-inferred topic name at startup — it attaches explicitly,
+// and a bare attach surfaces a picker. rememberAttach/replayLastAttach stay for
+// the `attach`-tool → broker-restart replay path (covered below).
 
 // TestReplayLastAttach_SendsReplayFrame covers the D3 (adapter-ipc-3) replay:
 // after a reconnect, the remembered attach is re-sent with Replay=true so the

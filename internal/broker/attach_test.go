@@ -379,10 +379,11 @@ func TestAttach_TopicID_ValidatesAndClaims(t *testing.T) {
 	}
 }
 
-func TestAttach_SavedMapping_SilentClaim(t *testing.T) {
-	// When no explicit name is provided (or name matches saved mapping), the
-	// saved cwd mapping wins as a silent claim — the common "cd into project,
-	// type attach" flow.
+func TestAttach_SavedMapping_ShowsPickerNoClaim(t *testing.T) {
+	// Post-redesign a bare attach NEVER consults the saved cwd→topic mapping
+	// (PATH A deleted, spec §2). With an empty stableSessionID (no recover op
+	// yet) and no already-held route, a bare attach shows the picker and claims
+	// NOTHING — the cwd map only seeds a suggestion (Phase 2), never a bind.
 	mf := mfWithTelegram()
 	mf.Mappings["/projects/widget"] = mappings.Mapping{
 		Channel: "telegram", ChatID: -100, TopicID: 281,
@@ -396,20 +397,22 @@ func TestAttach_SavedMapping_SilentClaim(t *testing.T) {
 	defer done()
 	helloAck(t, peer, "/projects/widget")
 
-	// Bare `attach` (no name) → saved mapping wins.
+	// Bare `attach` (no name) → picker, no silent claim.
 	_ = peer.WriteJSON(ipc.AttachReq{Op: ipc.OpAttach, CWD: "/projects/widget"})
 	raw, _ := peer.ReadFrame()
 	var ack ipc.AttachedMsg
 	_ = json.Unmarshal(raw, &ack)
 
-	if !ack.OK {
-		t.Fatalf("saved-mapping attach failed: %s", ack.Err)
+	if ack.OK {
+		t.Fatalf("saved-mapping bare attach must NOT silently claim; got OK Name=%q", ack.Name)
 	}
-	if ack.NeedsConfirmation {
-		t.Error("saved mapping should be silent claim")
+	if ack.Proposal == nil || ack.Proposal.Action != "pick_topic" {
+		t.Fatalf("bare attach must return a pick_topic proposal; got Status=%q Proposal=%+v Err=%q",
+			ack.Status, ack.Proposal, ack.Err)
 	}
-	if ack.Name != "c3" {
-		t.Errorf("Name=%q, want c3 (from saved mapping)", ack.Name)
+	tid := int64(281)
+	if h, ok := b.Routes.Holder(MakeRouteKey("telegram", -100, &tid)); ok {
+		t.Errorf("the cwd-mapped topic must stay UNCLAIMED; got holder=%+v", h)
 	}
 }
 
@@ -1405,7 +1408,9 @@ func TestAttach_PolicyRejectedHint_ShortCircuitsToStatusPolicyRejected(t *testin
 	}
 }
 
-func TestAttach_SavedMapping_EmitsStatusOK(t *testing.T) {
+func TestAttach_SavedMapping_ShowsPickerNotStatusOK(t *testing.T) {
+	// Flipped from the old status-OK assertion: a bare attach against a saved
+	// cwd mapping no longer emits AttachStatusOK — it shows the picker (spec §2).
 	mf := mfWithTelegram()
 	mf.Mappings["/projects/widget"] = mappings.Mapping{
 		Channel: "telegram", ChatID: -100, TopicID: 281,
@@ -1424,10 +1429,10 @@ func TestAttach_SavedMapping_EmitsStatusOK(t *testing.T) {
 	var ack ipc.AttachedMsg
 	_ = json.Unmarshal(raw, &ack)
 
-	if !ack.OK {
-		t.Fatalf("attach failed: %s", ack.Err)
+	if ack.OK || ack.Status == ipc.AttachStatusOK {
+		t.Fatalf("saved-mapping bare attach must not emit status OK; got OK=%v Status=%q", ack.OK, ack.Status)
 	}
-	if ack.Status != ipc.AttachStatusOK {
-		t.Errorf("Status=%q want %q", ack.Status, ipc.AttachStatusOK)
+	if ack.Proposal == nil || ack.Proposal.Action != "pick_topic" {
+		t.Fatalf("bare attach must return a pick_topic proposal; got Proposal=%+v", ack.Proposal)
 	}
 }

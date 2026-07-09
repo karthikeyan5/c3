@@ -12,7 +12,7 @@ Call `mcp__plugin_c3_c3__attach` with `expr` set to the user's argument string (
 
 If the response is **needs_confirmation** with proposal action:
 
-- **`create`**: Ask the user via `AskUserQuestion` whether to create the topic. On yes → re-invoke `attach(expr="create $ARGUMENTS")` (or `attach(name=..., create=true)` if you have the name parsed). On no → tell them how to use an existing topic instead.
+- **`create`**: Ask the user via `AskUserQuestion` whether to create the topic. On yes → re-invoke with the name explicitly: `attach(name="<the proposal's name>", create=true)` (or `attach(expr="create <name>")`, which also carries the name). A bare `attach(create=true)` no longer works — the name must be present. On no → tell them how to use an existing topic instead.
 
 - **`use_existing_other_group`**: Ask the user via `AskUserQuestion` whether to claim the existing topic (in a different group) or create a new one in the default group. Re-invoke accordingly.
 
