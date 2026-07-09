@@ -55,6 +55,26 @@ func TestRecoverBroker_CtxCancelStopsLoop(t *testing.T) {
 // and a bare attach surfaces a picker. rememberAttach/replayLastAttach stay for
 // the `attach`-tool → broker-restart replay path (covered below).
 
+// TestResolvedAttachReq_Parity pins the §3d1 substitution on the Codex side
+// (DORMANT — a Codex bare attach never returns OK post-Phase-1 — but wired for
+// symmetry): an explicit request is remembered verbatim, a bare resolution
+// substitutes the resolved identity ({Name,Group} for a topic, {Target:"dm"}
+// for the DM).
+func TestResolvedAttachReq_Parity(t *testing.T) {
+	explicit := ipc.AttachReq{Op: ipc.OpAttach, CWD: "/p", Name: "c3"}
+	if got := resolvedAttachReq(explicit, ipc.AttachedMsg{OK: true, Name: "c3"}); got != explicit {
+		t.Fatalf("explicit must be verbatim: %+v", got)
+	}
+	tid := int64(281)
+	bare := ipc.AttachReq{Op: ipc.OpAttach, CWD: "/p"}
+	if got := resolvedAttachReq(bare, ipc.AttachedMsg{OK: true, Name: "c3", Group: "g", TopicID: &tid}); got.Name != "c3" || got.Group != "g" || got.Target != "" {
+		t.Fatalf("bare→topic: %+v", got)
+	}
+	if got := resolvedAttachReq(bare, ipc.AttachedMsg{OK: true, Name: "dm"}); got.Target != "dm" || got.Name != "" {
+		t.Fatalf("bare→DM: %+v", got)
+	}
+}
+
 // TestReplayLastAttach_SendsReplayFrame covers the D3 (adapter-ipc-3) replay:
 // after a reconnect, the remembered attach is re-sent with Replay=true so the
 // route claim is re-established silently (no welcome message).

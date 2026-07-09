@@ -470,6 +470,33 @@ func (a *adapter) rememberAttach(req ipc.AttachReq) {
 	a.lastAttach = &cp
 }
 
+// isBareAttachReq reports whether an attach request carried no explicit target
+// (no Target, Name, TopicID, or Create — Codex has no Expr arg). Mirrors the
+// Claude adapter.
+func isBareAttachReq(req ipc.AttachReq) bool {
+	return req.Expr == "" && req.Target == "" && req.Name == "" && req.TopicID == nil && !req.Create
+}
+
+// resolvedAttachReq picks the request to REMEMBER for reconnect replay (§3d1) —
+// an explicit request verbatim, a BARE-resolved one as its RESOLVED identity
+// ({Name, Group} for a topic, {Target:"dm"} for the DM) so a fresh-broker replay
+// re-binds explicitly instead of regressing to a picker. Parity with the Claude
+// adapter; DORMANT here because a Codex bare attach never returns OK post-Phase-1
+// (it always yields a picker), but wired for symmetry.
+func resolvedAttachReq(req ipc.AttachReq, attached ipc.AttachedMsg) ipc.AttachReq {
+	if !isBareAttachReq(req) {
+		return req
+	}
+	resolved := ipc.AttachReq{Op: ipc.OpAttach, CWD: req.CWD}
+	if attached.TopicID == nil {
+		resolved.Target = "dm"
+	} else {
+		resolved.Name = attached.Name
+		resolved.Group = attached.Group
+	}
+	return resolved
+}
+
 // replayLastAttach re-sends the saved attach request to the (just-reconnected)
 // broker so the route claim is re-established without user intervention (D3).
 // Best-effort — failures are logged and not surfaced. The Replay flag tells the
@@ -1086,9 +1113,11 @@ func (a *adapter) toolAttach(ctx context.Context, req *mcp.CallToolRequest) (*mc
 		attached, _ := res.Result["_attached"].(ipc.AttachedMsg)
 		if attached.OK {
 			// D3 (adapter-ipc-3): remember the successful attach so a broker
-			// restart re-claims this route via replayLastAttach. Parity with
-			// the Claude adapter's toolAttach.
-			a.rememberAttach(attachReq)
+			// restart re-claims this route via replayLastAttach. §3d1: a
+			// bare-resolved attach is remembered as its resolved identity so a
+			// fresh-broker replay re-binds explicitly. Parity with the Claude
+			// adapter's toolAttach.
+			a.rememberAttach(resolvedAttachReq(attachReq, attached))
 			// Side-effect surface: OSC-0 title-bar escape to stderr
 			// for the currently-attached topic. Closes TODO #19(a).
 			// Cross-CLI parity with the Claude adapter; same gates

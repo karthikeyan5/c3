@@ -156,11 +156,11 @@ func (b *Broker) attachBare(conn *ipc.Conn, stub *Stub, chanName, cwd, group str
 
 	// (ii) Own recover — the ONLY silent claim. Ungated: a manual bare attach
 	// re-claims the session's own recorded route even for a user who disabled
-	// the AUTOMATIC auto-attach-on-resume gate. recoverSession sets the route
-	// and peeks the count; withBacklog re-peeks for the preview — an interim,
-	// non-destructive double peek (Phase 3 widens recoverSession to return the
-	// preview and drops this second peek).
-	if key, _, ok := b.recoverSession(stub); ok {
+	// the AUTOMATIC auto-attach-on-resume gate. recoverSession sets the route and
+	// returns the queued count AND preview from a SINGLE backlogSummary peek —
+	// stamp both straight onto the response (no withBacklog re-peek, which would
+	// re-introduce the §3c double-peek TOCTOU on this manual path).
+	if key, cnt, preview, ok := b.recoverSession(stub); ok {
 		name, groupName := "dm", ""
 		if sa, ok := b.Mappings().LookupSessionAttachment(stub.StableSessionIDValue()); ok {
 			name = sa.Name
@@ -183,13 +183,14 @@ func (b *Broker) attachBare(conn *ipc.Conn, stub *Stub, chanName, cwd, group str
 			t := key.TopicID
 			topicID = &t
 		}
-		_ = conn.WriteJSON(b.withBacklog(key, ipc.AttachedMsg{
+		_ = conn.WriteJSON(ipc.AttachedMsg{
 			Op: ipc.OpAttached, OK: true,
 			Status:  ipc.AttachStatusOK,
 			Channel: key.Channel, ChatID: key.ChatID, TopicID: topicID,
 			Name: name, Group: groupName,
+			QueuedCount: cnt, QueuedSummary: preview,
 			Capabilities: b.capsForChannel(key.Channel),
-		}))
+		})
 		return
 	}
 
@@ -1022,26 +1023,31 @@ func routeKeyFromSessionAttachment(sa mappings.SessionAttachment) RouteKey {
 // LastAttachedAt only when staler than sessionRefreshInterval, so a burst of
 // broker-bounce / reconnect-driven recover ops doesn't rewrite mappings.json
 // (with its .bak + fsyncs) every time.
-func (b *Broker) recoverSession(stub *Stub) (RouteKey, int, bool) {
+func (b *Broker) recoverSession(stub *Stub) (RouteKey, int, []ipc.QueuedItem, bool) {
 	sid := stub.StableSessionIDValue()
 	if sid == "" {
-		return RouteKey{}, 0, false
+		return RouteKey{}, 0, nil, false
 	}
 	sa, ok := b.Mappings().LookupSessionAttachment(sid)
 	if !ok || !sa.Recoverable(time.Now(), SessionAttachmentTTL) {
-		return RouteKey{}, 0, false
+		return RouteKey{}, 0, nil, false
 	}
 	key := routeKeyFromSessionAttachment(sa)
 	if _, held := b.heldByDifferentLiveSession(key, stub); held {
 		log.Printf("recover: SKIPPED session=%s topic=%q (held by another live session)", sid, sa.Name)
-		return RouteKey{}, 0, false
+		return RouteKey{}, 0, nil, false
 	}
 	if _, claimed := b.Routes.Claim(key, stub); !claimed {
 		log.Printf("recover: claim FAILED session=%s topic=%q", sid, sa.Name)
-		return RouteKey{}, 0, false
+		return RouteKey{}, 0, nil, false
 	}
 	stub.SetRoute(&key)
-	cnt, _ := b.backlogSummary(key)
+	// SINGLE live peek: return the count AND the preview from ONE backlogSummary
+	// job so they always describe the same queue snapshot. Callers (the automatic
+	// handleRecoverSession and the manual attachBare path (ii)) consume both from
+	// this result — no second peek, so count and preview can never disagree (the
+	// stale-peek TOCTOU that §3c closes).
+	cnt, preview := b.backlogSummary(key)
 	if time.Since(sa.LastAttachedAt) > sessionRefreshInterval {
 		b.mutateMappings(func(mf *mappings.MappingsFile) {
 			if cur, ok := mf.LookupSessionAttachment(sid); ok {
@@ -1052,7 +1058,7 @@ func (b *Broker) recoverSession(stub *Stub) (RouteKey, int, bool) {
 		_ = b.SaveMappings()
 	}
 	log.Printf("recover: session=%s cli=%s pid=%d → %q (queued=%d)", sid, stub.CLI, stub.PID, sa.Name, cnt)
-	return key, cnt, true
+	return key, cnt, preview, true
 }
 
 // recordCurrentRouteForStable saves the stub's CURRENT route under its stable

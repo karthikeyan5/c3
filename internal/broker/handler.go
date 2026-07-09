@@ -246,13 +246,14 @@ func (b *Broker) handleRecoverSession(conn *ipc.Conn, stub *Stub, raw []byte) {
 		// auto-re-attach, so it runs regardless of the auto_attach_on_resume gate.
 		b.recordCurrentRouteForStable(stub, *cur)
 	} else if !b.Mappings().AutoAttachOnResumeEnabled() {
-		// Gate (v1 default OFF): the stable id is recorded above via
-		// SetStableSessionID (so a later SIGHUP-enable / attach still works), but
-		// the broker does NOT auto-re-claim the last route. Read live from the
-		// current mappings snapshot, so a SIGHUP config reload flips it without a
-		// restart. One line per resumed session (recover fires exactly once).
-		log.Printf("recover: auto-attach-on-resume DISABLED by config — session=%s not re-attached (set \"auto_attach_on_resume\": true in mappings.json to enable)", req.StableSessionID)
-	} else if key, cnt, ok := b.recoverSession(stub); ok {
+		// Gate (default ON post-redesign — nil ⇒ enabled; only an explicit
+		// "auto_attach_on_resume": false disables it): the stable id is recorded
+		// above via SetStableSessionID (so a later SIGHUP-enable / attach still
+		// works), but the broker does NOT auto-re-claim the last route. Read live
+		// from the current mappings snapshot, so a SIGHUP config reload flips it
+		// without a restart. One line per resumed session (recover fires once).
+		log.Printf("recover: auto-attach-on-resume DISABLED by config — session=%s not re-attached (remove \"auto_attach_on_resume\": false from mappings.json to re-enable)", req.StableSessionID)
+	} else if key, cnt, preview, ok := b.recoverSession(stub); ok {
 		resp.Recovered = true
 		resp.Channel = key.Channel
 		resp.ChatID = key.ChatID
@@ -260,13 +261,12 @@ func (b *Broker) handleRecoverSession(conn *ipc.Conn, stub *Stub, raw []byte) {
 			t := key.TopicID
 			resp.TopicID = &t
 		}
+		// Count AND preview come from recoverSession's SINGLE backlogSummary peek
+		// (§3c) — one job, so they always describe the same snapshot. The preview
+		// SURFACES the held messages into the resumed session (not just a count,
+		// BUG #2); the authoritative live count is fetch_queue's Remaining.
 		resp.QueuedCount = cnt
-		// Carry a compact backlog PREVIEW (not just the count) so the adapter can
-		// SURFACE the held messages into the resumed session — the same data a
-		// normal attach delivers via withBacklog/AttachedMsg (BUG #2). Peek only.
-		if cnt > 0 {
-			_, resp.QueuedSummary = b.backlogSummary(key)
-		}
+		resp.QueuedSummary = preview
 		// Name/Group: prefer the recorded attachment, fall back to the topic
 		// registry. DM (no topic) reports name "dm".
 		if sa, ok := b.Mappings().LookupSessionAttachment(req.StableSessionID); ok {

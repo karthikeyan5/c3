@@ -325,7 +325,7 @@ func TestRecoverSession_RefreshesStaleLastAttachedAt(t *testing.T) {
 
 	stub := b.Stubs.Register("claude", 1, "/x", nil)
 	stub.SetStableSessionID("sess-1")
-	if _, _, ok := b.recoverSession(stub); !ok {
+	if _, _, _, ok := b.recoverSession(stub); !ok {
 		t.Fatal("expected recoverSession to succeed")
 	}
 	sa, _ := b.Mappings().LookupSessionAttachment("sess-1")
@@ -346,7 +346,7 @@ func TestRecoverSession_SkipsRefreshWhenFresh(t *testing.T) {
 
 	stub := b.Stubs.Register("claude", 1, "/x", nil)
 	stub.SetStableSessionID("sess-1")
-	if _, _, ok := b.recoverSession(stub); !ok {
+	if _, _, _, ok := b.recoverSession(stub); !ok {
 		t.Fatal("fresh attachment should still recover")
 	}
 	sa, _ := b.Mappings().LookupSessionAttachment("sess-1")
@@ -377,7 +377,52 @@ func TestRecoverSession_EmptyStableIDNoOp(t *testing.T) {
 	b := brokerWithChannel(t, mf, &fakeChannel{})
 	defer b.Shutdown()
 	stub := b.Stubs.Register("claude", 1, "/x", nil) // no stable id
-	if _, _, ok := b.recoverSession(stub); ok {
+	if _, _, _, ok := b.recoverSession(stub); ok {
 		t.Fatal("recoverSession must be a no-op without a stable id")
+	}
+}
+
+// TestRecoverSession_SinglePeekCountPreviewConsistent pins §3c: recoverSession
+// returns the count AND the preview from ONE backlogSummary peek, so they always
+// describe the same queue snapshot. With a queue at the preview cap the count
+// and the preview length are exactly equal — a regression that peeked twice
+// (the old stale-double-peek TOCTOU) could return a count and a preview drawn
+// from two different snapshots.
+func TestRecoverSession_SinglePeekCountPreviewConsistent(t *testing.T) {
+	t.Setenv("C3_QUEUE_DIR", t.TempDir())
+	mf := mfWithTelegram()
+	seedSessionAttachment(mf, "sess-1", time.Now().UTC(), false) // → c3 / 281
+	b := brokerWithChannel(t, mf, &fakeChannel{})
+	defer b.Shutdown()
+
+	tid := int64(281)
+	qrk := queue.RouteKey{Channel: "telegram", ChatID: -100, TopicID: &tid}
+	for i := int64(1); i <= backlogSummaryMax; i++ {
+		if err := b.Queue.Append(qrk, &c3types.Inbound{
+			Channel: "telegram", ChatID: -100, TopicID: &tid, MessageID: i,
+			Sender: c3types.Sender{Username: "k"}, Text: "held msg", Timestamp: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	stub := b.Stubs.Register("claude", 1, "/x", nil)
+	stub.SetStableSessionID("sess-1")
+
+	key, cnt, preview, ok := b.recoverSession(stub)
+	if !ok {
+		t.Fatal("expected recoverSession to succeed")
+	}
+	if cnt != backlogSummaryMax {
+		t.Fatalf("count = %d, want %d", cnt, backlogSummaryMax)
+	}
+	if len(preview) != cnt {
+		t.Fatalf("preview length %d disagrees with count %d — a single peek must keep them consistent", len(preview), cnt)
+	}
+	if preview[0].MessageID != 1 || preview[0].Preview == "" {
+		t.Fatalf("first preview item malformed: %+v", preview[0])
+	}
+	if !key.HasTopic || key.TopicID != 281 {
+		t.Fatalf("recovered key = %+v, want own topic 281", key)
 	}
 }

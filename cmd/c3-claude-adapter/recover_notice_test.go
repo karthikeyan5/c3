@@ -23,7 +23,8 @@ func TestRenderRecoverNotice_SurfacesBacklogPreview(t *testing.T) {
 		},
 	}
 	out := renderRecoverNotice(resp)
-	for _, want := range []string{"deploy the thing", "@k", "voice", "fetch_queue", "and 1 more"} {
+	// The count is worded at-resume (§3c) — fetch_queue's Remaining is the live count.
+	for _, want := range []string{"deploy the thing", "@k", "voice", "fetch_queue", "and 1 more", "at resume"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("recover notice missing %q:\n%s", want, out)
 		}
@@ -34,6 +35,46 @@ func TestRenderRecoverNotice_SurfacesBacklogPreview(t *testing.T) {
 	got, ok := a.takePendingRecoverNotice()
 	if !ok || !strings.Contains(got, "deploy the thing") {
 		t.Fatalf("flushed deferred notice lost the backlog preview: ok=%v\n%s", ok, got)
+	}
+}
+
+// TestResolvedAttachReq_BareSubstitutesResolvedIdentity pins §3d1: a BARE attach
+// that the broker resolves (idempotent already-attached, or own-recover) is
+// remembered as its RESOLVED identity, so a replay landing on a FRESH broker
+// (self-update/rebuild restart) re-binds the same topic EXPLICITLY instead of
+// regressing to a picker and silently dropping the claim. A topic resolution
+// remembers {Name, Group}; a DM resolution (no topic) remembers {Target:"dm"} —
+// never a "dm" name, which the broker would treat as a topic lookup.
+func TestResolvedAttachReq_BareSubstitutesResolvedIdentity(t *testing.T) {
+	bare := ipc.AttachReq{Op: ipc.OpAttach, CWD: "/proj"}
+
+	tid := int64(281)
+	got := resolvedAttachReq(bare, ipc.AttachedMsg{OK: true, Name: "c3", Group: "work", TopicID: &tid})
+	if got.Name != "c3" || got.Group != "work" || got.Target != "" || got.TopicID != nil || got.CWD != "/proj" {
+		t.Fatalf("bare→topic remembered %+v, want {Name:c3 Group:work CWD:/proj}", got)
+	}
+
+	got = resolvedAttachReq(bare, ipc.AttachedMsg{OK: true, Name: "dm", TopicID: nil})
+	if got.Target != "dm" || got.Name != "" || got.TopicID != nil {
+		t.Fatalf("bare→DM remembered %+v, want {Target:dm}", got)
+	}
+}
+
+// TestResolvedAttachReq_ExplicitRememberedVerbatim proves an explicit request is
+// remembered as-is, and that a later idempotent BARE OK cannot clobber it with a
+// bare request: the bare OK resolves back to the SAME identity, so the remembered
+// request keeps pointing at the live route.
+func TestResolvedAttachReq_ExplicitRememberedVerbatim(t *testing.T) {
+	explicit := ipc.AttachReq{Op: ipc.OpAttach, CWD: "/proj", Name: "feature-x", Group: "work"}
+	if got := resolvedAttachReq(explicit, ipc.AttachedMsg{OK: true, Name: "feature-x", Group: "work"}); got != explicit {
+		t.Fatalf("explicit request must be remembered verbatim: got %+v", got)
+	}
+
+	tid := int64(412)
+	bare := ipc.AttachReq{Op: ipc.OpAttach, CWD: "/proj"}
+	got := resolvedAttachReq(bare, ipc.AttachedMsg{OK: true, Name: "feature-x", Group: "work", TopicID: &tid})
+	if got.Name != "feature-x" || got.Group != "work" {
+		t.Fatalf("idempotent bare OK must re-remember the resolved identity, not a bare req: got %+v", got)
 	}
 }
 

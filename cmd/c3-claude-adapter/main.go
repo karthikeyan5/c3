@@ -244,10 +244,15 @@ type adapter struct {
 	rsmu      sync.Mutex
 	rsPending chan ipc.RecoverSessionResp
 
-	// recoverFired guards the single RecoverSessionReq per session. Both the
-	// background handoff watch (watchForHandoff) and the first-tools/call
-	// belt-and-suspenders recheck call fireRecover; the CompareAndSwap ensures the
-	// broker never sees a duplicate recover for the same session (BUG #1).
+	// recoverFired guards the RecoverSessionReq to at most once per BROKER
+	// CONNECTION. Both the background handoff watch (watchForHandoff) and the
+	// first-tools/call belt-and-suspenders recheck call fireRecover; the
+	// CompareAndSwap ensures the broker never sees a duplicate recover on one
+	// connection (BUG #1). recoverBroker RESETS it after a reconnect (§3d2) and
+	// re-fires, so a FRESH broker (self-update/rebuild restart, which has no sid
+	// and no reconnect-transfer) re-learns this session's stable id — otherwise
+	// every post-restart attach records nothing and a future --resume recovers a
+	// stale own topic.
 	recoverFired atomic.Bool
 	// recoverRechecked makes the first-tools/call belt-and-suspenders recheck run
 	// at most once, so a non-resume session doesn't re-stat the handoff file on
@@ -492,6 +497,7 @@ func (a *adapter) recoverBroker(ctx context.Context) bool {
 			log.Printf("broker reconnected (attempt %d)", attempt)
 			a.clearBrokerDownAdvisory()
 			a.replayLastAttach()
+			a.refireRecoverOnReconnect(ctx)
 			return true
 		}
 		log.Printf("broker reconnect attempt %d failed: %v (retry in %v)", attempt, err, backoff)
@@ -562,6 +568,39 @@ func (a *adapter) rememberAttach(req ipc.AttachReq) {
 	a.lastAttach = &cp
 }
 
+// isBareAttachReq reports whether an attach request carried no explicit target
+// (no name-bearing Expr, Target, Name, TopicID, or Create). A bare attach that
+// the broker resolves via its idempotent-already-attached branch or the
+// session's own recover returns OK=true, but the raw request has nothing that a
+// post-broker-restart replay could re-bind explicitly.
+func isBareAttachReq(req ipc.AttachReq) bool {
+	return req.Expr == "" && req.Target == "" && req.Name == "" && req.TopicID == nil && !req.Create
+}
+
+// resolvedAttachReq picks the request to REMEMBER for reconnect replay (§3d1).
+// An explicit request is remembered verbatim. A BARE request that resolved to a
+// real route is remembered as the RESOLVED identity — {Name, Group} for a topic,
+// {Target:"dm"} for the DM — so that a replay landing on a FRESH broker (after a
+// self-update/rebuild restart, where there is no sid and no reconnect-transfer)
+// re-binds the same topic EXPLICITLY instead of regressing to a picker and
+// silently dropping the claim. This also stops a later idempotent bare OK from
+// clobbering a previously-remembered explicit request with a bare one: the bare
+// OK resolves back to the same identity, so the remembered request keeps
+// pointing at the live route.
+func resolvedAttachReq(req ipc.AttachReq, attached ipc.AttachedMsg) ipc.AttachReq {
+	if !isBareAttachReq(req) {
+		return req
+	}
+	resolved := ipc.AttachReq{Op: ipc.OpAttach, CWD: req.CWD}
+	if attached.TopicID == nil {
+		resolved.Target = "dm" // DM has no topic; replay by target, not by a "dm" name.
+	} else {
+		resolved.Name = attached.Name
+		resolved.Group = attached.Group
+	}
+	return resolved
+}
+
 // replayLastAttach sends the saved attach request to the (just-reconnected)
 // broker. Best-effort — failures are logged to stderr and not surfaced.
 // The broker will respond with AttachedMsg which brokerReader processes
@@ -583,6 +622,34 @@ func (a *adapter) replayLastAttach() {
 		}
 		log.Printf("replayed attach (target=%q name=%q)", req.Target, req.Name)
 	}
+}
+
+// refireRecoverOnReconnect re-registers this session's stable id on a FRESH
+// broker connection (§3d2). A broker restart yields a fresh stub with no stable
+// id and no reconnect-transfer, so without this the new broker never learns the
+// sid: persistMapping no-ops on an empty stable id, the recorded attachment goes
+// stale, and a later --resume silently recovers an OLDER own topic. It resets
+// recoverFired (demoting the guard from once-per-process to once-per-connection),
+// re-reads the handoff, and re-fires RecoverSessionReq — in a goroutine, because
+// fireRecover blocks on the RecoverSessionResp that brokerReader (this same
+// goroutine's loop) must be free to read.
+//
+// Ordering is safe: replayLastAttach's synchronous write above already put the
+// replayed attach on the wire before this fires, and the broker's same-conn
+// serial dispatch processes that attach FIRST — so the recover takes the
+// record-only branch when the replay restored the route (and the gated own-route
+// recover when the replay's proposal was discarded).
+func (a *adapter) refireRecoverOnReconnect(ctx context.Context) {
+	inst := instanceIDFromEnv()
+	if inst == "" {
+		return
+	}
+	e, ok := sessionhandoff.Read(inst)
+	if !ok {
+		return // not a resumed/hook session — nothing to re-register.
+	}
+	a.recoverFired.Store(false)
+	go a.fireRecover(ctx, e)
 }
 
 // wakePendingWithErr resolves every pending entry with an error.
@@ -1491,7 +1558,9 @@ func (a *adapter) toolAttach(ctx context.Context, req *mcp.CallToolRequest) (*mc
 	case res := <-ch:
 		attached, _ := res.Result["_attached"].(ipc.AttachedMsg)
 		if attached.OK {
-			a.rememberAttach(attachReq)
+			// §3d1: remember the RESOLVED identity for a bare attach so a
+			// post-broker-restart replay re-binds the same topic explicitly.
+			a.rememberAttach(resolvedAttachReq(attachReq, attached))
 			// Side-effect surface: write OSC-0 title-bar escape to
 			// stderr so the user's terminal-emulator title reflects
 			// the currently-attached topic. Closes TODO #19(a).
@@ -2104,7 +2173,7 @@ func renderRecoverNotice(resp ipc.RecoverSessionResp) string {
 			noun = "messages"
 		}
 		var sb strings.Builder
-		fmt.Fprintf(&sb, "📨 Auto-attached to %q (resumed session). %d %s held while no session was attached — process them now, then call `fetch_queue` (limit:\"all\") to drain any remainder:",
+		fmt.Fprintf(&sb, "📨 Auto-attached to %q (resumed session). ~%d %s held at resume — process them now, then call `fetch_queue` (limit:\"all\") to drain any remainder (its Remaining is the live count):",
 			name, resp.QueuedCount, noun)
 		for _, it := range resp.QueuedSummary {
 			preview := it.Preview
