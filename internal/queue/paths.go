@@ -21,6 +21,27 @@ const (
 	MaxAge = 14 * 24 * time.Hour
 )
 
+// Retention window (.trash/). A drained/evicted route pair is renamed into
+// <QueueDir>/.trash instead of hard-deleted, so any drain — right topic, wrong
+// topic, rogue skill, orphaned consume — is recoverable for TrashTTL. GC piggybacks
+// on retire/snapshot (throttled) plus one unthrottled sweep at startup, and only
+// ever touches files inside .trash/.
+const (
+	// TrashTTL is how long a retired pair is kept before GC removes it. Held to
+	// MaxAge so a wrongly-drained message survives exactly as long as an
+	// undelivered one would have — one retention story (≥14 days, held or drained).
+	TrashTTL = MaxAge
+	// TrashMaxBytes caps total .trash/ bytes; GC evicts oldest-first beyond it.
+	TrashMaxBytes = 256 << 20 // 256 MiB
+	// TrashMaxFiles caps the .trash/ file count; GC evicts oldest-first beyond it.
+	TrashMaxFiles = 8192
+	// trashGCInterval throttles the piggybacked GC sweep (a CAS timestamp gates
+	// it — no goroutine/ticker). The startup sweep bypasses the throttle.
+	trashGCInterval = 10 * time.Minute
+	// trashDirName is the retention subdirectory under QueueDir().
+	trashDirName = ".trash"
+)
+
 // RouteKey identifies one queued route. TopicID nil = DM / no topic.
 type RouteKey struct {
 	Channel string

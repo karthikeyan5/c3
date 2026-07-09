@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/karthikeyan5/c3/internal/c3types"
@@ -36,6 +39,12 @@ type Store struct {
 	// canonical entry per route — so the count is deterministic, drain clears it,
 	// and StatusFor/StatusAll stay file-free / race-free (I7).
 	idx map[string]Status
+
+	// lastTrashGC is the UnixNano of the last gcTrash sweep. It throttles the
+	// GC piggybacked on retirePair/snapshotDropped to once per trashGCInterval
+	// via a lock-free CAS — no goroutine, ticker, or shutdown lifecycle. The
+	// startup sweep bypasses it.
+	lastTrashGC atomic.Int64
 }
 
 // NewStore creates the queue dir (0700) and returns a Store. Call
@@ -43,6 +52,9 @@ type Store struct {
 func NewStore(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("queue: mkdir %s: %w", dir, err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, trashDirName), 0700); err != nil {
+		return nil, fmt.Errorf("queue: mkdir %s: %w", filepath.Join(dir, trashDirName), err)
 	}
 	return &Store{dir: dir, idx: map[string]Status{}}, nil
 }
@@ -173,8 +185,8 @@ func (s *Store) Peek(rk RouteKey, n int) ([]c3types.Inbound, error) {
 }
 
 // Consume returns up to n oldest pending messages AND advances the cursor past
-// them (corrupt placeholder lines are stepped over too). Deletes both files when
-// the cursor reaches EOF.
+// them (corrupt placeholder lines are stepped over too). Retires the pair into
+// .trash/ (recoverable for TrashTTL) when the cursor reaches EOF.
 func (s *Store) Consume(rk RouteKey, n int) ([]c3types.Inbound, error) {
 	lines, cursor, err := s.readLines(rk)
 	if err != nil {
@@ -202,7 +214,7 @@ func (s *Store) Consume(rk RouteKey, n int) ([]c3types.Inbound, error) {
 	}
 	// Advance the cursor to pos (after the last consumed/skipped line).
 	if pos >= len(lines) {
-		if err := s.deletePair(rk); err != nil {
+		if err := s.retirePair(rk); err != nil {
 			return nil, err
 		}
 	} else if err := s.writeCursor(rk, pos); err != nil {
@@ -286,11 +298,13 @@ func (s *Store) EvictOverCap(rk RouteKey) (int, error) {
 		real = append(real, in)
 	}
 	if len(real) == 0 {
-		// Only corrupt lines remained; rewrite drops them all (deletes the pair).
+		// Only corrupt lines remained; rewrite drops them all. The resulting
+		// zero-byte .jsonl carries nothing recoverable, so retirePair plain-removes
+		// it rather than cluttering .trash/ with an empty snapshot.
 		if err := s.rewrite(rk, real); err != nil {
 			return 0, err
 		}
-		if err := s.deletePair(rk); err != nil {
+		if err := s.retirePair(rk); err != nil {
 			return 0, err
 		}
 		s.refreshIndex(rk)
@@ -316,6 +330,14 @@ func (s *Store) EvictOverCap(rk RouteKey) (int, error) {
 		drop = len(real)
 	}
 	kept := real[drop:]
+	// Snapshot the dropped lines into .trash/ BEFORE the live rewrite discards
+	// them, so a cap/age eviction stays recoverable for TrashTTL. A crash between
+	// the snapshot and the rewrite leaves the lines in both places — a harmless
+	// duplicate GC'd later; a snapshot failure returns before the rewrite, so the
+	// live queue is untouched (fail-toward-keeping).
+	if err := s.snapshotDropped(rk, real[:drop]); err != nil {
+		return 0, err
+	}
 	if err := s.rewrite(rk, kept); err != nil {
 		return 0, err
 	}
@@ -324,7 +346,7 @@ func (s *Store) EvictOverCap(rk RouteKey) (int, error) {
 		newCursor = 0
 	}
 	if newCursor >= len(kept) {
-		if err := s.deletePair(rk); err != nil {
+		if err := s.retirePair(rk); err != nil {
 			return 0, err
 		}
 	} else if err := s.writeCursor(rk, newCursor); err != nil {
@@ -386,7 +408,7 @@ func (s *Store) RefreshText(rk RouteKey, messageID int64, newText string) (bool,
 	// the remapped cursor so consumed lines stay consumed.
 	if cursorReal != cursor {
 		if cursorReal >= len(real) {
-			if err := s.deletePair(rk); err != nil {
+			if err := s.retirePair(rk); err != nil {
 				return false, err
 			}
 		} else if err := s.writeCursor(rk, cursorReal); err != nil {
@@ -398,8 +420,11 @@ func (s *Store) RefreshText(rk RouteKey, messageID int64, newText string) (bool,
 }
 
 // RecoverOnStartup scans the queue dir and rebuilds the status index. A route
-// whose cursor is at/after its line count has its pair deleted; otherwise the
-// index records the derived pending count.
+// whose cursor is at/after its line count has its pair retired into .trash/;
+// otherwise the index records the derived pending count. It finishes with one
+// unthrottled GC sweep of .trash/ (safe: this runs before the worker pool exists,
+// so startup has zero concurrency). The .jsonl-suffix filter skips the .trash
+// directory entry, so retained files are never rescanned as routes.
 func (s *Store) RecoverOnStartup() error {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
@@ -423,11 +448,14 @@ func (s *Store) RecoverOnStartup() error {
 			continue
 		}
 		if cursor >= len(lines) {
-			_ = s.deletePair(rk)
+			_ = s.retirePair(rk)
 			continue
 		}
 		s.refreshIndex(rk)
 	}
+	now := time.Now()
+	s.lastTrashGC.Store(now.UnixNano())
+	s.sweepTrash(now)
 	return nil
 }
 
@@ -466,6 +494,284 @@ func (s *Store) deletePair(rk RouteKey) error {
 		return fmt.Errorf("queue: remove jsonl: %w", err)
 	}
 	return nil
+}
+
+// --- retention window (.trash/) ---
+
+// trashDir is the retention subdirectory under the queue dir.
+func (s *Store) trashDir() string { return filepath.Join(s.dir, trashDirName) }
+
+// Retained-file path builders. A retired pair shares one stamp; evict snapshots
+// insert ".evicted". The stamp is a UnixNano, parsed back positionally from the
+// end by trashStamp (the base is config-supplied and may contain dots).
+func (s *Store) trashJSONL(base string, stamp int64) string {
+	return filepath.Join(s.trashDir(), fmt.Sprintf("%s.%d.jsonl", base, stamp))
+}
+func (s *Store) trashCur(base string, stamp int64) string {
+	return filepath.Join(s.trashDir(), fmt.Sprintf("%s.%d.cur", base, stamp))
+}
+func (s *Store) trashEvicted(base string, stamp int64) string {
+	return filepath.Join(s.trashDir(), fmt.Sprintf("%s.%d.evicted.jsonl", base, stamp))
+}
+
+func pathExists(p string) bool {
+	_, err := os.Lstat(p)
+	return err == nil
+}
+
+// firstFreeStamp returns the first stamp >= start for which taken(stamp) is
+// false. Retirement/snapshot use it to resolve the rare clock-step collision by
+// bumping stamp++ (per-route ops are serialized on one worker goroutine, so the
+// walk is short and bounded).
+func firstFreeStamp(start int64, taken func(int64) bool) int64 {
+	stamp := start
+	for taken(stamp) {
+		stamp++
+	}
+	return stamp
+}
+
+// retirePair moves a route's queue pair into .trash/ instead of hard-deleting it,
+// so any drain (right topic, wrong topic, rogue skill, orphaned consume) stays
+// recoverable for TrashTTL. Same directory subtree ⇒ same filesystem ⇒ rename(2)
+// is atomic (EXDEV impossible).
+//
+// A zero-byte .jsonl (the all-corrupt rewrite, or an evict that dropped every
+// line — already snapshotted) carries nothing recoverable, so it is plain-removed
+// like deletePair rather than trashed.
+//
+// Ordering is load-bearing: the .cur is renamed FIRST. The only non-loss-free
+// intermediate is "live .cur, no .jsonl" — a later Append would recreate a fresh
+// .jsonl whose lines sit behind the stale cursor and go invisible — so the cursor
+// must leave before the history (deletePair removed .cur before .jsonl for the
+// same reason). ENOENT is tolerated on BOTH renames: a never-partially-consumed
+// route has no .cur, and an empty-queue drain (no .jsonl at all) must stay a
+// no-op. Only a NON-ENOENT rename failure is an error, and it returns before
+// touching .jsonl — so Consume fails exactly like today's deletePair-error path
+// (batch not returned, live queue intact, fail-toward-replay).
+func (s *Store) retirePair(rk RouteKey) error {
+	if fi, err := os.Stat(s.jsonlPath(rk)); err == nil && fi.Size() == 0 {
+		return s.deletePair(rk)
+	}
+	base := rk.File()
+	stamp := firstFreeStamp(time.Now().UnixNano(), func(st int64) bool {
+		return pathExists(s.trashJSONL(base, st)) || pathExists(s.trashCur(base, st))
+	})
+	// (1) .cur first (ENOENT tolerated).
+	if err := os.Rename(s.curPath(rk), s.trashCur(base, stamp)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("queue: retire cur: %w", err)
+	}
+	// (2) then .jsonl (ENOENT tolerated).
+	if err := os.Rename(s.jsonlPath(rk), s.trashJSONL(base, stamp)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("queue: retire jsonl: %w", err)
+	}
+	// (3) durability polish: fsync the queue dir (entries removed) and .trash/
+	// (entries added). Correctness holds without these (either rename state is
+	// loss-free); they harden against power loss.
+	if err := s.syncDir(); err != nil {
+		return err
+	}
+	if err := fsyncDir(s.trashDir()); err != nil {
+		return err
+	}
+	s.gcTrash(time.Now())
+	return nil
+}
+
+// snapshotDropped atomically writes the lines EvictOverCap is about to drop to
+// .trash/<base>.<stamp>.evicted.jsonl (tmp → fsync → rename inside .trash/, the
+// same crash-safe pattern as rewrite) BEFORE the live rewrite discards them.
+// Corrupt placeholder lines carry no recoverable content and are skipped; an
+// empty (or all-corrupt) dropped set is a no-op.
+func (s *Store) snapshotDropped(rk RouteKey, dropped []c3types.Inbound) error {
+	real := make([]c3types.Inbound, 0, len(dropped))
+	for _, in := range dropped {
+		if in.Channel == corruptSentinel {
+			continue
+		}
+		real = append(real, in)
+	}
+	if len(real) == 0 {
+		return nil
+	}
+	base := rk.File()
+	stamp := firstFreeStamp(time.Now().UnixNano(), func(st int64) bool {
+		return pathExists(s.trashEvicted(base, st))
+	})
+	final := s.trashEvicted(base, stamp)
+	tmp := final + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		return fmt.Errorf("queue: open evict snapshot: %w", err)
+	}
+	w := bufio.NewWriter(f)
+	for _, in := range real {
+		data, merr := json.Marshal(in)
+		if merr != nil {
+			_ = f.Close()
+			_ = os.Remove(tmp)
+			return fmt.Errorf("queue: marshal evict snapshot: %w", merr)
+		}
+		_, _ = w.Write(append(data, '\n'))
+	}
+	if err := w.Flush(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("queue: flush evict snapshot: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("queue: fsync evict snapshot: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("queue: close evict snapshot: %w", err)
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("queue: rename evict snapshot: %w", err)
+	}
+	if err := fsyncDir(s.trashDir()); err != nil {
+		return err
+	}
+	s.gcTrash(time.Now())
+	return nil
+}
+
+// fsyncDir fsyncs a directory so newly-created or renamed entries in it are
+// durable across a crash. Mirrors syncDir (which fsyncs the queue dir).
+func fsyncDir(path string) error {
+	d, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("queue: open dir for fsync: %w", err)
+	}
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return fmt.Errorf("queue: fsync dir: %w", err)
+	}
+	if err := d.Close(); err != nil {
+		return fmt.Errorf("queue: close dir: %w", err)
+	}
+	return nil
+}
+
+// trashStamp extracts the UnixNano stamp encoded in a .trash/ filename, or
+// (0, false) when it doesn't parse — the caller then falls back to ModTime, so
+// foreign junk (including a crashed .tmp) still ages out of the window.
+func trashStamp(name string) (int64, bool) {
+	s := name
+	switch {
+	case strings.HasSuffix(s, ".evicted.jsonl"):
+		s = strings.TrimSuffix(s, ".evicted.jsonl")
+	case strings.HasSuffix(s, ".jsonl"):
+		s = strings.TrimSuffix(s, ".jsonl")
+	case strings.HasSuffix(s, ".cur"):
+		s = strings.TrimSuffix(s, ".cur")
+	default:
+		return 0, false
+	}
+	dot := strings.LastIndexByte(s, '.')
+	if dot < 0 {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(s[dot+1:], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// gcTrash runs the .trash/ sweep, throttled to once per trashGCInterval via a
+// lock-free CAS on lastTrashGC. Piggybacked on retirePair/snapshotDropped — the
+// only points where trash grows — so no goroutine/ticker exists. A fresh store
+// (lastTrashGC == 0) runs immediately.
+func (s *Store) gcTrash(now time.Time) {
+	last := s.lastTrashGC.Load()
+	if last != 0 && now.Sub(time.Unix(0, last)) < trashGCInterval {
+		return
+	}
+	if !s.lastTrashGC.CompareAndSwap(last, now.UnixNano()) {
+		return // another goroutine just claimed the sweep — let it run
+	}
+	s.sweepTrash(now)
+}
+
+// sweepTrash is the unthrottled GC body against the production caps.
+func (s *Store) sweepTrash(now time.Time) {
+	s.sweepTrashCaps(now, TrashTTL, TrashMaxBytes, TrashMaxFiles)
+}
+
+// sweepTrashCaps TTL-expires then cap-enforces .trash/, evicting oldest-first.
+// It ONLY ever ReadDirs and Removes inside .trash/ — live queue files are never
+// candidates. Retained files are written exactly once (atomic rename-in) and
+// never modified, so concurrent sweeps from two route workers are safe: an
+// already-removed file yields a tolerated ENOENT. A fresh retire can't be
+// TTL-selected (fresh stamp) and cap-eviction is oldest-first, so the newest
+// snapshots (the likeliest recovery targets) survive. The caps are parameterized
+// so tests can exercise eviction without materializing 256 MiB; production always
+// passes the consts via sweepTrash.
+func (s *Store) sweepTrashCaps(now time.Time, ttl time.Duration, maxBytes int64, maxFiles int) {
+	entries, err := os.ReadDir(s.trashDir())
+	if err != nil {
+		return // trash dir missing/unreadable — nothing to GC
+	}
+	type tf struct {
+		name   string
+		ageRef int64 // UnixNano age reference (filename stamp, else ModTime)
+		size   int64
+	}
+	files := make([]tf, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, ierr := e.Info()
+		if ierr != nil {
+			continue
+		}
+		ageRef, ok := trashStamp(e.Name())
+		if !ok {
+			ageRef = info.ModTime().UnixNano()
+		}
+		files = append(files, tf{name: e.Name(), ageRef: ageRef, size: info.Size()})
+	}
+	// 1) TTL expiry.
+	cutoff := now.Add(-ttl).UnixNano()
+	kept := files[:0]
+	for _, f := range files {
+		if f.ageRef < cutoff {
+			_ = os.Remove(filepath.Join(s.trashDir(), f.name))
+			continue
+		}
+		kept = append(kept, f)
+	}
+	files = kept
+	// 2) Cap enforcement — oldest-first (ascending age reference).
+	var total int64
+	for _, f := range files {
+		total += f.size
+	}
+	if len(files) <= maxFiles && total <= maxBytes {
+		return
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].ageRef < files[j].ageRef })
+	evicted := 0
+	i := 0
+	for i < len(files) && (len(files)-i > maxFiles || total > maxBytes) {
+		f := files[i]
+		if err := os.Remove(filepath.Join(s.trashDir(), f.name)); err == nil || os.IsNotExist(err) {
+			total -= f.size
+			evicted++
+		}
+		i++
+	}
+	if evicted > 0 {
+		// The only log in this package, deliberate: cap eviction shortens the
+		// promised retention window for the oldest retained pairs (they were still
+		// within TTL), so it must be visible in broker.log.
+		log.Printf("queue: trash GC evicted %d sub-TTL retained file(s) to stay within caps (limits: %d files / %d bytes)", evicted, maxFiles, maxBytes)
+	}
 }
 
 // rewrite atomically replaces the jsonl with the given lines (cap valve only).
