@@ -16,7 +16,7 @@ C3 is a Telegram (today; more channels later) multiplexer for Claude Code, Codex
 Three things to internalize:
 
 - **One broker per machine.** It's a long-lived background daemon that owns the bot token, polls Telegram, and routes messages. You never start it manually — your first CLI session of the day does that for you.
-- **One mapping per directory.** When you `cd ~/projects/foo && claude`, C3 looks up `/home/you/projects/foo` in `~/.config/c3/mappings.json`. If it's mapped, the session auto-attaches to that topic. If not, you type `attach` and confirm.
+- **A session remembers its own topic — it never guesses.** The first time you `attach` in a session you pick a topic (or create one); C3 records that choice against the session. When that session is resumed later, a bare `attach` silently re-attaches its **own** last topic. A brand-new session with no prior choice gets a friendly picker — it never binds a topic you didn't choose. Your cwd only *seeds* the picker's suggestions (the current project's topic ranks first); it is never a silent claim.
 - **One claim per topic.** Two sessions can't hold the same topic at once. The second session sees who's holding it and stays unattached. Useful: you can park Claude Code on the topic and open Codex elsewhere; one project, one Telegram chat, no double-replies.
 
 ## The one command you'll use most
@@ -25,11 +25,13 @@ Three things to internalize:
 attach
 ```
 
-Type it (or have your CLI agent type it) when you want to bind the current directory to a Telegram topic. Three things happen:
+Type it (or have your CLI agent type it) when you want to bind this session to a Telegram topic. A bare `attach` resolves in a fixed order and **never guesses a topic you didn't choose**:
 
-1. **Mapped directory** — silent claim. The session attaches. You see "Auto-attached to 'foo' topic" and inbound Telegram messages start showing up.
-2. **Unmapped directory** — proposal. The broker says "I'd create a topic 'foo' in the 'main' Telegram group. Confirm with `attach(create=true)`, or pass an existing topic id with `attach(topic_id=<n>)`." You confirm; the topic is created; the mapping is persisted; future sessions in this dir auto-attach.
-3. **Topic claimed by another session** — broker tells you who's holding it. You either wait for that session to detach or attach to a different topic.
+1. **Already attached** — idempotent. The session confirms its current claim; nothing else happens.
+2. **This session has attached before** — silent resume of its **own** last topic. You see "Auto-attached to 'foo'" and inbound Telegram messages start flowing. (The choice is remembered against the session, not the directory, so it only ever re-claims your own route.)
+3. **First-time session (no prior choice)** — a friendly picker. C3 shows a short ranked list — the current project's topic first (seeded from cwd), then recently-used topics, plus "create new" and "see the full list" — and asks you to choose. It **never** auto-picks. Your pick is an explicit `attach(topic_id=<n>)` (or `attach(name="<name>", create=true)` to create), which is then remembered so future resumes are silent.
+
+If the topic you target is already claimed by another live session, the broker tells you who's holding it; wait for it to detach or attach to a different topic.
 
 Variations:
 
@@ -110,6 +112,37 @@ Type `/status` directly into a Telegram chat (it autocompletes in the `/` menu) 
 
 - Per-route cap: **1000 messages OR 14 days**, whichever comes first. On overflow the oldest held messages are dropped, logged to `broker.log`, **and** announced in the topic (*"⚠️ queue full — dropped N oldest held message(s); attach a session soon."*) — never a silent truncation.
 - **24-hour Telegram bound (outside C3's control).** Telegram itself keeps undelivered updates for at most 24 hours. C3 can only queue what it has actually received, so a gap longer than 24 hours with **no broker polling anywhere** loses messages at Telegram's level before C3 ever sees them. Keeping a broker polling (the opt-in `systemd --user` unit helps) is the only guard against that window.
+
+### Safe draining — named nudges and the confirmed-route guard
+
+Two belts keep a drain from ever taking the *wrong* topic's messages:
+
+- **Nudges name the topic.** Every "N held — call `fetch_queue`" advertisement (backlog summary, pending nudge, held notice) now names the route it refers to. A stale or mis-addressed advertisement is therefore distinguishable at a glance, rather than an anonymous count you can't place.
+- **`fetch_queue(ack=true)` only consumes off a confirmed route.** The destructive drain (and the live-push delivery ack) is refused unless the session holds a route it *explicitly confirmed* — an explicit attach, a silent resume of its own topic, or an explicit pick from the picker. A session can never consume a topic it merely had suggested to it. This is fail-closed insurance: every legitimate claim sets the flag, so it only ever fires against a future regression that binds a route without a real claim.
+
+### Queue trash & recovery
+
+Nothing ever leaves the queue by hard delete. When a route drains — the right topic, a wrong topic, a rogue skill, an orphaned consume — the queue files are **moved into a `.trash/` subdirectory**, not removed. Any drain is therefore recoverable for the retention window (≥14 days). This is a manual, broker-side recovery — there is no Telegram surface for it.
+
+The trash lives beside the queue, at `$XDG_STATE_HOME/c3/queue/.trash/` (fallback `~/.local/state/c3/queue/.trash/`). Two kinds of file appear there:
+
+- **A retired drain pair** — `<base>.<stamp>.jsonl` is the full line history at the moment of the drain, and `<base>.<stamp>.cur` is the pre-drain cursor. The pair shares one `<stamp>` (a UnixNano timestamp). `<base>` is the route-key filename — `<channel>__<chat_id>__<topic|none>`, e.g. `telegram__-100__none` for a DM/no-topic route, or `telegram__-1001234__948` for topic 948.
+- **An evict snapshot** — `<base>.<stamp>.evicted.jsonl` holds lines dropped by the per-route cap/age eviction (never a whole drain).
+
+**Recovering a drained batch (broker STOPPED).** The store is single-owner via the route workers, so an external `mv` against a live broker races the writer. Stop the broker first (`pkill c3-broker` from a separate terminal), do the moves, then let the next CLI session spawn a fresh broker — `RecoverOnStartup` re-indexes the restored route, and you `fetch_queue` it from the session attached to that topic.
+
+1. `ls "$XDG_STATE_HOME/c3/queue/.trash/"` (or `~/.local/state/c3/queue/.trash/`) and find the pair for the route; note the `<stamp>`.
+2. **No live `<base>.jsonl`** (nothing new arrived since the drain): `mv` both files back to `<base>.jsonl` and `<base>.cur`. Restoring the `.cur` replays **only the final drained batch** (`lines[cursor:]`). Omit the `.cur` to replay **everything** in the file (over-delivery, never loss).
+3. **Live `<base>.jsonl` exists** (new messages arrived since): concatenate the trash `.jsonl` **first**, then the live `.jsonl`, into the live name, and remove the live `.cur`:
+   ```
+   cat .trash/<base>.<stamp>.jsonl <base>.jsonl > <base>.jsonl.tmp \
+     && mv <base>.jsonl.tmp <base>.jsonl \
+     && rm -f <base>.cur
+   ```
+   Dropping the cursor replays the whole merged file (the old cursor no longer aligns once you prepend history — over-delivery of the recovered lines, never loss).
+4. **A partial wrong-drain that's still live** (no trash pair yet — the file is still in the queue dir): there's nothing to move. Lower or delete the live `<base>.cur` (delete = replay from the first line).
+
+**GC.** Trash is swept automatically (piggybacked on drains, plus one sweep at broker startup — no extra process): every retired file is kept at least the retention window (14 days, the same window an undelivered message gets), and hard caps of 256 MiB / 8192 files evict oldest-first if trash grows past them (the newest snapshots — the likeliest recovery targets — survive). A cap-eviction that shortens the promised window logs one line to `broker.log`.
 
 ## Multi-group setups
 
@@ -230,6 +263,25 @@ marketplace when it offers a newer version.
 Security notes: downloads are HTTPS-only and checksum-verification is mandatory;
 C3 never downgrades and never installs a prerelease automatically. There is no
 release-signature check in v1 (checksum-only) — that's future work.
+
+### Upgrading — attach behavior changes
+
+This release changes how a session binds to a topic. Three user-visible changes:
+
+- **Auto-attach-on-resume now defaults ON.** When you resume a session, C3
+  silently re-attaches it to its **own** last topic (keyed on the session id, so
+  it only ever re-claims your own route — never a neighbour's). Previously this
+  was off unless you opted in. To opt **out**, set `"auto_attach_on_resume": false`
+  in `mappings.json`.
+- **A bare `attach` shows a picker instead of guessing from cwd.** A first-time
+  session (one with no remembered topic) now gets a friendly ranked picker and
+  chooses explicitly, rather than silently claiming whatever the cwd mapping
+  pointed at. cwd only *seeds* the suggestions. After you pick once, future
+  resumes are silent (per the first change above).
+- **Codex no longer auto-attaches at startup.** Codex sessions start unattached
+  and attach explicitly (a bare `attach` lands on the picker). The old
+  launch-time silent bind — which could claim a topic inferred from the
+  directory name — is gone.
 
 ## Privacy and safety
 

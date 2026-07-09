@@ -880,7 +880,7 @@ func (a *adapter) buildInstructions() string {
 		if cwd == "" {
 			cwd, _ = os.Getwd()
 		}
-		head = fmt.Sprintf("No C3 mapping for %q. Use the `attach` tool to set one up. Inbound Telegram messages are held in C3's durable queue; call `fetch_queue` to read them.", cwd)
+		head = fmt.Sprintf("No saved C3 topic for this session (cwd %q). Call the `attach` tool with no argument: the broker returns a picker of suggested topics — list them for the user and let them choose (never guess), then re-invoke `attach` with the chosen `topic_id` or `name`. Or attach a specific topic directly with `attach(name=\"<name>\")`. Inbound Telegram messages are held in C3's durable queue; call `fetch_queue` to read them.", cwd)
 	default:
 		head = "C3 connected. Use `attach` to claim a Telegram topic, `fetch_queue` to read held/new inbound, `reply` to send. Codex doesn't render unsolicited MCP notifications today; call `fetch_queue` when you see a 'new Telegram message' nudge or periodically."
 	}

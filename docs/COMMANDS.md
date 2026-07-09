@@ -53,7 +53,7 @@ Codex is at parity on the message/queue tools and lacks only `ask` (and `detach`
 
 | Input                              | Resolves to                                  |
 |------------------------------------|----------------------------------------------|
-| `""` (empty)                       | use cwd-saved mapping (silent claim)         |
+| `""` (empty)                       | bare attach — never guesses (see below)      |
 | `"dm"` / `"DM"` (case-insensitive) | `target = "dm"` (DM disambiguation may fire) |
 | `"<int>"`                          | `topic_id = <int>`                           |
 | `"create <name>"`                  | `name = <name>, create = true`               |
@@ -61,6 +61,30 @@ Codex is at parity on the message/queue tools and lacks only `ask` (and `detach`
 | `"<other string>"`                 | `name = <string>`                            |
 
 Whitespace is trimmed. Unparsable input falls through to `name`.
+
+### Bare `attach` (empty input) — never guesses
+
+A bare `attach` (no `name`/`topic_id`/`target`/`create`) resolves in this order,
+and **never silently binds a topic the session didn't choose**:
+
+1. **Already attached** → idempotent no-op: the current claim is confirmed
+   (OK), no re-claim, no re-notify.
+2. **This session's own last topic is recoverable** → silent resume. The
+   session's prior attachment is keyed on its stable session id (not on cwd),
+   so this only ever re-claims the session's **own** route — never a
+   neighbour's. This is the *only* silent bind in the system.
+3. **Otherwise (first-time session, no own attachment)** → a friendly
+   **`pick_topic` picker** (proposal flow below). The cwd only *seeds*
+   suggestions (the current project's topic ranks first); it is never a claim.
+
+Consequences worth stating:
+
+- **cwd is a suggestion seed, not a claim.** A stale or wrong cwd→topic
+  mapping can only *rank a suggestion*; it can never drain or bind a topic.
+- **`create` needs an explicit name.** A bare `attach(create=true)` errors —
+  there is no basename synthesis. Pass the name: `attach(name="<name>", create=true)`.
+- **Non-Claude hosts (Codex) have no stable session id**, so step 2 never
+  fires for them — a bare Codex `attach` always lands on the picker.
 
 ## attach — proposal flow
 
@@ -72,7 +96,8 @@ flag set.
 
 | Proposal action            | What the wrapper should do                                                                                                       |
 |----------------------------|----------------------------------------------------------------------------------------------------------------------------------|
-| `create`                   | Ask "create new topic <name> in group <group>?" → on yes, re-invoke with `create=true`.                                           |
+| `pick_topic`               | Bare attach with no own topic to resume. **Ask the user** which topic (via `AskUserQuestion`, or plain conversation on hosts without it) — presenting exactly the ranked suggestions, **never auto-pick**. Re-invoke with the exact command shown on the chosen line (`topic_id=<n>` for existing, `name=<n>, create=true` to create). "See the full list" → call `topics`, then attach by id. |
+| `create`                   | Ask "create new topic <name> in group <group>?" → on yes, re-invoke with `name=<name>, create=true` (the name must be passed explicitly; a bare `create=true` errors).                                           |
 | `use_existing_other_group` | Ask "claim existing <name> in group <other_group>, or create new in <default_group>?" → re-invoke per choice.                     |
 | `disambiguate_dm`          | Ask "topic 'dm' exists; did you mean the topic or actual DM?" → topic: `topic_id=<from proposal>`. DM: `target="dm", steal=true`. |
 | `force_steal`              | Ask "topic held by <holder cli pid cwd>; evict and take?" → on yes, re-invoke with `steal=true`. Only with explicit user OK.      |

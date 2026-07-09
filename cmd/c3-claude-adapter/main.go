@@ -1290,7 +1290,7 @@ func (a *adapter) buildInstructions() string {
 		head = "C3 not yet configured. Run `/c3:setup` (or `c3-broker setup`) to provide your Telegram bot token, DM chat id, and at least one group chat id, then restart this session."
 	case a.helloAck.NoMapping:
 		cwd, _ := os.Getwd()
-		head = fmt.Sprintf("No C3 mapping for %q. Use the `attach` tool to set one up — the broker proposes a topic named %q in the default group; confirm to create.", cwd, filepath.Base(cwd))
+		head = fmt.Sprintf("No saved C3 topic for this session (cwd %q). Call the `attach` tool with no argument: if this session has a topic it attached to before, it silently re-attaches that one; otherwise the broker returns a picker of suggested topics for you to choose from (it never guesses). Or attach a specific topic by name: `attach(name=\"<name>\")`.", cwd)
 	case a.helloAck.AutoAttached && a.helloAck.Mapping != nil:
 		// Vestigial: the broker no longer auto-attaches at hello (recovery moved
 		// to the post-hello RecoverSessionReq path, surfaced via a notification).

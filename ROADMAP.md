@@ -5,6 +5,7 @@ What's next for C3 after v1. Everything here is future or unbuilt; shipped work 
 ## Interactive & trust
 
 - Interactive Q&A: free-text / "Other" / comment answers (single/multi-select + Skip already ship).
+- Native free-text option in the attach picker — today "type your own" is body prose (`/c3:attach <name>`); a real free-text choice needs the deferred free-text answer surface above.
 - Codex parity for tap-to-approve, `ask`, and `detach`.
 - Per-user access control — who is allowed to drive which CLI.
 - Trusted-operator authorization for actions the CLI would otherwise hard-deny.
@@ -32,9 +33,11 @@ What's next for C3 after v1. Everything here is future or unbuilt; shipped work 
 - Drop the development-channels flag once C3 ships through a trusted plugin store.
 - External (non-Go) loadable plugins.
 - Broker-side `/list` and `/route` commands.
-- Auto-attach on resume enabled by default (after live verification).
 - Monitoring dashboard, persistent message history, STT latency instrumentation.
 - Async-dispatch more non-critical broker sends (as the voice-readback echo already does), preserving strict per-topic ordering.
+- Id-targeted, delivery-contingent consume — ack/consume specific message ids only when their delivery succeeded, closing the orphaned-consume loss window (adapter abandons a fetch, broker consumes anyway). Needed by the pooled-queue work regardless.
+- Attach-replay refinements: gate `disambiguate_dm` on `Replay`, and honor `group` in the step-2 name lookup, so a replayed DM or non-default-group attach restores cleanly instead of falling to a discarded proposal.
+- Surface the silent auto-recover skip: when a resumed session's own last topic is held by another live session, carry a `Skipped`/reason field and show a one-line CLI notice, instead of resuming quietly with no explanation.
 
 ## Open design questions
 

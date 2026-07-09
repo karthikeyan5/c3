@@ -30,7 +30,7 @@ Works great with one agent; scales to ten.
 
 Differentiators first:
 
-- **One bot, a topic per project** — multiplex any number of Claude Code and Codex sessions. `cd` into a project, run `claude` (or `codex`), and the adapter auto-attaches to that project's topic. Two sessions never fight over one topic.
+- **One bot, a topic per project** — multiplex any number of Claude Code and Codex sessions. Run `claude` (or `codex`) in a project, `attach` once to pick or create its topic, and every resume of that session silently re-attaches its own topic. Two sessions never fight over one topic.
 - **Durable inbound queue** — once C3 has *received* a Telegram message it never drops it: messages that arrive while a session is down (or before you attach) are held on disk and delivered on attach, with a per-message backlog preview. You never re-forward a voice note.
 - **Cross-CLI on one broker** — Claude Code and Codex on the same project coordinate through the broker, so only one holds the topic claim at a time; no double-replies.
 - **Rich two-way Telegram** — markdown in both directions (bold/italic, lists, code blocks, tables, blockquotes), quote-replies with the quoted text in context, attachments, message edits, reactions, and polls, all surfaced to the CLI as structured channel events.
@@ -109,7 +109,7 @@ The unduplicated cut: self-hosted single-binary + CLI-agnostic + one-token multi
 
 ## Routing
 
-- **Topic-based** (primary) — a Telegram supergroup with topics enabled; each topic binds to one CLI session. The natural start is `cd <project-dir> && claude` — the adapter looks up the cwd's saved mapping and silent-claims it; the first time in a directory you confirm a proposal and the topic gets created.
+- **Topic-based** (primary) — a Telegram supergroup with topics enabled; each topic binds to one CLI session. The natural start is `cd <project-dir> && claude`, then `attach`: a session that has attached before silently re-claims its own topic, and a first-time session gets a picker (seeded from the project dir) to choose or create one. C3 never binds a topic the session didn't choose.
 - **DM-based** — your personal DMs with the bot route to whichever CLI claims `dm`. Works anywhere, no project binding.
 - **Group-based** — a whole group without topics maps to one CLI. Useful for shared rooms.
 
