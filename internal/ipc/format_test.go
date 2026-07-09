@@ -121,6 +121,117 @@ func TestFormatAttached_ProposalParity(t *testing.T) {
 	}
 }
 
+// ptrI64 is a tiny helper for building *int64 test fixtures.
+func ptrI64(v int64) *int64 { return &v }
+
+// TestFormatAttached_PickTopic is the format golden for the bare-attach friendly
+// picker (spec §4). Every suggestion line must carry its EXACT runnable re-invoke
+// command: topic_id for a default-group existing topic, topic_id+group for a
+// non-default group, target="dm" for a DM recent, name+create=true for a create
+// row. A live-held topic renders its holder suffix; the type-your-own +
+// create-by-name body always prints; HasMore adds the "See the full list" row.
+// The wording stays host-neutral (Codex has no AskUserQuestion / /c3:attach) and
+// never instructs an auto-pick.
+func TestFormatAttached_PickTopic(t *testing.T) {
+	msg := &AttachedMsg{
+		Op: OpAttached, OK: false, NeedsConfirmation: true,
+		Proposal: &Proposal{
+			Action: "pick_topic", Channel: "telegram", Project: "c3", HasMore: true,
+			Suggestions: []PickSuggestion{
+				{Kind: "attach_existing", Reason: "current project", Name: "c3", ChatID: -100, TopicID: ptrI64(948)},
+				{Kind: "attach_existing", Reason: "recently used", Name: "feature-x", Group: "work", ChatID: -200, TopicID: ptrI64(412)},
+				{Kind: "attach_existing", Reason: "recently used", Name: "dm", ChatID: 42, // TopicID nil → target="dm"
+					ClaimedBy: &Holder{CLI: "codex", PID: 1234}},
+			},
+		},
+	}
+	got := FormatAttached(msg)
+	for _, w := range []string{
+		"ASK the user", // never-assume framing
+		"use AskUserQuestion if your host has it", // host-neutral hint
+		"otherwise ask in plain conversation",     // Codex fallback
+		`Attach "c3" (current project)`,           // suggestion 1 description
+		"attach(topic_id=948)",                    // default-group re-invoke
+		`attach(topic_id=412, group="work")`,      // non-default-group re-invoke
+		`attach(target="dm")`,                     // DM recent re-invoke
+		"held by codex pid 1234",                  // ClaimedBy suffix
+		"picking it will ask before stealing",     // steal warning
+		"See the full list",                       // HasMore row
+		"`topics` tool",                           // full-list flow
+		`attach(name="<name>")`,                   // type-your-own body
+		"/c3:attach <name>",                       // Claude slash hint
+		`attach(name="<name>", create=true)`,      // create-by-name body
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("FormatAttached(pick_topic) missing %q in:\n%s", w, got)
+		}
+	}
+	if strings.Contains(got, "unspecified failure") {
+		t.Errorf("FormatAttached(pick_topic) leaked unspecified-failure:\n%s", got)
+	}
+}
+
+// TestFormatAttached_PickTopic_Create pins the create-row rendering and that a
+// create suggestion carries the name in its re-invoke (a bare attach(create=true)
+// is not offered — the name must travel).
+func TestFormatAttached_PickTopic_Create(t *testing.T) {
+	msg := &AttachedMsg{
+		Op: OpAttached, OK: false, NeedsConfirmation: true,
+		Proposal: &Proposal{
+			Action: "pick_topic", Channel: "telegram", Project: "newproj",
+			Suggestions: []PickSuggestion{
+				{Kind: "create", Reason: "current project (new)", Name: "newproj"},
+			},
+		},
+	}
+	got := FormatAttached(msg)
+	for _, w := range []string{`Create new topic "newproj"`, `attach(name="newproj", create=true)`} {
+		if !strings.Contains(got, w) {
+			t.Errorf("FormatAttached(pick_topic create) missing %q in:\n%s", w, got)
+		}
+	}
+	if strings.Contains(got, "See the full list") {
+		t.Errorf("no HasMore → no full-list row; got:\n%s", got)
+	}
+}
+
+// TestFormatAttached_PickTopic_ZeroSuggestions asserts the degenerate payload
+// (empty cwd, no valid recents) still renders actionably: header + the
+// create-by-name / attach-by-name body, plus a full-list row when the registry
+// holds topics the picker couldn't seed (HasMore).
+func TestFormatAttached_PickTopic_ZeroSuggestions(t *testing.T) {
+	// With topics hidden (HasMore) — full-list row must appear.
+	withTopics := &AttachedMsg{
+		Op: OpAttached, OK: false, NeedsConfirmation: true,
+		Proposal: &Proposal{Action: "pick_topic", Channel: "telegram", HasMore: true},
+	}
+	got := FormatAttached(withTopics)
+	for _, w := range []string{
+		`attach(name="<name>")`,
+		`attach(name="<name>", create=true)`,
+		"See the full list",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("FormatAttached(pick_topic zero+topics) missing %q in:\n%s", w, got)
+		}
+	}
+	// Nothing at all (empty cwd, empty registry) — body only, no full-list row.
+	empty := &AttachedMsg{
+		Op: OpAttached, OK: false, NeedsConfirmation: true,
+		Proposal: &Proposal{Action: "pick_topic", Channel: "telegram"},
+	}
+	got = FormatAttached(empty)
+	if !strings.Contains(got, `attach(name="<name>", create=true)`) {
+		t.Errorf("FormatAttached(pick_topic empty) missing create-by-name body in:\n%s", got)
+	}
+	if strings.Contains(got, "See the full list") {
+		t.Errorf("empty registry → no full-list row; got:\n%s", got)
+	}
+	if strings.Contains(got, "unspecified failure") {
+		t.Errorf("FormatAttached(pick_topic empty) leaked unspecified-failure:\n%s", got)
+	}
+}
+
 // TestFormatAttached_NoTopicsConfigured asserts the 3-state actionable
 // guidance for the broker's no_topics_configured status.
 func TestFormatAttached_NoTopicsConfigured(t *testing.T) {

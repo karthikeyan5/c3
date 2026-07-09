@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -192,14 +193,223 @@ func (b *Broker) attachBare(conn *ipc.Conn, stub *Stub, chanName, cwd, group str
 		return
 	}
 
-	// (iii) Picker — NEVER claims. Phase 1 placeholder: the minimal pick_topic
-	// proposal with no suggestions. Phase 2 adds buildPickTopic (cwd-seeded,
-	// ranked suggestions) and the host-neutral FormatAttached "pick_topic" case.
+	// (iii) Picker — NEVER claims. buildPickTopic seeds a cwd-derived
+	// "current project" suggestion + recently-used topics; the human picks and
+	// the agent re-invokes with an explicit topic_id/create (that re-invoke is
+	// the only thing that claims). The host-neutral FormatAttached "pick_topic"
+	// case renders each suggestion's exact re-invoke command.
 	_ = conn.WriteJSON(ipc.AttachedMsg{
 		Op: ipc.OpAttached, OK: false,
 		NeedsConfirmation: true,
-		Proposal:          &ipc.Proposal{Action: "pick_topic", Channel: chanName},
+		Proposal:          b.buildPickTopic(stub, chanName, cwd),
 	})
+}
+
+// maxPickOptions bounds the host AskUserQuestion budget for the friendly picker:
+// the shown suggestions plus an optional "See the full list" row must fit within
+// this many options (spec §4). The create row is itself a suggestion.
+const maxPickOptions = 4
+
+// buildPickTopic assembles the ranked suggestion set for a bare attach that
+// resolved to neither an existing claim nor the session's own recorded route
+// (attachBare branch iii). It NEVER claims — a claim only ever happens when the
+// agent re-invokes attach with an explicit topic_id / create after the human
+// picks. Ranking (spec §4), capped at 3 suggestions:
+//
+//  1. Current project — cwd → LookupByCwd, else basename(cwd) in the default
+//     group, else basename(cwd) across groups (offered with its Group so the
+//     re-invoke disambiguates instead of minting a duplicate), else a
+//     "create <project>" row. Skipped entirely when cwd is empty; the create
+//     row is omitted when the channel has no default group.
+//  2. Recently used — the 1–2 newest session_attachments (by LastAttachedAt),
+//     deduped by route, registry-validated (a DM entry is exempt — validated by
+//     a configured dm_chat_id), TTL-filtered, tombstone-ALLOWED (a deliberate
+//     detach blocks silent recovery, not an explicit pick).
+//  3. ClaimedBy — a live-held suggestion is marked so the human is warned; the
+//     re-invoke still goes through the normal force_steal confirmation.
+//  4. HasMore — true when the registry holds more EXISTING topics than the
+//     picker shows (FormatAttached then offers "See the full list"). It counts
+//     only shown suggestions that reference a real registry topic (a create row
+//     and a DM row are not registry topics), so a hidden topic is never masked
+//     by a non-topic row. A final ≤4-option budget trim (suggestions + the
+//     optional full-list row) keeps the host AskUserQuestion cap.
+//
+// stub is threaded for signature parity with the other attach helpers (and for a
+// future same-session ClaimedBy suppression); the picker itself reads only the
+// mappings + the live route table. Returns a *ipc.Proposal (Action "pick_topic")
+// kept pure of any conn write so ranking is unit-testable.
+func (b *Broker) buildPickTopic(stub *Stub, chanName, cwd string) *ipc.Proposal {
+	_ = stub
+	mf := b.Mappings()
+	cc, hasChan := mf.Channels[chanName]
+
+	var suggestions []ipc.PickSuggestion
+	seen := map[RouteKey]bool{}
+	project := ""
+
+	markClaim := func(s *ipc.PickSuggestion, key RouteKey) {
+		if holder, ok := b.Routes.Holder(key); ok && holder.IsAlive() {
+			s.ClaimedBy = &ipc.Holder{CLI: holder.CLI, PID: holder.PID, CWD: holder.CWD}
+		}
+	}
+
+	// (1) Current project.
+	if cwd != "" {
+		project = filepath.Base(cwd)
+		var cur *ipc.PickSuggestion
+		if m, ok := mf.LookupByCwd(cwd); ok && m.Channel == chanName {
+			tid := m.TopicID
+			grp := ""
+			if hasChan && m.Group != cc.DefaultGroup {
+				grp = m.Group
+			}
+			cur = &ipc.PickSuggestion{
+				Kind: "attach_existing", Reason: "current project",
+				Name: m.Name, Group: grp, ChatID: m.ChatID, TopicID: &tid,
+			}
+		} else if tp, ok := mf.LookupTopicInDefaultGroup(chanName, project); ok {
+			tid := tp.TopicID
+			cur = &ipc.PickSuggestion{
+				Kind: "attach_existing", Reason: "current project",
+				Name: tp.Name, ChatID: tp.ChatID, TopicID: &tid, // default group → no group arg
+			}
+		} else if hits := mf.LookupTopicAcrossGroups(chanName, project); len(hits) > 0 {
+			tp := hits[0]
+			tid := tp.TopicID
+			cur = &ipc.PickSuggestion{
+				Kind: "attach_existing", Reason: "current project",
+				Name: tp.Name, Group: tp.Group, ChatID: tp.ChatID, TopicID: &tid,
+			}
+		} else if hasChan && cc.DefaultGroup != "" {
+			// Found nowhere → offer to create <project> in the default group.
+			cur = &ipc.PickSuggestion{
+				Kind: "create", Reason: "current project (new)", Name: project,
+			}
+		}
+		if cur != nil {
+			if cur.Kind == "attach_existing" && cur.TopicID != nil {
+				key := MakeRouteKey(chanName, cur.ChatID, cur.TopicID)
+				seen[key] = true
+				markClaim(cur, key)
+			}
+			suggestions = append(suggestions, *cur)
+		}
+	}
+
+	// (2) Recently used — newest session_attachments, filtered.
+	for _, sa := range recentSessionAttachments(mf, chanName) {
+		if len(suggestions) >= 3 {
+			break
+		}
+		var key RouteKey
+		var suggestion ipc.PickSuggestion
+		if sa.TopicID == nil {
+			// DM recent — validated by a configured DM chat, not the registry.
+			if !hasChan || cc.DMChatID == 0 {
+				continue
+			}
+			key = MakeRouteKey(chanName, cc.DMChatID, nil)
+			suggestion = ipc.PickSuggestion{
+				Kind: "attach_existing", Reason: "recently used",
+				Name: "dm", ChatID: cc.DMChatID, // TopicID nil → renders as target="dm"
+			}
+		} else {
+			// Drop entries whose topic no longer resolves — a topic_id re-invoke
+			// would fail ValidateTopic. Use the registry's current name/group so
+			// the suggestion (and its group arg) is authoritative, not stale.
+			tp, ok := mf.LookupTopicByID(sa.Channel, sa.ChatID, *sa.TopicID)
+			if !ok {
+				continue
+			}
+			tid := tp.TopicID
+			grp := ""
+			if hasChan && tp.Group != cc.DefaultGroup {
+				grp = tp.Group
+			}
+			key = MakeRouteKey(chanName, tp.ChatID, &tid)
+			suggestion = ipc.PickSuggestion{
+				Kind: "attach_existing", Reason: "recently used",
+				Name: tp.Name, Group: grp, ChatID: tp.ChatID, TopicID: &tid,
+			}
+		}
+		if seen[key] {
+			continue // dedupe by route (many session ids can record the same topic)
+		}
+		seen[key] = true
+		markClaim(&suggestion, key)
+		suggestions = append(suggestions, suggestion)
+	}
+
+	// (4) HasMore + the ≤maxPickOptions budget trim. Dropping a shown existing
+	// topic raises the hidden count, so recompute HasMore each pass; the loop
+	// terminates because len(suggestions) strictly decreases.
+	var totalExisting int
+	if hasChan {
+		totalExisting = len(cc.Topics)
+	}
+	hasMore := false
+	for {
+		shown := 0
+		for i := range suggestions {
+			if suggestions[i].Kind == "attach_existing" && suggestions[i].TopicID != nil {
+				shown++
+			}
+		}
+		hasMore = totalExisting > shown
+		rows := len(suggestions)
+		if hasMore {
+			rows++
+		}
+		if rows <= maxPickOptions || len(suggestions) == 0 {
+			break
+		}
+		suggestions = suggestions[:len(suggestions)-1]
+	}
+
+	return &ipc.Proposal{
+		Action:      "pick_topic",
+		Channel:     chanName,
+		Project:     project,
+		Suggestions: suggestions,
+		HasMore:     hasMore,
+	}
+}
+
+// recentSessionAttachments returns the channel's session attachments newest-first
+// (by LastAttachedAt), filtered to the picker's TTL and channel. Tombstoned
+// entries are KEPT (a deliberate detach blocks silent recovery, not an explicit
+// pick). A stable secondary sort keeps picker ranking deterministic for tests.
+func recentSessionAttachments(mf *mappings.MappingsFile, chanName string) []mappings.SessionAttachment {
+	if mf == nil {
+		return nil
+	}
+	now := time.Now()
+	var out []mappings.SessionAttachment
+	for _, sa := range mf.SessionAttachments {
+		if sa.Channel != chanName {
+			continue
+		}
+		if now.Sub(sa.LastAttachedAt) >= SessionAttachmentTTL {
+			continue // TTL-expired (the age arm of Recoverable); tombstones are kept.
+		}
+		out = append(out, sa)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if !out[i].LastAttachedAt.Equal(out[j].LastAttachedAt) {
+			return out[i].LastAttachedAt.After(out[j].LastAttachedAt)
+		}
+		return sessionAttachmentSortKey(out[i]) < sessionAttachmentSortKey(out[j])
+	})
+	return out
+}
+
+// sessionAttachmentSortKey is a deterministic tiebreak for equal LastAttachedAt.
+func sessionAttachmentSortKey(sa mappings.SessionAttachment) string {
+	tid := int64(0)
+	if sa.TopicID != nil {
+		tid = *sa.TopicID
+	}
+	return fmt.Sprintf("%s\x00%d\x00%d", sa.Name, sa.ChatID, tid)
 }
 
 // applyExprToAttachReq parses the user-supplied freeform argument string and

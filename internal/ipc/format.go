@@ -53,6 +53,8 @@ func FormatAttached(a *AttachedMsg) string {
 			h := a.Proposal.Holder
 			return fmt.Sprintf("Topic %q is currently held by %s pid %d (cwd %q). Re-invoke attach with steal=true to evict that session and take the claim. Only do this if the user explicitly confirms.",
 				a.Proposal.Name, h.CLI, h.PID, h.CWD)
+		case "pick_topic":
+			return formatPickTopic(a.Proposal)
 		}
 	}
 	// Status-aware structured failures (2026-05-19). Lets the agent tell
@@ -89,6 +91,59 @@ func FormatAttached(a *AttachedMsg) string {
 		return "attach failed: " + a.Err
 	}
 	return "attach: unspecified failure"
+}
+
+// formatPickTopic renders a "pick_topic" proposal (spec §4) — the bare-attach
+// friendly picker. The string is shared VERBATIM by both adapters, and Codex has
+// neither an AskUserQuestion tool nor the /c3:attach slash command nor an `expr`
+// attach arg — so the wording is HOST-NEUTRAL: every re-invoke is a plain
+// attach(...) call that both hosts' attach tool schema accepts, and the
+// AskUserQuestion / /c3:attach mentions are parenthetical hints, never
+// instructions to call a tool Codex lacks. Each suggestion line carries its EXACT
+// re-invoke command so the agent runs it directly on the human's pick; the picker
+// never auto-attaches. Renders actionably even with zero suggestions (the
+// create-by-name + attach-by-name body always prints).
+func formatPickTopic(p *Proposal) string {
+	var b strings.Builder
+	b.WriteString("This session isn't attached to a topic yet — ASK the user which one before doing anything ")
+	b.WriteString("(use AskUserQuestion if your host has it; otherwise ask in plain conversation). Do NOT assume, never auto-pick:")
+
+	n := 0
+	for i := range p.Suggestions {
+		s := p.Suggestions[i]
+		n++
+		var desc, cmd string
+		switch s.Kind {
+		case "create":
+			desc = fmt.Sprintf("Create new topic %q", s.Name)
+			cmd = fmt.Sprintf("attach(name=%q, create=true)", s.Name)
+		default: // attach_existing
+			reason := s.Reason
+			if reason == "" {
+				reason = "existing topic"
+			}
+			desc = fmt.Sprintf("Attach %q (%s)", s.Name, reason)
+			switch {
+			case s.TopicID == nil:
+				cmd = `attach(target="dm")`
+			case s.Group != "":
+				cmd = fmt.Sprintf("attach(topic_id=%d, group=%q)", *s.TopicID, s.Group)
+			default:
+				cmd = fmt.Sprintf("attach(topic_id=%d)", *s.TopicID)
+			}
+			if s.ClaimedBy != nil {
+				desc += fmt.Sprintf(" — held by %s pid %d; picking it will ask before stealing", s.ClaimedBy.CLI, s.ClaimedBy.PID)
+			}
+		}
+		fmt.Fprintf(&b, "\n  %d. %s → %s", n, desc, cmd)
+	}
+	if p.HasMore {
+		n++
+		fmt.Fprintf(&b, "\n  %d. See the full list → call the `topics` tool, then attach by name/id", n)
+	}
+	b.WriteString("\nTo attach a topic by name instead: attach(name=\"<name>\") (Claude Code users can type /c3:attach <name>).")
+	b.WriteString("\nTo create a new topic: attach(name=\"<name>\", create=true) (or /c3:attach create <name>).")
+	return b.String()
 }
 
 // FormatTopics renders a TopicsListMsg as the user-facing string for

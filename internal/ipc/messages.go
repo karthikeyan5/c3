@@ -557,6 +557,12 @@ type AttachedMsg struct {
 //   - "force_steal" — the requested route is held by Holder; agent asks
 //     user for confirmation, then re-invokes attach with steal=true to
 //     evict and claim.
+//   - "pick_topic" — a BARE attach that resolved to neither an existing claim
+//     nor the session's own recorded route. The broker claims NOTHING; it
+//     returns Suggestions (ranked ≤3) + HasMore so the agent ASKS the user
+//     which topic to attach. The chosen suggestion's exact re-invoke command
+//     is rendered by FormatAttached; a claim happens only on that explicit
+//     re-invoke. See §4 of the attach-redesign spec.
 type Proposal struct {
 	Action      string      `json:"action"`
 	Channel     string      `json:"channel"`
@@ -565,6 +571,36 @@ type Proposal struct {
 	Existing    *TopicEntry `json:"existing,omitempty"`    // populated for use_existing_* / disambiguate_dm
 	Alternative *Proposal   `json:"alternative,omitempty"` // recursion: e.g. "or create new in default group"
 	Holder      *Holder     `json:"holder,omitempty"`      // populated for force_steal
+
+	// pick_topic payload (bare-attach friendly picker, spec §4). Additive +
+	// omitempty so every other proposal action and older brokers are byte-stable.
+	Suggestions []PickSuggestion `json:"suggestions,omitempty"` // ≤3, ranked (current project, then recently used)
+	Project     string           `json:"project,omitempty"`     // basename(cwd) — the label source for the create row
+	HasMore     bool             `json:"has_more,omitempty"`    // registry holds more existing topics than shown → offer "See the full list"
+}
+
+// PickSuggestion is one ranked option in a "pick_topic" proposal (spec §4). The
+// broker never claims when it emits these; FormatAttached renders each with its
+// EXACT re-invoke command, and the claim happens only when the agent runs that
+// command on the human's pick.
+//
+// Kind is "attach_existing" (an already-registered topic or the DM) or "create"
+// (mint a new topic named Name). Group is set ONLY for an existing topic that
+// lives in a NON-default group — its presence tells FormatAttached to add a
+// group="…" arg to the re-invoke (a topic_id re-invoke otherwise validates
+// against the default group's chat). TopicID is set iff Kind=="attach_existing"
+// AND the suggestion is a real topic; a nil TopicID on an attach_existing row is
+// the DM (rendered as target="dm"). ClaimedBy is set when the topic is held by a
+// live session, so the human is warned — the re-invoke still goes through the
+// normal force_steal confirmation, never a silent steal.
+type PickSuggestion struct {
+	Kind      string  `json:"kind"`                 // "attach_existing" | "create"
+	Reason    string  `json:"reason,omitempty"`     // "current project" | "recently used" | "current project (new)"
+	Name      string  `json:"name"`                 //
+	Group     string  `json:"group,omitempty"`      // set only for a non-default-group existing topic
+	ChatID    int64   `json:"chat_id,omitempty"`    //
+	TopicID   *int64  `json:"topic_id,omitempty"`   // set iff attach_existing AND not the DM
+	ClaimedBy *Holder `json:"claimed_by,omitempty"` // live holder, when the topic is held (ranking rule 3)
 }
 
 // PairModeStartReq is the adapter → broker request to arm a pairing

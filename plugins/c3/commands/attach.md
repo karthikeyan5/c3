@@ -1,7 +1,7 @@
 ---
-description: Attach this session to a Telegram topic. Empty = cwd-saved silent claim. "dm" = actual DM. "<int>" = topic_id. "<name>" = topic by name. "create <name>" or "-y <name>" = create that topic immediately.
+description: Attach this session to a Telegram topic. Empty = silently re-attach this session's own topic, or (first time) show a picker. "dm" = actual DM. "<int>" = topic_id. "<name>" = topic by name. "create <name>" or "-y <name>" = create that topic immediately.
 argument-hint: "[empty | dm | <topic-id> | <name> | \"create <name>\" | \"-y <name>\"]"
-allowed-tools: ["mcp__plugin_c3_c3__attach", "AskUserQuestion"]
+allowed-tools: ["mcp__plugin_c3_c3__attach", "mcp__plugin_c3_c3__topics", "AskUserQuestion"]
 ---
 
 User typed: $ARGUMENTS
@@ -11,6 +11,8 @@ Call `mcp__plugin_c3_c3__attach` with `expr` set to the user's argument string (
 - Returns a proposal (`create` / `use_existing_other_group` / `disambiguate_dm` / `force_steal`) requiring confirmation
 
 If the response is **needs_confirmation** with proposal action:
+
+- **`pick_topic`**: this session isn't attached yet and the broker claimed NOTHING — it returned a ranked list of options. **You MUST call `AskUserQuestion`** presenting exactly the listed options — **never auto-pick, never assume, never attach silently.** On the user's choice, run the exact `attach(...)` command shown on that option's line (verbatim — it already carries the right `topic_id`/`group`/`target="dm"`/`create=true`). If an option is marked *held by* another session, picking it will prompt a `force_steal` confirmation — surface that. For **"See the full list"**, call the `topics` tool, show the topics, then attach by the chosen id (`attach(topic_id=<id>)`, adding `group="<g>"` if the topic is in a non-default group). For **"type your own"**, tell the user to run `/c3:attach <name>` (or you call `attach(name="<name>")`).
 
 - **`create`**: Ask the user via `AskUserQuestion` whether to create the topic. On yes → re-invoke with the name explicitly: `attach(name="<the proposal's name>", create=true)` (or `attach(expr="create <name>")`, which also carries the name). A bare `attach(create=true)` no longer works — the name must be present. On no → tell them how to use an existing topic instead.
 
