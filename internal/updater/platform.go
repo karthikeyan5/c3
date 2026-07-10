@@ -6,14 +6,15 @@ import (
 	"strings"
 )
 
-// BinaryNames are the six runnable binaries a release tarball carries and the
-// updater installs. MUST stay in sync with scripts/package.sh's BINS list — if
-// package.sh adds/removes a binary, update this too or an install will fail
+// BinaryNames are the seven runnable binaries a release tarball carries and
+// the updater installs. MUST stay in sync with scripts/package.sh's BINS list —
+// if package.sh adds/removes a binary, update this too or an install will fail
 // looking for a binary the tarball doesn't contain (or silently skip a new one).
 var BinaryNames = []string{
 	"c3-broker",
 	"c3-claude-adapter",
 	"c3-codex-adapter",
+	"c3-grok-adapter",
 	"codex",
 	"claude-shim",
 	"migrate-legacy",
