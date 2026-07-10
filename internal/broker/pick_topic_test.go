@@ -254,6 +254,75 @@ func TestBuildPickTopic_HasMoreCountsHiddenTopics(t *testing.T) {
 	}
 }
 
+// TestBuildPickTopic_CwdMappingDMLegacy (item H1): a legacy cwd→route mapping with
+// TopicID==0 means the DM (the deleted PATH A normalized a DM cwd mapping to 0). It
+// must render as a DM row (TopicID nil → the formatter's target="dm" form), not a
+// bogus topic_id=0 re-invoke.
+func TestBuildPickTopic_CwdMappingDMLegacy(t *testing.T) {
+	mf := mfWithTelegram()
+	mf.Mappings["/home/x/dmproj"] = mappings.Mapping{
+		Channel: "telegram", ChatID: 42, TopicID: 0, Name: "dm",
+	}
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	p := b.buildPickTopic(nil, "telegram", "/home/x/dmproj")
+	if len(p.Suggestions) == 0 {
+		t.Fatalf("expected a current-project DM suggestion; got none")
+	}
+	s := p.Suggestions[0]
+	if s.Kind != "attach_existing" || s.Reason != "current project" {
+		t.Fatalf("option#1 = %+v; want attach_existing/current project", s)
+	}
+	if s.TopicID != nil {
+		t.Fatalf("legacy TopicID==0 cwd mapping must render as a DM row (TopicID nil); got %+v", s)
+	}
+	if s.Name != "dm" {
+		t.Errorf("DM row name = %q, want dm", s.Name)
+	}
+}
+
+// TestBuildPickTopic_CwdMappingStaleFallsThrough (item H2): a cwd→route mapping
+// whose topic is NOT in the registry (deleted) must NOT render an unvalidated
+// topic_id re-invoke, and must NOT inflate the HasMore "shown" count. It falls
+// through to the basename/create arms. Here: registry holds exactly ONE topic
+// (t1), the stale mapping points at phantom 777. The OLD code rendered 777 as a
+// shown topic → HasMore=false, masking the real hidden t1. The fix drops the
+// phantom → a create row leads and HasMore correctly surfaces t1.
+func TestBuildPickTopic_CwdMappingStaleFallsThrough(t *testing.T) {
+	mf := &mappings.MappingsFile{
+		SchemaVersion: 1,
+		Channels: map[string]mappings.ChannelConfig{
+			"telegram": {
+				DefaultGroup: "main",
+				Groups:       map[string]mappings.GroupConfig{"main": {ChatID: -100}},
+				DMChatID:     42,
+				Topics:       []mappings.Topic{{ChatID: -100, TopicID: 101, Name: "t1", Group: "main"}},
+			},
+		},
+		Mappings: map[string]mappings.Mapping{
+			"/home/x/ghostproj": {Channel: "telegram", ChatID: -100, TopicID: 777, Name: "ghost", Group: "main"},
+		},
+	}
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	p := b.buildPickTopic(nil, "telegram", "/home/x/ghostproj")
+	for _, s := range p.Suggestions {
+		if s.TopicID != nil && *s.TopicID == 777 {
+			t.Fatalf("stale cwd mapping rendered an unvalidated topic 777: %+v", p.Suggestions)
+		}
+	}
+	if len(p.Suggestions) != 1 || p.Suggestions[0].Kind != "create" || p.Suggestions[0].Name != "ghostproj" {
+		t.Fatalf("stale mapping must fall through to a create row for the basename; got %+v", p.Suggestions)
+	}
+	if !p.HasMore {
+		t.Fatal("HasMore must be true: the phantom topic must not inflate shown-count and mask the real hidden topic t1")
+	}
+}
+
 // TestBuildPickTopic_EmptyCwdEmptyRegistry: the degenerate payload — no cwd
 // signal, no topics — is a proposal with zero suggestions and HasMore=false,
 // which the formatter still renders actionably (create-by-name body).

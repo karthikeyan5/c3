@@ -40,8 +40,13 @@ func FormatAttached(a *AttachedMsg) string {
 		case "use_existing_other_group":
 			alt := ""
 			if a.Proposal.Alternative != nil {
-				alt = fmt.Sprintf(" or attach(create=true, group=%q) to create a new topic in %q",
-					a.Proposal.Alternative.Group, a.Proposal.Alternative.Group)
+				// The alternative "create" carries the name explicitly (the broker
+				// sets Alternative.Name to the searched-for name — attach.go's
+				// attachByName). A name-less attach(create=true) errors since the
+				// cwd-basename backfill was deleted, so the re-invoke MUST carry the
+				// name.
+				alt = fmt.Sprintf(" or attach(name=%q, create=true, group=%q) to create a new topic in %q",
+					a.Proposal.Alternative.Name, a.Proposal.Alternative.Group, a.Proposal.Alternative.Group)
 			}
 			return fmt.Sprintf("Found topic %q in group %q (thread %d). Reply yes to claim it%s.",
 				a.Proposal.Existing.Name, a.Proposal.Existing.Group, a.Proposal.Existing.TopicID, alt)

@@ -258,37 +258,62 @@ func (b *Broker) buildPickTopic(stub *Stub, chanName, cwd string) *ipc.Proposal 
 	if cwd != "" {
 		project = filepath.Base(cwd)
 		var cur *ipc.PickSuggestion
+
+		// (1a/1b) A saved cwd→route mapping for this channel takes priority — but it
+		// must be VALIDATED like the recents arm (item H2): a stale mapping whose
+		// topic was deleted from the registry must NOT render an unattachable
+		// topic_id re-invoke NOR inflate the HasMore "shown" count. TopicID==0 is
+		// the legacy DM marker (the deleted PATH A normalized a DM cwd mapping to
+		// TopicID 0), rendered as a DM row (item H1). On a registry miss, leave cur
+		// nil so the basename/create arms below get a chance (fall through).
 		if m, ok := mf.LookupByCwd(cwd); ok && m.Channel == chanName {
-			tid := m.TopicID
-			grp := ""
-			if hasChan && m.Group != cc.DefaultGroup {
-				grp = m.Group
+			if m.TopicID == 0 {
+				cur = &ipc.PickSuggestion{
+					Kind: "attach_existing", Reason: "current project",
+					Name: "dm", ChatID: m.ChatID, // TopicID nil → renders as target="dm"
+				}
+			} else if tp, okReg := mf.LookupTopicByID(chanName, m.ChatID, m.TopicID); okReg {
+				tid := tp.TopicID
+				grp := ""
+				if hasChan && tp.Group != cc.DefaultGroup {
+					grp = tp.Group
+				}
+				cur = &ipc.PickSuggestion{
+					Kind: "attach_existing", Reason: "current project",
+					Name: tp.Name, Group: grp, ChatID: tp.ChatID, TopicID: &tid, // registry-authoritative name/group
+				}
 			}
-			cur = &ipc.PickSuggestion{
-				Kind: "attach_existing", Reason: "current project",
-				Name: m.Name, Group: grp, ChatID: m.ChatID, TopicID: &tid,
-			}
-		} else if tp, ok := mf.LookupTopicInDefaultGroup(chanName, project); ok {
-			tid := tp.TopicID
-			cur = &ipc.PickSuggestion{
-				Kind: "attach_existing", Reason: "current project",
-				Name: tp.Name, ChatID: tp.ChatID, TopicID: &tid, // default group → no group arg
-			}
-		} else if hits := mf.LookupTopicAcrossGroups(chanName, project); len(hits) > 0 {
-			tp := hits[0]
-			tid := tp.TopicID
-			cur = &ipc.PickSuggestion{
-				Kind: "attach_existing", Reason: "current project",
-				Name: tp.Name, Group: tp.Group, ChatID: tp.ChatID, TopicID: &tid,
-			}
-		} else if hasChan && cc.DefaultGroup != "" {
-			// Found nowhere → offer to create <project> in the default group.
-			cur = &ipc.PickSuggestion{
-				Kind: "create", Reason: "current project (new)", Name: project,
+			// else: mapping points at a topic no longer in the registry → fall through.
+		}
+
+		// (1c) No usable cwd mapping → seed from basename(cwd).
+		if cur == nil {
+			if tp, ok := mf.LookupTopicInDefaultGroup(chanName, project); ok {
+				tid := tp.TopicID
+				cur = &ipc.PickSuggestion{
+					Kind: "attach_existing", Reason: "current project",
+					Name: tp.Name, ChatID: tp.ChatID, TopicID: &tid, // default group → no group arg
+				}
+			} else if hits := mf.LookupTopicAcrossGroups(chanName, project); len(hits) > 0 {
+				tp := hits[0]
+				tid := tp.TopicID
+				cur = &ipc.PickSuggestion{
+					Kind: "attach_existing", Reason: "current project",
+					Name: tp.Name, Group: tp.Group, ChatID: tp.ChatID, TopicID: &tid,
+				}
+			} else if hasChan && cc.DefaultGroup != "" {
+				// Found nowhere → offer to create <project> in the default group.
+				cur = &ipc.PickSuggestion{
+					Kind: "create", Reason: "current project (new)", Name: project,
+				}
 			}
 		}
+
 		if cur != nil {
-			if cur.Kind == "attach_existing" && cur.TopicID != nil {
+			// Mark seen + claim for any attach_existing row, INCLUDING the DM row
+			// (TopicID nil → MakeRouteKey builds the DM key) so a duplicate DM
+			// recents row is deduped. A create row references no route.
+			if cur.Kind == "attach_existing" {
 				key := MakeRouteKey(chanName, cur.ChatID, cur.TopicID)
 				seen[key] = true
 				markClaim(cur, key)
@@ -417,7 +442,9 @@ func sessionAttachmentSortKey(sa mappings.SessionAttachment) string {
 // fills in the structured fields. Rules (documented in the AttachReq.Expr
 // godoc and docs/COMMANDS.md):
 //
-//	""                          → leave fields untouched (cwd-saved silent claim)
+//	""                          → leave fields untouched → BARE attach (attachBare:
+//	                              idempotent guard → session's OWN recover → picker;
+//	                              NEVER a silent cwd-saved claim — spec §1-§2)
 //	"dm" / "DM" (case-insens)   → Target = "dm"
 //	"<int>"                     → TopicID = <int>
 //	"-y <name>" / "yes <name>" / "create <name>"
@@ -802,7 +829,15 @@ func (b *Broker) tryClaim(conn *ipc.Conn, stub *Stub, key RouteKey, label string
 	// claim". The steal pre-step stays before the claim: the user has already
 	// confirmed displacement, so we evict the current holder of `key` first.
 	if steal {
-		b.Routes.ForceReleaseKey(key)
+		if evicted := b.Routes.ForceReleaseKey(key); evicted != nil && evicted != stub {
+			// The evicted holder still thinks it owns `key`: its Stub.Route +
+			// routeConfirmed are set, so its next destructive fetch_queue(ack=true)
+			// would drain a topic it no longer owns. Clear its route (item E) —
+			// SetRoute(nil) also clears routeConfirmed (Phase 4), so that drain hits
+			// the "no route claimed" refusal instead. SetRoute is stubMu-guarded, so
+			// this cross-connection call is race-safe.
+			evicted.SetRoute(nil)
+		}
 	}
 	holder, ok := b.Routes.Claim(key, stub)
 	if !ok {

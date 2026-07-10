@@ -166,6 +166,67 @@ func TestHandleInboundDelivered_DropsConsumeUntilRouteConfirmed(t *testing.T) {
 	}
 }
 
+// TestSteal_ClearsEvictedStubRouteAndRefusesDestructiveFetch (item E): a
+// user-confirmed steal force-evicts the previous holder, but ForceReleaseKey only
+// removed the ROUTES-table entry — the evicted stub's own Route + routeConfirmed
+// stayed set, so its next destructive fetch_queue(ack=true) would drain a topic it
+// no longer owns. tryClaim must clear the evicted stub's route (SetRoute(nil),
+// which also clears routeConfirmed), so that fetch hits the "no route claimed"
+// refusal instead.
+func TestSteal_ClearsEvictedStubRouteAndRefusesDestructiveFetch(t *testing.T) {
+	t.Setenv("C3_QUEUE_DIR", t.TempDir())
+	b := brokerWithChannel(t, mfWithTelegram(), &fakeChannel{})
+	defer b.Shutdown()
+
+	tid := int64(914)
+	key := MakeRouteKey("telegram", -100, &tid)
+	qrk := queue.RouteKey{Channel: "telegram", ChatID: -100, TopicID: &tid}
+	for i := int64(1); i <= 3; i++ {
+		_ = b.Queue.Append(qrk, &c3types.Inbound{Channel: "telegram", ChatID: -100, TopicID: &tid, MessageID: i, Text: "m", Timestamp: time.Now()})
+	}
+
+	// Victim holds + confirms the route (a legitimate claim).
+	victim := b.Stubs.Register("claude", 4242, "/victim", struct{}{})
+	if !b.tryClaim(nil, victim, key, "c3", false /*steal*/, true /*replay*/) {
+		t.Fatal("victim claim should succeed on a free key")
+	}
+	if victim.CurrentRoute() == nil || !victim.RouteConfirmed() {
+		t.Fatal("precondition: victim should hold a confirmed route")
+	}
+
+	// Thief steals the same route (user-confirmed steal=true).
+	thief := b.Stubs.Register("codex", 9999, "/thief", struct{}{})
+	if !b.tryClaim(nil, thief, key, "c3", true /*steal*/, true /*replay*/) {
+		t.Fatal("steal claim should succeed")
+	}
+
+	// The evicted victim's route + confirmation must be cleared.
+	if victim.CurrentRoute() != nil {
+		t.Fatalf("evicted victim still holds a route: %+v", victim.CurrentRoute())
+	}
+	if victim.RouteConfirmed() {
+		t.Fatal("evicted victim's route must be unconfirmed (SetRoute(nil) clears it)")
+	}
+
+	// A destructive fetch by the victim is refused — it no longer owns the topic,
+	// so it must NOT drain the 3 held messages the thief now owns.
+	agentSide, brokerSide := newConnPair(t)
+	raw, _ := json.Marshal(ipc.FetchQueueReq{Op: ipc.OpFetchQueue, ID: "1", All: true, Ack: true})
+	go b.handleFetchQueue(brokerSide, victim, raw)
+	resp := readFetchResp(t, agentSide)
+	if resp.Err == "" {
+		t.Fatalf("evicted victim's destructive fetch must be refused; got %+v", resp)
+	}
+	if n, _ := b.Queue.Pending(qrk); n != 3 {
+		t.Fatalf("refused fetch must consume nothing; pending=%d, want 3", n)
+	}
+
+	// The thief owns the route and can still drain it.
+	if thief.CurrentRoute() == nil || !thief.RouteConfirmed() {
+		t.Fatal("thief should hold a confirmed route after the steal")
+	}
+}
+
 // handleRelease (detach) clears routeConfirmed — the tripwire re-arms, so a route
 // bound again without a fresh claim is once more refused the destructive consume.
 func TestHandleRelease_ClearsRouteConfirmed(t *testing.T) {

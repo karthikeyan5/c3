@@ -571,6 +571,13 @@ func (a *adapter) rememberAttach(req ipc.AttachReq) {
 	a.amu.Lock()
 	defer a.amu.Unlock()
 	cp := req
+	// A steal is a ONE-SHOT human confirmation, not a standing property (item D).
+	// Replaying steal=true verbatim after a broker bounce would silently
+	// force-evict whoever currently holds the route (last-reconnector-wins). On a
+	// fresh broker the route table is empty, so a plain replay claims fine; and a
+	// route genuinely re-claimed by another session must surface a force_steal
+	// proposal, not be silently evicted. So never remember the steal.
+	cp.Steal = false
 	a.lastAttach = &cp
 }
 
@@ -599,28 +606,43 @@ func isBareAttachReq(req ipc.AttachReq) bool {
 	return req.Expr == "" && req.Target == "" && req.Name == "" && req.TopicID == nil && !req.Create
 }
 
+// rememberedIdentityReq builds the AttachReq to REMEMBER for a route that
+// resolved to a concrete identity, addressing a topic by its stable id + group
+// (NOT by name + group). A name+non-default-group replay can't re-claim across
+// groups: attachByName's step-1 searches only the default group, and its
+// otherGroupHits step excludes same-group hits — so a default-group-name replay
+// with a non-default group arg discards the create proposal and the claim is
+// silently dropped; and a registry-missing topic synthesizes an unreplayable
+// "topic-N" name. attachByTopicID(topic_id, group) validates against the group's
+// chat and re-claims cleanly across groups. A DM has no topic → replay by target.
+// Shared by resolvedAttachReq (§3d1, item C) and fireRecover (item B).
+func rememberedIdentityReq(cwd string, topicID *int64, group string) ipc.AttachReq {
+	req := ipc.AttachReq{Op: ipc.OpAttach, CWD: cwd}
+	if topicID == nil {
+		req.Target = "dm" // DM has no topic; replay by target, not by a "dm" name.
+		return req
+	}
+	tid := *topicID
+	req.TopicID = &tid
+	req.Group = group
+	return req
+}
+
 // resolvedAttachReq picks the request to REMEMBER for reconnect replay (§3d1).
 // An explicit request is remembered verbatim. A BARE request that resolved to a
-// real route is remembered as the RESOLVED identity — {Name, Group} for a topic,
-// {Target:"dm"} for the DM — so that a replay landing on a FRESH broker (after a
-// self-update/rebuild restart, where there is no sid and no reconnect-transfer)
-// re-binds the same topic EXPLICITLY instead of regressing to a picker and
-// silently dropping the claim. This also stops a later idempotent bare OK from
-// clobbering a previously-remembered explicit request with a bare one: the bare
-// OK resolves back to the same identity, so the remembered request keeps
-// pointing at the live route.
+// real route is remembered as the RESOLVED identity — {TopicID, Group} for a
+// topic, {Target:"dm"} for the DM — so that a replay landing on a FRESH broker
+// (after a self-update/rebuild restart, where there is no sid and no
+// reconnect-transfer) re-binds the same topic EXPLICITLY instead of regressing to
+// a picker and silently dropping the claim. This also stops a later idempotent
+// bare OK from clobbering a previously-remembered explicit request with a bare
+// one: the bare OK resolves back to the same identity, so the remembered request
+// keeps pointing at the live route.
 func resolvedAttachReq(req ipc.AttachReq, attached ipc.AttachedMsg) ipc.AttachReq {
 	if !isBareAttachReq(req) {
 		return req
 	}
-	resolved := ipc.AttachReq{Op: ipc.OpAttach, CWD: req.CWD}
-	if attached.TopicID == nil {
-		resolved.Target = "dm" // DM has no topic; replay by target, not by a "dm" name.
-	} else {
-		resolved.Name = attached.Name
-		resolved.Group = attached.Group
-	}
-	return resolved
+	return rememberedIdentityReq(req.CWD, attached.TopicID, attached.Group)
 }
 
 // replayLastAttach sends the saved attach request to the (just-reconnected)
@@ -1999,9 +2021,13 @@ func (a *adapter) fireRecover(ctx context.Context, entry sessionhandoff.Entry) {
 			return // already attached, or nothing recoverable — stay quiet.
 		}
 		// Remember the recovered attach so a later broker reconnect replays it.
-		a.rememberAttach(ipc.AttachReq{
-			Op: ipc.OpAttach, CWD: entry.CWD, Name: resp.Name, Group: resp.Group,
-		})
+		// Address the topic by its stable id + group, NOT by {Name, Group}: for a
+		// DM recover resp.Name=="dm", and a replayed attach(name="dm") can silently
+		// bind a TOPIC literally named "dm" (the disambiguate_dm flow exists
+		// precisely because such topics occur). rememberedIdentityReq maps
+		// resp.TopicID==nil → {Target:"dm"} and a topic → {TopicID, Group}, which a
+		// fresh broker re-claims via attachByTopicID (item B, shared with item C).
+		a.rememberAttach(rememberedIdentityReq(entry.CWD, resp.TopicID, resp.Group))
 		// Track the recovered topic name for the fetch_queue nudges (§5).
 		a.setAttachedTopic(resp.Name)
 		log.Printf("recover-session: auto-attached to %q (queued=%d)", resp.Name, resp.QueuedCount)

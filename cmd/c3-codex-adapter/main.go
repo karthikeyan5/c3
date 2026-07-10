@@ -473,6 +473,13 @@ func (a *adapter) rememberAttach(req ipc.AttachReq) {
 	a.amu.Lock()
 	defer a.amu.Unlock()
 	cp := req
+	// A steal is a ONE-SHOT human confirmation, not a standing property (item D).
+	// Replaying steal=true verbatim after a broker bounce would silently
+	// force-evict whoever currently holds the route (last-reconnector-wins). On a
+	// fresh broker the route table is empty, so a plain replay claims fine; and a
+	// route genuinely re-claimed by another session must surface a force_steal
+	// proposal, not be silently evicted. So never remember the steal.
+	cp.Steal = false
 	a.lastAttach = &cp
 }
 
@@ -499,24 +506,38 @@ func isBareAttachReq(req ipc.AttachReq) bool {
 	return req.Expr == "" && req.Target == "" && req.Name == "" && req.TopicID == nil && !req.Create
 }
 
+// rememberedIdentityReq builds the AttachReq to REMEMBER for a route that
+// resolved to a concrete identity, addressing a topic by its stable id + group
+// (NOT by name + group). A name+non-default-group replay can't re-claim across
+// groups: attachByName's step-1 searches only the default group, and its
+// otherGroupHits step excludes same-group hits — so the create proposal is
+// discarded and the claim silently dropped; a registry-missing topic also
+// synthesizes an unreplayable "topic-N" name. attachByTopicID(topic_id, group)
+// re-claims cleanly across groups. A DM has no topic → replay by target. Parity
+// with the Claude adapter (item C).
+func rememberedIdentityReq(cwd string, topicID *int64, group string) ipc.AttachReq {
+	req := ipc.AttachReq{Op: ipc.OpAttach, CWD: cwd}
+	if topicID == nil {
+		req.Target = "dm"
+		return req
+	}
+	tid := *topicID
+	req.TopicID = &tid
+	req.Group = group
+	return req
+}
+
 // resolvedAttachReq picks the request to REMEMBER for reconnect replay (§3d1) —
 // an explicit request verbatim, a BARE-resolved one as its RESOLVED identity
-// ({Name, Group} for a topic, {Target:"dm"} for the DM) so a fresh-broker replay
-// re-binds explicitly instead of regressing to a picker. Parity with the Claude
-// adapter; DORMANT here because a Codex bare attach never returns OK post-Phase-1
-// (it always yields a picker), but wired for symmetry.
+// ({TopicID, Group} for a topic, {Target:"dm"} for the DM) so a fresh-broker
+// replay re-binds explicitly instead of regressing to a picker. Parity with the
+// Claude adapter; DORMANT here because a Codex bare attach never returns OK
+// post-Phase-1 (it always yields a picker), but wired for symmetry.
 func resolvedAttachReq(req ipc.AttachReq, attached ipc.AttachedMsg) ipc.AttachReq {
 	if !isBareAttachReq(req) {
 		return req
 	}
-	resolved := ipc.AttachReq{Op: ipc.OpAttach, CWD: req.CWD}
-	if attached.TopicID == nil {
-		resolved.Target = "dm"
-	} else {
-		resolved.Name = attached.Name
-		resolved.Group = attached.Group
-	}
-	return resolved
+	return rememberedIdentityReq(req.CWD, attached.TopicID, attached.Group)
 }
 
 // replayLastAttach re-sends the saved attach request to the (just-reconnected)

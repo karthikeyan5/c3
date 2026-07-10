@@ -23,7 +23,7 @@ support.
 | `pair`          | `c3-broker pair …` (CLI)          | pure shell    | Arm a Telegram pairing window. A 4-digit code sent from Telegram allowlists the DM `user_id` (`pair dm`) or a group `chat_id` (`pair group <chat_id>`). The setup flow uses this under the hood for id-free discovery. |
 | `ping`          | `c3-broker ping` (CLI)            | pure shell    | Send a one-shot "this is me" message to the attached topic, identifying which CLI session currently owns it. Run in each candidate tab to find the owner before force-stealing. |
 | `sessions`      | `c3-broker sessions` (CLI)        | pure shell    | List every live Claude Code / Codex session the broker tracks — CWD, attached topic, and a "you are here" marker for the calling terminal. |
-| `attach`        | `attach(expr=…)` (MCP tool)       | LLM dispatch  | Attach this session's adapter to a Telegram topic. Broker parses `expr` and either silent-claims or proposes.          |
+| `attach`        | `attach(expr=…)` (MCP tool)       | LLM dispatch  | Attach this session's adapter to a Telegram topic. Broker parses `expr` and either claims an explicit target, resumes the session's own topic, or proposes a picker/confirmation. |
 | `detach`        | `detach()` (MCP tool)             | LLM dispatch  | Release the session's current claim (sends `OpRelease`). Claude Code only; the Codex adapter has no `detach` tool yet. |
 | `release`       | `c3-broker release <cwd>` (CLI)   | pure shell    | **Stubbed in v1** — intended to drop a route claim by cwd without restarting the broker; returns 'not yet implemented' today; workaround is `/exit` the holding session. |
 

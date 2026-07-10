@@ -607,6 +607,52 @@ func TestRecoverOnStartup_FullyConsumedPairRetiredToTrash(t *testing.T) {
 	_ = retiredJSONL(t) // retired, not deleted
 }
 
+// TestNewStore_RetentionDisabledWhenTrashBlocked (item G): a stray regular FILE
+// named .trash occupies the retention dir's path, so MkdirAll can't create it.
+// NewStore must NOT fail (that would take down the PRIMARY durable queue over a
+// defense-in-depth subfeature); it runs with retention disabled and drains
+// hard-delete the pair instead of retiring it.
+func TestNewStore_RetentionDisabledWhenTrashBlocked(t *testing.T) {
+	dir := t.TempDir()
+	// Occupy the .trash path with a regular file → MkdirAll(.trash) fails (ENOTDIR).
+	if err := os.WriteFile(filepath.Join(dir, trashDirName), []byte("stray"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore must succeed (retention disabled), not fail: %v", err)
+	}
+	if !s.retentionDisabled {
+		t.Fatal("retention should be disabled when .trash/ can't be created")
+	}
+
+	rk := RouteKey{Channel: "telegram", ChatID: -100}
+	for i := int64(1); i <= 3; i++ {
+		if err := s.Append(rk, msg(i, "m")); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	got, err := s.Consume(rk, -1) // drain → retirePair falls back to a hard delete
+	if err != nil {
+		t.Fatalf("drain with retention disabled: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("drain returned %d msgs, want 3", len(got))
+	}
+	// The live pair is hard-deleted (not retired — there's no .trash/ dir to hold it).
+	if _, err := os.Stat(filepath.Join(dir, rk.File()+".jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("live jsonl should be hard-deleted; stat err = %v", err)
+	}
+	// The stray .trash FILE is untouched — still a regular file, never a directory.
+	fi, err := os.Stat(filepath.Join(dir, trashDirName))
+	if err != nil {
+		t.Fatalf("stray .trash file vanished: %v", err)
+	}
+	if fi.IsDir() {
+		t.Fatal("the stray .trash regular file must NOT have become a directory")
+	}
+}
+
 // TestConcurrentRetireAndSweep_NoRace runs two route workers, each draining
 // (retire) and GC-sweeping the shared .trash/ concurrently. Under -race it pins
 // that concurrent sweeps tolerate ENOENT and never touch live route files. The

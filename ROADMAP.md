@@ -38,6 +38,7 @@ What's next for C3 after v1. Everything here is future or unbuilt; shipped work 
 - Id-targeted, delivery-contingent consume — ack/consume specific message ids only when their delivery succeeded, closing the orphaned-consume loss window (adapter abandons a fetch, broker consumes anyway). Needed by the pooled-queue work regardless.
 - Attach-replay refinements: gate `disambiguate_dm` on `Replay`, and honor `group` in the step-2 name lookup, so a replayed DM or non-default-group attach restores cleanly instead of falling to a discarded proposal.
 - Surface the silent auto-recover skip: when a resumed session's own last topic is held by another live session, carry a `Skipped`/reason field and show a one-line CLI notice, instead of resuming quietly with no explanation.
+- Idempotent-attach hint: an already-attached bare `attach` could return an "already attached to X — to switch topics attach by name, or detach first" hint instead of a bare confirmation. Needs an additive `AttachedMsg` field so the formatter can tell an idempotent re-confirm apart from a fresh claim.
 
 ## Open design questions
 

@@ -124,6 +124,29 @@ func TestDispatch_SetsDispatchedFlag(t *testing.T) {
 	}
 }
 
+// TestRememberAttach_SanitizesSteal (item D): a user-confirmed steal is a
+// ONE-SHOT confirmation, not a standing property. rememberAttach must clear Steal
+// in the stored copy so a post-broker-bounce replay does not silently force-evict
+// whoever holds the route (last-reconnector-wins). Other fields survive.
+func TestRememberAttach_SanitizesSteal(t *testing.T) {
+	a := newAdapter()
+	tid := int64(914)
+	a.rememberAttach(ipc.AttachReq{Op: ipc.OpAttach, Name: "c3", TopicID: &tid, Group: "main", Steal: true})
+
+	a.amu.Lock()
+	got := a.lastAttach
+	a.amu.Unlock()
+	if got == nil {
+		t.Fatal("rememberAttach stored nothing")
+	}
+	if got.Steal {
+		t.Fatalf("remembered attach must clear Steal (one-shot, not standing): %+v", got)
+	}
+	if got.Name != "c3" || got.Group != "main" || got.TopicID == nil || *got.TopicID != 914 {
+		t.Fatalf("rememberAttach dropped non-Steal fields: %+v", got)
+	}
+}
+
 // TestReplayLastAttach_ResendsLastAttachWithReplayFlag verifies the
 // `--resume` re-attach path: after a broker reconnect the adapter
 // must re-send its last successful AttachReq with Replay=true so the

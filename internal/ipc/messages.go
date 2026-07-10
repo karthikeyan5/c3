@@ -449,7 +449,8 @@ const (
 //     Lets every CLI's slash-command wrapper be a one-liner —
 //     `attach(expr=$ARGUMENTS)` — instead of duplicating arg-parsing logic.
 //     Parsing rules in the broker:
-//     ""                  → fall back to cwd-saved mapping
+//     ""                  → bare attach (idempotent / session's own recover /
+//     picker; never a silent cwd-saved claim)
 //     "dm" (any case)     → target=dm (with disambiguation if a topic
 //     named "dm" also exists)
 //     "<int>"             → topic_id=<int>

@@ -72,12 +72,17 @@ func TestFormatAttached_ProposalParity(t *testing.T) {
 			msg: AttachedMsg{
 				NeedsConfirmation: true,
 				Proposal: &Proposal{
-					Action:      "use_existing_other_group",
-					Existing:    &TopicEntry{Name: "my-feature", Group: "other", TopicID: 42},
-					Alternative: &Proposal{Group: "dev"},
+					Action:   "use_existing_other_group",
+					Existing: &TopicEntry{Name: "my-feature", Group: "other", TopicID: 42},
+					// The broker sets Alternative.Name to the searched-for name
+					// (attach.go: alt := &ipc.Proposal{Action:"create", Group:gName,
+					// Name:name}). The alternative re-invoke MUST carry that name — a
+					// name-less attach(create=true) errors post-backfill-deletion.
+					Alternative: &Proposal{Action: "create", Name: "my-feature", Group: "dev"},
 				},
 			},
-			want: []string{`attach(create=true, group="dev")`},
+			want:    []string{`attach(name="my-feature", create=true, group="dev")`},
+			wantNot: []string{`attach(create=true, group="dev")`},
 		},
 		{
 			name: "disambiguate_dm",

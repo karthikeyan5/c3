@@ -77,6 +77,91 @@ func TestRecoverWatchBudget_OutlastsOldWindow(t *testing.T) {
 	}
 }
 
+// waitLastAttach polls a.lastAttach until fireRecover (which runs in a goroutine)
+// has recorded the remembered request, or fails after a short budget.
+func waitLastAttach(t *testing.T, a *adapter) ipc.AttachReq {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		a.amu.Lock()
+		la := a.lastAttach
+		a.amu.Unlock()
+		if la != nil {
+			return *la
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("fireRecover did not remember an attach within 2s")
+	return ipc.AttachReq{}
+}
+
+// TestFireRecover_RemembersDMByTargetNotName (item B): a DM auto-resume must be
+// remembered as {Target:"dm"}, NOT {Name:"dm"} — a replayed attach(name="dm")
+// onto a fresh broker can silently bind a TOPIC literally named "dm" (which is why
+// the disambiguate_dm flow exists). resp.TopicID==nil is the DM signal.
+func TestFireRecover_RemembersDMByTargetNotName(t *testing.T) {
+	a := newAdapter()
+	pipeA, pipeB := net.Pipe()
+	defer pipeA.Close()
+	defer pipeB.Close()
+	a.bmu.Lock()
+	a.conn = ipc.NewConn(pipeA)
+	a.bmu.Unlock()
+	peer := ipc.NewConn(pipeB)
+
+	entry := sessionhandoff.Entry{StableSessionID: "stable-dm", CWD: "/projects/c3"}
+	go a.fireRecover(context.Background(), entry)
+
+	if _, err := peer.ReadFrame(); err != nil { // drain the RecoverSessionReq
+		t.Fatalf("read recover req: %v", err)
+	}
+	respRaw, _ := json.Marshal(ipc.RecoverSessionResp{
+		Op: ipc.OpRecoverSessionResult, Recovered: true,
+		Channel: "telegram", ChatID: 42, Name: "dm", TopicID: nil,
+	})
+	a.dispatchRecoverSessionResult(respRaw)
+
+	req := waitLastAttach(t, a)
+	if req.Target != "dm" || req.Name != "" || req.TopicID != nil {
+		t.Fatalf("DM recover must be remembered as {Target:dm}, got %+v (a name=\"dm\" replay could bind a topic named dm)", req)
+	}
+	if req.CWD != "/projects/c3" {
+		t.Errorf("remembered CWD = %q, want /projects/c3", req.CWD)
+	}
+}
+
+// TestFireRecover_RemembersTopicById (item B/C): a topic auto-resume is remembered
+// id-addressed ({TopicID, Group}), not by {Name, Group}, so a fresh-broker replay
+// re-claims it via attachByTopicID even across groups.
+func TestFireRecover_RemembersTopicById(t *testing.T) {
+	a := newAdapter()
+	pipeA, pipeB := net.Pipe()
+	defer pipeA.Close()
+	defer pipeB.Close()
+	a.bmu.Lock()
+	a.conn = ipc.NewConn(pipeA)
+	a.bmu.Unlock()
+	peer := ipc.NewConn(pipeB)
+
+	entry := sessionhandoff.Entry{StableSessionID: "stable-topic", CWD: "/projects/c3"}
+	go a.fireRecover(context.Background(), entry)
+
+	if _, err := peer.ReadFrame(); err != nil {
+		t.Fatalf("read recover req: %v", err)
+	}
+	tid := int64(412)
+	respRaw, _ := json.Marshal(ipc.RecoverSessionResp{
+		Op: ipc.OpRecoverSessionResult, Recovered: true,
+		Channel: "telegram", ChatID: -200, TopicID: &tid, Name: "feature-x", Group: "work",
+	})
+	a.dispatchRecoverSessionResult(respRaw)
+
+	req := waitLastAttach(t, a)
+	if req.TopicID == nil || *req.TopicID != 412 || req.Group != "work" || req.Name != "" || req.Target != "" {
+		t.Fatalf("topic recover must be remembered id-addressed {TopicID:412 Group:work}, got %+v", req)
+	}
+}
+
 // TestFireRecover_SendsOnceIdempotent covers the safety requirement: the
 // background watch and the first-tools/call belt-and-suspenders recheck both call
 // fireRecover, but the broker must never see a duplicate RecoverSessionReq for

@@ -45,6 +45,13 @@ type Store struct {
 	// via a lock-free CAS — no goroutine, ticker, or shutdown lifecycle. The
 	// startup sweep bypasses it.
 	lastTrashGC atomic.Int64
+
+	// retentionDisabled is set when the .trash/ retention dir could not be
+	// created at construction (item G). Retention is defense-in-depth on TOP of
+	// the primary durable queue, so its subdir failing must NOT take down the
+	// whole queue: the store runs with retirePair hard-deleting (deletePair) and
+	// snapshotDropped / gcTrash no-op'ing. Read-only after NewStore, so no lock.
+	retentionDisabled bool
 }
 
 // NewStore creates the queue dir (0700) and returns a Store. Call
@@ -53,10 +60,19 @@ func NewStore(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("queue: mkdir %s: %w", dir, err)
 	}
+	s := &Store{dir: dir, idx: map[string]Status{}}
 	if err := os.MkdirAll(filepath.Join(dir, trashDirName), 0700); err != nil {
-		return nil, fmt.Errorf("queue: mkdir %s: %w", filepath.Join(dir, trashDirName), err)
+		// Item G: the .trash/ retention window is defense-in-depth on top of the
+		// primary durable queue. Its subdir failing to create (e.g. a stray FILE
+		// named .trash occupies the path) must NOT disable the whole queue — that
+		// would drop the PRIMARY loss protection because a secondary subfeature
+		// failed. Fail toward keeping the queue: run with retention DISABLED
+		// (retirePair hard-deletes, snapshotDropped + gcTrash no-op). Loud log so
+		// the degraded mode is visible in broker.log.
+		log.Printf("queue: WARNING could not create retention dir %s: %v — running with .trash retention DISABLED; drains hard-delete instead of retaining for TrashTTL", filepath.Join(dir, trashDirName), err)
+		s.retentionDisabled = true
 	}
-	return &Store{dir: dir, idx: map[string]Status{}}, nil
+	return s, nil
 }
 
 func (s *Store) jsonlPath(rk RouteKey) string { return filepath.Join(s.dir, rk.File()+".jsonl") }
@@ -549,7 +565,21 @@ func firstFreeStamp(start int64, taken func(int64) bool) int64 {
 // no-op. Only a NON-ENOENT rename failure is an error, and it returns before
 // touching .jsonl — so Consume fails exactly like today's deletePair-error path
 // (batch not returned, live queue intact, fail-toward-replay).
+//
+// The post-rename dir fsyncs (step 3) are durability polish only, and by the time
+// they run BOTH renames already succeeded — the pair is in .trash/ and the live
+// queue is gone. Returning their error would make Consume report failure with the
+// live queue already empty, violating the live-queue-intact-on-error contract, so
+// they LOG-and-continue (item F). Only the PRE-rename errors keep the strict
+// fail-toward-replay semantics above.
+//
+// When retention is disabled (the .trash/ dir couldn't be created — item G), the
+// whole path degrades to a hard delete (deletePair), same fail-toward-replay
+// error semantics as today's delete-on-empty.
 func (s *Store) retirePair(rk RouteKey) error {
+	if s.retentionDisabled {
+		return s.deletePair(rk) // retention off: hard-delete, no .trash/ to retire into.
+	}
 	if fi, err := os.Stat(s.jsonlPath(rk)); err == nil && fi.Size() == 0 {
 		return s.deletePair(rk)
 	}
@@ -567,12 +597,15 @@ func (s *Store) retirePair(rk RouteKey) error {
 	}
 	// (3) durability polish: fsync the queue dir (entries removed) and .trash/
 	// (entries added). Correctness holds without these (either rename state is
-	// loss-free); they harden against power loss.
+	// loss-free); they harden against power loss. Both renames already succeeded,
+	// so a failure here must NOT be returned — the live queue is already gone and
+	// returning would make Consume claim failure with an empty live queue,
+	// breaking the fail-toward-replay contract. Log and continue (item F).
 	if err := s.syncDir(); err != nil {
-		return err
+		log.Printf("queue: retire %s: post-rename dir fsync failed (durability polish, ignored): %v", base, err)
 	}
 	if err := fsyncDir(s.trashDir()); err != nil {
-		return err
+		log.Printf("queue: retire %s: post-rename .trash fsync failed (durability polish, ignored): %v", base, err)
 	}
 	s.gcTrash(time.Now())
 	return nil
@@ -584,6 +617,9 @@ func (s *Store) retirePair(rk RouteKey) error {
 // Corrupt placeholder lines carry no recoverable content and are skipped; an
 // empty (or all-corrupt) dropped set is a no-op.
 func (s *Store) snapshotDropped(rk RouteKey, dropped []c3types.Inbound) error {
+	if s.retentionDisabled {
+		return nil // retention off (item G): no .trash/ to snapshot into; EvictOverCap drops the lines.
+	}
 	real := make([]c3types.Inbound, 0, len(dropped))
 	for _, in := range dropped {
 		if in.Channel == corruptSentinel {
@@ -687,6 +723,9 @@ func trashStamp(name string) (int64, bool) {
 // only points where trash grows — so no goroutine/ticker exists. A fresh store
 // (lastTrashGC == 0) runs immediately.
 func (s *Store) gcTrash(now time.Time) {
+	if s.retentionDisabled {
+		return // retention off (item G): nothing ever lands in .trash/, nothing to GC.
+	}
 	last := s.lastTrashGC.Load()
 	if last != 0 && now.Sub(time.Unix(0, last)) < trashGCInterval {
 		return
@@ -767,9 +806,10 @@ func (s *Store) sweepTrashCaps(now time.Time, ttl time.Duration, maxBytes int64,
 		i++
 	}
 	if evicted > 0 {
-		// The only log in this package, deliberate: cap eviction shortens the
-		// promised retention window for the oldest retained pairs (they were still
-		// within TTL), so it must be visible in broker.log.
+		// Deliberately logged: cap eviction shortens the promised retention window
+		// for the oldest retained pairs (they were still within TTL), so it must be
+		// visible in broker.log. (The retire/NewStore degradation logs in items F/G
+		// are the other deliberate broker.log lines in this package.)
 		log.Printf("queue: trash GC evicted %d sub-TTL retained file(s) to stay within caps (limits: %d files / %d bytes)", evicted, maxFiles, maxBytes)
 	}
 }

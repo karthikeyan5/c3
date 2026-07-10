@@ -55,7 +55,7 @@ Structured args (`name=`, `topic_id=`, `target=`, `create=`) and the group overr
 topics                  # list known topics + who's currently holding each
 ```
 
-That's basically it for daily use. Most flow runs implicitly — the topic auto-attaches, your messages flow.
+That's basically it for daily use. Once a session has attached to its topic, resuming that session re-attaches automatically and your messages flow.
 
 ## Telegram-side workflow
 
@@ -162,22 +162,22 @@ Configure multiple Telegram supergroups in `mappings.json`:
 }
 ```
 
-`attach` and `attach <name>` default to `main`. `attach --group=work <name>` targets the work group. The broker tracks the chosen group in the mapping so future sessions auto-attach to the right place.
+`attach` and `attach <name>` default to `main`. `attach --group=work <name>` targets the work group. The broker records the chosen group against the session, so resuming that session re-attaches to the right group.
 
 Each group needs the bot as an admin with `Manage Topics`.
 
 ## Cross-CLI on the same project
 
-You're in `~/projects/widget`. You started Claude Code there earlier; it auto-attached to topic `widget`. Now you want to ask Codex something about the same project. From a different terminal:
+You're in `~/projects/widget`. You started Claude Code there earlier and attached it to topic `widget` (a bare `attach` seeds the current project first in the picker, so it's one tap). Now you want to ask Codex something about the same project. From a different terminal:
 
 ```
 $ cd ~/projects/widget
 $ codex
 ```
 
-The `codex` command goes through the C3 launcher, which spawns a Codex app-server, registers the C3 MCP adapter, and launches the visible TUI bound to that app-server. The adapter sees the cwd has a mapping but it's already claimed by Claude Code — so Codex stays unattached and tells you. To take over, `/exit` the Claude session to drop the claim. (`c3-broker release <cwd>` is on the roadmap but stubbed in v1 — for now, `/exit` the Claude session to drop the claim.) Then `attach` from Codex.
+The `codex` command goes through the C3 launcher, which spawns a Codex app-server, registers the C3 MCP adapter, and launches the visible TUI bound to that app-server. A bare `attach` from Codex shows the picker with `widget` ranked first — but marked **held by** the Claude session, so you're warned instead of silently stealing it. To take over, `/exit` the Claude session to drop the claim (`c3-broker release <cwd>` is on the roadmap but stubbed in v1), then `attach` from Codex.
 
-If you want Claude and Codex on different topics in the same group, attach Codex to a different topic explicitly: `attach(target="widget-codex")`. The broker creates that as a sibling topic in the group; future Codex sessions in this dir will need the same explicit override (or you switch the dir's default mapping).
+If you want Claude and Codex on different topics in the same group, attach Codex to a different topic explicitly: `attach(name="widget-codex", create=true)`. The broker creates that as a sibling topic in the group, and Codex remembers it for that session's future resumes.
 
 ## Editing mappings.json by hand
 
@@ -282,6 +282,11 @@ This release changes how a session binds to a topic. Three user-visible changes:
   and attach explicitly (a bare `attach` lands on the picker). The old
   launch-time silent bind — which could claim a topic inferred from the
   directory name — is gone.
+- **Restart your running CLI sessions after updating.** An old in-process adapter
+  that replays a bare `attach` onto the freshly-restarted broker can land on the
+  new picker (a discarded proposal, not a claim) and stay detached until you run a
+  manual `/attach`. Nothing is lost while detached — inbound is held in the durable
+  queue — but a quick relaunch of each live session avoids the surprise.
 
 ## Privacy and safety
 

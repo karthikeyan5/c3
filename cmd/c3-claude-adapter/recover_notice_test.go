@@ -38,20 +38,22 @@ func TestRenderRecoverNotice_SurfacesBacklogPreview(t *testing.T) {
 	}
 }
 
-// TestResolvedAttachReq_BareSubstitutesResolvedIdentity pins §3d1: a BARE attach
-// that the broker resolves (idempotent already-attached, or own-recover) is
-// remembered as its RESOLVED identity, so a replay landing on a FRESH broker
-// (self-update/rebuild restart) re-binds the same topic EXPLICITLY instead of
-// regressing to a picker and silently dropping the claim. A topic resolution
-// remembers {Name, Group}; a DM resolution (no topic) remembers {Target:"dm"} —
+// TestResolvedAttachReq_BareSubstitutesResolvedIdentity pins §3d1 + item C: a
+// BARE attach that the broker resolves (idempotent already-attached, or
+// own-recover) is remembered as its RESOLVED identity, so a replay landing on a
+// FRESH broker (self-update/rebuild restart) re-binds the same topic EXPLICITLY
+// instead of regressing to a picker and silently dropping the claim. A topic
+// resolution remembers {TopicID, Group} — NOT {Name, Group}, which a fresh broker
+// can't re-claim across groups (attachByName's default-group step-1 + same-group
+// exclusion drops the claim). A DM resolution (no topic) remembers {Target:"dm"} —
 // never a "dm" name, which the broker would treat as a topic lookup.
 func TestResolvedAttachReq_BareSubstitutesResolvedIdentity(t *testing.T) {
 	bare := ipc.AttachReq{Op: ipc.OpAttach, CWD: "/proj"}
 
 	tid := int64(281)
 	got := resolvedAttachReq(bare, ipc.AttachedMsg{OK: true, Name: "c3", Group: "work", TopicID: &tid})
-	if got.Name != "c3" || got.Group != "work" || got.Target != "" || got.TopicID != nil || got.CWD != "/proj" {
-		t.Fatalf("bare→topic remembered %+v, want {Name:c3 Group:work CWD:/proj}", got)
+	if got.TopicID == nil || *got.TopicID != 281 || got.Group != "work" || got.Name != "" || got.Target != "" || got.CWD != "/proj" {
+		t.Fatalf("bare→topic remembered %+v, want {TopicID:281 Group:work CWD:/proj} (id-addressed, no Name)", got)
 	}
 
 	got = resolvedAttachReq(bare, ipc.AttachedMsg{OK: true, Name: "dm", TopicID: nil})
@@ -62,8 +64,8 @@ func TestResolvedAttachReq_BareSubstitutesResolvedIdentity(t *testing.T) {
 
 // TestResolvedAttachReq_ExplicitRememberedVerbatim proves an explicit request is
 // remembered as-is, and that a later idempotent BARE OK cannot clobber it with a
-// bare request: the bare OK resolves back to the SAME identity, so the remembered
-// request keeps pointing at the live route.
+// bare request: the bare OK resolves back to the SAME identity (id-addressed), so
+// the remembered request keeps pointing at the live route.
 func TestResolvedAttachReq_ExplicitRememberedVerbatim(t *testing.T) {
 	explicit := ipc.AttachReq{Op: ipc.OpAttach, CWD: "/proj", Name: "feature-x", Group: "work"}
 	if got := resolvedAttachReq(explicit, ipc.AttachedMsg{OK: true, Name: "feature-x", Group: "work"}); got != explicit {
@@ -73,8 +75,8 @@ func TestResolvedAttachReq_ExplicitRememberedVerbatim(t *testing.T) {
 	tid := int64(412)
 	bare := ipc.AttachReq{Op: ipc.OpAttach, CWD: "/proj"}
 	got := resolvedAttachReq(bare, ipc.AttachedMsg{OK: true, Name: "feature-x", Group: "work", TopicID: &tid})
-	if got.Name != "feature-x" || got.Group != "work" {
-		t.Fatalf("idempotent bare OK must re-remember the resolved identity, not a bare req: got %+v", got)
+	if got.TopicID == nil || *got.TopicID != 412 || got.Group != "work" {
+		t.Fatalf("idempotent bare OK must re-remember the id-addressed identity, not a bare req: got %+v", got)
 	}
 }
 

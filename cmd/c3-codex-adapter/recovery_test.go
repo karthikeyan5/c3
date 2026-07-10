@@ -55,11 +55,12 @@ func TestRecoverBroker_CtxCancelStopsLoop(t *testing.T) {
 // and a bare attach surfaces a picker. rememberAttach/replayLastAttach stay for
 // the `attach`-tool → broker-restart replay path (covered below).
 
-// TestResolvedAttachReq_Parity pins the §3d1 substitution on the Codex side
-// (DORMANT — a Codex bare attach never returns OK post-Phase-1 — but wired for
-// symmetry): an explicit request is remembered verbatim, a bare resolution
-// substitutes the resolved identity ({Name,Group} for a topic, {Target:"dm"}
-// for the DM).
+// TestResolvedAttachReq_Parity pins the §3d1 + item C substitution on the Codex
+// side (DORMANT — a Codex bare attach never returns OK post-Phase-1 — but wired
+// for symmetry): an explicit request is remembered verbatim, a bare resolution
+// substitutes the resolved identity id-addressed ({TopicID,Group} for a topic,
+// {Target:"dm"} for the DM) — never {Name,Group}, which a fresh broker can't
+// re-claim across groups.
 func TestResolvedAttachReq_Parity(t *testing.T) {
 	explicit := ipc.AttachReq{Op: ipc.OpAttach, CWD: "/p", Name: "c3"}
 	if got := resolvedAttachReq(explicit, ipc.AttachedMsg{OK: true, Name: "c3"}); got != explicit {
@@ -67,11 +68,33 @@ func TestResolvedAttachReq_Parity(t *testing.T) {
 	}
 	tid := int64(281)
 	bare := ipc.AttachReq{Op: ipc.OpAttach, CWD: "/p"}
-	if got := resolvedAttachReq(bare, ipc.AttachedMsg{OK: true, Name: "c3", Group: "g", TopicID: &tid}); got.Name != "c3" || got.Group != "g" || got.Target != "" {
-		t.Fatalf("bare→topic: %+v", got)
+	if got := resolvedAttachReq(bare, ipc.AttachedMsg{OK: true, Name: "c3", Group: "g", TopicID: &tid}); got.TopicID == nil || *got.TopicID != 281 || got.Group != "g" || got.Name != "" || got.Target != "" {
+		t.Fatalf("bare→topic: %+v (want id-addressed {TopicID:281 Group:g})", got)
 	}
 	if got := resolvedAttachReq(bare, ipc.AttachedMsg{OK: true, Name: "dm"}); got.Target != "dm" || got.Name != "" {
 		t.Fatalf("bare→DM: %+v", got)
+	}
+}
+
+// TestRememberAttach_SanitizesSteal (item D): parity with the Claude adapter — a
+// one-shot user-confirmed steal must be cleared in the remembered copy so a
+// reconnect replay never silently force-evicts the current holder.
+func TestRememberAttach_SanitizesSteal(t *testing.T) {
+	a := newAdapter()
+	tid := int64(281)
+	a.rememberAttach(ipc.AttachReq{Op: ipc.OpAttach, Name: "c3", TopicID: &tid, Steal: true})
+
+	a.amu.Lock()
+	got := a.lastAttach
+	a.amu.Unlock()
+	if got == nil {
+		t.Fatal("rememberAttach stored nothing")
+	}
+	if got.Steal {
+		t.Fatalf("remembered attach must clear Steal (one-shot, not standing): %+v", got)
+	}
+	if got.Name != "c3" || got.TopicID == nil || *got.TopicID != 281 {
+		t.Fatalf("rememberAttach dropped non-Steal fields: %+v", got)
 	}
 }
 
