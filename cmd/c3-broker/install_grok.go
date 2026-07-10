@@ -124,21 +124,22 @@ func lookPath(file string) (string, error) {
 }
 
 func findGrokPluginSource() string {
-	// Prefer plugin next to this binary's source tree if installed from a checkout.
-	exe, err := os.Executable()
+	// Walk up from the working directory looking for the plugin dir — the
+	// documented flow runs install-grok from a source checkout.
+	dir, err := os.Getwd()
 	if err != nil {
 		return ""
 	}
-	// $GOBIN/c3-broker → walk up unlikely; try common arogara path.
-	candidates := []string{
-		filepath.Join(filepath.Dir(exe), "..", "arogara", "c3", "plugins", "c3-grok"),
-		filepath.Join(os.Getenv("HOME"), "arogara", "c3", "plugins", "c3-grok"),
-	}
-	for _, c := range candidates {
+	for {
+		c := filepath.Join(dir, "plugins", "c3-grok")
 		if st, err := os.Stat(filepath.Join(c, ".mcp.json")); err == nil && !st.IsDir() {
 			abs, _ := filepath.Abs(c)
 			return abs
 		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
 	}
-	return ""
 }

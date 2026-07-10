@@ -195,14 +195,14 @@ func TestFormatInboundTurnText(t *testing.T) {
 		MessageID: 42,
 		Text:      "hi from phone",
 	}
-	in.Sender.Username = "karthi"
+	in.Sender.Username = "maintainer"
 	in.Sender.UserID = 99
 	text := formatInboundTurnText(&in)
 	// Body first so TUI preview shows real content.
 	if !strings.HasPrefix(text, "hi from phone") {
 		t.Fatalf("body should lead, got:\n%q", text)
 	}
-	if !strings.Contains(text, "@karthi (99)") || !strings.Contains(text, "-100/914") {
+	if !strings.Contains(text, "@maintainer (99)") || !strings.Contains(text, "-100/914") {
 		t.Fatalf("missing meta, got:\n%q", text)
 	}
 	if strings.Contains(text, "<channel") || strings.HasPrefix(text, "message:") {
