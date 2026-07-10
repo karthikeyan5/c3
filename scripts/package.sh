@@ -5,7 +5,7 @@
 #   e.g. scripts/package.sh linux amd64 v1.0.0 dist
 #
 # Produces: <outdir>/c3_<version>_<goos>_<goarch>.tar.gz
-# Each tarball contains the six compiled binaries, LICENSE, and a MANIFEST.txt.
+# Each tarball contains the seven compiled binaries, LICENSE, and a MANIFEST.txt.
 # Pure-Go cross-compile (CGO disabled), so every target builds on any host.
 #
 # Shared by .github/workflows/release.yml and the Makefile `dist` target so the

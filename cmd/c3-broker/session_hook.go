@@ -85,7 +85,14 @@ func runSessionHook() error {
 	// CLAUDE_ENV_FILE still no-op (TestRunSessionHook_EmptyEnvFileNoOp).
 	if (instanceID == "" || instanceID == "." || instanceID == string(filepath.Separator)) &&
 		(os.Getenv("GROK_SESSION_ID") != "" || os.Getenv("GROK_HOOK_EVENT") != "") {
-		if in.SessionID != "" {
+		// The Grok session id arrives straight from hook stdin, so any same-user
+		// process can set it. Only trust it as the handoff filename stem when it
+		// is a clean base name — no path separators, no "."/".." — mirroring the
+		// invariant sessionhandoff.Path enforces. A crafted id (e.g. "../x") is
+		// rejected here and falls through to the no-op below, so it can never key
+		// a write outside the 0700 handoff dir.
+		if in.SessionID != "" && in.SessionID == filepath.Base(in.SessionID) &&
+			in.SessionID != "." && in.SessionID != ".." {
 			instanceID = in.SessionID
 		}
 	}

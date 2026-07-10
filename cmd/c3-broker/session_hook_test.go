@@ -84,6 +84,46 @@ func TestRunSessionHook_EmptySessionIDNoOp(t *testing.T) {
 	}
 }
 
+func TestRunSessionHook_GrokWritesHandoffByStableID(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", state)
+	t.Setenv("CLAUDE_ENV_FILE", "")              // no Claude instance id derivable
+	t.Setenv("GROK_SESSION_ID", "grok-uuid-123") // Grok env present → Grok branch
+
+	withStdin(t, `{"session_id":"grok-uuid-123","cwd":"/w","source":"startup"}`, func() {
+		if err := runSessionHook(); err != nil {
+			t.Fatalf("runSessionHook returned error (must be nil): %v", err)
+		}
+	})
+
+	e, ok := sessionhandoff.Read("grok-uuid-123")
+	if !ok {
+		t.Fatal("expected a handoff entry keyed by the Grok stable session id")
+	}
+	if e.StableSessionID != "grok-uuid-123" || e.CWD != "/w" {
+		t.Fatalf("handoff entry = %+v", e)
+	}
+}
+
+func TestRunSessionHook_GrokRejectsUnsafeSessionID(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", state)
+	t.Setenv("CLAUDE_ENV_FILE", "")
+	t.Setenv("GROK_SESSION_ID", "present") // trigger the Grok branch
+
+	// A traversal-shaped session id must be refused as a handoff key (exit 0,
+	// nothing written) — the guard mirrors sessionhandoff.Path's invariant.
+	withStdin(t, `{"session_id":"../evil","cwd":"/w","source":"startup"}`, func() {
+		if err := runSessionHook(); err != nil {
+			t.Fatalf("runSessionHook must exit 0 on an unsafe session id: %v", err)
+		}
+	})
+	dir := filepath.Join(state, "c3", "session-instances")
+	if ents, err := os.ReadDir(dir); err == nil && len(ents) > 0 {
+		t.Fatalf("no handoff should be written for an unsafe session id; found %d entries", len(ents))
+	}
+}
+
 func TestRunSessionHook_GarbageStdinNoOp(t *testing.T) {
 	state := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", state)

@@ -19,15 +19,15 @@ import (
 //   - Spoiler:       ||x||                      → <span class="tg-spoiler">x</span>
 //   - Inline code:   `x`                        → <code>x</code>
 //   - Fenced code:   ```lang\n...\n```          → <pre><code class="language-lang">...</code></pre>
-//                    ```\n...\n```              → <pre>...</pre>
+//     ```\n...\n```              → <pre>...</pre>
 //   - Link:          [label](url)               → <a href="url">label</a>
 //   - Blockquote:    a run of "> " lines        → <blockquote>...</blockquote>
-//                    a "> " run ending in "||"  → <blockquote expandable>...</blockquote>
-//                    (the "Show more" affordance; the bare trailing "||" is the
-//                    terminator and is stripped — distinct from an inline spoiler)
+//     a "> " run ending in "||"  → <blockquote expandable>...</blockquote>
+//     (the "Show more" affordance; the bare trailing "||" is the
+//     terminator and is stripped — distinct from an inline spoiler)
 //   - Lists:         "- "/"* "/"+ "/"N. " items → bullet TEXT ("• item"), since
-//                    Telegram HTML has NO list tag. Ordered lists keep their
-//                    numbers; unordered lists get a "• " prefix.
+//     Telegram HTML has NO list tag. Ordered lists keep their
+//     numbers; unordered lists get a "• " prefix.
 //
 // There is no standard markdown for underline, so underline is not emitted.
 //

@@ -118,12 +118,12 @@ func ClearTo(w io.Writer, isTTY bool, suppressed bool) {
 //
 // Rules:
 //   - Name=="dm"             → "c3: dm" (canonical DM attach, also covers the
-//                              disambiguate_dm "actual DM" branch).
+//     disambiguate_dm "actual DM" branch).
 //   - Name set + Group set   → "c3: <name> · <group>" (the common case).
 //   - Name set, no Group     → "c3: <name>" (defensive — broker normally
-//                              populates Group; tolerate the missing field).
+//     populates Group; tolerate the missing field).
 //   - Name empty             → "c3" (defensive — never emit "c3: " with a
-//                              dangling colon).
+//     dangling colon).
 //
 // Bullet separator is U+00B7 MIDDLE DOT to match the task brief's
 // example verbatim.

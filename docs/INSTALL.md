@@ -53,11 +53,12 @@ project.
 
 ## Step 2: Get the binaries onto your PATH
 
-C3 ships six Go binaries:
+C3 ships seven Go binaries:
 
 - `c3-broker` — the daemon
 - `c3-claude-adapter` — Claude Code MCP server
 - `c3-codex-adapter` — Codex MCP server
+- `c3-grok-adapter` — Grok Build MCP server
 - `claude-shim` — the `claude` wrapper that auto-injects the dev-channels flag (symlinked into PATH by `install-claude-shim`; see Step 4.5)
 - `codex` — the C3 launcher (will replace `which codex`)
 - `migrate-legacy` — one-shot migrator from a legacy Python-prototype config layout (only relevant if you have such a config)
@@ -75,7 +76,7 @@ curl -fsSL -O "$base/SHA256SUMS"
 sha256sum --ignore-missing -c SHA256SUMS      # macOS: shasum -a 256 -c SHA256SUMS
 mkdir -p ~/.local/bin
 tar xzf "c3_${VERSION}_${OS}_${ARCH}.tar.gz" -C ~/.local/bin \
-  c3-broker c3-claude-adapter c3-codex-adapter claude-shim codex migrate-legacy
+  c3-broker c3-claude-adapter c3-codex-adapter c3-grok-adapter claude-shim codex migrate-legacy
 ```
 
 Confirm the install dir (`~/.local/bin` here) is on your `PATH`.
@@ -83,7 +84,7 @@ Confirm the install dir (`~/.local/bin` here) is on your `PATH`.
 **From source (contributors, or a platform without a prebuilt tarball).** With
 the repo cloned and added as a local marketplace (Step 1's contributor path),
 run `/c3:build` inside Claude Code — a slash command that runs
-`go install ./cmd/...` and drops the six binaries in `$GOBIN` (default
+`go install ./cmd/...` and drops the seven binaries in `$GOBIN` (default
 `~/go/bin`). Needs Go ≥1.25. Confirm `$GOBIN` (or `$(go env GOPATH)/bin`) is on
 your `PATH`:
 

@@ -167,7 +167,7 @@ func TestGate_AllowsAllowlistedGroup(t *testing.T) {
 
 	in := &c3types.Inbound{
 		Channel: "telegram",
-		ChatID:  -1009123456789, // negative = group/supergroup
+		ChatID:  -1009123456789,             // negative = group/supergroup
 		Sender:  c3types.Sender{UserID: 99}, // any member
 		Text:    "hello team",
 	}

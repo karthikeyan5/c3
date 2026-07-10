@@ -8,10 +8,11 @@ import (
 )
 
 // findRealCodex must:
-//   1. Honor an explicit C3_CODEX_REAL env override.
-//   2. Skip the wrapper path on PATH (don't recurse into ourselves).
-//   3. Fall back to NVM's @openai/codex package script when nothing on PATH
-//      is the real codex.
+//  1. Honor an explicit C3_CODEX_REAL env override.
+//  2. Skip the wrapper path on PATH (don't recurse into ourselves).
+//  3. Fall back to NVM's @openai/codex package script when nothing on PATH
+//     is the real codex.
+//
 // Regression coverage for the resolution logic; ported from the deleted
 // mvp/tests/test_codex_launcher.py.
 func TestFindRealCodex_HonorsExplicitEnv(t *testing.T) {

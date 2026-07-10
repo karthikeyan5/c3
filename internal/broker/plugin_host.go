@@ -24,12 +24,12 @@ import (
 type PluginHost struct {
 	broker *Broker
 
-	mu              sync.RWMutex
-	onInbound       []func(context.Context, *c3types.Inbound) (*c3types.Inbound, bool)
-	onVoice         []func(context.Context, c3types.VoicePayload) (string, error)
-	onOutbound      []func(context.Context, *c3types.Outbound) (*c3types.Outbound, bool)
-	onAttach        []func(*plugin.Stub, *plugin.Mapping)
-	tools           map[string]plugin.Tool
+	mu         sync.RWMutex
+	onInbound  []func(context.Context, *c3types.Inbound) (*c3types.Inbound, bool)
+	onVoice    []func(context.Context, c3types.VoicePayload) (string, error)
+	onOutbound []func(context.Context, *c3types.Outbound) (*c3types.Outbound, bool)
+	onAttach   []func(*plugin.Stub, *plugin.Mapping)
+	tools      map[string]plugin.Tool
 }
 
 func newPluginHost(b *Broker) *PluginHost {

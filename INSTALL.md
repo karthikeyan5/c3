@@ -36,8 +36,8 @@ the clone path; you'll need it for the from-source fallback in step 2.)
 
 ## 2. Install the binaries
 
-C3 ships six binaries: `c3-broker`, `c3-claude-adapter`, `c3-codex-adapter`,
-`claude-shim`, `codex`, `migrate-legacy`. Prefer the prebuilt release
+C3 ships seven binaries: `c3-broker`, `c3-claude-adapter`, `c3-codex-adapter`,
+`c3-grok-adapter`, `claude-shim`, `codex`, `migrate-legacy`. Prefer the prebuilt release
 tarball; fall back to building from source only if there's no tarball for
 the user's platform.
 
@@ -53,7 +53,7 @@ curl -fsSL -O "$base/SHA256SUMS"
 { sha256sum --ignore-missing -c SHA256SUMS || shasum -a 256 -c SHA256SUMS; }
 mkdir -p ~/.local/bin
 tar xzf "c3_${VERSION}_${OS}_${ARCH}.tar.gz" -C ~/.local/bin \
-  c3-broker c3-claude-adapter c3-codex-adapter claude-shim codex migrate-legacy
+  c3-broker c3-claude-adapter c3-codex-adapter c3-grok-adapter claude-shim codex migrate-legacy
 ```
 
 If the download 404s (no tarball for this platform), fall through to the
@@ -80,7 +80,7 @@ Go installs to `$GOBIN` (default `$(go env GOPATH)/bin`).
 ## 3. Verify the binaries are installed
 
 ```bash
-for bin in c3-broker c3-claude-adapter c3-codex-adapter claude-shim codex migrate-legacy; do
+for bin in c3-broker c3-claude-adapter c3-codex-adapter c3-grok-adapter claude-shim codex migrate-legacy; do
   command -v "$bin" >/dev/null && echo "  ✓ $bin" || echo "  ✗ $bin (missing)"
 done
 command -v c3-broker >/dev/null || echo "WARNING: the install dir is not on \$PATH"

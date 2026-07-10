@@ -46,7 +46,7 @@ func (f *funcBotClient) count() int {
 	return f.n
 }
 
-func (f *funcBotClient) GetAPIURL(*gotgbot.RequestOpts) string             { return "" }
+func (f *funcBotClient) GetAPIURL(*gotgbot.RequestOpts) string               { return "" }
 func (f *funcBotClient) FileURL(string, string, *gotgbot.RequestOpts) string { return "" }
 
 func newConflictTestChannel(h *fakeHost, bc gotgbot.BotClient) *Channel {
@@ -156,7 +156,7 @@ func TestPollLoop_TransientConflictRetriesAndRecovers(t *testing.T) {
 // Telegram (the fake) re-returns it on every call. After the first sighting
 // dispatches it once, every later sighting is a dedup-skip → the loop must pace.
 func TestPollLoop_PacesNoProgressRepollOnUnackedFrontier(t *testing.T) {
-	h := &fakeHost{} // default decision = GateInboundAllow; Emit returns true
+	h := &fakeHost{}       // default decision = GateInboundAllow; Emit returns true
 	fb := &funcBotClient{} // delay 0 → an UNPACED loop spins as fast as the CPU allows
 	c := newConflictTestChannel(h, fb)
 	c.offTrk = newOffsetTracker(4)

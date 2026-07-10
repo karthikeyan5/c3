@@ -46,8 +46,8 @@ func brokerWithBlockingReply(t *testing.T) (*Broker, *blockingReplyChannel) {
 	b.chMu.Lock()
 	b.channels["telegram"] = &channelRegistration{Channel: bc}
 	b.chMu.Unlock()
-	t.Cleanup(func() { b.Shutdown() })       // registered first  -> runs LAST
-	t.Cleanup(func() { close(bc.release) })  // registered second -> runs FIRST
+	t.Cleanup(func() { b.Shutdown() })      // registered first  -> runs LAST
+	t.Cleanup(func() { close(bc.release) }) // registered second -> runs FIRST
 	return b, bc
 }
 

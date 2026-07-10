@@ -62,8 +62,8 @@ func (h *fakeHost) ChannelConfig(name string, target any) error {
 	return json.Unmarshal(b, target)
 }
 
-func (h *fakeHost) State(name string) plugin.StateDir          { return nil }
-func (h *fakeHost) CacheDir(name string) string                { return "" }
+func (h *fakeHost) State(name string) plugin.StateDir            { return nil }
+func (h *fakeHost) CacheDir(name string) string                  { return "" }
 func (h *fakeHost) Channel(name string) (channel.Channel, error) { return nil, nil }
 func (h *fakeHost) Logf(format string, args ...any) {
 	h.logs = append(h.logs, format)
