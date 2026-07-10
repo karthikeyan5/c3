@@ -16,10 +16,6 @@ const recoverRespTimeout = 8 * time.Second
 
 // recover fields live on adapter (declared here via methods).
 
-func (a *adapter) initRecoverState() {
-	// no-op placeholder if we later need more setup
-}
-
 // trySessionRecover fires OpRecoverSession once after hello so a resumed Grok
 // session silently re-claims its last topic (Claude parity, Grok-flavored:
 // stable id is the Grok session UUID from env / active_sessions.json).
@@ -32,16 +28,38 @@ func (a *adapter) trySessionRecover(ctx context.Context) {
 	a.fireRecover(ctx, sid, a.cwd())
 }
 
+// stableSessionID returns the Grok session UUID this adapter is bound to — the
+// leader-bound id when set, else the env / active_sessions.json resolution.
+// leader.sessionID is written under leader.mu everywhere (connectLocked,
+// fireRecover, bindSessionIDForAttach), so the read takes the same mutex: an
+// unlocked read of a Go string racing those writers is a torn-read data race
+// (pointer/length pair). May block briefly behind an in-flight Inject (which
+// holds leader.mu); every caller runs on its own goroutine (trySessionRecover,
+// the MCP attach handler, refireRecoverOnReconnect's goroutine) — never on
+// brokerReader — so a stall never blocks inbound dispatch.
 func (a *adapter) stableSessionID() string {
-	if a.leader != nil && a.leader.sessionID != "" {
-		return a.leader.sessionID
+	if a.leader != nil {
+		a.leader.mu.Lock()
+		sid := a.leader.sessionID
+		a.leader.mu.Unlock()
+		if sid != "" {
+			return sid
+		}
 	}
 	return resolveGrokSessionID()
 }
 
+// cwd returns the working directory to report on recover ops — the
+// leader-bound cwd when set (read under leader.mu, same contract as
+// stableSessionID), else env / process cwd.
 func (a *adapter) cwd() string {
-	if a.leader != nil && a.leader.cwd != "" {
-		return a.leader.cwd
+	if a.leader != nil {
+		a.leader.mu.Lock()
+		cwd := a.leader.cwd
+		a.leader.mu.Unlock()
+		if cwd != "" {
+			return cwd
+		}
 	}
 	if v := os.Getenv("C3_GROK_CWD"); v != "" {
 		return v
@@ -171,24 +189,33 @@ func (a *adapter) emitRecoverNotice(text string) {
 	}
 }
 
-// releaseClaim sends OpRelease best-effort so a clean adapter exit drops the
-// topic claim immediately instead of waiting for broker PID-death heuristics.
-func (a *adapter) releaseClaim() {
-	conn := a.currentConn()
-	if conn == nil {
-		return
-	}
-	if err := conn.WriteJSON(struct {
-		Op ipc.Op `json:"op"`
-	}{Op: ipc.OpRelease}); err != nil {
-		log.Printf("release on exit: %v", err)
-		return
-	}
-	a.amu.Lock()
-	a.lastAttach = nil
-	a.attachedTopic = ""
-	a.amu.Unlock()
-	log.Printf("release on exit: claim released")
+// refireRecoverOnReconnect re-registers this session's stable id on a FRESH
+// broker connection (§3d2, ported from the Claude adapter). A broker RESTART
+// (self-update / rebuild) yields a fresh stub with no stable id and no
+// reconnect-transfer, so without this the new broker never learns the sid:
+// recordSessionAttachment no-ops on an empty stable id, post-restart attach
+// changes are never recorded, and a later Grok resume either silently
+// re-attaches to the STALE pre-restart topic or finds nothing to recover. It
+// demotes the recoverFired guard from once-per-process to once-per-connection
+// (reset + re-fire) — in a goroutine, because fireRecover blocks on the
+// RecoverSessionResp that brokerReader (whose recovery loop calls this) must
+// be free to read, and stableSessionID() may briefly contend on leader.mu.
+//
+// Ordering is safe: replayLastAttach's synchronous write already put the
+// replayed attach on the wire before this fires, and the broker's same-conn
+// serial dispatch processes that attach FIRST — so the recover takes the
+// record-only branch when the replay restored the route (and the gated
+// own-route recover when the replay's proposal was discarded).
+func (a *adapter) refireRecoverOnReconnect(ctx context.Context) {
+	a.recoverFired.Store(false)
+	go func() {
+		sid := a.stableSessionID()
+		if sid == "" {
+			return // no session id resolvable — nothing to re-register yet;
+			// the next attach's ensureStableSessionRegistered retries.
+		}
+		a.fireRecover(ctx, sid, a.cwd())
+	}()
 }
 
 // ensureStableSessionRegistered tells the broker this stub's stable session id
@@ -198,7 +225,9 @@ func (a *adapter) ensureStableSessionRegistered(ctx context.Context) {
 	if sid == "" {
 		return
 	}
-	// fireRecover is once-only; if already fired, stable id is already set.
+	// fireRecover is once per BROKER CONNECTION (refireRecoverOnReconnect
+	// resets the guard after a reconnect); if it already fired on this
+	// connection, the stable id is already registered on the live stub.
 	if a.recoverFired.Load() {
 		return
 	}
@@ -222,4 +251,3 @@ func (a *adapter) bindSessionIDForAttach(cwd string) {
 		a.leader.mu.Unlock()
 	}
 }
-

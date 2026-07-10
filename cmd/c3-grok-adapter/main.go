@@ -62,7 +62,7 @@ func run() error {
 
 	a := newAdapter()
 	a.runCtx = ctx
-	installSignalHandlers(cancel, a)
+	installSignalHandlers(cancel)
 
 	if err := a.connectBroker(); err != nil {
 		log.Printf("adapter: exit pid=%d reason=connect-broker err=%v", os.Getpid(), err)
@@ -82,8 +82,17 @@ func run() error {
 	go a.trySessionRecover(ctx)
 
 	err := srv.Run(ctx, a.transport)
-	// Clean leave: drop topic claim so close-and-leave doesn't keep the route.
-	a.releaseClaim()
+	// Process exit is NOT a detach — deliberately NO OpRelease here (or in the
+	// signal handler). The broker treats OpRelease as an explicit user detach:
+	// handleRelease releases the claim AND tombstones the session attachment so
+	// a later resume of the same session stays unattached (its doc-comment says
+	// the process-exit path must NOT call it). Sending it on every exit made the
+	// resume-recovery feature self-defeating — each quit-without-detach wiped
+	// the recorded attachment — and, via the single-live-session sid fallback in
+	// resolveGrokSessionID, an abandoned adapter spawn's idle-watchdog exit could
+	// tombstone a LIVE session's mapping. Claude/codex parity: OpRelease is sent
+	// only by the explicit `detach` tool; the broker's conn-drop + PID-liveness
+	// reaping releases dead holders on its own.
 	if a.leader != nil {
 		a.leader.Close()
 	}
@@ -100,15 +109,16 @@ func run() error {
 	}
 }
 
-// installSignalHandlers cancels ctx on SIGTERM/SIGINT/SIGHUP and releases the
-// broker claim so "close and leave" does not leave a zombie holder.
-func installSignalHandlers(cancel context.CancelFunc, a *adapter) {
+// installSignalHandlers cancels ctx on SIGTERM/SIGINT/SIGHUP so run() logs the
+// exit reason (Claude-adapter parity). It deliberately does NOT send OpRelease:
+// a signal is a process exit, not a user detach — see the comment in run().
+// The broker's conn-drop + PID-liveness path reaps this holder's claims.
+func installSignalHandlers(cancel context.CancelFunc) {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	go func() {
 		sig := <-ch
 		log.Printf("adapter: received signal=%v pid=%d", sig, os.Getpid())
-		a.releaseClaim()
 		cancel()
 	}()
 }
@@ -189,29 +199,56 @@ type adapter struct {
 
 	// forwardBlocked latches true the instant an undelivered gap opens at/near the
 	// queue head — a leader inject FAILURE in grokForwardLoop OR a forwardCh
-	// buffer-full DROP in handleInbound. Once set, the loop stops acking so no
-	// later count-off-head ack can Consume an undelivered head message.
+	// buffer-full DROP in handleInbound. While set, the loop stops acking so no
+	// later count-off-head ack can Consume an undelivered head message. It is NOT
+	// process-lifetime: a full fetch_queue(ack=true) drain (Remaining==0) re-syncs
+	// the queue head and clearForwardBlocked re-arms per-message acking. The old
+	// never-cleared latch froze acks forever after ONE inject hiccup, so every
+	// later live-handled message stayed queued and re-delivered to the next
+	// session (2026-07-10 double-delivery incident, task #43).
 	forwardBlocked atomic.Bool
+
+	// forwardEpoch is bumped by clearForwardBlocked on every full-drain re-sync.
+	// Each grokForwardReq captures the epoch at ENQUEUE time (handleInbound); the
+	// loop skips — no inject, no ack — any non-event req from an older epoch: its
+	// durable queue line was already consumed AND delivered to the agent by the
+	// very fetch_queue drain that bumped the epoch, so re-injecting would
+	// duplicate content and acking would Consume a NEWER post-drain line off the
+	// head (silent loss). The loop re-checks the epoch at ACK time too, closing
+	// the window where a drain completes while an inject is in flight.
+	forwardEpoch atomic.Uint64
 
 	// leader is the long-lived Grok leader ACP client used for live inject.
 	// REQUIRED — without leader mode, inbound stays in the durable queue.
 	leader *leaderClient
 
 	// Session-resume recover (OpRecoverSession).
-	runCtx         context.Context
-	rsmu           sync.Mutex
-	rsPending      chan ipc.RecoverSessionResp
-	recoverFired   atomic.Bool
+	runCtx    context.Context
+	rsmu      sync.Mutex
+	rsPending chan ipc.RecoverSessionResp
+	// recoverFired guards RecoverSessionReq to at most once per BROKER
+	// CONNECTION (not per process): fireRecover CompareAndSwaps it, and
+	// refireRecoverOnReconnect RESETS it after a successful reconnect so a
+	// FRESH broker (self-update / rebuild restart, which has no stub and no
+	// reconnect-transfer) re-learns this session's stable id — otherwise every
+	// post-restart attach records nothing and a later Grok resume silently
+	// re-attaches to a stale topic. Claude-adapter parity (§3d2).
+	recoverFired atomic.Bool
 }
 
 // grokForwardReq is one inbound queued for the serial Grok-forward goroutine.
 // conn is captured at ENQUEUE time (handleInbound) — not resolved at completion —
 // so a broker reconnect+reattach during the up-to-15s forward can't make the ack
-// land on a route this stub no longer holds (M2 hazard b).
+// land on a route this stub no longer holds (M2 hazard b). epoch is likewise
+// captured at enqueue time; a full-drain re-sync (clearForwardBlocked) bumps the
+// adapter's forwardEpoch, marking every earlier req stale — its queue line was
+// consumed + delivered by that drain, so the loop must neither re-inject nor ack
+// it (see forwardEpoch).
 type grokForwardReq struct {
 	inbound c3types.Inbound
 	covered int
 	conn    *ipc.Conn
+	epoch   uint64
 }
 
 func newAdapter() *adapter {
@@ -391,6 +428,7 @@ func (a *adapter) recoverBroker(ctx context.Context) bool {
 			log.Printf("broker reconnected (attempt %d)", attempt)
 			a.clearBrokerDownAdvisory()
 			a.replayLastAttach()
+			a.refireRecoverOnReconnect(ctx)
 			return true
 		}
 		log.Printf("broker reconnect attempt %d failed: %v (retry in %v)", attempt, err, backoff)
@@ -577,7 +615,7 @@ func (a *adapter) handleInbound(raw []byte) {
 	if err := json.Unmarshal(raw, &msg); err != nil {
 		return
 	}
-	req := grokForwardReq{inbound: msg.Inbound, covered: msg.Covered, conn: a.currentConn()}
+	req := grokForwardReq{inbound: msg.Inbound, covered: msg.Covered, conn: a.currentConn(), epoch: a.forwardEpoch.Load()}
 	select {
 	case a.forwardCh <- req:
 	default:
@@ -627,24 +665,56 @@ func capRunes(s string, n int) string {
 	return string(r[:n]) + "…"
 }
 
+// eventInjectBudget bounds the WHOLE inject attempt (retries included) for a
+// best-effort channel event. Events ride the same single serial consumer as
+// durable messages, so the full injectWithRetry budget (~2min of mid-turn
+// backoff) on a never-acked event would head-of-line-block real durable
+// traffic behind a busy TUI. An event that can't land inside this budget is
+// dropped — by design it has no durable copy broker-side (worker.go forces
+// Covered=0 and never queues events), so there is nothing to recover.
+const eventInjectBudget = 10 * time.Second
+
 // grokForwardLoop is the SINGLE consumer of forwardCh. It injects each inbound
 // as a Grok turn via the leader ACP client (session/prompt), strictly in enqueue
 // order, and is the ONLY path that sends OpInboundDelivered.
 //
 // Mid-turn: session/prompt may fail while a turn is in flight. We retry with
-// backoff (Grok will queue or accept once free). Permanent latch only after
-// retries are exhausted so a single busy window does not freeze inject forever.
+// backoff (Grok will queue or accept once free). The forwardBlocked latch fires
+// only after retries are exhausted, and holds until a full fetch_queue(ack=true)
+// drain re-syncs the queue head (clearForwardBlocked) — NOT for the process
+// lifetime, which froze acks forever after one hiccup (task #43).
 //
 // M2: count-off-HEAD acks require serial, head-first delivery and never-ack-past-gap.
 func (a *adapter) grokForwardLoop() {
 	for req := range a.forwardCh {
-		// Events (poll_result/reaction/callback) are not durable queue lines —
-		// inject best-effort, never ack a consume.
+		// Events (poll_result/reaction/callback/system) are not durable queue
+		// lines — inject best-effort under a short budget, never ack a consume.
+		// Rendered with the event-aware formatter: formatInboundTurnText reads
+		// only Text/Attachments (both empty on an event), so routing events
+		// through it injected the literal "(empty Telegram message)" and
+		// discarded the entire payload (poll tally / reaction diff / callback
+		// data). Events skip the epoch check too: they were never queued, so a
+		// drain neither delivers nor consumes them.
 		if req.inbound.IsEvent() {
-			text := formatInboundTurnText(&req.inbound)
 			if a.leader != nil {
-				_ = a.injectWithRetry(context.Background(), text, req.inbound.MessageID)
+				text := formatEventTurnText(&req.inbound)
+				evCtx, cancel := context.WithTimeout(context.Background(), eventInjectBudget)
+				if err := a.injectWithRetry(evCtx, text, req.inbound.MessageID); err != nil {
+					log.Printf("grok event inject dropped kind=%s id=%d: %v (best-effort — events are never queued broker-side)",
+						req.inbound.Kind, req.inbound.MessageID, err)
+				}
+				cancel()
 			}
+			continue
+		}
+
+		if req.epoch != a.forwardEpoch.Load() {
+			// Enqueued before a full-drain re-sync (clearForwardBlocked): the
+			// fetch_queue drain already consumed this message's queue line AND
+			// delivered its content to the agent. Re-injecting would duplicate
+			// the content into the TUI; acking would Consume a NEWER post-drain
+			// line off the head (silent loss). Skip entirely — held-not-lost.
+			log.Printf("grok forward skip inbound id=%d: stale epoch (queue re-synced by fetch_queue drain)", req.inbound.MessageID)
 			continue
 		}
 
@@ -655,22 +725,128 @@ func (a *adapter) grokForwardLoop() {
 			a.latchForwardBlocked("leader inject failed: " + err.Error())
 			continue // DO NOT ack — durable queue keeps the message
 		}
-		if a.forwardBlocked.Load() {
-			// Delivered live but earlier gap still undelivered — skip ack.
+		if a.forwardBlocked.Load() || req.epoch != a.forwardEpoch.Load() {
+			// Delivered live, but either an earlier gap is still undelivered
+			// (forwardBlocked) or a full drain re-synced the head while this
+			// inject was in flight (epoch re-check) — an ack now would Consume
+			// a line this inject did not deliver. Skip: the message stays
+			// queued / was already drained — a benign duplicate, never loss.
 			continue
 		}
-		if req.conn != nil {
-			// Covered defaults to 1 when the broker omitted it (older wire).
-			n := req.covered
-			if n < 1 {
-				n = 1
-			}
+		// Success AND head-synced: safe to ack so the broker Consumes exactly
+		// the lines this push covered. Count echoes Covered VERBATIM — no 0→1
+		// bump: the broker forwards Count as-is and drops Count<1 precisely so
+		// a covers-nothing ack can never consume a real backlog line the push
+		// didn't deliver (queue_dispatch.go C1). A zero-covered push therefore
+		// skips the ack (nothing to consume; the line stays queued for
+		// fetch_queue — the safe side). Claude/codex parity.
+		if req.conn != nil && req.covered >= 1 {
 			_ = req.conn.WriteJSON(ipc.InboundDeliveredMsg{
-				Op: ipc.OpInboundDelivered, UpdateID: req.inbound.MessageID, OK: true, Count: n,
+				Op: ipc.OpInboundDelivered, UpdateID: req.inbound.MessageID, OK: true, Count: req.covered,
 			})
 		}
 	}
 }
+
+// formatEventTurnText renders a synthesized channel event (poll_result /
+// reaction / callback / system) as a Grok user turn. It ports the content half
+// of the Claude adapter's buildEventFrame contract (cmd/c3-claude-adapter/
+// main.go): poll tallies, reaction diffs, callback data, and system advisories
+// become real text instead of the "(empty Telegram message)" that
+// formatInboundTurnText produced for payload-less inbounds. Grok's leader
+// inject is plain text, so the structured meta map is folded into a short
+// trailer line (event kind + chat/topic), mirroring formatInboundTurnText's
+// body-first/meta-last shape so TUI previews show the payload.
+func formatEventTurnText(in *c3types.Inbound) string {
+	content := renderEventContent(in)
+	trailer := fmt.Sprintf("— c3 %s event", in.Kind)
+	// A broker-originated system advisory has no chat (ChatID 0) — omit the
+	// channel suffix rather than render a meaningless "· 0".
+	if in.ChatID != 0 {
+		channel := strconv.FormatInt(in.ChatID, 10)
+		if in.TopicID != nil {
+			channel = fmt.Sprintf("%d/%d", in.ChatID, *in.TopicID)
+		}
+		trailer += " · " + channel
+	}
+	return content + "\n\n" + trailer
+}
+
+// renderEventContent renders an event Inbound's payload into the content
+// string. Byte-parity with the Claude adapter's buildEventFrame content
+// rendering (its meta map has no plain-text equivalent here); the default arm
+// is the same safe fallback for an unknown/empty event shape.
+func renderEventContent(in *c3types.Inbound) string {
+	ev := in.Event
+	switch {
+	case ev != nil && ev.PollResult != nil:
+		pr := ev.PollResult
+		var b strings.Builder
+		fmt.Fprintf(&b, "Poll results: %q — %d vote", pr.Question, pr.TotalVoters)
+		if pr.TotalVoters != 1 {
+			b.WriteString("s")
+		}
+		parts := make([]string, 0, len(pr.Options))
+		for _, o := range pr.Options {
+			parts = append(parts, fmt.Sprintf("%s:%d", o.Text, o.VoterCount))
+		}
+		if len(parts) > 0 {
+			b.WriteString(" — ")
+			b.WriteString(strings.Join(parts, " "))
+		}
+		if pr.IsClosed {
+			b.WriteString(" (closed)")
+		}
+		return b.String()
+
+	case ev != nil && ev.Reaction != nil:
+		r := ev.Reaction
+		var b strings.Builder
+		fmt.Fprintf(&b, "%s reacted on message %d", senderLabel(r.Actor), r.MessageID)
+		if len(r.Added) > 0 {
+			fmt.Fprintf(&b, " — added %s", strings.Join(r.Added, " "))
+		}
+		if len(r.Removed) > 0 {
+			fmt.Fprintf(&b, " — removed %s", strings.Join(r.Removed, " "))
+		}
+		return b.String()
+
+	case ev != nil && ev.Callback != nil:
+		cb := ev.Callback
+		return fmt.Sprintf("%s pressed a button (data=%q) on message %d", senderLabel(cb.Actor), cb.Data, cb.MessageID)
+
+	case ev != nil && ev.System != nil:
+		// Broker-originated system advisory (e.g. a channel-health alert
+		// broadcast to every CLI session). Surfaced loud so the user sees that
+		// their phone messages won't arrive while the channel is down. NOT user
+		// content — purely operational.
+		return "⚠️ SYSTEM: " + ev.System.Message
+
+	default:
+		return fmt.Sprintf("(%s event)", in.Kind)
+	}
+}
+
+// senderLabel renders a Sender into a short display label for event content.
+// Same helper as the Claude adapter's (Go has no cross-main-package sharing).
+func senderLabel(s c3types.Sender) string {
+	if s.Username != "" {
+		return "@" + s.Username
+	}
+	if s.UserID != 0 {
+		return "user " + strconv.FormatInt(s.UserID, 10)
+	}
+	return "someone"
+}
+
+// injectRetryBaseWait / injectRetryMaxWait shape injectWithRetry's mid-turn
+// backoff (2s doubling to 15s, ~2min worst case over 12 attempts). They are
+// vars (not consts) only so tests can shorten the schedule; production never
+// reassigns them (same convention as broker.workerJobTimeout).
+var (
+	injectRetryBaseWait = 2 * time.Second
+	injectRetryMaxWait  = 15 * time.Second
+)
 
 // injectWithRetry retries session/prompt when Grok is mid-turn. Transient
 // errors (turn in flight / busy) wait and retry; other errors fail fast.
@@ -678,13 +854,9 @@ func (a *adapter) injectWithRetry(ctx context.Context, text string, msgID int64)
 	if a.leader == nil {
 		return errLeaderUnavailable
 	}
-	const (
-		maxAttempts = 12
-		baseWait    = 2 * time.Second
-		maxWait     = 15 * time.Second
-	)
+	const maxAttempts = 12
 	var last error
-	wait := baseWait
+	wait := injectRetryBaseWait
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -705,10 +877,10 @@ func (a *adapter) injectWithRetry(ctx context.Context, text string, msgID int64)
 			return ctx.Err()
 		case <-time.After(wait):
 		}
-		if wait < maxWait {
+		if wait < injectRetryMaxWait {
 			wait *= 2
-			if wait > maxWait {
-				wait = maxWait
+			if wait > injectRetryMaxWait {
+				wait = injectRetryMaxWait
 			}
 		}
 	}
@@ -738,13 +910,15 @@ func isTransientInjectErr(err error) bool {
 	return false
 }
 
-// latchForwardBlocked marks the Grok forward path blocked the first time an
-// undelivered gap opens at the queue head — either a forward FAILURE
-// (grokForwardLoop) or a forwardCh buffer-full DROP (handleInbound). It is
-// idempotent and concurrency-safe: both callers race through CompareAndSwap, and
-// only the goroutine that wins the false→true transition proceeds. Once latched,
+// latchForwardBlocked marks the Grok forward path blocked when an undelivered
+// gap opens at the queue head — either a forward FAILURE (grokForwardLoop) or a
+// forwardCh buffer-full DROP (handleInbound). It is idempotent and
+// concurrency-safe: both callers race through CompareAndSwap, and only the
+// goroutine that wins the false→true transition proceeds. While latched,
 // grokForwardLoop stops acking so no later count-off-head ack consumes the
-// undelivered head message (the loss vector this closes).
+// undelivered head message (the loss vector this closes). The latch holds until
+// a full fetch_queue(ack=true) drain re-syncs the queue head — the exact action
+// the nudge below prompts — at which point clearForwardBlocked re-arms acking.
 //
 // On the transition it fires exactly ONE fetch_queue recovery nudge so the agent
 // drains the durable backlog even in bridge mode — where the steady-state nudge in
@@ -768,6 +942,32 @@ func (a *adapter) latchForwardBlocked(reason string) {
 		"data": "c3: live Telegram inject interrupted (" + reason + ") — call `fetch_queue` to read " + target + ". C3 Grok requires leader mode (`[cli] use_leader = true`).",
 	}); err != nil {
 		log.Printf("grok forwardBlocked recovery nudge FAIL (%s): %v — content durably queued; call fetch_queue to drain", reason, err)
+	}
+}
+
+// clearForwardBlocked re-arms per-message acking after the durable queue has
+// been FULLY re-synced: a fetch_queue(ack=true) that left Remaining==0 consumed
+// every queued line and delivered its content to the agent, so no undelivered
+// gap can sit at/near the head anymore. This is the un-latch half of
+// latchForwardBlocked — without it, ONE inject failure froze acking for the
+// process lifetime, so every later message the session handled live stayed
+// queued and re-delivered wholesale to the next session that claimed the topic
+// (the 2026-07-10 double-delivery incident, task #43).
+//
+// The epoch bump invalidates reqs still sitting in forwardCh from before the
+// drain: their lines were consumed + delivered by that very drain, so the loop
+// must neither re-inject them (duplicate) nor ack them (the ack would Consume a
+// NEWER post-drain line off the head — loss). Bump-then-clear ordering matters:
+// an enqueue or in-flight inject racing the two writes degrades to
+// held-as-backlog (skipped / unacked), never to an over-consume.
+//
+// Called on EVERY full ack-drain, latched or not — the epoch bump also narrows
+// the pre-existing fetch-vs-forward race where a drain lands while a healthy
+// forward is mid-inject.
+func (a *adapter) clearForwardBlocked() {
+	a.forwardEpoch.Add(1)
+	if a.forwardBlocked.CompareAndSwap(true, false) {
+		log.Printf("grok forwardBlocked cleared: durable queue fully drained (fetch_queue ack=true, remaining=0) — live inject acks re-enabled")
 	}
 }
 
@@ -1260,6 +1460,13 @@ func (a *adapter) toolFetchQueue(ctx context.Context, req *mcp.CallToolRequest) 
 	case resp := <-ch:
 		if resp.Err != "" {
 			return toolErrorResult(resp.Err), nil
+		}
+		// A FULL ack-drain (Remaining==0) re-syncs the durable queue head:
+		// everything queued was just consumed and returned to the agent, so the
+		// forwardBlocked undelivered-gap latch can be safely released and
+		// per-message live-inject acks resume (see clearForwardBlocked).
+		if fq.Ack && resp.Remaining == 0 {
+			a.clearForwardBlocked()
 		}
 		return toolTextResult(renderFetchedMessages(resp.Messages, resp.Remaining, a.currentTopicName())), nil
 	}
