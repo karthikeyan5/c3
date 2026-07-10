@@ -125,6 +125,12 @@ func main() {
 				os.Exit(exitConfig)
 			}
 			return
+		case "install-grok":
+			if err := runInstallGrok(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "c3-broker install-grok: %v\n", err)
+				os.Exit(exitConfig)
+			}
+			return
 		case "session-hook":
 			// SessionStart hook (c3 plugin). NEVER connects to the broker and is
 			// designed to exit 0 even on bad input — a hook that errors would
@@ -186,6 +192,10 @@ Usage:
                         the flag if already passed.
   c3-broker uninstall-claude-shim [--force] [--path PATH]
                         Remove the installed Claude Code wrapper.
+  c3-broker install-grok
+                        Configure Grok Build for C3: enable leader mode,
+                        pin mcp_servers.c3 → c3-grok-adapter, print plugin
+                        install steps. Live Telegram inject requires leader.
   c3-broker pair [dm|group <chat_id>]
                         Arm a pairing window on the running broker and print
                         the generated 4-digit code. Default target is "dm".

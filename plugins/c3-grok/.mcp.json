@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "c3": {
+      "command": "c3-grok-adapter"
+    }
+  }
+}

@@ -1,6 +1,6 @@
 # Writing C3 CLI Adapters
 
-A C3 adapter is the bridge between the broker and a specific CLI's MCP-server expectations. Today there are two: `c3-claude-adapter` (Claude Code) and `c3-codex-adapter` (Codex). If you want to integrate C3 with a CLI we don't yet support — Cursor, Aider, plain shell, your own thing — write an adapter.
+A C3 adapter is the bridge between the broker and a specific CLI's MCP-server expectations. Today there are three: `c3-claude-adapter` (Claude Code), `c3-codex-adapter` (Codex), and `c3-grok-adapter` (Grok Build). If you want to integrate C3 with a CLI we don't yet support — Cursor, Aider, plain shell, your own thing — write an adapter.
 
 Adapters are not channels. Channels move bytes between users and the broker over the network (Telegram, web, voice). Adapters move messages between the broker and a single CLI process over MCP stdio. The two never see each other directly — both talk to the broker.
 
@@ -80,7 +80,9 @@ The broker emits a normalized `Inbound{}` payload. Your adapter has to convert i
 1. Emit a `notifications/message` log notification (cheap; future-proofs for when Codex starts surfacing unsolicited notifications).
 2. **If `C3_CODEX_REMOTE_BRIDGE=1`** is set in env (the C3 launcher sets it), forward the inbound as a real `turn/start` to the running Codex app-server via WebSocket. This is the path that makes a Telegram message appear as a normal turn in the user's TUI.
 
-Held messages — anything that arrived while no session was attached — are **not** buffered in the adapter. They live in the broker's durable per-route queue, and the agent drains them with the universal `fetch_queue` tool (both adapters expose it). An earlier Codex-only in-memory `inbox(limit, ack)` ring was retired in favor of that durable queue.
+**Grok Build** has no channel-notification dialect. Live inject **requires leader mode** (`[cli] use_leader = true`). The Grok adapter registers as a client on `$GROK_HOME/leader.sock` and issues ACP `session/prompt` against the TUI session id (see [`GROK-INJECT.md`](GROK-INJECT.md)). Without a leader socket, inbound stays in the durable queue for `fetch_queue`.
+
+Held messages — anything that arrived while no session was attached — are **not** buffered in the adapter. They live in the broker's durable per-route queue, and the agent drains them with the universal `fetch_queue` tool (all adapters expose it). An earlier Codex-only in-memory `inbox(limit, ack)` ring was retired in favor of that durable queue.
 
 For a new CLI, look at what unsolicited-notification capability it has. If none, `fetch_queue` against the broker's durable queue is the safe baseline. If there's a push API (websocket, HTTP, IPC), use it; the adapter can have multiple delivery paths in parallel.
 

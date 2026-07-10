@@ -24,27 +24,27 @@ support.
 | `ping`          | `c3-broker ping` (CLI)            | pure shell    | Send a one-shot "this is me" message to the attached topic, identifying which CLI session currently owns it. Run in each candidate tab to find the owner before force-stealing. |
 | `sessions`      | `c3-broker sessions` (CLI)        | pure shell    | List every live Claude Code / Codex session the broker tracks — CWD, attached topic, and a "you are here" marker for the calling terminal. |
 | `attach`        | `attach(expr=…)` (MCP tool)       | LLM dispatch  | Attach this session's adapter to a Telegram topic. Broker parses `expr` and either claims an explicit target, resumes the session's own topic, or proposes a picker/confirmation. |
-| `detach`        | `detach()` (MCP tool)             | LLM dispatch  | Release the session's current claim (sends `OpRelease`). Claude Code only; the Codex adapter has no `detach` tool yet. |
+| `detach`        | `detach()` (MCP tool)             | LLM dispatch  | Release the session's current claim (sends `OpRelease`). Claude + Grok; the Codex adapter has no `detach` tool yet. |
 | `release`       | `c3-broker release <cwd>` (CLI)   | pure shell    | **Stubbed in v1** — intended to drop a route claim by cwd without restarting the broker; returns 'not yet implemented' today; workaround is `/exit` the holding session. |
 
 ## MCP tools (agent-invoked)
 
 Beyond `attach` / `detach` / `topics`, the adapters expose a set of message and interaction tools the agent calls directly (no slash wrapper). All are broker-dispatched; the `✓ / —` columns are per-CLI availability.
 
-| Tool                 | Claude | Codex | What it does                                                                 |
-|----------------------|:------:|:-----:|------------------------------------------------------------------------------|
-| `reply`              |   ✓    |   ✓   | Send a markdown reply (text/media/quote-reply/buttons) into the attached topic. |
-| `react`              |   ✓    |   ✓   | Set a single emoji reaction on a message (validated against Telegram's set).  |
-| `edit_message`       |   ✓    |   ✓   | Edit a previously-sent message's text and/or inline keyboard.                 |
-| `poll`               |   ✓    |   ✓   | Send a Telegram poll (regular or quiz; anonymous/multiple/timer options).     |
-| `stop_poll`          |   ✓    |   ✓   | Force-close a bot-sent poll and return its final aggregate tally.             |
-| `download_attachment`|   ✓    |   ✓   | Download an inbound attachment by `file_id` to the local cache.               |
-| `fetch_queue`        |   ✓    |   ✓   | Drain held inbound from the durable queue (`limit` / `"all"`; `ack` peek vs consume). |
-| `retranscribe`       |   ✓    |   ✓   | Re-run the STT chain on saved audio by `file_id`; refresh a queued transcript in place. |
-| `ask`                |   ✓    |   —   | Blocking human question (single/multi-select + Skip) via an inline keyboard.  |
-| `codex_forward`      |   —    |   ✓   | Env-gated debug tool: forward a payload into the Codex app-server (diagnostics). |
+| Tool                 | Claude | Codex | Grok | What it does                                                                 |
+|----------------------|:------:|:-----:|:----:|------------------------------------------------------------------------------|
+| `reply`              |   ✓    |   ✓   |  ✓   | Send a markdown reply (text/media/quote-reply/buttons) into the attached topic. |
+| `react`              |   ✓    |   ✓   |  ✓   | Set a single emoji reaction on a message (validated against Telegram's set).  |
+| `edit_message`       |   ✓    |   ✓   |  ✓   | Edit a previously-sent message's text and/or inline keyboard.                 |
+| `poll`               |   ✓    |   ✓   |  ✓   | Send a Telegram poll (regular or quiz; anonymous/multiple/timer options).     |
+| `stop_poll`          |   ✓    |   ✓   |  ✓   | Force-close a bot-sent poll and return its final aggregate tally.             |
+| `download_attachment`|   ✓    |   ✓   |  ✓   | Download an inbound attachment by `file_id` to the local cache.               |
+| `fetch_queue`        |   ✓    |   ✓   |  ✓   | Drain held inbound from the durable queue (`limit` / `"all"`; `ack` peek vs consume). |
+| `retranscribe`       |   ✓    |   ✓   |  ✓   | Re-run the STT chain on saved audio by `file_id`; refresh a queued transcript in place. |
+| `ask`                |   ✓    |   —   |  —   | Blocking human question (single/multi-select + Skip) via an inline keyboard.  |
+| `codex_forward`      |   —    |   ✓   |  —   | Env-gated debug tool: forward a payload into the Codex app-server (diagnostics). |
 
-Codex is at parity on the message/queue tools and lacks only `ask` (and `detach`, above). The permission relay is likewise Claude Code only.
+Codex is at parity on the message/queue tools and lacks only `ask` (and `detach`, above). Grok matches that message/queue set **and** has `detach`; live inbound inject requires leader mode (`[cli] use_leader = true`) — see [`GROK-INJECT.md`](GROK-INJECT.md). The permission relay is Claude Code only.
 
 ## attach — the parser (lives in the broker)
 

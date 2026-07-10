@@ -20,6 +20,7 @@ dist/
 /c3-broker
 /c3-claude-adapter
 /c3-codex-adapter
+/c3-grok-adapter
 /codex
 /migrate-legacy
 

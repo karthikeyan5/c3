@@ -1,0 +1,15 @@
+{
+  "description": "C3 SessionStart hook — records the stable Grok session id for leader inject + attach resume.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "c3-broker session-hook"
+          }
+        ]
+      }
+    ]
+  }
+}

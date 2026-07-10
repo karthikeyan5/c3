@@ -20,18 +20,19 @@ type sessionHookInput struct {
 	Source    string `json:"source"`
 }
 
-// runSessionHook implements `c3-broker session-hook`, wired to the c3 plugin's
-// SessionStart hook. It maps Claude Code's EPHEMERAL per-MCP-spawn instance id
-// (the UUID directory in $CLAUDE_ENV_FILE — which equals the adapter's
-// CLAUDE_CODE_SESSION_ID) to the STABLE, --resume-able session id (stdin
-// `session_id`, == the transcript filename), writing a handoff the adapter then
-// reads to ask the broker to re-attach the resumed session.
+// runSessionHook implements `c3-broker session-hook`, wired to C3 SessionStart
+// hooks for Claude Code and Grok Build.
 //
-// CRITICAL: this NEVER touches the broker socket and ALWAYS returns nil (exit 0),
-// even on bad input — a SessionStart hook that errors breaks the user's session.
-// All "can't do it" cases (unset/malformed CLAUDE_ENV_FILE, empty session id,
-// write failure) log a short note to stderr and exit 0 (fail-closed → no handoff
-// → the adapter falls through to today's no-recovery behavior).
+// Claude: maps EPHEMERAL per-MCP-spawn instance id (UUID dir in $CLAUDE_ENV_FILE
+// == CLAUDE_CODE_SESSION_ID) → STABLE session id (stdin session_id).
+//
+// Grok: stdin/env already carry the stable UUID (session_id / GROK_SESSION_ID).
+// We write a handoff keyed by that stable id so tools can re-read it; the Grok
+// adapter primarily recovers via OpRecoverSession using active_sessions.json /
+// GROK_SESSION_ID, but the handoff is a durable belt-and-suspenders record.
+//
+// CRITICAL: NEVER touches the broker socket; ALWAYS exit 0 (hook must not break
+// the user's session).
 func runSessionHook() error {
 	raw, err := io.ReadAll(os.Stdin)
 	if err != nil {
@@ -43,10 +44,50 @@ func runSessionHook() error {
 		fmt.Fprintf(os.Stderr, "c3-broker session-hook: parse stdin: %v (ignoring)\n", err)
 		return nil
 	}
+	// Grok hooks may use sessionId camelCase in some payloads; accept both via
+	// a second pass if session_id empty.
+	if in.SessionID == "" {
+		var alt struct {
+			SessionID string `json:"sessionId"`
+			CWD       string `json:"cwd"`
+			Source    string `json:"source"`
+		}
+		_ = json.Unmarshal(raw, &alt)
+		if alt.SessionID != "" {
+			in.SessionID = alt.SessionID
+		}
+		if in.CWD == "" {
+			in.CWD = alt.CWD
+		}
+		if in.Source == "" {
+			in.Source = alt.Source
+		}
+	}
+	if in.SessionID == "" {
+		if s := os.Getenv("GROK_SESSION_ID"); s != "" {
+			in.SessionID = s
+		}
+	}
+	if in.CWD == "" {
+		if s := os.Getenv("GROK_WORKSPACE_ROOT"); s != "" {
+			in.CWD = s
+		} else if s := os.Getenv("CLAUDE_PROJECT_DIR"); s != "" {
+			in.CWD = s
+		}
+	}
 
 	instanceID := ""
 	if env := os.Getenv("CLAUDE_ENV_FILE"); env != "" {
 		instanceID = filepath.Base(filepath.Dir(env))
+	}
+	// Grok: no CLAUDE_ENV_FILE — key the handoff by the stable session id itself.
+	// Only take this path when Grok env is present so Claude hooks without
+	// CLAUDE_ENV_FILE still no-op (TestRunSessionHook_EmptyEnvFileNoOp).
+	if (instanceID == "" || instanceID == "." || instanceID == string(filepath.Separator)) &&
+		(os.Getenv("GROK_SESSION_ID") != "" || os.Getenv("GROK_HOOK_EVENT") != "") {
+		if in.SessionID != "" {
+			instanceID = in.SessionID
+		}
 	}
 	if instanceID == "" || instanceID == "." || instanceID == string(filepath.Separator) || in.SessionID == "" {
 		fmt.Fprintf(os.Stderr, "c3-broker session-hook: no usable instance/session id (instance=%q session_present=%v) — nothing to do\n",
