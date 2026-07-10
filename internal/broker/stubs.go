@@ -171,6 +171,27 @@ func (s *Stub) SetRoute(key *RouteKey) {
 	s.Route = &k
 }
 
+// ClearRouteIf clears the stub's route (and routeConfirmed) ONLY IF the current
+// route still equals key. Returns true when it cleared, false when the stub holds
+// a different route (or none). This is the steal-eviction primitive: a stolen
+// holder must have its Route + routeConfirmed zeroed so its next destructive
+// fetch_queue(ack=true) is refused instead of draining a topic it no longer owns —
+// but a victim that was MID-SWITCH to a DIFFERENT topic (its stub Route already
+// re-pointed away from the stolen key) must NOT be zeroed, or it would see a nil
+// CurrentRoute, skip releasing its OLD route, and leak it as an orphaned claim.
+// An unconditional SetRoute(nil) can't tell the two apart; this key-guarded clear
+// can. Guarded by stubMu.
+func (s *Stub) ClearRouteIf(key RouteKey) bool {
+	s.stubMu.Lock()
+	defer s.stubMu.Unlock()
+	if s.Route == nil || *s.Route != key {
+		return false
+	}
+	s.Route = nil
+	s.routeConfirmed = false
+	return true
+}
+
 // MarkRouteConfirmed records that the stub's current route was set by a legitimate
 // claim (tryClaim / recoverSession). Called immediately after SetRoute(&key) at
 // those two sites. Cleared by SetRoute(nil). See the routeConfirmed field doc for

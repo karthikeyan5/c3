@@ -31,6 +31,47 @@ func TestStub_StableSessionID(t *testing.T) {
 	}
 }
 
+// TestStub_ClearRouteIf pins the steal-eviction primitive: it clears
+// route+routeConfirmed only when the stub still points at the target key, so a
+// mid-switch victim's OTHER route is never zeroed out from under it.
+func TestStub_ClearRouteIf(t *testing.T) {
+	tidA, tidB := int64(11), int64(22)
+	keyA := MakeRouteKey("telegram", -100, &tidA)
+	keyB := MakeRouteKey("telegram", -100, &tidB)
+
+	r := NewStubRegistry()
+	s := r.Register("claude", 1, "/x", nil)
+	s.SetRoute(&keyA)
+	s.MarkRouteConfirmed()
+
+	// A no-op: the stub is routed to A, so a steal on B must NOT touch it.
+	if s.ClearRouteIf(keyB) {
+		t.Fatal("ClearRouteIf(B) must return false when the stub holds A")
+	}
+	if s.CurrentRoute() == nil || *s.CurrentRoute() != keyA {
+		t.Fatalf("ClearRouteIf(B) must leave route A intact; got %+v", s.CurrentRoute())
+	}
+	if !s.RouteConfirmed() {
+		t.Fatal("ClearRouteIf(B) must leave routeConfirmed intact")
+	}
+
+	// The real steal: clearing the held key zeroes route + confirmation.
+	if !s.ClearRouteIf(keyA) {
+		t.Fatal("ClearRouteIf(A) must return true when the stub holds A")
+	}
+	if s.CurrentRoute() != nil {
+		t.Fatalf("ClearRouteIf(A) must clear the route; got %+v", s.CurrentRoute())
+	}
+	if s.RouteConfirmed() {
+		t.Fatal("ClearRouteIf(A) must clear routeConfirmed")
+	}
+
+	// Clearing an already-empty stub is a harmless no-op.
+	if s.ClearRouteIf(keyA) {
+		t.Fatal("ClearRouteIf on an unrouted stub must return false")
+	}
+}
+
 func TestStubRegistry_GetByConnID(t *testing.T) {
 	r := NewStubRegistry()
 	s := r.Register("claude", 1, "/x", nil)

@@ -68,8 +68,8 @@ func TestResolvedAttachReq_Parity(t *testing.T) {
 	}
 	tid := int64(281)
 	bare := ipc.AttachReq{Op: ipc.OpAttach, CWD: "/p"}
-	if got := resolvedAttachReq(bare, ipc.AttachedMsg{OK: true, Name: "c3", Group: "g", TopicID: &tid}); got.TopicID == nil || *got.TopicID != 281 || got.Group != "g" || got.Name != "" || got.Target != "" {
-		t.Fatalf("bare→topic: %+v (want id-addressed {TopicID:281 Group:g})", got)
+	if got := resolvedAttachReq(bare, ipc.AttachedMsg{OK: true, Name: "c3", Group: "g", ChatID: -99, TopicID: &tid}); got.TopicID == nil || *got.TopicID != 281 || got.Group != "g" || got.ChatID != -99 || got.Name != "" || got.Target != "" {
+		t.Fatalf("bare→topic: %+v (want id-addressed {TopicID:281 Group:g ChatID:-99})", got)
 	}
 	if got := resolvedAttachReq(bare, ipc.AttachedMsg{OK: true, Name: "dm"}); got.Target != "dm" || got.Name != "" {
 		t.Fatalf("bare→DM: %+v", got)

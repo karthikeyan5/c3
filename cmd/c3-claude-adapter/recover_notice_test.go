@@ -51,9 +51,9 @@ func TestResolvedAttachReq_BareSubstitutesResolvedIdentity(t *testing.T) {
 	bare := ipc.AttachReq{Op: ipc.OpAttach, CWD: "/proj"}
 
 	tid := int64(281)
-	got := resolvedAttachReq(bare, ipc.AttachedMsg{OK: true, Name: "c3", Group: "work", TopicID: &tid})
-	if got.TopicID == nil || *got.TopicID != 281 || got.Group != "work" || got.Name != "" || got.Target != "" || got.CWD != "/proj" {
-		t.Fatalf("bare→topic remembered %+v, want {TopicID:281 Group:work CWD:/proj} (id-addressed, no Name)", got)
+	got := resolvedAttachReq(bare, ipc.AttachedMsg{OK: true, Name: "c3", Group: "work", ChatID: -200, TopicID: &tid})
+	if got.TopicID == nil || *got.TopicID != 281 || got.Group != "work" || got.ChatID != -200 || got.Name != "" || got.Target != "" || got.CWD != "/proj" {
+		t.Fatalf("bare→topic remembered %+v, want {TopicID:281 Group:work ChatID:-200 CWD:/proj} (id-addressed w/ chat cross-check, no Name)", got)
 	}
 
 	got = resolvedAttachReq(bare, ipc.AttachedMsg{OK: true, Name: "dm", TopicID: nil})
@@ -74,9 +74,9 @@ func TestResolvedAttachReq_ExplicitRememberedVerbatim(t *testing.T) {
 
 	tid := int64(412)
 	bare := ipc.AttachReq{Op: ipc.OpAttach, CWD: "/proj"}
-	got := resolvedAttachReq(bare, ipc.AttachedMsg{OK: true, Name: "feature-x", Group: "work", TopicID: &tid})
-	if got.TopicID == nil || *got.TopicID != 412 || got.Group != "work" {
-		t.Fatalf("idempotent bare OK must re-remember the id-addressed identity, not a bare req: got %+v", got)
+	got := resolvedAttachReq(bare, ipc.AttachedMsg{OK: true, Name: "feature-x", Group: "work", ChatID: -200, TopicID: &tid})
+	if got.TopicID == nil || *got.TopicID != 412 || got.Group != "work" || got.ChatID != -200 {
+		t.Fatalf("idempotent bare OK must re-remember the id-addressed identity (with chat cross-check), not a bare req: got %+v", got)
 	}
 }
 

@@ -157,8 +157,8 @@ func TestFireRecover_RemembersTopicById(t *testing.T) {
 	a.dispatchRecoverSessionResult(respRaw)
 
 	req := waitLastAttach(t, a)
-	if req.TopicID == nil || *req.TopicID != 412 || req.Group != "work" || req.Name != "" || req.Target != "" {
-		t.Fatalf("topic recover must be remembered id-addressed {TopicID:412 Group:work}, got %+v", req)
+	if req.TopicID == nil || *req.TopicID != 412 || req.Group != "work" || req.ChatID != -200 || req.Name != "" || req.Target != "" {
+		t.Fatalf("topic recover must be remembered id-addressed {TopicID:412 Group:work ChatID:-200}, got %+v", req)
 	}
 }
 

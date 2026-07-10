@@ -124,6 +124,14 @@ Two belts keep a drain from ever taking the *wrong* topic's messages:
 
 Nothing ever leaves the queue by hard delete. When a route drains — the right topic, a wrong topic, a rogue skill, an orphaned consume — the queue files are **moved into a `.trash/` subdirectory**, not removed. Any drain is therefore recoverable for the retention window (≥14 days). This is a manual, broker-side recovery — there is no Telegram surface for it.
 
+> **Caveat — retention can be disabled.** The `.trash/` window is defense-in-depth on top of the primary durable queue, and it is **skipped** if the broker could not create the `.trash/` directory at startup (e.g. a stray file occupies the path). In that degraded mode drains **hard-delete** and are **NOT recoverable**. The broker logs exactly one line to `broker.log` when this happens:
+>
+> ```
+> queue: WARNING could not create retention dir …/.trash: … — running with .trash retention DISABLED; drains hard-delete instead of retaining for TrashTTL
+> ```
+>
+> If that line is present, the recovery steps below do not apply until you clear the `.trash/` obstruction and **restart the broker** (retention state is decided once, at `NewStore`).
+
 The trash lives beside the queue, at `$XDG_STATE_HOME/c3/queue/.trash/` (fallback `~/.local/state/c3/queue/.trash/`). Two kinds of file appear there:
 
 - **A retired drain pair** — `<base>.<stamp>.jsonl` is the full line history at the moment of the drain, and `<base>.<stamp>.cur` is the pre-drain cursor. The pair shares one `<stamp>` (a UnixNano timestamp). `<base>` is the route-key filename — `<channel>__<chat_id>__<topic|none>`, e.g. `telegram__-100__none` for a DM/no-topic route, or `telegram__-1001234__948` for topic 948.

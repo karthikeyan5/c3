@@ -347,10 +347,12 @@ func (s *Store) EvictOverCap(rk RouteKey) (int, error) {
 	}
 	kept := real[drop:]
 	// Snapshot the dropped lines into .trash/ BEFORE the live rewrite discards
-	// them, so a cap/age eviction stays recoverable for TrashTTL. A crash between
-	// the snapshot and the rewrite leaves the lines in both places — a harmless
-	// duplicate GC'd later; a snapshot failure returns before the rewrite, so the
-	// live queue is untouched (fail-toward-keeping).
+	// them, so a cap/age eviction stays recoverable for TrashTTL — UNLESS retention
+	// is disabled (the .trash/ dir couldn't be created at NewStore), in which case
+	// snapshotDropped no-ops and the dropped lines are hard-deleted by the rewrite.
+	// A crash between the snapshot and the rewrite leaves the lines in both places —
+	// a harmless duplicate GC'd later; a snapshot failure returns before the
+	// rewrite, so the live queue is untouched (fail-toward-keeping).
 	if err := s.snapshotDropped(rk, real[:drop]); err != nil {
 		return 0, err
 	}

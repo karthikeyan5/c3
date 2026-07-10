@@ -90,7 +90,7 @@ func (b *Broker) handleAttach(conn *ipc.Conn, stub *Stub, raw []byte) {
 	case strings.EqualFold(req.Target, "dm"):
 		b.attachDM(conn, stub, chanName, req.Steal, req.Replay)
 	case req.TopicID != nil:
-		b.attachByTopicID(conn, stub, chanName, *req.TopicID, req.Group, req.Steal, req.Replay)
+		b.attachByTopicID(conn, stub, chanName, req.ChatID, *req.TopicID, req.Group, req.Steal, req.Replay)
 	default:
 		// Explicit name (or create=true) → attachByName (path (i)): the user
 		// typed a name, so an exact bind is inherently safe. A BARE attach (no
@@ -268,9 +268,17 @@ func (b *Broker) buildPickTopic(stub *Stub, chanName, cwd string) *ipc.Proposal 
 		// nil so the basename/create arms below get a chance (fall through).
 		if m, ok := mf.LookupByCwd(cwd); ok && m.Channel == chanName {
 			if m.TopicID == 0 {
-				cur = &ipc.PickSuggestion{
-					Kind: "attach_existing", Reason: "current project",
-					Name: "dm", ChatID: m.ChatID, // TopicID nil → renders as target="dm"
+				// Legacy DM cwd mapping (TopicID==0). Render the DM row ONLY when the
+				// channel has a configured DM chat (parity with the recents arm) — else
+				// picking it errors "dm_chat_id not set". Key it on cc.DMChatID (not the
+				// mapping's stored ChatID) so it uses the SAME route key as the recents
+				// DM row and the two dedupe into one "dm" row. Unconfigured → leave cur
+				// nil so the basename/create arms below get a chance (fall through).
+				if hasChan && cc.DMChatID != 0 {
+					cur = &ipc.PickSuggestion{
+						Kind: "attach_existing", Reason: "current project",
+						Name: "dm", ChatID: cc.DMChatID, // TopicID nil → renders as target="dm"
+					}
 				}
 			} else if tp, okReg := mf.LookupTopicByID(chanName, m.ChatID, m.TopicID); okReg {
 				tid := tp.TopicID
@@ -565,7 +573,12 @@ func (b *Broker) attachDM(conn *ipc.Conn, stub *Stub, chanName string, steal, re
 // attachByTopicID validates a topic id against the channel (cheap typing
 // action) and, if valid, claims it. Adds to topics registry as `topic-<n>`
 // if not already known. Persists cwd mapping if cwd is provided.
-func (b *Broker) attachByTopicID(conn *ipc.Conn, stub *Stub, chanName string, topicID int64, groupName string, steal, replay bool) {
+//
+// chatID is an OPTIONAL fail-closed cross-check (0 = skip): when non-zero it must
+// equal the chat the named group resolves to, or the attach is refused — this
+// stops an id-addressed replay with a mismatched/absent group from binding a
+// same-id thread in the wrong chat (item 3).
+func (b *Broker) attachByTopicID(conn *ipc.Conn, stub *Stub, chanName string, chatID int64, topicID int64, groupName string, steal, replay bool) {
 	cc, ok := b.Mappings().Channels[chanName]
 	if !ok {
 		_ = conn.WriteJSON(ipc.AttachedMsg{
@@ -579,6 +592,21 @@ func (b *Broker) attachByTopicID(conn *ipc.Conn, stub *Stub, chanName string, to
 		_ = conn.WriteJSON(ipc.AttachedMsg{
 			Op: ipc.OpAttached, OK: false,
 			Err: fmt.Sprintf("attach: group %q not in mappings.json:channels.%s.groups", groupName, chanName),
+		})
+		return
+	}
+	// Fail-closed cross-check for id-addressed replays (item 3): if the caller
+	// supplied the topic's chat, it MUST equal the chat the named group resolves
+	// to. A remembered Group=="" for a topic that actually lived in a non-default
+	// group would otherwise replay against the DEFAULT group's chat, and a
+	// coincidental same-id live thread there would pass ValidateTopic — silently
+	// claiming the WRONG topic. Refuse (fail-detached; do NOT probe other groups).
+	// ChatID==0 means "no cross-check" → today's behavior is preserved.
+	if chatID != 0 && gCfg.ChatID != chatID {
+		_ = conn.WriteJSON(ipc.AttachedMsg{
+			Op: ipc.OpAttached, OK: false,
+			Err: fmt.Sprintf("attach --topic=%d: chat_id cross-check failed (group %q resolves to chat %d, replay expected chat %d) — refusing to claim a possibly-wrong topic",
+				topicID, gName, gCfg.ChatID, chatID),
 		})
 		return
 	}
@@ -832,11 +860,15 @@ func (b *Broker) tryClaim(conn *ipc.Conn, stub *Stub, key RouteKey, label string
 		if evicted := b.Routes.ForceReleaseKey(key); evicted != nil && evicted != stub {
 			// The evicted holder still thinks it owns `key`: its Stub.Route +
 			// routeConfirmed are set, so its next destructive fetch_queue(ack=true)
-			// would drain a topic it no longer owns. Clear its route (item E) —
-			// SetRoute(nil) also clears routeConfirmed (Phase 4), so that drain hits
-			// the "no route claimed" refusal instead. SetRoute is stubMu-guarded, so
-			// this cross-connection call is race-safe.
-			evicted.SetRoute(nil)
+			// would drain a topic it no longer owns. Clear its route (item E) so that
+			// drain hits the "no route claimed" refusal instead. Use ClearRouteIf(key),
+			// NOT an unconditional SetRoute(nil): a victim that is MID-SWITCH to a
+			// DIFFERENT topic (its Route already re-pointed away from `key`) must not be
+			// zeroed, or it would skip releasing its OLD route and leak it as an
+			// orphaned claim. ClearRouteIf clears route+routeConfirmed only when the
+			// stub still points at the stolen key; it's stubMu-guarded, so this
+			// cross-connection call is race-safe.
+			evicted.ClearRouteIf(key)
 		}
 	}
 	holder, ok := b.Routes.Claim(key, stub)

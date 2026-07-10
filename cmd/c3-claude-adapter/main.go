@@ -615,8 +615,11 @@ func isBareAttachReq(req ipc.AttachReq) bool {
 // silently dropped; and a registry-missing topic synthesizes an unreplayable
 // "topic-N" name. attachByTopicID(topic_id, group) validates against the group's
 // chat and re-claims cleanly across groups. A DM has no topic → replay by target.
-// Shared by resolvedAttachReq (§3d1, item C) and fireRecover (item B).
-func rememberedIdentityReq(cwd string, topicID *int64, group string) ipc.AttachReq {
+// chatID is carried as an OPTIONAL cross-check (ipc.AttachReq.ChatID): a replay
+// whose group resolves to a DIFFERENT chat than the topic actually lived in is
+// then refused fail-closed instead of silently binding a same-id thread in the
+// wrong chat. Shared by resolvedAttachReq (§3d1, item C) and fireRecover (item B).
+func rememberedIdentityReq(cwd string, chatID int64, topicID *int64, group string) ipc.AttachReq {
 	req := ipc.AttachReq{Op: ipc.OpAttach, CWD: cwd}
 	if topicID == nil {
 		req.Target = "dm" // DM has no topic; replay by target, not by a "dm" name.
@@ -625,6 +628,7 @@ func rememberedIdentityReq(cwd string, topicID *int64, group string) ipc.AttachR
 	tid := *topicID
 	req.TopicID = &tid
 	req.Group = group
+	req.ChatID = chatID
 	return req
 }
 
@@ -642,7 +646,7 @@ func resolvedAttachReq(req ipc.AttachReq, attached ipc.AttachedMsg) ipc.AttachRe
 	if !isBareAttachReq(req) {
 		return req
 	}
-	return rememberedIdentityReq(req.CWD, attached.TopicID, attached.Group)
+	return rememberedIdentityReq(req.CWD, attached.ChatID, attached.TopicID, attached.Group)
 }
 
 // replayLastAttach sends the saved attach request to the (just-reconnected)
@@ -2027,7 +2031,7 @@ func (a *adapter) fireRecover(ctx context.Context, entry sessionhandoff.Entry) {
 		// precisely because such topics occur). rememberedIdentityReq maps
 		// resp.TopicID==nil → {Target:"dm"} and a topic → {TopicID, Group}, which a
 		// fresh broker re-claims via attachByTopicID (item B, shared with item C).
-		a.rememberAttach(rememberedIdentityReq(entry.CWD, resp.TopicID, resp.Group))
+		a.rememberAttach(rememberedIdentityReq(entry.CWD, resp.ChatID, resp.TopicID, resp.Group))
 		// Track the recovered topic name for the fetch_queue nudges (§5).
 		a.setAttachedTopic(resp.Name)
 		log.Printf("recover-session: auto-attached to %q (queued=%d)", resp.Name, resp.QueuedCount)

@@ -467,6 +467,18 @@ type AttachReq struct {
 	Create  bool   `json:"create,omitempty"`
 	Expr    string `json:"expr,omitempty"`
 
+	// ChatID is an OPTIONAL cross-check for id-addressed replays. When an
+	// adapter remembers a resolved topic identity for reconnect/fresh-broker
+	// replay it records the topic's chat here; attachByTopicID then refuses if
+	// the group named in the replay resolves to a DIFFERENT chat than this
+	// value. This closes a fail-open hole: a remembered Group=="" for a topic
+	// that actually lives in a non-default group would otherwise replay against
+	// the DEFAULT group's chat, and if that chat happened to hold a live thread
+	// with the same id, the broker would silently claim the wrong topic. Zero
+	// (omitted) means "no cross-check" — preserves the behavior of callers that
+	// don't set it. Only meaningful alongside TopicID.
+	ChatID int64 `json:"chat_id,omitempty"`
+
 	// Steal: when true, evict any existing alive holder of the target
 	// route before claiming. Used in the force_steal proposal flow —
 	// LLM asks the user for confirmation, then re-invokes with steal=true.

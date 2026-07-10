@@ -281,6 +281,77 @@ func TestBuildPickTopic_CwdMappingDMLegacy(t *testing.T) {
 	if s.Name != "dm" {
 		t.Errorf("DM row name = %q, want dm", s.Name)
 	}
+	if s.ChatID != 42 {
+		t.Errorf("DM row ChatID = %d, want cc.DMChatID (42)", s.ChatID)
+	}
+}
+
+// TestBuildPickTopic_CwdMappingDMLegacy_NoDMConfigured (item 5a): a legacy
+// TopicID==0 cwd mapping must NOT render a DM row when the channel has no
+// dm_chat_id — picking it would error "dm_chat_id not set". It falls through to
+// the basename arms instead (parity with the recents DM arm's cc.DMChatID==0
+// skip). Here basename "dmproj" is in no group → a create row leads.
+func TestBuildPickTopic_CwdMappingDMLegacy_NoDMConfigured(t *testing.T) {
+	mf := &mappings.MappingsFile{
+		SchemaVersion: 1,
+		Channels: map[string]mappings.ChannelConfig{
+			"telegram": {
+				DefaultGroup: "main",
+				Groups:       map[string]mappings.GroupConfig{"main": {ChatID: -100}},
+				// No DMChatID.
+			},
+		},
+		Mappings: map[string]mappings.Mapping{
+			"/home/x/dmproj": {Channel: "telegram", ChatID: 42, TopicID: 0, Name: "dm"},
+		},
+	}
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	p := b.buildPickTopic(nil, "telegram", "/home/x/dmproj")
+	for _, s := range p.Suggestions {
+		if s.Kind == "attach_existing" && s.TopicID == nil {
+			t.Fatalf("no dm_chat_id → must NOT render a DM row; got %+v", s)
+		}
+	}
+	if len(p.Suggestions) != 1 || p.Suggestions[0].Kind != "create" || p.Suggestions[0].Name != "dmproj" {
+		t.Fatalf("legacy DM mapping without dm_chat_id must fall through to a create row; got %+v", p.Suggestions)
+	}
+}
+
+// TestBuildPickTopic_CwdMappingDMLegacy_DedupesWithRecents (item 5b): the cwd DM
+// row must key on cc.DMChatID (not the mapping's stored ChatID) so it collapses
+// with a recents DM row into a SINGLE "dm" row. Here the cwd mapping stores a
+// STALE ChatID (99) while the configured DM chat is 42; the old code keyed the
+// cwd row on 99 and the recents row on 42 → two "dm" rows. The fix keys both on
+// 42 → one row.
+func TestBuildPickTopic_CwdMappingDMLegacy_DedupesWithRecents(t *testing.T) {
+	now := time.Now()
+	mf := mfWithTelegram() // DMChatID = 42
+	mf.Mappings["/home/x/dmproj"] = mappings.Mapping{
+		Channel: "telegram", ChatID: 99, TopicID: 0, Name: "dm", // stale chat id
+	}
+	mf.SessionAttachments = map[string]mappings.SessionAttachment{
+		"dm-recent": {Channel: "telegram", ChatID: 42, TopicID: nil, Name: "dm", LastAttachedAt: now.Add(-1 * time.Minute)},
+	}
+	fc := &fakeChannel{}
+	b := brokerWithChannel(t, mf, fc)
+	defer b.Shutdown()
+
+	p := b.buildPickTopic(nil, "telegram", "/home/x/dmproj")
+	dmRows := 0
+	for _, s := range p.Suggestions {
+		if s.Kind == "attach_existing" && s.TopicID == nil {
+			dmRows++
+			if s.ChatID != 42 {
+				t.Errorf("DM row ChatID = %d, want cc.DMChatID (42) so it dedupes with recents", s.ChatID)
+			}
+		}
+	}
+	if dmRows != 1 {
+		t.Fatalf("cwd DM row + recents DM row must dedupe into ONE dm row; got %d", dmRows)
+	}
 }
 
 // TestBuildPickTopic_CwdMappingStaleFallsThrough (item H2): a cwd→route mapping

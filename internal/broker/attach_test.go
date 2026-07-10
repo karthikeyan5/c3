@@ -379,6 +379,82 @@ func TestAttach_TopicID_ValidatesAndClaims(t *testing.T) {
 	}
 }
 
+// TestAttach_TopicID_ChatIDCrossCheck (item 3) pins the id-addressed-replay
+// fail-closed guard: when the replay carries the topic's chat_id, attachByTopicID
+// refuses if the named group resolves to a DIFFERENT chat (so a same-id thread in
+// the wrong chat can't be silently claimed); a MATCHING chat_id claims; and a
+// zero/absent chat_id keeps the pre-fix behavior (no cross-check).
+func TestAttach_TopicID_ChatIDCrossCheck(t *testing.T) {
+	// group "work" → chat -200; group "main" → chat -100.
+	tid := int64(412)
+
+	t.Run("mismatch refused", func(t *testing.T) {
+		b := brokerWithChannel(t, mfWithTelegram(), &fakeChannel{})
+		defer b.Shutdown()
+		peer, done := peerPair(t, b)
+		defer done()
+		helloAck(t, peer, "/x")
+
+		// Topic 412 lives in "work"/-200, but the replay names group "main" (chat
+		// -100) and cross-checks against the real chat -200 → mismatch → refuse.
+		_ = peer.WriteJSON(ipc.AttachReq{Op: ipc.OpAttach, CWD: "/x", TopicID: &tid, Group: "main", ChatID: -200})
+		raw, _ := peer.ReadFrame()
+		var ack ipc.AttachedMsg
+		_ = json.Unmarshal(raw, &ack)
+		if ack.OK {
+			t.Fatalf("mismatched chat_id must be refused; got OK ack %+v", ack)
+		}
+		if !strings.Contains(ack.Err, "cross-check") {
+			t.Errorf("refusal should name the cross-check; got err %q", ack.Err)
+		}
+		// No route claimed, no validate performed.
+		if _, held := b.Routes.Holder(MakeRouteKey("telegram", -100, &tid)); held {
+			t.Error("refused attach must not claim the default-group route")
+		}
+	})
+
+	t.Run("match claims", func(t *testing.T) {
+		fc := &fakeChannel{}
+		b := brokerWithChannel(t, mfWithTelegram(), fc)
+		defer b.Shutdown()
+		peer, done := peerPair(t, b)
+		defer done()
+		helloAck(t, peer, "/x")
+
+		// group "work" resolves to chat -200 == the supplied chat_id → claim.
+		_ = peer.WriteJSON(ipc.AttachReq{Op: ipc.OpAttach, CWD: "/x", TopicID: &tid, Group: "work", ChatID: -200})
+		raw, _ := peer.ReadFrame()
+		var ack ipc.AttachedMsg
+		_ = json.Unmarshal(raw, &ack)
+		if !ack.OK {
+			t.Fatalf("matching chat_id must claim; got err %q", ack.Err)
+		}
+		if ack.ChatID != -200 || ack.TopicID == nil || *ack.TopicID != 412 {
+			t.Errorf("claimed the wrong route: %+v", ack)
+		}
+	})
+
+	t.Run("zero chat_id skips cross-check", func(t *testing.T) {
+		b := brokerWithChannel(t, mfWithTelegram(), &fakeChannel{})
+		defer b.Shutdown()
+		peer, done := peerPair(t, b)
+		defer done()
+		helloAck(t, peer, "/x")
+
+		// No chat_id → today's behavior: group "work" claims topic 412 as before.
+		_ = peer.WriteJSON(ipc.AttachReq{Op: ipc.OpAttach, CWD: "/x", TopicID: &tid, Group: "work"})
+		raw, _ := peer.ReadFrame()
+		var ack ipc.AttachedMsg
+		_ = json.Unmarshal(raw, &ack)
+		if !ack.OK {
+			t.Fatalf("absent chat_id must preserve today's claim behavior; got err %q", ack.Err)
+		}
+		if ack.ChatID != -200 {
+			t.Errorf("ChatID=%d, want -200", ack.ChatID)
+		}
+	})
+}
+
 func TestAttach_SavedMapping_ShowsPickerNoClaim(t *testing.T) {
 	// Post-redesign a bare attach NEVER consults the saved cwd→topic mapping
 	// (PATH A deleted, spec §2). With an empty stableSessionID (no recover op

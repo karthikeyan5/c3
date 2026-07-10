@@ -513,9 +513,12 @@ func isBareAttachReq(req ipc.AttachReq) bool {
 // otherGroupHits step excludes same-group hits — so the create proposal is
 // discarded and the claim silently dropped; a registry-missing topic also
 // synthesizes an unreplayable "topic-N" name. attachByTopicID(topic_id, group)
-// re-claims cleanly across groups. A DM has no topic → replay by target. Parity
-// with the Claude adapter (item C).
-func rememberedIdentityReq(cwd string, topicID *int64, group string) ipc.AttachReq {
+// re-claims cleanly across groups. A DM has no topic → replay by target. chatID is
+// an OPTIONAL cross-check (ipc.AttachReq.ChatID) so a replay whose group resolves
+// to a different chat than the topic lived in is refused fail-closed rather than
+// binding a same-id thread in the wrong chat. Parity with the Claude adapter
+// (items C + id-addressed cross-check).
+func rememberedIdentityReq(cwd string, chatID int64, topicID *int64, group string) ipc.AttachReq {
 	req := ipc.AttachReq{Op: ipc.OpAttach, CWD: cwd}
 	if topicID == nil {
 		req.Target = "dm"
@@ -524,6 +527,7 @@ func rememberedIdentityReq(cwd string, topicID *int64, group string) ipc.AttachR
 	tid := *topicID
 	req.TopicID = &tid
 	req.Group = group
+	req.ChatID = chatID
 	return req
 }
 
@@ -537,7 +541,7 @@ func resolvedAttachReq(req ipc.AttachReq, attached ipc.AttachedMsg) ipc.AttachRe
 	if !isBareAttachReq(req) {
 		return req
 	}
-	return rememberedIdentityReq(req.CWD, attached.TopicID, attached.Group)
+	return rememberedIdentityReq(req.CWD, attached.ChatID, attached.TopicID, attached.Group)
 }
 
 // replayLastAttach re-sends the saved attach request to the (just-reconnected)
