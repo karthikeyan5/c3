@@ -217,12 +217,12 @@ Grok’s leader model is **one shared agent process** + N TUI clients:
 
 | Piece | Behavior |
 |-------|----------|
-| **Resume auto-attach** | After hello, adapter fires `OpRecoverSession` with Grok session UUID (`GROK_SESSION_ID` / `active_sessions.json` / cwd match). Silent re-claim + backlog notice. |
+| **Resume auto-attach** | After hello, adapter fires `OpRecoverSession` with Grok session UUID — strict, fail-closed resolution (`GROK_SESSION_ID` pin > single cwd match > single live match > PID ancestry; ambiguity refuses and the message stays queued). Silent re-claim + backlog notice. Re-fired on broker reconnect so a restarted broker re-learns the stable id. |
 | **Stable id on attach** | Before attach, bind session id (cwd-matched when multiple sessions) so broker records session attachment for next resume. |
-| **Clean leave** | On SIGTERM/SIGINT/SIGHUP and process exit: `OpRelease` so the topic is not held by a zombie. |
+| **Clean leave** | Exits (including signals) keep the claim so the session can resume; the broker's conn-drop + PID-liveness reaping handles dead holders. Only the explicit `detach` tool sends `OpRelease`. (An earlier OpRelease-on-exit tombstoned the session attachment and broke resume — removed.) |
 | **Host setup** | `c3-broker install-grok` → `use_leader=true` + pin `c3-grok-adapter` + print plugin steps. |
 | **SessionStart hook** | Grok-aware `session-hook` (GROK_SESSION_ID / sessionId camelCase). |
-| **Queue ack** | Ack on `user_message_chunk` (landed), not end-of-turn. |
+| **Queue ack** | Ack only on a landing confirm bound to the prompted session whose `user_message_chunk` echoes a prefix of our injected text. Post-write silence/timeouts classify as UNCERTAIN: never acked, never blind-retried — the line stays in the durable queue (double-delivery over loss). A failed inject latches acks off until a full `fetch_queue` drain (`Remaining==0`) re-syncs the head. |
 
 ## Still worth a soak test
 

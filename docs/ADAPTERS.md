@@ -31,7 +31,7 @@ Every adapter speaks the same broker IPC over `$XDG_RUNTIME_DIR/c3.sock`. Newlin
 | broker → adapter | `topics_list` | Listing response. |
 | broker → adapter | `error` | Generic error. |
 
-There is no shared adapter-client package to import. Each adapter hand-rolls its broker IPC on the low-level `internal/ipc` primitives (`ipc.NewConn`, `Conn.WriteJSON`, `Conn.ReadFrame`) dialed at `broker.SocketPath()`. Budget for real work: the two built-in adapters are ~2.3k LOC (Claude Code) and ~1.5k LOC (Codex), each reimplementing the handshake, attach, tool-forward, reconnect, and host-specific inbound translation described below. This is the hardest of C3's three extension seams.
+There is no shared adapter-client package to import. Each adapter hand-rolls its broker IPC on the low-level `internal/ipc` primitives (`ipc.NewConn`, `Conn.WriteJSON`, `Conn.ReadFrame`) dialed at `broker.SocketPath()`. Budget for real work: the three built-in adapters are ~2.3k LOC (Claude Code), ~1.5k LOC (Codex), and ~2.9k LOC (Grok Build), each reimplementing the handshake, attach, tool-forward, reconnect, and host-specific inbound translation described below. This is the hardest of C3's three extension seams.
 
 ## Adapter responsibilities, in order
 
