@@ -467,32 +467,36 @@ func (s *Store) RefreshText(rk RouteKey, messageID int64, newText string) (bool,
 	return true, nil
 }
 
-// RemoveIDs removes, from the PENDING region of the route's file, at most
-// counts[id] occurrences per MessageID, first-occurrences-first in file order,
-// and returns the removed records in that same order. It is the non-prefix
-// companion to Consume (which can only advance the single cursor past an oldest
-// prefix, store.go Consume): a drain of "6-10 leaving 1-5" is a mid-range removal
-// Consume cannot express.
+// RemoveIDs removes, from the PENDING region of the route's file, the lines
+// selected by sel — for each MessageID, the set of 1-based OCCURRENCE ORDINALS
+// (that id's position among its OWN pending occurrences, oldest→newest in file
+// order) to remove — and returns the removed records in file order. It is the
+// non-prefix companion to Consume (which can only advance the single cursor
+// past an oldest prefix, store.go Consume): a drain of "6-10 leaving 1-5" is a
+// mid-range removal Consume cannot express.
 //
-// Selection is a frozen MULTISET, not a set (amendment A2): a queue can
-// legitimately hold two lines with one MessageID — an edited message re-
-// dispatches with the SAME id — so counts is a per-id occurrence BUDGET. Each
-// pending line whose id still has budget is removed (budget--); the rest are
-// kept. First-occurrences-first falls out of the in-order walk: counts[id]=1 over
-// two same-id lines takes the FIRST and leaves the second. Ids absent from
-// pending (or with no remaining budget) are skipped silently and simply not in
-// the returned slice, so a crash-retry re-issue converges (idempotent).
+// Selection is by OCCURRENCE POSITION, not a per-id count (amendment A2,
+// hardened): a queue can legitimately hold two lines with one MessageID — an
+// edited message re-dispatches with the SAME id — and the caller selects
+// LINES, so sel[5]={2} removes ONLY the 2nd id-5 line and keeps the 1st (a
+// per-id count budget would always take the FIRST occurrence — a silent
+// wrong-line removal when the operator named the later one). Ids absent from
+// pending, and ordinals no longer present (a concurrent consume shifted that
+// id's occurrences down), match nothing and are simply not in the returned
+// slice, so a crash-retry re-issue converges on the surviving intersection
+// (idempotent).
 //
 // It reuses the proven composite (same internals as EvictOverCap/RefreshText):
-// readLines + cursor projection → partition pending by counted id → snapshotDropped
-// the removed lines to .trash/ (recoverable for TrashTTL, INV-4) BEFORE the atomic
-// rewrite (tmp → fsync → rename → dir-fsync) → cursor remap → retirePair when the
-// pending region empties → refreshIndex. Only lines AT/AFTER the cursor are
-// eligible; the consumed (pre-cursor) region is preserved. Corrupt placeholder
-// lines are stepped over — never removed, never counted in the walk. A call that
+// readLines + cursor projection → walk pending counting per-id occurrences and
+// partition selected vs kept → snapshotDropped the removed lines to .trash/
+// (recoverable for TrashTTL, INV-4) BEFORE the atomic rewrite (tmp → fsync →
+// rename → dir-fsync) → cursor remap → retirePair when the pending region
+// empties → refreshIndex. Only lines AT/AFTER the cursor are eligible; the
+// consumed (pre-cursor) region is preserved. Corrupt placeholder lines are
+// stepped over — never removed, never counted in the walk. A call that
 // matches nothing mutates no file (idempotent no-op).
-func (s *Store) RemoveIDs(rk RouteKey, counts map[int64]int) (removed []c3types.Inbound, err error) {
-	if len(counts) == 0 {
+func (s *Store) RemoveIDs(rk RouteKey, sel map[int64][]int) (removed []c3types.Inbound, err error) {
+	if len(sel) == 0 {
 		return nil, nil // nothing requested — clean no-op, no file I/O
 	}
 	lines, cursor, err := s.readLines(rk)
@@ -513,21 +517,27 @@ func (s *Store) RemoveIDs(rk RouteKey, counts map[int64]int) (removed []c3types.
 		}
 		real = append(real, in)
 	}
-	// Work off a COPY of the per-id budget so the caller's frozen multiset is never
-	// mutated (phase 2 reuses it across the append presence-check and this remove).
-	remaining := make(map[int64]int, len(counts))
-	for id, c := range counts {
-		remaining[id] = c
+	// Project the caller's ordinal lists into per-id ordinal SETS. The caller's
+	// frozen selection is never mutated (phase 2 reuses it across a re-issue).
+	want := make(map[int64]map[int]bool, len(sel))
+	for id, ords := range sel {
+		set := make(map[int]bool, len(ords))
+		for _, o := range ords {
+			set[o] = true
+		}
+		want[id] = set
 	}
-	// Walk the still-pending (cursor-onward) real lines in file order, partitioning
-	// into removed (id still has budget; decrement) vs kept. The consumed region
+	// Walk the still-pending (cursor-onward) real lines in file order, counting
+	// each id's occurrences as we go and partitioning into removed (this
+	// occurrence's ordinal was selected) vs kept. The consumed region
 	// (real[:cursorReal]) is preserved verbatim.
 	kept := make([]c3types.Inbound, 0, len(real))
 	kept = append(kept, real[:cursorReal]...)
+	seen := make(map[int64]int)
 	for idx := cursorReal; idx < len(real); idx++ {
 		in := real[idx]
-		if remaining[in.MessageID] > 0 {
-			remaining[in.MessageID]--
+		seen[in.MessageID]++
+		if want[in.MessageID][seen[in.MessageID]] {
 			removed = append(removed, in)
 			continue
 		}

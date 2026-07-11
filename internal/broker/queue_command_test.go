@@ -513,6 +513,83 @@ func TestScope_AmbiguousNameRejects(t *testing.T) {
 	}
 }
 
+// --- topicless group route ("general") labeling + addressing ----------------------------
+
+// A group's General topic (MessageThreadId 0 → TopicID nil) must never be
+// labeled "dm" — that collided with the real DM in /queue and misdirected
+// operators to `/drain dm`. It lists as "general", is addressable by the bare
+// token `general` in-group and by serial, and the real DM keeps "dm".
+func TestGeneralRoute_LabeledAndAddressable(t *testing.T) {
+	b, fc, host := cmdTestBroker(t)
+	gen := RouteKey{Channel: "telegram", ChatID: -100} // group main's General topic
+	seedTexts(t, b, gen, 2, "general body")
+	seedTexts(t, b, rDM(), 1, "dm body")
+
+	// In-group list: the topicless route is labeled general (topicless sorts
+	// before topics), never dm.
+	reply, _ := host.HandleCommand(inGroupC3("/queue", cmdOperator))
+	if !strings.Contains(reply, "[1] general · 2 queued") {
+		t.Errorf("in-group list must label the topicless route general: %q", reply)
+	}
+	if strings.Contains(reply, "[1] dm") {
+		t.Errorf("topicless group route must NOT be labeled dm: %q", reply)
+	}
+	// DM-scope list: the group General and the real DM are distinct rows with
+	// distinct labels (key-sorted: -100 before 42).
+	reply, _ = host.HandleCommand(inDM("/queue", cmdOperator))
+	if !strings.Contains(reply, "[1] general · 2 queued") || !strings.Contains(reply, "[2] dm · 1 queued") {
+		t.Errorf("DM list must label group General 'general' and the real DM 'dm': %q", reply)
+	}
+
+	// Addressable by the bare token in-group (async content peek).
+	if reply, handled := host.HandleCommand(inGroupC3("/queue general", cmdOperator)); !handled || reply != "" {
+		t.Fatalf("/queue general in-group must go async: handled=%v reply=%q", handled, reply)
+	}
+	waitReplyWhere(t, fc, "general peek by name", func(r c3types.ReplyArgs) bool {
+		return strings.Contains(r.Text, "«general» · 2 queued")
+	})
+	// ...and by serial (queueIndex row → resolveQueueRef serial path).
+	fc.mu.Lock()
+	fc.replyCalls = nil
+	fc.mu.Unlock()
+	if reply, handled := host.HandleCommand(inGroupC3("/queue 1", cmdOperator)); !handled || reply != "" {
+		t.Fatalf("/queue 1 in-group must go async: handled=%v reply=%q", handled, reply)
+	}
+	waitReplyWhere(t, fc, "general peek by serial", func(r c3types.ReplyArgs) bool {
+		return strings.Contains(r.Text, "«general» · 2 queued")
+	})
+
+	// Drainable by name in-group; the reply echoes «general», not «dm».
+	if reply, handled := host.HandleCommand(inGroupC3("/drain general first 1 to c3", cmdOperator)); !handled || reply != "" {
+		t.Fatalf("/drain general in-group: handled=%v reply=%q", handled, reply)
+	}
+	waitReplyWhere(t, fc, "drain from general", func(r c3types.ReplyArgs) bool {
+		return strings.Contains(r.Text, "drained «general» → «c3»")
+	})
+	moved := drainPeekAll(t, b, rC3())
+	if len(moved) != 1 || !strings.HasPrefix(moved[0].Text, "↩︎ from «general»") {
+		t.Fatalf("drained line must carry the general provenance banner: %+v", moved)
+	}
+
+	// From the DM the bare token is ambiguous (every group has a General) —
+	// reject, never guess.
+	reply, _ = host.HandleCommand(inDM("/queue general", cmdOperator))
+	if !strings.Contains(reply, "ambiguous") {
+		t.Errorf("DM-scope bare general must reject as ambiguous: %q", reply)
+	}
+
+	// DP-1 friction echoes the ADDRESSABLE resolved name for the topicless
+	// route ("general"), never "dm" (the real DM). general has 1 left → DM rows:
+	// [1] general (chat -100), [2] dm (chat 42).
+	reply, _ = host.HandleCommand(inDM("/drain 1 all to feature-x", cmdOperator))
+	if !strings.Contains(reply, "«general»") || !strings.Contains(reply, "/drain general") {
+		t.Errorf("friction must echo the resolved name general: %q", reply)
+	}
+	if strings.Contains(reply, "«dm»") {
+		t.Errorf("friction must not misdirect to the real DM: %q", reply)
+	}
+}
+
 // --- parser table (B3) -----------------------------------------------------------------
 
 func TestParseDrainCommand_Table(t *testing.T) {
@@ -660,6 +737,57 @@ func TestDrainCommand_SameRouteRejects(t *testing.T) {
 	reply, _ := host.HandleCommand(inGroupC3("/drain c3 all", cmdOperator))
 	if !strings.Contains(reply, "same queue") {
 		t.Errorf("source==target must reject synchronously: %q", reply)
+	}
+}
+
+// --- plain-text markup (security) --------------------------------------------------------
+
+// Broker command replies render attacker-controlled content as PLAIN TEXT: a
+// queued body like "[Payroll login](https://evil)" must appear literally
+// (inert), never become a live link sent by the trusted bot. Asserts the
+// /queue <q> peek reply, the /drain origin reply, and the Step-D drain-notice
+// all carry MarkupNone with the raw text present unescaped.
+func TestCommandReplies_PlainTextMarkup(t *testing.T) {
+	b, fc, host := cmdTestBroker(t)
+	evil := "[Payroll login](https://evil.example)"
+	in := &c3types.Inbound{Channel: "telegram", ChatID: -100, TopicID: ptrI64(281), MessageID: 1,
+		Sender: c3types.Sender{UserID: 11, Username: "alice"}, Text: evil,
+		Timestamp: time.Now().Add(-time.Minute)}
+	drainSeed(t, b, rC3(), in)
+
+	// /queue <q>: the preview interpolates the body raw, but as plain text.
+	if reply, handled := host.HandleCommand(inDM("/queue c3", cmdOperator)); !handled || reply != "" {
+		t.Fatalf("/queue c3 must go async: handled=%v reply=%q", handled, reply)
+	}
+	peek := waitReplyWhere(t, fc, "peek reply", func(r c3types.ReplyArgs) bool {
+		return strings.Contains(r.Text, "«c3»")
+	})
+	if peek.Markup != c3types.MarkupNone {
+		t.Errorf("/queue <q> reply Markup = %q, want MarkupNone", peek.Markup)
+	}
+	if !strings.Contains(peek.Text, evil) {
+		t.Errorf("preview must carry the raw text unescaped (inert under MarkupNone): %q", peek.Text)
+	}
+
+	// /drain: the origin reply (echoes the first-preview) and the Step-D
+	// drain-notice (interpolates the renameable source topic name) are plain.
+	if reply, handled := host.HandleCommand(inDM("/drain c3 all to feature-x", cmdOperator)); !handled || reply != "" {
+		t.Fatalf("/drain must go async: handled=%v reply=%q", handled, reply)
+	}
+	origin := waitReplyWhere(t, fc, "drain origin reply", func(r c3types.ReplyArgs) bool {
+		return strings.Contains(r.Text, "drained «c3» → «feature-x»")
+	})
+	if origin.Markup != c3types.MarkupNone {
+		t.Errorf("/drain reply Markup = %q, want MarkupNone", origin.Markup)
+	}
+	if !strings.Contains(origin.Text, evil) {
+		t.Errorf("drain reply's first-preview must carry the raw text: %q", origin.Text)
+	}
+	notice := waitReplyWhere(t, fc, "step-D notice", func(r c3types.ReplyArgs) bool {
+		return r.ChatID == -200 && strings.Contains(r.Text, "drained in from")
+	})
+	if notice.Markup != c3types.MarkupNone {
+		t.Errorf("Step-D drain-notice Markup = %q, want MarkupNone", notice.Markup)
 	}
 }
 

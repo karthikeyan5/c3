@@ -1104,7 +1104,12 @@ func (c *Channel) dispatchMessage(updateID int64, msg *gotgbot.Message, edited b
 					updateID, msg.Chat.Id, msg.MessageThreadId)
 			} else if _, err := c.SendReply(c3types.ReplyArgs{
 				Channel: c.Name(), ChatID: in.ChatID, TopicID: in.TopicID, Text: reply,
-				Markup: c3types.MarkupMarkdown,
+				// MarkupNone (security): these broker-generated replies
+				// (/status, bare /queue, parse/resolve rejects) interpolate
+				// topic names — renameable by any group member — and echo
+				// operator tokens; plain text keeps them inert instead of
+				// rendering as live Telegram markdown from the trusted bot.
+				Markup: c3types.MarkupNone,
 			}); err != nil {
 				c.host.Logf("telegram: command reply send failed update=%d chat=%d: %v", updateID, in.ChatID, err)
 			} else {

@@ -10,7 +10,8 @@ package broker
 // store's single-owner discipline holds (internal/queue/store.go):
 //
 //	Step A  JobDrainPeek   on the SOURCE worker — freeze the selection as a
-//	        MULTISET of (MessageID → count) + the captured lines (A2: edited
+//	        per-id set of 1-based OCCURRENCE ORDINALS (each id's position among
+//	        its OWN pending occurrences) + the captured lines (A2: edited
 //	        messages re-dispatch with the SAME id, so a queue can legitimately
 //	        hold two lines with one id; ordinals number LINES, not unique ids).
 //	Step B  JobDrainAppend on the TARGET worker — presence-check per
@@ -20,8 +21,9 @@ package broker
 //	        durability commit (INV-1). The target's deliveredDedup is NEVER
 //	        seeded (INV-8).
 //	Step C  JobDrainRemove on the SOURCE worker — RemoveIDs with the frozen
-//	        counts; surviving-intersection semantics (INV-5): a frozen line a
-//	        concurrent fetch consumed meanwhile is reported, not an error.
+//	        occurrence ordinals; surviving-intersection semantics (INV-5): a
+//	        frozen line a concurrent fetch consumed meanwhile is reported, not
+//	        an error.
 //	Step D  advisory, best-effort — a live alive holder on the target gets a
 //	        targeted SystemEvent nudge via a DIRECT conn write (A4: never the
 //	        forwardOrFallback/worker push path); otherwise ONE drain-notice is
@@ -172,9 +174,9 @@ type RangeBeyondPendingError struct{ Lo, Hi, Pending int }
 
 func (e *RangeBeyondPendingError) Error() string {
 	if e.Lo > e.Pending {
-		return fmt.Sprintf("drain: range %d-%d starts beyond the queue — it has only %d pending; try `all` or a range within 1-%d", e.Lo, e.Hi, e.Pending, e.Pending)
+		return fmt.Sprintf("drain: range %d-%d starts beyond the queue — it has only %d pending; try all or a range within 1-%d", e.Lo, e.Hi, e.Pending, e.Pending)
 	}
-	return fmt.Sprintf("drain: range %d-%d runs past the queue — it has %d pending; try %d-%d or `all`", e.Lo, e.Hi, e.Pending, e.Lo, e.Pending)
+	return fmt.Sprintf("drain: range %d-%d runs past the queue — it has %d pending; try %d-%d or all", e.Lo, e.Hi, e.Pending, e.Lo, e.Pending)
 }
 
 // DrainStep names the worker round-trip a broker-busy failure hit, so the
@@ -328,11 +330,22 @@ func (b *Broker) Drain(spec DrainSpec) (DrainResult, error) {
 	res.WindowLo, res.WindowHi = lo, hi
 	res.Clamped = clamped
 	res.FirstPreview = drainPreview(&captured[0])
-	// Frozen MULTISET (A2): per-id occurrence budget, not a set — two same-id
-	// lines with counts[id]=1 drains exactly the first occurrence.
-	counts := make(map[int64]int, len(captured))
-	for i := range captured {
-		counts[captured[i].MessageID]++
+	// Frozen selection (A2, by OCCURRENCE POSITION): sel[id] lists the 1-based
+	// occurrence ordinals — id's position among its OWN pending occurrences,
+	// oldest→newest — that fall inside the selected window. Two same-id lines
+	// (an edited message re-dispatches with the SAME id) are distinct
+	// occurrences, so a window naming only the LATER one removes exactly that
+	// line; a per-id count would silently take the first (wrong-line removal).
+	// applyDrainSelector's window [lo,hi] is contiguous over pending for every
+	// selector kind, so one walk over the FULL snapshot assigns the ordinals.
+	sel := make(map[int64][]int, len(captured))
+	occ := make(map[int64]int, len(pending))
+	for i := range pending {
+		id := pending[i].MessageID
+		occ[id]++
+		if i >= lo-1 && i < hi {
+			sel[id] = append(sel[id], occ[id])
+		}
 	}
 	log.Printf("drain freeze src=%s dst=%s pending=%d frozen=%d window=%d-%d clamped=%v",
 		srcKey, dstKey, len(pending), len(captured), lo, hi, clamped)
@@ -384,10 +397,10 @@ func (b *Broker) Drain(spec DrainSpec) (DrainResult, error) {
 
 	// ---- Step C: remove on the SOURCE worker. --------------------------------
 	// Every frozen line durably landed (appended or presence-skipped), so the
-	// remove uses the FULL frozen multiset. RemoveIDs skips ids no longer
-	// pending — the surviving intersection (INV-5).
+	// remove uses the FULL frozen selection. RemoveIDs skips occurrence
+	// ordinals no longer pending — the surviving intersection (INV-5).
 	removeCh := make(chan DrainRemoveResult, 1)
-	if !b.Workers.Submit(spec.Source, Job{Kind: JobDrainRemove, DrainRemove: &DrainRemoveJob{Counts: counts, ResultCh: removeCh}}) {
+	if !b.Workers.Submit(spec.Source, Job{Kind: JobDrainRemove, DrainRemove: &DrainRemoveJob{Sel: sel, ResultCh: removeCh}}) {
 		return res, &DrainBusyError{Step: DrainStepRemove, CopiesLanded: true}
 	}
 	// B1: durable mutation — block indefinitely.
@@ -473,8 +486,13 @@ func (b *Broker) drainAdvisory(spec DrainSpec, res *DrainResult) {
 		t := spec.Target.TopicID
 		topicID = &t
 	}
+	// MarkupNone: SourceName is a topic name any group member with rename
+	// rights controls — it must render as inert plain text, never as live
+	// Telegram markdown from the trusted bot (an empty Markup would default to
+	// markdown, outbound.go).
 	if _, serr := ch.SendReply(c3types.ReplyArgs{
 		Channel: spec.Target.Channel, ChatID: spec.Target.ChatID, TopicID: topicID,
+		Markup: c3types.MarkupNone,
 		Text: fmt.Sprintf("↩︎ %d drained in from «%s» — %d total queued. Attach & run fetch_queue to recover.",
 			landed, res.SourceName, res.TargetPending),
 	}); serr != nil {
@@ -607,11 +625,12 @@ type DrainAppendResult struct {
 }
 
 // DrainRemoveJob (Step C) runs on the SOURCE worker: RemoveIDs with the frozen
-// multiset. Ids no longer pending are skipped by the store (surviving
-// intersection, INV-5); the removed lines were snapshotted to .trash/ first
-// (INV-4).
+// per-id occurrence-ordinal selection (Sel[id] = the 1-based positions among
+// id's pending occurrences to remove). Ordinals no longer pending are skipped
+// by the store (surviving intersection, INV-5); the removed lines were
+// snapshotted to .trash/ first (INV-4).
 type DrainRemoveJob struct {
-	Counts   map[int64]int
+	Sel      map[int64][]int
 	ResultCh chan<- DrainRemoveResult
 }
 
@@ -724,7 +743,7 @@ func (w *RouteWorker) handleDrainRemove(job *DrainRemoveJob) {
 		job.ResultCh <- DrainRemoveResult{Err: errOutboundNotImpl}
 		return
 	}
-	removed, err := w.broker.Queue.RemoveIDs(queueRouteKey(w.key), job.Counts)
+	removed, err := w.broker.Queue.RemoveIDs(queueRouteKey(w.key), job.Sel)
 	if err != nil {
 		log.Printf("drain remove FAIL chan=%s chat=%d topic=%s: %v",
 			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), err)
@@ -732,6 +751,6 @@ func (w *RouteWorker) handleDrainRemove(job *DrainRemoveJob) {
 		return
 	}
 	log.Printf("drain remove chan=%s chat=%d topic=%s requested=%d removed=%d",
-		w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), len(job.Counts), len(removed))
+		w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), len(job.Sel), len(removed))
 	job.ResultCh <- DrainRemoveResult{Removed: removed}
 }

@@ -96,7 +96,7 @@ func TestRemoveIDs_MidRangeLeavesHeadAndTail(t *testing.T) {
 			t.Fatalf("append %d: %v", i, err)
 		}
 	}
-	removed, err := s.RemoveIDs(rk, map[int64]int{2: 1, 3: 1, 4: 1})
+	removed, err := s.RemoveIDs(rk, map[int64][]int{2: {1}, 3: {1}, 4: {1}})
 	if err != nil {
 		t.Fatalf("RemoveIDs: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestRemoveIDs_PrefixRemoval(t *testing.T) {
 	for i := int64(1); i <= 5; i++ {
 		_ = s.Append(rk, msg(i, "m"))
 	}
-	removed, err := s.RemoveIDs(rk, map[int64]int{1: 1, 2: 1})
+	removed, err := s.RemoveIDs(rk, map[int64][]int{1: {1}, 2: {1}})
 	if err != nil {
 		t.Fatalf("RemoveIDs: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestRemoveIDs_RemoveAllRetiresPairAndSnapshots(t *testing.T) {
 	for i := int64(1); i <= 3; i++ {
 		_ = s.Append(rk, msg(i, "m"))
 	}
-	removed, err := s.RemoveIDs(rk, map[int64]int{1: 1, 2: 1, 3: 1})
+	removed, err := s.RemoveIDs(rk, map[int64][]int{1: {1}, 2: {1}, 3: {1}})
 	if err != nil {
 		t.Fatalf("RemoveIDs: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestRemoveIDs_UnknownIDNoOp(t *testing.T) {
 		_ = s.Append(rk, msg(i, "m"))
 	}
 	before := rawJSONL(t, dir, rk)
-	removed, err := s.RemoveIDs(rk, map[int64]int{999: 1})
+	removed, err := s.RemoveIDs(rk, map[int64][]int{999: {1}})
 	if err != nil {
 		t.Fatalf("RemoveIDs: %v", err)
 	}
@@ -186,9 +186,9 @@ func TestRemoveIDs_UnknownIDNoOp(t *testing.T) {
 	if after := rawJSONL(t, dir, rk); !reflect.DeepEqual(after, before) {
 		t.Fatalf("file mutated on no-op: before=%v after=%v", before, after)
 	}
-	// An empty counts map is likewise a clean no-op.
-	if r, err := s.RemoveIDs(rk, map[int64]int{}); err != nil || len(r) != 0 {
-		t.Fatalf("empty-counts RemoveIDs = (%v,%v), want (nil,nil)", idsOf(r), err)
+	// An empty selection map is likewise a clean no-op.
+	if r, err := s.RemoveIDs(rk, map[int64][]int{}); err != nil || len(r) != 0 {
+		t.Fatalf("empty-sel RemoveIDs = (%v,%v), want (nil,nil)", idsOf(r), err)
 	}
 }
 
@@ -200,14 +200,14 @@ func TestRemoveIDs_AlreadyAbsentIdempotent(t *testing.T) {
 	for i := int64(1); i <= 3; i++ {
 		_ = s.Append(rk, msg(i, "m"))
 	}
-	if _, err := s.RemoveIDs(rk, map[int64]int{2: 1}); err != nil {
+	if _, err := s.RemoveIDs(rk, map[int64][]int{2: {1}}); err != nil {
 		t.Fatalf("RemoveIDs first: %v", err)
 	}
 	if want := []int64{1, 3}; !reflect.DeepEqual(peekIDs(t, s, rk), want) {
 		t.Fatalf("pending after first = %v, want %v", peekIDs(t, s, rk), want)
 	}
 	// Re-issue: 2 is already gone ⇒ removes nothing, pending unchanged.
-	removed, err := s.RemoveIDs(rk, map[int64]int{2: 1})
+	removed, err := s.RemoveIDs(rk, map[int64][]int{2: {1}})
 	if err != nil {
 		t.Fatalf("RemoveIDs re-issue: %v", err)
 	}
@@ -219,19 +219,21 @@ func TestRemoveIDs_AlreadyAbsentIdempotent(t *testing.T) {
 	}
 }
 
-// TestRemoveIDs_DuplicateMessageIDCounted: two pending lines share one MessageID
-// (edited-message re-dispatch, A2). counts=1 removes the FIRST occurrence only;
-// counts=2 removes both.
-func TestRemoveIDs_DuplicateMessageIDCounted(t *testing.T) {
-	// counts=1 → first occurrence only.
+// TestRemoveIDs_DuplicateMessageIDByOccurrence: two pending lines share one
+// MessageID (edited-message re-dispatch, A2). Selection is by OCCURRENCE
+// ORDINAL: sel={id:{1}} removes ONLY the first occurrence, sel={id:{2}}
+// removes ONLY the second (the first survives — the wrong-line removal a
+// per-id count could not express), and sel={id:{1,2}} removes both.
+func TestRemoveIDs_DuplicateMessageIDByOccurrence(t *testing.T) {
+	// sel={7:{1}} → first occurrence only.
 	s := newStore(t)
 	rk := RouteKey{Channel: "telegram", ChatID: -100}
 	_ = s.Append(rk, msg(1, "head"))
 	_ = s.Append(rk, msg(7, "first-7"))
 	_ = s.Append(rk, msg(7, "second-7"))
-	removed, err := s.RemoveIDs(rk, map[int64]int{7: 1})
+	removed, err := s.RemoveIDs(rk, map[int64][]int{7: {1}})
 	if err != nil {
-		t.Fatalf("RemoveIDs count=1: %v", err)
+		t.Fatalf("RemoveIDs sel={7:{1}}: %v", err)
 	}
 	if len(removed) != 1 || removed[0].MessageID != 7 || removed[0].Text != "first-7" {
 		t.Fatalf("removed = %+v, want exactly the FIRST id-7 (text first-7)", removed)
@@ -241,20 +243,38 @@ func TestRemoveIDs_DuplicateMessageIDCounted(t *testing.T) {
 		t.Fatalf("pending = %+v, want [msg1, second-7]", got)
 	}
 
-	// counts=2 → both occurrences.
+	// sel={7:{2}} → the SECOND occurrence only; the first survives in place.
 	s2 := newStore(t)
 	rk2 := RouteKey{Channel: "telegram", ChatID: -100}
-	_ = s2.Append(rk2, msg(7, "a"))
-	_ = s2.Append(rk2, msg(7, "b"))
-	removed2, err := s2.RemoveIDs(rk2, map[int64]int{7: 2})
+	_ = s2.Append(rk2, msg(1, "head"))
+	_ = s2.Append(rk2, msg(7, "first-7"))
+	_ = s2.Append(rk2, msg(7, "second-7"))
+	removed2, err := s2.RemoveIDs(rk2, map[int64][]int{7: {2}})
 	if err != nil {
-		t.Fatalf("RemoveIDs count=2: %v", err)
+		t.Fatalf("RemoveIDs sel={7:{2}}: %v", err)
 	}
-	if len(removed2) != 2 || removed2[0].Text != "a" || removed2[1].Text != "b" {
-		t.Fatalf("removed = %+v, want both id-7 in file order [a,b]", removed2)
+	if len(removed2) != 1 || removed2[0].MessageID != 7 || removed2[0].Text != "second-7" {
+		t.Fatalf("removed = %+v, want exactly the SECOND id-7 (text second-7)", removed2)
 	}
-	if n, _ := s2.Pending(rk2); n != 0 {
-		t.Fatalf("pending after count=2 = %d, want 0", n)
+	got2, _ := s2.Peek(rk2, -1)
+	if len(got2) != 2 || got2[0].MessageID != 1 || got2[1].MessageID != 7 || got2[1].Text != "first-7" {
+		t.Fatalf("pending = %+v, want [msg1, first-7] (first occurrence KEPT)", got2)
+	}
+
+	// sel={7:{1,2}} → both occurrences, file order.
+	s3 := newStore(t)
+	rk3 := RouteKey{Channel: "telegram", ChatID: -100}
+	_ = s3.Append(rk3, msg(7, "a"))
+	_ = s3.Append(rk3, msg(7, "b"))
+	removed3, err := s3.RemoveIDs(rk3, map[int64][]int{7: {1, 2}})
+	if err != nil {
+		t.Fatalf("RemoveIDs sel={7:{1,2}}: %v", err)
+	}
+	if len(removed3) != 2 || removed3[0].Text != "a" || removed3[1].Text != "b" {
+		t.Fatalf("removed = %+v, want both id-7 in file order [a,b]", removed3)
+	}
+	if n, _ := s3.Pending(rk3); n != 0 {
+		t.Fatalf("pending after sel={7:{1,2}} = %d, want 0", n)
 	}
 }
 
@@ -273,7 +293,7 @@ func TestRemoveIDs_CorruptLineSteppedOver(t *testing.T) {
 	_ = s.Append(rk, msg(2, "m"))
 	_ = s.Append(rk, msg(3, "m"))
 
-	removed, err := s.RemoveIDs(rk, map[int64]int{2: 1})
+	removed, err := s.RemoveIDs(rk, map[int64][]int{2: {1}})
 	if err != nil {
 		t.Fatalf("RemoveIDs: %v", err)
 	}
@@ -327,7 +347,7 @@ func TestRemoveIDs_CursorRemapPreservesConsumed(t *testing.T) {
 
 	// Remove the pending msg3. rewrite() strips the corrupt line that sat BEFORE the
 	// cursor, so the cursor must be remapped (old .cur=3 → new .cur=2).
-	removed, err := s.RemoveIDs(rk, map[int64]int{3: 1})
+	removed, err := s.RemoveIDs(rk, map[int64][]int{3: {1}})
 	if err != nil {
 		t.Fatalf("RemoveIDs: %v", err)
 	}
@@ -360,7 +380,7 @@ func TestRemoveIDs_TrashSnapshotMatchesRemoved(t *testing.T) {
 	for i := int64(1); i <= 5; i++ {
 		_ = s.Append(rk, msg(i, "body-"+string(rune('0'+i))))
 	}
-	removed, err := s.RemoveIDs(rk, map[int64]int{2: 1, 4: 1})
+	removed, err := s.RemoveIDs(rk, map[int64][]int{2: {1}, 4: {1}})
 	if err != nil {
 		t.Fatalf("RemoveIDs: %v", err)
 	}
@@ -396,7 +416,7 @@ func TestRemoveIDs_MinMaxAgesRecompute(t *testing.T) {
 		t.Fatalf("NewestUnix = %d, want MAX %d (t1h)", st.NewestUnix, t1h.Unix())
 	}
 	// Remove the oldest line (id 3) → ages recompute over {t3h, t1h}.
-	if _, err := s.RemoveIDs(rk, map[int64]int{3: 1}); err != nil {
+	if _, err := s.RemoveIDs(rk, map[int64][]int{3: {1}}); err != nil {
 		t.Fatalf("RemoveIDs: %v", err)
 	}
 	st = s.StatusFor(rk)

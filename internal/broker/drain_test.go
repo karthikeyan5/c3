@@ -427,8 +427,8 @@ func TestDrain_CrashBetweenCopyAndRemove_ReissueConverges(t *testing.T) {
 
 // TestDrain_DuplicateMessageIDMultiset_MovesFirstOccurrenceOnly: a queue can
 // hold two lines with one MessageID (edited message re-dispatch, A2). Draining
-// 1 moves the FIRST occurrence and leaves the second — the frozen selection is
-// a multiset, not a set.
+// 1 moves the FIRST occurrence and leaves the second — the frozen selection
+// addresses occurrences (lines), not unique ids.
 func TestDrain_DuplicateMessageIDMultiset_MovesFirstOccurrenceOnly(t *testing.T) {
 	b, _ := drainTestBroker(t)
 	drainSeed(t, b, drainSrc(), drainSrcMsg(5, "original"), drainSrcMsg(5, "edited"))
@@ -447,6 +447,33 @@ func TestDrain_DuplicateMessageIDMultiset_MovesFirstOccurrenceOnly(t *testing.T)
 	dstGot := drainPeekAll(t, b, drainDst())
 	if len(dstGot) != 1 || !strings.HasSuffix(dstGot[0].Text, "\noriginal") {
 		t.Fatalf("the FIRST occurrence must be the moved one: %+v", dstGot)
+	}
+}
+
+// TestDrain_DuplicateMessageID_RangeSelectsLaterOccurrence: the wrong-line-
+// removal regression. Pending [ord1={id5,"orig"}, ord2={id7,"mid"},
+// ord3={id5,"edited"}] and a range selecting ONLY ordinal 3 must remove the
+// LATER id-5 occurrence ("edited") and KEEP ordinal 1 ("orig") — a per-id
+// count would have silently removed the first occurrence instead.
+func TestDrain_DuplicateMessageID_RangeSelectsLaterOccurrence(t *testing.T) {
+	b, _ := drainTestBroker(t)
+	drainSeed(t, b, drainSrc(), drainSrcMsg(5, "orig"), drainSrcMsg(7, "mid"), drainSrcMsg(5, "edited"))
+
+	res, err := b.Drain(drainSpec(DrainSelector{Kind: SelectRange, Lo: 3, Hi: 3}))
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if res.Requested != 1 || res.Appended != 1 || res.RemovedFromSource != 1 || res.AlreadyGone != 0 {
+		t.Fatalf("range drain counts wrong: %+v", res)
+	}
+	srcLeft := drainPeekAll(t, b, drainSrc())
+	if len(srcLeft) != 2 || srcLeft[0].MessageID != 5 || srcLeft[0].Text != "orig" ||
+		srcLeft[1].MessageID != 7 || srcLeft[1].Text != "mid" {
+		t.Fatalf("source must end [id5 orig, id7 mid] — ordinal 1 KEPT, ordinal 3 removed: %+v", srcLeft)
+	}
+	dstGot := drainPeekAll(t, b, drainDst())
+	if len(dstGot) != 1 || dstGot[0].MessageID != 5 || !strings.HasSuffix(dstGot[0].Text, "\nedited") {
+		t.Fatalf("the moved line must be the EDITED (later) occurrence: %+v", dstGot)
 	}
 }
 

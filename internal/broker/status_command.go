@@ -131,11 +131,20 @@ func (b *Broker) statusGlobal() string {
 	return sb.String()
 }
 
-// topicDisplayName looks up the topic's friendly name; falls back to "dm" or
-// "topic-<id>".
+// topicDisplayName looks up the topic's friendly name; falls back to "dm"
+// (the channel's configured DM chat only), "general" (a topicless GROUP route
+// — a forum group's General topic arrives with MessageThreadId 0 → TopicID
+// nil), or "topic-<id>". Labeling every nil-topic route "dm" collided a
+// group's General queue with the real DM in /queue and misdirected operators
+// to `/drain dm`; "general" is the same bare token resolveQueueRef accepts
+// in-group, so every surface that shows the label also teaches an addressable
+// name.
 func (b *Broker) topicDisplayName(channelName string, chatID int64, topicID *int64) string {
 	if topicID == nil {
-		return "dm"
+		if cc, ok := b.Mappings().Channels[channelName]; ok && cc.DMChatID != 0 && cc.DMChatID == chatID {
+			return "dm"
+		}
+		return "general"
 	}
 	if tp, ok := b.Mappings().LookupTopicByID(channelName, chatID, *topicID); ok && tp.Name != "" {
 		return tp.Name

@@ -252,10 +252,12 @@ type queueRef struct {
 
 // resolveQueueRef resolves one command token into a route per the pinned
 // grammar (B3): bare integer = serial from the scope's /queue index; `dm` = the
-// channel's DM route (A7: requires dm_chat_id); `name:<x>` forces name
-// interpretation (numeric-named topics); quoted tokens are always names; names
-// match case-insensitively within the B2 scope. Returns the reference or a
-// human reject message (exactly one is set).
+// channel's DM route (A7: requires dm_chat_id); `general` = the topicless
+// route of the CURRENT group (a forum group's General topic — rejected in DM
+// scope, where every group has one); `name:<x>` forces name interpretation
+// (numeric-named topics); quoted tokens are always names; names match
+// case-insensitively within the B2 scope. Returns the reference or a human
+// reject message (exactly one is set).
 func (b *Broker) resolveQueueRef(tok cmdToken, scope cmdScope, role refRole) (queueRef, string) {
 	raw := strings.TrimSpace(tok.text)
 	if raw == "" {
@@ -272,6 +274,16 @@ func (b *Broker) resolveQueueRef(tok cmdToken, scope cmdScope, role refRole) (qu
 				return queueRef{}, "⚠️ «dm» is operator-private — run that command in the DM instead"
 			}
 			return queueRef{key: RouteKey{Channel: scope.channel, ChatID: cc.DMChatID}, name: "dm"}, ""
+		}
+		if strings.EqualFold(raw, "general") {
+			// The topicless route of the CURRENT group — the label queueIndex /
+			// topicDisplayName renders for a forum group's General topic. From
+			// the DM there is no "current group" (every group has a General), so
+			// reject rather than guess (A7 posture).
+			if scope.dm {
+				return queueRef{}, "⚠️ «general» is ambiguous from the DM — every group has a General topic; use its serial from /queue, or run the command in that group"
+			}
+			return queueRef{key: RouteKey{Channel: scope.channel, ChatID: scope.chatID}, name: "general"}, ""
 		}
 		if isAllDigits(raw) {
 			rows := b.queueIndex(scope)
@@ -503,7 +515,11 @@ func (b *Broker) queueCommand(in *c3types.Inbound, rest string) (string, bool) {
 	if cerr != nil {
 		return "⚠️ channel unavailable: " + cerr.Error(), true
 	}
-	reply := c3types.ReplyArgs{Channel: in.Channel, ChatID: in.ChatID, TopicID: copyTopicPtr(in.TopicID), Markup: c3types.MarkupMarkdown}
+	// MarkupNone (security): the page interpolates attacker-controlled message
+	// bodies raw — "[Payroll login](https://evil)" must render as inert plain
+	// text, never a live link from the trusted bot (the markdown renderer does
+	// not honor backslash escapes, so escaping is not an option).
+	reply := c3types.ReplyArgs{Channel: in.Channel, ChatID: in.ChatID, TopicID: copyTopicPtr(in.TopicID), Markup: c3types.MarkupNone}
 	// A1: the peek is a worker round-trip (the source worker may be mid-STT for
 	// minutes) — run it off the poll goroutine and post the reply ourselves.
 	go func() {
@@ -731,7 +747,10 @@ func (b *Broker) drainCommand(in *c3types.Inbound, rest string) (string, bool) {
 		return "⚠️ channel unavailable: " + cerr.Error(), true
 	}
 	spec := DrainSpec{Source: src.key, Target: dst.key, SourceName: src.name, TargetName: dst.name, Selector: p.sel}
-	reply := c3types.ReplyArgs{Channel: in.Channel, ChatID: in.ChatID, TopicID: copyTopicPtr(in.TopicID), Markup: c3types.MarkupMarkdown}
+	// MarkupNone (security): the reply echoes operator-supplied names and the
+	// first-message preview (attacker-controlled body) — plain text keeps them
+	// inert (see queueCommand).
+	reply := c3types.ReplyArgs{Channel: in.Channel, ChatID: in.ChatID, TopicID: copyTopicPtr(in.TopicID), Markup: c3types.MarkupNone}
 	// A1: Broker.Drain blocks (B1: Steps B/C wait indefinitely on their durable
 	// mutations) — never on the poll goroutine.
 	go func() {
@@ -800,10 +819,10 @@ func renderDrainError(res *DrainResult, err error) string {
 	switch {
 	case errors.As(err, &rbp):
 		if rbp.Lo > rbp.Pending {
-			return fmt.Sprintf("⚠️ queue «%s» has only %d pending — range %d-%d starts past the end; try `all` or a range within 1-%d",
+			return fmt.Sprintf("⚠️ queue «%s» has only %d pending — range %d-%d starts past the end; try all or a range within 1-%d",
 				res.SourceName, rbp.Pending, rbp.Lo, rbp.Hi, rbp.Pending)
 		}
-		return fmt.Sprintf("⚠️ queue «%s» has %d pending — try %d-%d or `all`", res.SourceName, rbp.Pending, rbp.Lo, rbp.Pending)
+		return fmt.Sprintf("⚠️ queue «%s» has %d pending — try %d-%d or all", res.SourceName, rbp.Pending, rbp.Lo, rbp.Pending)
 	case errors.As(err, &badsel):
 		return "⚠️ " + badsel.Reason + " — " + drainGrammarHint
 	case errors.As(err, &empty):
