@@ -11,7 +11,7 @@ A plugin is a unit of code that subscribes to one or more **hooks** the broker e
 There are two delivery models:
 
 - **Compiled-in plugins (v1, today)** — Go packages under `internal/plugin/builtins/<name>/`, statically linked into the broker binary. Discovered at build time. The STT plugin is shipped this way.
-- **External subprocess plugins (v1.x roadmap)** — separate executables registered via a manifest under `~/.config/c3/plugins/<name>/`. Spoken to over a stdio JSON-RPC protocol. Allows plugins in any language without recompiling the broker.
+- **External subprocess plugins (roadmap)** — separate executables registered via a manifest under `~/.config/c3/plugins/<name>/`. Spoken to over a stdio JSON-RPC protocol. Allows plugins in any language without recompiling the broker.
 
 This guide covers compiled-in plugins. The subprocess-plugin protocol is documented at the end with a note that it's not implemented in v1.
 

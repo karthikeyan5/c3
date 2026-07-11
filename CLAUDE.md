@@ -4,7 +4,7 @@
 
 1. Read `README.md` — what C3 is and the architecture.
 2. Read `ROADMAP.md` — future/unbuilt work (what's next after v1).
-3. Read `TODO.md` — the v1 finish-line checklist.
+3. Read `TODO.md` — the v0.1 finish-line checklist.
 4. Read `DECISIONS.md` — all decisions made so far.
 
 ## The Short Version
@@ -25,7 +25,7 @@ claude --dangerously-load-development-channels plugin:c3@c3
 (or the same with `--resume` / `--resume <id>` appended)
 
 A plain `claude` leaves the c3 channel notifications enabled at the broker
-but not rendered live in the session. As of v1 this no longer means silent
+but not rendered live in the session. As of v0.1 this no longer means silent
 loss: the adapter detects a host that can't render and the broker **holds
 those messages in the durable queue** (a held-notice fires in the topic; the
 agent recovers them with `fetch_queue`) while the session keeps its claim for

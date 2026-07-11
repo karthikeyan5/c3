@@ -1,6 +1,6 @@
 # C3 — Roadmap
 
-What's next for C3 after v1. Everything here is future or unbuilt; shipped work is in git history. One line per item — details land in the design when each is built.
+What's next for C3 after v0.1. Everything here is future or unbuilt; shipped work is in git history. One line per item — details land in the design when each is built.
 
 ## Interactive & trust
 

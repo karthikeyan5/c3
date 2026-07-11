@@ -116,9 +116,9 @@ What to look for, in order:
 
 ### "Broker says delivered but Claude Code doesn't show the message"
 
-**First, the flagless case (v1).** If this session was launched without
+**First, the flagless case (v0.1).** If this session was launched without
 `--dangerously-load-development-channels plugin:c3@c3`, it can't render
-`<channel>` blocks at all. As of v1 the adapter detects a host that can't
+`<channel>` blocks at all. As of v0.1 the adapter detects a host that can't
 render (a lightweight ancestor-process check) and reports it at hello, so
 the broker **holds** that session's inbound in the durable queue instead of
 dropping it — a held-notice fires in the topic, the broker log shows

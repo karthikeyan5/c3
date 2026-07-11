@@ -67,7 +67,7 @@ C3 ships seven Go binaries:
 verify it, and install the binaries into a directory on your `PATH`:
 
 ```bash
-VERSION=v1.0.0
+VERSION=v0.1.0
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m); [ "$ARCH" = x86_64 ] && ARCH=amd64; [ "$ARCH" = aarch64 ] && ARCH=arm64
 base="https://github.com/karthikeyan5/c3/releases/download/$VERSION"
@@ -165,7 +165,7 @@ claude --dangerously-load-development-channels plugin:c3@c3
 The plain `claude` command keeps `allowedChannelPlugins` enabled but
 also gates local-marketplace plugins behind the dev flag, so the c3
 adapter's `notifications/claude/channel` frames don't render live in that
-session. As of v1 they're not lost either — C3 detects a session that
+session. As of v0.1 they're not lost either — C3 detects a session that
 can't render and holds inbound in the durable queue (a held-notice fires
 in the topic; recover with `fetch_queue`); relaunch with the flag for live
 rendering. The official-marketplace plugin distribution flow doesn't need
@@ -186,7 +186,7 @@ c3-broker install-claude-shim
 The shim is a tiny launcher symlinked at `~/.local/bin/claude` that
 transparently adds `--dangerously-load-development-channels plugin:c3@c3`
 to every `claude` invocation. Without it you type the long flag form by
-hand on every session start — easy to forget, which is why v1 holds
+hand on every session start — easy to forget, which is why v0.1 holds
 flagless inbound in the durable queue instead of dropping it (the shim
 still saves you the missed-live-rendering papercut).
 

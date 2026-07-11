@@ -53,7 +53,7 @@ Typed directly in Telegram, not agent tools. The channel intercepts them
 broker answers directly — a bot command is never queued or routed to an
 agent. Registered via `setMyCommands` so they autocomplete in Telegram's `/`
 menu (menu hint only). Commands inside media captions are **not** intercepted
-(the attachment would be swallowed); command-in-caption is unsupported in v1.
+(the attachment would be swallowed); command-in-caption is unsupported in v0.1.
 
 | Command | Cleared for | What it does |
 |---|---|---|

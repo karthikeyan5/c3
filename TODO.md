@@ -1,6 +1,6 @@
-# TODO — C3 v1 release
+# TODO — C3 v0.1 release
 
-The v1 finish line. The multiplexer, topic routing, durable queue, and
+The v0.1 finish line. The multiplexer, topic routing, durable queue, and
 cross-CLI core already ship — this is what's left before the public push.
 Future/unbuilt work lives in [`ROADMAP.md`](ROADMAP.md); shipped history is
 in git.
@@ -16,7 +16,7 @@ in git.
 - [x] COMMANDS.md: complete the verb/tool tables; resolve the Codex rows
 - [x] DEBUGGING.md: `c3-ping.md` → `ping.md`; scrub personal names
 - [x] USAGE.md / INSTALL.md: genericize examples; describe the STT chain honestly
-- [x] Bump `plugins/c3/.claude-plugin/plugin.json` to `1.0.0`
+- [x] Bump `plugins/c3/.claude-plugin/plugin.json` to `0.1.0`
 
 ## Release gates
 
@@ -46,7 +46,7 @@ Open — minor / deferred:
 
 ## Packaging
 
-- [ ] Prebuilt binaries (Linux + macOS, amd64/arm64) — may slip to v1.1
+- [ ] Prebuilt binaries (Linux + macOS, amd64/arm64) — may slip to a later release
 - [ ] GitHub-source marketplace edit — paired with prebuilt binaries
 - [x] Auto-update system: always-on status-line update notice + `/c3:update` / `c3-broker update` (checksum-verified atomic swap) + opt-in `auto_update` toggle (broker self-updates and restartlessly bounces). Binaries carry a build version via `-ldflags -X`. Needs one live end-to-end verify once the first GitHub release exists.
 

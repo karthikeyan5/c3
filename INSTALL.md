@@ -44,7 +44,7 @@ the user's platform.
 **Prebuilt (default).** Download, verify, and install into `~/.local/bin`:
 
 ```bash
-VERSION=v1.0.0
+VERSION=v0.1.0
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m); [ "$ARCH" = x86_64 ] && ARCH=amd64; [ "$ARCH" = aarch64 ] && ARCH=arm64
 base="https://github.com/karthikeyan5/c3/releases/download/$VERSION"

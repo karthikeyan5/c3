@@ -1,6 +1,6 @@
 # Writing C3 Channels
 
-A C3 channel is a transport — the thing that carries messages between users and the broker. Telegram is the v1 channel. The architecture admits more (web chat with magic-link sessions, voice mode, IRC, Slack, Matrix); each one is a Go package implementing a small interface.
+A C3 channel is a transport — the thing that carries messages between users and the broker. Telegram is the v0.1 channel. The architecture admits more (web chat with magic-link sessions, voice mode, IRC, Slack, Matrix); each one is a Go package implementing a small interface.
 
 Channels are not plugins. Plugins extend the broker with capabilities orthogonal to transport (transcription, summarization, OCR). Channels move bytes. If you're adding "Slack support" you want a channel; if you're adding "auto-translate every inbound" you want a plugin.
 
@@ -150,9 +150,9 @@ The broker writes the ambient connectivity state to `$XDG_STATE_HOME/c3/health.j
 {
   "broker_pid": 12345,
   "written_unix": 1718722725,
-  "version": "v1.0.0",
+  "version": "v0.1.0",
   "update_available": true,
-  "latest_version": "v1.1.0",
+  "latest_version": "v0.2.0",
   "channels": {
     "telegram": {
       "state": "down",
@@ -232,7 +232,7 @@ For Telegram specifically, mock at the `gotgbot` boundary: don't hit the real Bo
 
 The Telegram channel implementation lives at `internal/channel/telegram/`. Key things it does that future channels may want to reference:
 
-- **Long-polling getUpdates loop** with `allowed_updates` opt-in for `message`, `edited_message`, `callback_query`, `message_reaction`. Service-message types (`forum_topic_created`/`forum_topic_edited`/etc) are received but ignored in v1 — plumbed for future use.
+- **Long-polling getUpdates loop** with `allowed_updates` opt-in for `message`, `edited_message`, `callback_query`, `message_reaction`. Service-message types (`forum_topic_created`/`forum_topic_edited`/etc) are received but ignored in v0.1 — plumbed for future use.
 - **General topic id is `1`, not `0`.** A common confusion — topic_id 0 means "no topic" (DM, non-forum group); General is a real topic with id 1.
 - **Bot API has no `getForumTopics`.** The local `topics` registry under `mappings.json:channels.telegram.topics` is the source of truth. Topics are added when a session attaches and creates one (or claims an explicit topic_id), never opportunistically from inbound traffic.
 - **Reply threading**: when an inbound has `reply_to_message`, the channel populates `ReplyContext` with `MessageID`, `User`, `Text`. The Claude adapter renders this as `<channel reply_to_message_id="..." reply_to_text="...">` attributes.
