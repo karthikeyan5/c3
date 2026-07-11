@@ -108,6 +108,13 @@ Type `/status` directly into a Telegram chat (it autocompletes in the `/` menu) 
   1 attached · 1 idle
   ```
 
+Two sibling bot commands manage the **pooled queues** (messages accumulating
+on unattached topics): `/queue` lists every non-empty queue (`[serial] name ·
+pending · oldest · newest` — metadata only), and the operator-only
+`/queue <name>` / `/drain <src> <sel> [to <t>]` peek and move queued messages
+between topics. Full grammar and the authorization matrix:
+[`COMMANDS.md`](COMMANDS.md) "Telegram bot commands".
+
 ### Limits
 
 - Per-route cap: **1000 messages OR 14 days**, whichever comes first. On overflow the oldest held messages are dropped, logged to `broker.log`, **and** announced in the topic (*"⚠️ queue full — dropped N oldest held message(s); attach a session soon."*) — never a silent truncation.

@@ -31,7 +31,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"strings"
 	"sync"
 	"time"
 
@@ -547,21 +546,11 @@ func drainBanner(srcName string, in *c3types.Inbound) string {
 const drainPreviewMax = 64
 
 // drainPreview renders a short single-line preview of a captured line for the
-// reply echo. Newlines collapse to spaces; over-long text truncates on a rune
-// boundary; a text-less media line names its attachment kind.
+// reply echo (newlines collapse, rune-safe truncation, media-kind fallback).
+// Delegates to previewLine (queue_command.go), which the /queue <q> render
+// shares — one preview shape everywhere.
 func drainPreview(in *c3types.Inbound) string {
-	text := strings.TrimSpace(strings.ReplaceAll(in.Text, "\n", " "))
-	if text == "" {
-		if len(in.Attachments) > 0 {
-			return "(" + in.Attachments[0].Kind + ")"
-		}
-		return "(no text)"
-	}
-	r := []rune(text)
-	if len(r) > drainPreviewMax {
-		return string(r[:drainPreviewMax]) + "…"
-	}
-	return text
+	return previewLine(in, drainPreviewMax)
 }
 
 // drainDisplayName prefers the resolved human name, falling back to the

@@ -24,6 +24,11 @@ type fakeHost struct {
 	// normally.
 	cmdHandled bool
 
+	// cmdFn, when set, overrides HandleCommand's canned behavior entirely —
+	// used by the broker-command intercept tests to simulate the silent-drop
+	// ("", true) and async ("", true) replies without a real broker.
+	cmdFn func(*c3types.Inbound) (string, bool)
+
 	// emitDrops makes Emit return false (the worker-queue-full / stopped DROP
 	// case) so the I4 stranded-update test can drive the drop branch. Default
 	// false ⇒ Emit accepts (returns true), matching the steady-state path.
@@ -63,7 +68,11 @@ func (h *fakeHost) GateInbound(in *c3types.Inbound) channel.GateInboundDecision 
 func (h *fakeHost) HandleCommand(in *c3types.Inbound) (string, bool) {
 	h.mu.Lock()
 	h.cmdCalled = true
+	fn := h.cmdFn
 	h.mu.Unlock()
+	if fn != nil {
+		return fn(in)
+	}
 	if h.cmdHandled && in != nil && in.Text == "/status" {
 		return "📊 ok", true
 	}

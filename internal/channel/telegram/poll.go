@@ -957,21 +957,31 @@ func reactionTypeString(r gotgbot.ReactionType) string {
 	}
 }
 
-// isStatusCommand reports whether text is the "/status" bot command (optionally
-// "/status@<botname>"), case-insensitive, after trimming. It must be an exact
-// command token — "/statusly" and "please /status" are NOT matched.
-func (c *Channel) isStatusCommand(text string) bool {
+// isBrokerCommand reports whether text is a broker-owned bot command —
+// "/status", "/queue" or "/drain" — optionally "@<botname>"-suffixed,
+// case-insensitive, after trimming. Only the FIRST token decides (and the
+// "@botname" strip applies to that token ONLY — amendment A5: truncating at
+// the first '@' anywhere would amputate /drain arguments containing '@').
+// "/statusly" and "please /status" are NOT matched; "/drain genie all" is.
+// The broker's HandleCommand does the real parsing — a matched-but-malformed
+// command it declines ("", false) falls through to normal routing.
+func (c *Channel) isBrokerCommand(text string) bool {
 	t := strings.TrimSpace(text)
-	if i := strings.IndexByte(t, '@'); i >= 0 {
+	if i := strings.IndexAny(t, " \t\n\r"); i >= 0 {
 		t = t[:i]
 	}
-	return strings.EqualFold(t, "/status")
+	if i := strings.IndexByte(t, '@'); i >= 0 { // A5: first token only
+		t = t[:i]
+	}
+	return strings.EqualFold(t, "/status") ||
+		strings.EqualFold(t, "/queue") ||
+		strings.EqualFold(t, "/drain")
 }
 
 // markUpdateDone marks an update done in the persisted-offset tracker for every
 // NON-persist outcome (gated, dropped, non-message, pair-consumed, dedup-skip,
-// /status). Nil-safe so the early-build paths and tests that leave offTrk unset
-// (the conflict/resilience suites) are no-ops.
+// broker commands /status //queue //drain). Nil-safe so the early-build paths
+// and tests that leave offTrk unset (the conflict/resilience suites) are no-ops.
 func (c *Channel) markUpdateDone(updateID int64) {
 	if c.offTrk != nil {
 		c.offTrk.MarkDone(updateID)
@@ -1073,22 +1083,33 @@ func (c *Channel) dispatchMessage(updateID int64, msg *gotgbot.Message, edited b
 		return
 	}
 	// Gate ALLOWED (allowlisted sender). Broker-owned command intercept: a
-	// "/status" inbound from an allowlisted sender is handled by the broker
-	// directly (it answers + is NEVER queued or routed to an agent). It is
-	// intercepted AFTER the gate (I-SEC) so a stranger can never reach it. Other
-	// commands fall through to normal routing.
-	if c.isStatusCommand(in.Text) {
+	// "/status", "/queue" or "/drain" inbound from an allowlisted sender is
+	// handled by the broker directly (it answers + is NEVER queued or routed to
+	// an agent). It is intercepted AFTER the gate (I-SEC) so a stranger can
+	// never reach it. Other commands fall through to normal routing.
+	//
+	// A6: the intercept fires only for attachment-free messages — convertInbound
+	// puts media CAPTIONS into in.Text, and a handled caption would silently
+	// swallow the attachment (command-in-caption is unsupported in v1).
+	//
+	// Empty-reply skip: handled with reply == "" means there is NOTHING to send
+	// — either an operator-gated command silently dropped for a non-operator
+	// (INV-7: zero bytes back, no hint the command exists) or an async command
+	// (/drain, /queue <q>) that posts its own reply from a broker goroutine
+	// (A1). The update is still marked done either way.
+	if len(in.Attachments) == 0 && c.isBrokerCommand(in.Text) {
 		if reply, handled := c.host.HandleCommand(in); handled {
-			if _, err := c.SendReply(c3types.ReplyArgs{
+			if reply == "" {
+				c.host.Logf("telegram: command handled silently update=%d chat=%d thread=%d (async or denied; not routed)",
+					updateID, msg.Chat.Id, msg.MessageThreadId)
+			} else if _, err := c.SendReply(c3types.ReplyArgs{
 				Channel: c.Name(), ChatID: in.ChatID, TopicID: in.TopicID, Text: reply,
 				Markup: c3types.MarkupMarkdown,
 			}); err != nil {
-				c.host.Logf("telegram: /status reply send failed update=%d chat=%d: %v", updateID, in.ChatID, err)
+				c.host.Logf("telegram: command reply send failed update=%d chat=%d: %v", updateID, in.ChatID, err)
 			} else {
-				c.host.Logf("telegram: /status reply sent update=%d chat=%d thread=%d", updateID, in.ChatID, msg.MessageThreadId)
+				c.host.Logf("telegram: command reply sent update=%d chat=%d thread=%d (not routed)", updateID, in.ChatID, msg.MessageThreadId)
 			}
-			c.host.Logf("telegram: /status handled update=%d chat=%d thread=%d (not routed)",
-				updateID, msg.Chat.Id, msg.MessageThreadId)
 			// Handled, never persisted — unblock the offset over this update.
 			c.markUpdateDone(updateID)
 			return

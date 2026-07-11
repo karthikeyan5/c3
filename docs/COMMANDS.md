@@ -46,6 +46,47 @@ Beyond `attach` / `detach` / `topics`, the adapters expose a set of message and 
 
 Codex is at parity on the message/queue tools and lacks only `ask` (and `detach`, above). Grok matches that message/queue set **and** has `detach`; live inbound inject requires leader mode (`[cli] use_leader = true`) — see [`GROK-INJECT.md`](GROK-INJECT.md). The permission relay is Claude Code only.
 
+## Telegram bot commands (human-typed, broker-owned)
+
+Typed directly in Telegram, not agent tools. The channel intercepts them
+**after** the allowlist gate (strangers get silence, never a reply) and the
+broker answers directly — a bot command is never queued or routed to an
+agent. Registered via `setMyCommands` so they autocomplete in Telegram's `/`
+menu (menu hint only). Commands inside media captions are **not** intercepted
+(the attachment would be swallowed); command-in-caption is unsupported in v1.
+
+| Command | Cleared for | What it does |
+|---|---|---|
+| `/status` | any allowlisted sender | In a topic: that topic's queue depth + attach state. In DM/General: broker-wide summary. |
+| `/queue` | any allowlisted sender | Index of non-empty pooled queues: `[serial] name · pending · oldest · newest`. **Metadata only — no message content, no kind counts.** In a group it lists only that group's queues; in the DM it lists everything. |
+| `/queue <q> [start]` | **operators only** (DM-allowlisted user id); everyone else gets a silent drop | One queue's messages: oldest-first ordinals, kind icon + preview + sender + age, 25 per page (`/queue <q> 26` pages on). |
+| `/drain <src> <sel> [to <t>]` | **operators only**; silent drop otherwise | Move the selected pending messages from `<src>` into `<t>` (default: the topic the command was typed in). Loss-free: fsync'd copy into the target **before** the atomic remove from the source; removed lines are also snapshotted to `.trash/` (14-day retention). The reply echoes the resolved names, the ordinal window, a first-message preview, and the target's new total. |
+
+Grammar (shared by `<q>`, `<src>`, `<t>`):
+
+- **Reference forms**: a topic **name** (case-insensitive; quote it if it has
+  spaces: `"my project"`), a **serial** from the latest `/queue` (a bare
+  integer is *always* a serial), `name:<n>` for a topic literally named with
+  digits, or `dm` for the DM route (requires `dm_chat_id`; from a group, `dm`
+  is target-only — its content is operator-private).
+- **Selectors**: `all` · `first N` · `N` (= `first N`; clamps to what's
+  pending) · `N-M` / `N..M` / `N to M` (inclusive ordinals, **1 = oldest**; an
+  explicit range past the queue rejects with the actual count).
+- **Target split**: the target is everything after the *last unquoted* ` to `.
+  When the whole tail already reads as a complete selector (`/drain genie 6 to
+  10`), it is the **range** and the target defaults — combine a range with a
+  target as `6-10 to <t>`.
+- **Scoping**: typed in a group, names and serials resolve only within that
+  group ("in another group — run /queue there"); typed in the DM they resolve
+  across everything. Ambiguous names (several groups share it) always reject.
+- **Friction instead of a confirm card**: `all`-drains and cross-chat drains
+  must address the source by NAME — a serial reference rejects with the
+  resolved name to paste back.
+
+All of this is a thin parser over `Broker.Drain` (`internal/broker/drain.go`)
+— any future MCP verb or confirm card reuses the same core ("implemented
+once").
+
 ## attach — the parser (lives in the broker)
 
 `AttachReq.Expr` is a single user-supplied string. The broker's

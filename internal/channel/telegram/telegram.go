@@ -362,9 +362,10 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 	// on its first successful getMe.
 	host.Logf("telegram: started (token-check deferred; identity confirmed on first successful call)")
 
-	// Register the /status bot command so it autocompletes in Telegram's "/"
-	// menu. Best-effort: a failure here never blocks Start (the command still
-	// works when typed; only the menu hint is missing).
+	// Register the broker-owned bot commands so they autocomplete in Telegram's
+	// "/" menu (A8: menu hint only — the poll intercept needs no registration).
+	// Best-effort: a failure here never blocks Start (the commands still work
+	// when typed; only the menu hint is missing).
 	go func() {
 		// Pass nil opts, NOT &SetMyCommandsOpts{}. gotgbot's SetMyCommands does
 		// `v["scope"] = opts.Scope` unconditionally whenever opts != nil, so an
@@ -372,10 +373,14 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 		// BotCommandScope: BotCommandScope must be an Object". nil opts omits the
 		// scope param entirely, so Telegram applies the default scope (what we want).
 		if _, err := c.bot.SetMyCommands(
-			[]gotgbot.BotCommand{{Command: "status", Description: "Show C3 broker + queue status"}},
+			[]gotgbot.BotCommand{
+				{Command: "status", Description: "Show C3 broker + queue status"},
+				{Command: "queue", Description: "List pooled queues · /queue <name> peeks one (operator)"},
+				{Command: "drain", Description: "Move queued messages to a topic (operator)"},
+			},
 			nil,
 		); err != nil {
-			c.host.Logf("telegram: setMyCommands(/status) failed (non-fatal): %v", err)
+			c.host.Logf("telegram: setMyCommands(/status,/queue,/drain) failed (non-fatal): %v", err)
 		}
 	}()
 
