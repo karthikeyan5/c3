@@ -17,6 +17,11 @@ What's next for C3 after v1. Everything here is future or unbuilt; shipped work 
 - Inter-agent messaging — one agent can message another's channel (rate-limited).
 - Stream the agent's reasoning to the channel.
 - Be the phone surface for session managers (Claude Squad, CCManager, Conductor, …).
+- A generic ACP-client adapter — one code path that spawns and drives any
+  Agent-Client-Protocol agent (`session/prompt` in, `session/update` out,
+  `session/request_permission` relayed to the channel).
+- Consider migrating the Grok adapter's inject path from the leader socket (an
+  undocumented internal surface) to the documented ACP `grok agent stdio` protocol.
 
 ## More channels
 
