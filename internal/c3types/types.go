@@ -36,6 +36,15 @@ type Inbound struct {
 	// Event carries the channel-neutral payload for a non-message Kind. Nil for
 	// an ordinary message.
 	Event *InboundEvent `json:",omitempty"`
+
+	// DrainedFrom is the canonical numeric route key of the immediate prior hop
+	// when this line was moved into its current queue by a drain; empty for
+	// organic messages. It keeps drain provenance machine-readable (beyond the
+	// human banner baked into Text) and, being keyed on numeric chat/topic ids,
+	// survives topic renames. The omitempty tag mirrors Kind/Event: an empty
+	// DrainedFrom is omitted so every pre-drain marshal stays byte-identical, and
+	// an old JSONL line without the field unmarshals to "" (zero migration).
+	DrainedFrom string `json:",omitempty"`
 }
 
 // IsEvent reports whether this inbound is a synthesized channel event (poll

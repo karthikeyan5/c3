@@ -17,11 +17,16 @@ import (
 	"github.com/karthikeyan5/c3/internal/c3types"
 )
 
-// Status is a per-route snapshot for /status. Pending is lines after the cursor;
-// OldestUnix is the timestamp of the oldest pending line (0 when empty).
+// Status is a per-route snapshot for /status and /queue. Pending is lines after
+// the cursor; OldestUnix and NewestUnix are the MIN and MAX timestamps over the
+// PENDING lines (0 when empty). They are NOT head/tail positional (B5): a
+// drained-in line carries its original timestamp and lands at the tail, so a
+// positional "oldest = head" would misreport — MIN/MAX read correctly regardless
+// of file position.
 type Status struct {
 	Pending    int
 	OldestUnix int64
+	NewestUnix int64
 }
 
 // Store owns the queue directory. It is single-owner per route (the broker
@@ -240,18 +245,38 @@ func (s *Store) Consume(rk RouteKey, n int) ([]c3types.Inbound, error) {
 	return out, nil
 }
 
-// Pending returns the count of pending messages and the oldest pending
+// Pending returns the count of pending messages and the oldest (MIN) pending
 // timestamp (zero time when empty).
 func (s *Store) Pending(rk RouteKey) (int, time.Time) {
+	n, oldest, _ := s.pendingStats(rk)
+	return n, oldest
+}
+
+// pendingStats returns the pending count plus the MIN and MAX pending timestamps
+// (both zero time when empty) from ONE readLines scan — the shared source for
+// Pending (MIN) and refreshIndex (MIN + MAX). Ages are MIN/MAX over the pending
+// set, NOT head/tail positional (B5), so a drained-in line whose original
+// timestamp lands at the tail is still reflected. Zero-timestamp lines (synthetic
+// / unset) are ignored so a stray one never drags MIN to the epoch — mirroring
+// oldestSuffix's Unix<=0 guard.
+func (s *Store) pendingStats(rk RouteKey) (n int, oldest, newest time.Time) {
 	lines, cursor, err := s.readLines(rk)
 	if err != nil {
-		return 0, time.Time{}
+		return 0, time.Time{}, time.Time{}
 	}
 	pending := pendingFrom(lines, cursor)
-	if len(pending) == 0 {
-		return 0, time.Time{}
+	for _, in := range pending {
+		if in.Timestamp.IsZero() {
+			continue
+		}
+		if oldest.IsZero() || in.Timestamp.Before(oldest) {
+			oldest = in.Timestamp
+		}
+		if newest.IsZero() || in.Timestamp.After(newest) {
+			newest = in.Timestamp
+		}
 	}
-	return len(pending), pending[0].Timestamp
+	return len(pending), oldest, newest
 }
 
 // StatusFor returns the single-route snapshot from the in-memory status index
@@ -410,6 +435,11 @@ func (s *Store) RefreshText(rk RouteKey, messageID int64, newText string) (bool,
 	// Find the matching message among the still-pending (cursor-onward) real lines.
 	found := false
 	for idx := cursorReal; idx < len(real); idx++ {
+		// B7: drained-in copies keep frozen text; organic STT refresh (matched by
+		// per-chat MessageID) must never hit a moved line that collides on id.
+		if real[idx].DrainedFrom != "" {
+			continue
+		}
 		if real[idx].MessageID == messageID {
 			real[idx].Text = newText
 			found = true
@@ -435,6 +465,100 @@ func (s *Store) RefreshText(rk RouteKey, messageID int64, newText string) (bool,
 	}
 	s.refreshIndex(rk)
 	return true, nil
+}
+
+// RemoveIDs removes, from the PENDING region of the route's file, at most
+// counts[id] occurrences per MessageID, first-occurrences-first in file order,
+// and returns the removed records in that same order. It is the non-prefix
+// companion to Consume (which can only advance the single cursor past an oldest
+// prefix, store.go Consume): a drain of "6-10 leaving 1-5" is a mid-range removal
+// Consume cannot express.
+//
+// Selection is a frozen MULTISET, not a set (amendment A2): a queue can
+// legitimately hold two lines with one MessageID — an edited message re-
+// dispatches with the SAME id — so counts is a per-id occurrence BUDGET. Each
+// pending line whose id still has budget is removed (budget--); the rest are
+// kept. First-occurrences-first falls out of the in-order walk: counts[id]=1 over
+// two same-id lines takes the FIRST and leaves the second. Ids absent from
+// pending (or with no remaining budget) are skipped silently and simply not in
+// the returned slice, so a crash-retry re-issue converges (idempotent).
+//
+// It reuses the proven composite (same internals as EvictOverCap/RefreshText):
+// readLines + cursor projection → partition pending by counted id → snapshotDropped
+// the removed lines to .trash/ (recoverable for TrashTTL, INV-4) BEFORE the atomic
+// rewrite (tmp → fsync → rename → dir-fsync) → cursor remap → retirePair when the
+// pending region empties → refreshIndex. Only lines AT/AFTER the cursor are
+// eligible; the consumed (pre-cursor) region is preserved. Corrupt placeholder
+// lines are stepped over — never removed, never counted in the walk. A call that
+// matches nothing mutates no file (idempotent no-op).
+func (s *Store) RemoveIDs(rk RouteKey, counts map[int64]int) (removed []c3types.Inbound, err error) {
+	if len(counts) == 0 {
+		return nil, nil // nothing requested — clean no-op, no file I/O
+	}
+	lines, cursor, err := s.readLines(rk)
+	if err != nil || len(lines) == 0 {
+		return nil, err
+	}
+	// Project lines→real (corrupt-free) and map the cursor into that index space,
+	// mirroring RefreshText/EvictOverCap so a rewrite that drops corrupt lines does
+	// not desync the cursor from the rewritten file.
+	real := make([]c3types.Inbound, 0, len(lines))
+	cursorReal := 0
+	for i, in := range lines {
+		if in.Channel == corruptSentinel {
+			continue
+		}
+		if i < cursor {
+			cursorReal++
+		}
+		real = append(real, in)
+	}
+	// Work off a COPY of the per-id budget so the caller's frozen multiset is never
+	// mutated (phase 2 reuses it across the append presence-check and this remove).
+	remaining := make(map[int64]int, len(counts))
+	for id, c := range counts {
+		remaining[id] = c
+	}
+	// Walk the still-pending (cursor-onward) real lines in file order, partitioning
+	// into removed (id still has budget; decrement) vs kept. The consumed region
+	// (real[:cursorReal]) is preserved verbatim.
+	kept := make([]c3types.Inbound, 0, len(real))
+	kept = append(kept, real[:cursorReal]...)
+	for idx := cursorReal; idx < len(real); idx++ {
+		in := real[idx]
+		if remaining[in.MessageID] > 0 {
+			remaining[in.MessageID]--
+			removed = append(removed, in)
+			continue
+		}
+		kept = append(kept, in)
+	}
+	if len(removed) == 0 {
+		return nil, nil // no pending line matched — mutate nothing (idempotent)
+	}
+	// Snapshot the removed lines into .trash/ BEFORE the live rewrite discards them,
+	// so a wrong-source/wrong-range drain stays recoverable for TrashTTL (INV-4). A
+	// snapshot failure returns before the rewrite, so the live queue is untouched
+	// (fail-toward-keeping); a crash between snapshot and rewrite leaves the lines in
+	// both places — a harmless duplicate GC'd later.
+	if err := s.snapshotDropped(rk, removed); err != nil {
+		return nil, err
+	}
+	if err := s.rewrite(rk, kept); err != nil {
+		return nil, err
+	}
+	// The consumed region is unchanged, so the new cursor is cursorReal (the count of
+	// consumed real lines). rewrite() stripped any corrupt lines, so the .cur must be
+	// persisted into the corrupt-free coordinate space regardless of its old value.
+	if cursorReal >= len(kept) {
+		if err := s.retirePair(rk); err != nil {
+			return nil, err
+		}
+	} else if err := s.writeCursor(rk, cursorReal); err != nil {
+		return nil, err
+	}
+	s.refreshIndex(rk)
+	return removed, nil
 }
 
 // RecoverOnStartup scans the queue dir and rebuilds the status index. A route
@@ -816,7 +940,8 @@ func (s *Store) sweepTrashCaps(now time.Time, ttl time.Duration, maxBytes int64,
 	}
 }
 
-// rewrite atomically replaces the jsonl with the given lines (cap valve only).
+// rewrite atomically replaces the jsonl with the given lines (the cap valve
+// EvictOverCap, the STT-fix RefreshText, and the drain primitive RemoveIDs).
 func (s *Store) rewrite(rk RouteKey, lines []c3types.Inbound) error {
 	tmp := s.jsonlPath(rk) + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
@@ -860,9 +985,14 @@ func (s *Store) rewrite(rk RouteKey, lines []c3types.Inbound) error {
 	return nil
 }
 
-// refreshIndex recomputes the cheap status counters for one route.
+// refreshIndex recomputes the cheap status counters for one route (Pending +
+// MIN/MAX pending ages). Every mutation path funnels through here (Append,
+// Consume, EvictOverCap, RefreshText, RemoveIDs, RecoverOnStartup) and this is
+// the ONLY writer of the index, so a full MIN/MAX recompute here keeps NewestUnix
+// correct everywhere with no extra rescan — the pendingStats scan replaces the
+// Pending scan this already did.
 func (s *Store) refreshIndex(rk RouteKey) {
-	n, oldest := s.Pending(rk)
+	n, oldest, newest := s.pendingStats(rk)
 	key := rk.File()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -870,7 +1000,7 @@ func (s *Store) refreshIndex(rk RouteKey) {
 		delete(s.idx, key)
 		return
 	}
-	s.idx[key] = Status{Pending: n, OldestUnix: oldest.Unix()}
+	s.idx[key] = Status{Pending: n, OldestUnix: oldest.Unix(), NewestUnix: newest.Unix()}
 }
 
 // parseRouteFile reverses RouteKey.File(): "<channel>__<chat>__<topic|none>".
