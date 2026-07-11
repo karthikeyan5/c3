@@ -33,10 +33,10 @@ func (a *adapter) trySessionRecover(ctx context.Context) {
 // leader.sessionID is written under leader.mu everywhere (connectLocked,
 // fireRecover, bindSessionIDForAttach), so the read takes the same mutex: an
 // unlocked read of a Go string racing those writers is a torn-read data race
-// (pointer/length pair). May block briefly behind an in-flight Inject (which
-// holds leader.mu); every caller runs on its own goroutine (trySessionRecover,
-// the MCP attach handler, refireRecoverOnReconnect's goroutine) — never on
-// brokerReader — so a stall never blocks inbound dispatch.
+// (pointer/length pair). leader.mu guards field state only (I/O runs under
+// leader.ioMu), so this never waits behind an in-flight Inject's socket I/O;
+// every caller runs on its own goroutine (trySessionRecover, the MCP attach
+// handler, refireRecoverOnReconnect's goroutine) — never on brokerReader.
 func (a *adapter) stableSessionID() string {
 	if a.leader != nil {
 		a.leader.mu.Lock()

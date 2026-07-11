@@ -103,25 +103,29 @@ func startFakeLeader(t *testing.T) (sockPath string, prompts *[]string, cleanup 
 					"jsonrpc": "2.0", "id": id, "result": map[string]any{"sessionId": "sess-test"},
 				})})
 			case "session/prompt":
+				text := ""
 				params, _ := acp["params"].(map[string]any)
-				prompt, _ := params["prompt"].([]any)
-				if len(prompt) > 0 {
+				if prompt, ok := params["prompt"].([]any); ok && len(prompt) > 0 {
 					if block, ok := prompt[0].(map[string]any); ok {
-						if text, ok := block["text"].(string); ok {
-							mu.Lock()
-							got = append(got, text)
-							mu.Unlock()
-						}
+						text, _ = block["text"].(string)
 					}
 				}
-				// Land user message first (adapter acks C3 here), then finish turn.
+				if text != "" {
+					mu.Lock()
+					got = append(got, text)
+					mu.Unlock()
+				}
+				// Land user message first (adapter acks C3 here), then finish
+				// turn. The chunk echoes OUR text on OUR session, like the real
+				// leader (GROK-INJECT.md probe) — the landing confirm requires
+				// both to match (session-bound + text-bound).
 				writeMsg(map[string]any{"type": "acp", "payload": mustJSON(map[string]any{
 					"jsonrpc": "2.0", "method": "session/update",
 					"params": map[string]any{
 						"sessionId": "sess-test",
 						"update": map[string]any{
 							"sessionUpdate": "user_message_chunk",
-							"content":       map[string]any{"type": "text", "text": "x"},
+							"content":       map[string]any{"type": "text", "text": text},
 						},
 					},
 				})})
@@ -202,8 +206,9 @@ func TestFormatInboundTurnText(t *testing.T) {
 	if !strings.HasPrefix(text, "hi from phone") {
 		t.Fatalf("body should lead, got:\n%q", text)
 	}
-	if !strings.Contains(text, "@maintainer (99)") || !strings.Contains(text, "-100/914") {
-		t.Fatalf("missing meta, got:\n%q", text)
+	// Meta rides a host-owned sentinel line derived from broker fields only.
+	if !strings.Contains(text, "\n\n"+c3TrailerSentinel+" — @maintainer (99) · -100/914") {
+		t.Fatalf("missing sentinel meta line, got:\n%q", text)
 	}
 	if strings.Contains(text, "<channel") || strings.HasPrefix(text, "message:") {
 		t.Fatalf("bad shape: %q", text)

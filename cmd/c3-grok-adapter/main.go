@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -57,6 +58,17 @@ func main() {
 }
 
 func run() error {
+	// Persistent adapter log at $XDG_STATE_HOME/c3/adapter.log. The Grok MCP
+	// host owns (and may discard) our stderr, and several failure-path
+	// contracts below promise adapter.log recoverability (the broker-down
+	// advisory body, the forwardBlocked nudge-fail line) — this tee is what
+	// makes those hold. Same content policy as the broker (DEBUGGING.md):
+	// metadata only on success, content on failure. Mirrors the Claude
+	// adapter's setupAdapterLog.
+	if path, err := setupAdapterLog(); err == nil {
+		fmt.Fprintf(os.Stderr, "c3-grok-adapter: log file %s\n", path)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -123,6 +135,31 @@ func installSignalHandlers(cancel context.CancelFunc) {
 	}()
 }
 
+// setupAdapterLog opens $XDG_STATE_HOME/c3/adapter.log (append, 0600) and tees
+// stdlib log there + stderr. Same file as the Claude adapter (one shared
+// adapter log); the started line carries cli=grok so interleaved lines stay
+// attributable.
+func setupAdapterLog() (string, error) {
+	state := os.Getenv("XDG_STATE_HOME")
+	if state == "" {
+		home, _ := os.UserHomeDir()
+		state = filepath.Join(home, ".local", "state")
+	}
+	dir := filepath.Join(state, "c3")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "adapter.log")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return "", err
+	}
+	log.SetOutput(io.MultiWriter(f, os.Stderr))
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	log.Printf("adapter: started pid=%d cli=grok", os.Getpid())
+	return path, nil
+}
+
 // idleStartupWatchdog cancels ctx if Grok never sends an MCP frame within
 // idleStartupTimeout. Grok's MCP host may abandon a spawned adapter
 // without driving stdin (similar to Claude Code on `--resume`); the
@@ -167,8 +204,9 @@ type adapter struct {
 
 	// Last successful attach request — replayed on broker reconnect so a
 	// session that survives a broker restart auto-reclaims its route (D3 /
-	// adapter-ipc-3). Nil until the session attaches. (Grok has no detach tool
-	// today, so it is never cleared once set.) Mirrors the Claude adapter's
+	// adapter-ipc-3). Nil until the session attaches; the `detach` tool clears
+	// it again so a deliberately-released route is not silently re-claimed by a
+	// reconnect replay. Mirrors the Claude adapter's
 	// rememberAttach/replayLastAttach machinery.
 	amu        sync.Mutex
 	lastAttach *ipc.AttachReq
@@ -698,7 +736,7 @@ func (a *adapter) grokForwardLoop() {
 		if req.inbound.IsEvent() {
 			if a.leader != nil {
 				text := formatEventTurnText(&req.inbound)
-				evCtx, cancel := context.WithTimeout(context.Background(), eventInjectBudget)
+				evCtx, cancel := context.WithTimeout(a.baseCtx(), eventInjectBudget)
 				if err := a.injectWithRetry(evCtx, text, req.inbound.MessageID); err != nil {
 					log.Printf("grok event inject dropped kind=%s id=%d: %v (best-effort — events are never queued broker-side)",
 						req.inbound.Kind, req.inbound.MessageID, err)
@@ -719,9 +757,18 @@ func (a *adapter) grokForwardLoop() {
 		}
 
 		text := formatInboundTurnText(&req.inbound)
-		err := a.injectWithRetry(context.Background(), text, req.inbound.MessageID)
+		err := a.injectWithRetry(a.baseCtx(), text, req.inbound.MessageID)
 		if err != nil {
-			log.Printf("grok leader inject failed for inbound id=%d after retries: %v", req.inbound.MessageID, err)
+			if errors.Is(err, errInjectUncertain) {
+				// Landed-but-unconfirmed is NOT a plain failure: the prompt was
+				// written and may have reached the agent (see the Inject
+				// contract). Still never ack — held-as-backlog / a later
+				// fetch_queue double-delivery is the accepted safe direction;
+				// consuming a possibly-undelivered line is not.
+				log.Printf("grok leader inject UNCERTAIN for inbound id=%d: %v — prompt may have landed; NOT acked (message stays queued: double-delivery possible, loss is not)", req.inbound.MessageID, err)
+			} else {
+				log.Printf("grok leader inject failed for inbound id=%d after retries: %v", req.inbound.MessageID, err)
+			}
 			a.latchForwardBlocked("leader inject failed: " + err.Error())
 			continue // DO NOT ack — durable queue keeps the message
 		}
@@ -756,10 +803,13 @@ func (a *adapter) grokForwardLoop() {
 // formatInboundTurnText produced for payload-less inbounds. Grok's leader
 // inject is plain text, so the structured meta map is folded into a short
 // trailer line (event kind + chat/topic), mirroring formatInboundTurnText's
-// body-first/meta-last shape so TUI previews show the payload.
+// body-first/meta-last shape so TUI previews show the payload. Event payloads
+// embed channel-controlled text (poll questions/options, callback data), so
+// the content passes through the same forgery sanitizer as message bodies and
+// the trailer carries the host-owned sentinel (see c3TrailerSentinel).
 func formatEventTurnText(in *c3types.Inbound) string {
-	content := renderEventContent(in)
-	trailer := fmt.Sprintf("— c3 %s event", in.Kind)
+	content := sanitizeInjectBody(renderEventContent(in))
+	trailer := fmt.Sprintf("%s — %s event", c3TrailerSentinel, in.Kind)
 	// A broker-originated system advisory has no chat (ChatID 0) — omit the
 	// channel suffix rather than render a meaningless "· 0".
 	if in.ChatID != 0 {
@@ -839,6 +889,21 @@ func senderLabel(s c3types.Sender) string {
 	return "someone"
 }
 
+// baseCtx is the parent context for leader injects: the adapter run context
+// when wired, so shutdown CANCELS an in-flight inject instead of waiting out
+// the 120s socket deadline (grokForwardLoop used to pass context.Background(),
+// which nothing could interrupt); Background only when unwired (tests
+// construct the adapter without run()). The unsynchronized runCtx read is
+// safe: run() writes it once before starting brokerReader, and this is only
+// called for reqs that arrived through forwardCh FROM brokerReader — the
+// channel send/receive orders the read after the write.
+func (a *adapter) baseCtx() context.Context {
+	if a.runCtx != nil {
+		return a.runCtx
+	}
+	return context.Background()
+}
+
 // injectRetryBaseWait / injectRetryMaxWait shape injectWithRetry's mid-turn
 // backoff (2s doubling to 15s, ~2min worst case over 12 attempts). They are
 // vars (not consts) only so tests can shorten the schedule; production never
@@ -849,7 +914,10 @@ var (
 )
 
 // injectWithRetry retries session/prompt when Grok is mid-turn. Transient
-// errors (turn in flight / busy) wait and retry; other errors fail fast.
+// errors (turn in flight / busy) wait and retry; other errors fail fast —
+// including errInjectUncertain, which must NEVER be retried: the prompt may
+// already have landed, so a retry could double-deliver into the TUI (see the
+// Inject contract in leader.go).
 func (a *adapter) injectWithRetry(ctx context.Context, text string, msgID int64) error {
 	if a.leader == nil {
 		return errLeaderUnavailable
@@ -889,6 +957,12 @@ func (a *adapter) injectWithRetry(ctx context.Context, text string, msgID int64)
 
 func isTransientInjectErr(err error) bool {
 	if err == nil {
+		return false
+	}
+	// An UNCERTAIN inject may already have landed — retrying could
+	// double-deliver into the TUI, so it is never transient (the durable
+	// queue keeps the message instead).
+	if errors.Is(err, errInjectUncertain) {
 		return false
 	}
 	s := strings.ToLower(err.Error())
@@ -1341,7 +1415,8 @@ func (a *adapter) toolAttach(ctx context.Context, req *mcp.CallToolRequest) (*mc
 			// Track the resolved topic name for the fetch_queue nudges (§5).
 			a.setAttachedTopic(attached.Name)
 			// Side-effect surface: OSC-0 title-bar escape to stderr
-			// for the currently-attached topic. Closes TODO #19(a).
+			// for the currently-attached topic, so the terminal tab
+			// names the topic this session is bound to.
 			// Cross-CLI parity with the Claude adapter; same gates
 			// (tty + C3_NO_TERMINAL_TITLE). See internal/termtitle.
 			termtitle.EmitAttach(&attached)
