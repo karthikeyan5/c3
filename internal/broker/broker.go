@@ -59,6 +59,12 @@ type Broker struct {
 	// hold disabled for the run, logged loudly) — callers must nil-check.
 	Queue *queue.Store
 
+	// drains is the per-SOURCE in-flight drain guard (drain.go, amendment A1/B8):
+	// a second Drain on a source that is already mid-drain rejects immediately
+	// (DrainInProgressError) instead of interleaving a double-copy. Keyed by the
+	// source's canonical queue file key; the zero value is ready to use.
+	drains drainLocks
+
 	mappings   atomic.Pointer[mappings.MappingsFile]
 	mutationMu sync.Mutex
 

@@ -24,18 +24,27 @@ const (
 	JobConsume
 	JobRefreshText
 	JobBacklog
+	// The three drain steps (drain.go): peek+freeze on the source, copy on the
+	// target, remove on the source — each on the OWNING worker so the store's
+	// single-owner discipline holds across a cross-route move.
+	JobDrainPeek
+	JobDrainAppend
+	JobDrainRemove
 )
 
 // Job is one unit of work for a route worker. Exactly one of the payload
 // fields is set based on Kind.
 type Job struct {
-	Kind     JobKind
-	Inbound  *c3types.Inbound
-	Outbound *OutboundJob
-	Fetch    *FetchJob
-	Consume  *ConsumeJob
-	Refresh  *RefreshTextJob
-	Backlog  *BacklogJob
+	Kind        JobKind
+	Inbound     *c3types.Inbound
+	Outbound    *OutboundJob
+	Fetch       *FetchJob
+	Consume     *ConsumeJob
+	Refresh     *RefreshTextJob
+	Backlog     *BacklogJob
+	DrainPeek   *DrainPeekJob
+	DrainAppend *DrainAppendJob
+	DrainRemove *DrainRemoveJob
 }
 
 // BacklogJob asks the worker to read the route's queued total AND a compact
@@ -332,6 +341,12 @@ func (w *RouteWorker) run(ctx context.Context) {
 				w.handleRefreshText(ctx, job.Refresh)
 			case JobBacklog:
 				w.handleBacklog(ctx, job.Backlog)
+			case JobDrainPeek:
+				w.handleDrainPeek(job.DrainPeek)
+			case JobDrainAppend:
+				w.handleDrainAppend(job.DrainAppend)
+			case JobDrainRemove:
+				w.handleDrainRemove(job.DrainRemove)
 			case JobRelease:
 				flushDeb()
 				return
@@ -1430,11 +1445,14 @@ func (w *RouteWorker) shutdown() {
 		select {
 		case job := <-w.queue:
 			// Only ResultCh-bearing jobs (JobFetch / JobOutbound / JobRefreshText /
-			// JobBacklog) get an errWorkerStopped reply so a blocked caller is never
-			// stranded. JobInbound / JobConsume / JobRelease carry no ResultCh and
-			// have no case below — they drop silently (loss-free; see the doc comment
-			// above: they re-deliver via the Telegram offset or remain durable
-			// backlog). Never ack.
+			// JobBacklog / the three JobDrain* steps) get an errWorkerStopped reply so
+			// a blocked caller is never stranded. This is what lets the drain's
+			// Steps B/C block INDEFINITELY on their result channels (drain.go, B1):
+			// a stopped worker reliably answers instead of wedging the drain
+			// goroutine forever. JobInbound / JobConsume / JobRelease carry no
+			// ResultCh and have no case below — they drop silently (loss-free; see
+			// the doc comment above: they re-deliver via the Telegram offset or
+			// remain durable backlog). Never ack.
 			switch job.Kind {
 			case JobFetch:
 				if job.Fetch != nil && job.Fetch.ResultCh != nil {
@@ -1461,6 +1479,27 @@ func (w *RouteWorker) shutdown() {
 				if job.Backlog != nil && job.Backlog.ResultCh != nil {
 					select {
 					case job.Backlog.ResultCh <- BacklogResult{Err: errWorkerStopped}:
+					default:
+					}
+				}
+			case JobDrainPeek:
+				if job.DrainPeek != nil && job.DrainPeek.ResultCh != nil {
+					select {
+					case job.DrainPeek.ResultCh <- DrainPeekResult{Err: errWorkerStopped}:
+					default:
+					}
+				}
+			case JobDrainAppend:
+				if job.DrainAppend != nil && job.DrainAppend.ResultCh != nil {
+					select {
+					case job.DrainAppend.ResultCh <- DrainAppendResult{Err: errWorkerStopped}:
+					default:
+					}
+				}
+			case JobDrainRemove:
+				if job.DrainRemove != nil && job.DrainRemove.ResultCh != nil {
+					select {
+					case job.DrainRemove.ResultCh <- DrainRemoveResult{Err: errWorkerStopped}:
 					default:
 					}
 				}
