@@ -44,17 +44,23 @@ func runSessionHook() error {
 		fmt.Fprintf(os.Stderr, "c3-broker session-hook: parse stdin: %v (ignoring)\n", err)
 		return nil
 	}
-	// Grok hooks may use sessionId camelCase in some payloads; accept both via
+	// Grok/Antigravity hooks may use sessionId camelCase or conversation_id in some payloads; accept them via
 	// a second pass if session_id empty.
 	if in.SessionID == "" {
 		var alt struct {
-			SessionID string `json:"sessionId"`
-			CWD       string `json:"cwd"`
-			Source    string `json:"source"`
+			SessionID      string `json:"sessionId"`
+			ConversationID string `json:"conversation_id"`
+			ConvID         string `json:"conversationId"`
+			CWD            string `json:"cwd"`
+			Source         string `json:"source"`
 		}
 		_ = json.Unmarshal(raw, &alt)
 		if alt.SessionID != "" {
 			in.SessionID = alt.SessionID
+		} else if alt.ConversationID != "" {
+			in.SessionID = alt.ConversationID
+		} else if alt.ConvID != "" {
+			in.SessionID = alt.ConvID
 		}
 		if in.CWD == "" {
 			in.CWD = alt.CWD
@@ -64,7 +70,9 @@ func runSessionHook() error {
 		}
 	}
 	if in.SessionID == "" {
-		if s := os.Getenv("GROK_SESSION_ID"); s != "" {
+		if s := os.Getenv("ANTIGRAVITY_CONVERSATION_ID"); s != "" {
+			in.SessionID = s
+		} else if s := os.Getenv("GROK_SESSION_ID"); s != "" {
 			in.SessionID = s
 		}
 	}

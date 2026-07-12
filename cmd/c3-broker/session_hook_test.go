@@ -25,9 +25,17 @@ func withStdin(t *testing.T, data string, fn func()) {
 	fn()
 }
 
-func TestRunSessionHook_WritesHandoff(t *testing.T) {
+func setupTestEnv(t *testing.T) string {
+	t.Helper()
+	t.Setenv("ANTIGRAVITY_CONVERSATION_ID", "")
+	t.Setenv("GROK_SESSION_ID", "")
 	state := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", state)
+	return state
+}
+
+func TestRunSessionHook_WritesHandoff(t *testing.T) {
+	_ = setupTestEnv(t)
 	// CLAUDE_ENV_FILE's parent dir basename is the ephemeral instance id.
 	envFile := filepath.Join(t.TempDir(), "b60e8044-instance", "sessionstart-hook-1.sh")
 	t.Setenv("CLAUDE_ENV_FILE", envFile)
@@ -52,8 +60,7 @@ func TestRunSessionHook_WritesHandoff(t *testing.T) {
 }
 
 func TestRunSessionHook_EmptyEnvFileNoOp(t *testing.T) {
-	state := t.TempDir()
-	t.Setenv("XDG_STATE_HOME", state)
+	state := setupTestEnv(t)
 	t.Setenv("CLAUDE_ENV_FILE", "") // no instance id derivable
 
 	withStdin(t, `{"session_id":"70341717-stable","source":"resume"}`, func() {
@@ -69,8 +76,7 @@ func TestRunSessionHook_EmptyEnvFileNoOp(t *testing.T) {
 }
 
 func TestRunSessionHook_EmptySessionIDNoOp(t *testing.T) {
-	state := t.TempDir()
-	t.Setenv("XDG_STATE_HOME", state)
+	_ = setupTestEnv(t)
 	envFile := filepath.Join(t.TempDir(), "inst-xyz", "sessionstart-hook-1.sh")
 	t.Setenv("CLAUDE_ENV_FILE", envFile)
 
@@ -85,8 +91,7 @@ func TestRunSessionHook_EmptySessionIDNoOp(t *testing.T) {
 }
 
 func TestRunSessionHook_GrokWritesHandoffByStableID(t *testing.T) {
-	state := t.TempDir()
-	t.Setenv("XDG_STATE_HOME", state)
+	_ = setupTestEnv(t)
 	t.Setenv("CLAUDE_ENV_FILE", "")              // no Claude instance id derivable
 	t.Setenv("GROK_SESSION_ID", "grok-uuid-123") // Grok env present → Grok branch
 
@@ -106,8 +111,7 @@ func TestRunSessionHook_GrokWritesHandoffByStableID(t *testing.T) {
 }
 
 func TestRunSessionHook_GrokRejectsUnsafeSessionID(t *testing.T) {
-	state := t.TempDir()
-	t.Setenv("XDG_STATE_HOME", state)
+	state := setupTestEnv(t)
 	t.Setenv("CLAUDE_ENV_FILE", "")
 	t.Setenv("GROK_SESSION_ID", "present") // trigger the Grok branch
 
@@ -125,8 +129,7 @@ func TestRunSessionHook_GrokRejectsUnsafeSessionID(t *testing.T) {
 }
 
 func TestRunSessionHook_GarbageStdinNoOp(t *testing.T) {
-	state := t.TempDir()
-	t.Setenv("XDG_STATE_HOME", state)
+	_ = setupTestEnv(t)
 	envFile := filepath.Join(t.TempDir(), "inst-garbage", "sessionstart-hook-1.sh")
 	t.Setenv("CLAUDE_ENV_FILE", envFile)
 

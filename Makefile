@@ -21,6 +21,7 @@ build:
 	go build -ldflags "$(VERSION_LDFLAGS)" -o $(BIN_DIR)/c3-claude-adapter ./cmd/c3-claude-adapter
 	go build -ldflags "$(VERSION_LDFLAGS)" -o $(BIN_DIR)/c3-codex-adapter ./cmd/c3-codex-adapter
 	go build -ldflags "$(VERSION_LDFLAGS)" -o $(BIN_DIR)/c3-grok-adapter ./cmd/c3-grok-adapter
+	go build -ldflags "$(VERSION_LDFLAGS)" -o $(BIN_DIR)/c3-agy-adapter ./cmd/c3-agy-adapter
 	go build -ldflags "$(VERSION_LDFLAGS)" -o $(BIN_DIR)/codex ./cmd/codex
 	go build -ldflags "$(VERSION_LDFLAGS)" -o $(BIN_DIR)/migrate-legacy ./cmd/migrate-legacy
 
