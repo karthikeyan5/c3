@@ -166,6 +166,17 @@ type RouteWorker struct {
 	// the worker's single run goroutine (flushInbounds), so it needs no lock.
 	dedup *deliveredDedup
 
+	// pendingAck holds human inbounds delivered to the current holder that it has
+	// not yet demonstrably processed (no outbound since delivery). The adapter acks
+	// a push as delivered the moment it writes to the CLI's stdin — a blind ack that
+	// CONSUMES the durable copy — so if the holder then dies/exits without handling
+	// them, they vanish silently (the 2026-07-12 dentist incident: a stolen-then-
+	// dead session ate two messages with no warning). On confirmed holder death
+	// these are re-queued + a notice fires (flushPendingAck); any outbound from the
+	// holder clears them (it is alive and handling the turn). Worker-goroutine-only
+	// (delivered path + dispatchOutbound + pulseTyping), so it needs no lock.
+	pendingAck []*c3types.Inbound
+
 	// prevEchoDone chains the per-topic voice-readback echoes so they post in
 	// strict arrival order (spec Phase 3 — the maintainer: "processed one by one"). The
 	// echo is dispatched off the critical path (a retrying send can back off for
@@ -197,6 +208,12 @@ const (
 	// full minute of an agent that took an inbound but never replied (e.g. the
 	// user switched to CLI mode mid-turn). It must never pulse forever.
 	maxTypingPulses = 15
+
+	// maxPendingAck bounds how many delivered-but-unprocessed inbounds a route
+	// tracks for the silent-loss safety net (flushPendingAck). Past this the oldest
+	// are dropped (logged) — a holder this far behind still gets the newest N
+	// re-queued on death, the recoverable-and-visible tail that matters.
+	maxPendingAck = 32
 )
 
 // newRouteWorker starts a worker that runs until ctx is canceled OR no jobs
@@ -792,6 +809,9 @@ func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound, 
 			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID,
 			holder.CLI, holder.PID)
 		w.broker.Routes.Release(w.key, holder.ConnID)
+		// Silent-loss net: any earlier pushes this now-dead holder never handled
+		// were consumed on its blind delivered-ack — re-queue them + notify.
+		w.flushPendingAck("The session exited")
 		claimed = false
 		holder = nil
 	}
@@ -885,6 +905,13 @@ func (w *RouteWorker) forwardOrFallback(_ context.Context, in *c3types.Inbound, 
 		// (the deterministic "in Telegram mode" gate; see Stub.hasReplied) and
 		// the channel supports typing. armTyping enforces both gates.
 		w.armTyping(holder)
+		// Silent-loss net: this push was acked-as-delivered and its durable copy
+		// gets consumed on the adapter's blind ack, so track it until the holder
+		// proves it handled the turn (any outbound clears pendingAck) — else it is
+		// re-queued if the holder dies. Events carry no lost content, never queued.
+		if !in.IsEvent() {
+			w.trackPendingAck(in)
+		}
 		return
 	}
 	// A synthesized channel EVENT (poll_result / reaction / callback) is NOT a
@@ -1300,6 +1327,9 @@ func (w *RouteWorker) dispatchOutbound(_ context.Context, job *OutboundJob) {
 	//     gated the same way as the initial arm (holder HasReplied + Typing cap)
 	//     via armTyping.
 	if err == nil {
+		// The holder produced outbound this turn — it is alive and processing, so
+		// its delivered backlog is being handled: clear the silent-loss tracker.
+		w.pendingAck = nil
 		if job.Tool == "reply" {
 			if holder, ok := w.broker.Routes.Holder(w.key); ok {
 				holder.MarkReplied()
@@ -1361,6 +1391,80 @@ func (w *RouteWorker) disarmTyping() {
 	w.typingPulses = 0
 }
 
+// trackPendingAck records a delivered-but-unconfirmed human inbound for the
+// silent-loss net, bounded by maxPendingAck (oldest dropped + logged past the
+// cap). See the pendingAck field and flushPendingAck.
+func (w *RouteWorker) trackPendingAck(in *c3types.Inbound) {
+	w.pendingAck = append(w.pendingAck, in)
+	if over := len(w.pendingAck) - maxPendingAck; over > 0 {
+		log.Printf("pendingAck chan=%s chat=%d topic=%s: over cap, dropping %d oldest tracked delivery(ies)",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), over)
+		w.pendingAck = w.pendingAck[over:]
+	}
+}
+
+// flushPendingAck re-queues every inbound that was delivered to a now-dead holder
+// but never handled, then posts one notice to the topic so the operator is told.
+// This closes the silent-loss gap: the adapter acked those pushes as delivered
+// (consuming the durable copy) on a blind stdin write, but the holder exited
+// without processing them. Called ONLY on confirmed holder death, so it never
+// fires for a merely-slow live session. No-op when nothing is tracked.
+func (w *RouteWorker) flushPendingAck(reason string) {
+	if len(w.pendingAck) == 0 {
+		return
+	}
+	lost := w.pendingAck
+	w.pendingAck = nil
+	requeued := 0
+	if w.broker != nil && w.broker.Queue != nil {
+		for _, in := range lost {
+			if err := w.broker.Queue.Append(queueRouteKey(w.key), in); err != nil {
+				log.Printf("pendingAck flush FAIL chan=%s chat=%d topic=%s msg=%d: re-queue: %v",
+					w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), in.MessageID, err)
+				continue
+			}
+			requeued++
+		}
+	}
+	log.Printf("pendingAck flush chan=%s chat=%d topic=%s: %s — re-queued %d/%d unprocessed delivery(ies)",
+		w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), reason, requeued, len(lost))
+	if requeued == 0 || w.broker == nil {
+		return
+	}
+	ch, err := w.broker.Channel(w.key.Channel)
+	if err != nil {
+		return
+	}
+	var topicID *int64
+	if w.key.HasTopic {
+		t := w.key.TopicID
+		topicID = &t
+	}
+	args := c3types.ReplyArgs{
+		Channel: w.key.Channel,
+		ChatID:  w.key.ChatID,
+		TopicID: topicID,
+		Text:    unprocessedNoticeText(requeued, reason),
+	}
+	if _, serr := ch.SendReply(args); serr != nil {
+		log.Printf("pendingAck flush chan=%s chat=%d topic=%s: send notice failed: %v",
+			w.key.Channel, w.key.ChatID, TopicKeyStr(w.key), serr)
+	}
+}
+
+// unprocessedNoticeText is the operator notice for flushPendingAck: N inbounds
+// were delivered to a holder that died before handling them and have been put
+// back on the durable queue, recoverable on the next attach / fetch_queue.
+func unprocessedNoticeText(n int, reason string) string {
+	noun := "message"
+	if n != 1 {
+		noun = "messages"
+	}
+	return fmt.Sprintf("⚠️ %s before answering %d %s it had received. "+
+		"They're back in the queue — they'll resurface when a session re-attaches "+
+		"(or run fetch_queue). Nothing lost.", reason, n, noun)
+}
+
 // pulseTyping fires one SendTyping for the route. Resolves the channel + the
 // route's chat/topic, releases (it holds no lock across the call), then sends.
 // On error it logs and disarms — a persistently failing channel should not keep
@@ -1368,6 +1472,14 @@ func (w *RouteWorker) disarmTyping() {
 func (w *RouteWorker) pulseTyping(_ context.Context) {
 	defer recoverGoroutine(fmt.Sprintf("worker.pulseTyping chan=%s chat=%d", w.key.Channel, w.key.ChatID))
 	if w.broker == nil {
+		w.disarmTyping()
+		return
+	}
+	// Silent-loss net (proactive): if the holder has died while we still hold
+	// pushes it never handled, re-queue them + notify now rather than waiting for
+	// the next inbound to detect the dead claim.
+	if holder, ok := w.broker.Routes.Holder(w.key); ok && !holder.IsAlive() {
+		w.flushPendingAck("The session exited")
 		w.disarmTyping()
 		return
 	}
