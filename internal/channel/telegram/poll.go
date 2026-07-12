@@ -605,6 +605,19 @@ func (c *Channel) dispatchPollUpdate(updateID int64, poll *gotgbot.Poll) {
 // see dispatchCallback. Keep the two constants in lockstep.
 const permTapDataPrefix = "perm:"
 
+// askTapDataPrefix mirrors the broker's askCallbackPrefix (internal/broker/
+// ask.go): the callback_data namespace of `ask`-tool keyboards ("ask:<id>:<idx>").
+// The ask flow OWNS these keyboards — single-select clears them on resolve,
+// multi-select toggles them in place — so the generic post-tap collapse below
+// MUST skip them. Keep in lockstep with askCallbackPrefix.
+const askTapDataPrefix = "ask:"
+
+// callbackChosenData is the callback_data stamped on the single inert indicator
+// button a generic keyboard collapses to after a tap (see
+// collapseCallbackKeyboard). A tap on that indicator is a no-op: acked to clear
+// the spinner, never re-collapsed or surfaced as an event.
+const callbackChosenData = "c3:_chosen"
+
 // Perm-tap feedback texts, delivered via answerCallbackQuery when the tap can
 // never reach the broker's resolver (which otherwise owns the deferred answer).
 // Short (Telegram caps answer text at 200 chars) and content-free — they never
@@ -658,6 +671,17 @@ func (c *Channel) dispatchCallback(updateID int64, cq *gotgbot.CallbackQuery) {
 	if cq == nil {
 		return
 	}
+	// A tap on the inert post-selection indicator (see collapseCallbackKeyboard)
+	// is a no-op: clear the spinner and stop — never re-collapse or surface it as
+	// an event. This is what makes a collapsed keyboard un-re-pressable.
+	if cq.Data == callbackChosenData {
+		if c.bot != nil {
+			if _, err := c.bot.AnswerCallbackQuery(cq.Id, &gotgbot.AnswerCallbackQueryOpts{}); err != nil {
+				c.host.Logf("telegram: callback update=%d indicator ack failed: %v", updateID, err)
+			}
+		}
+		return
+	}
 	permTap := strings.HasPrefix(cq.Data, permTapDataPrefix)
 	// Auto-ack immediately, regardless of whether we can route the event. A
 	// failed ack is logged but not fatal — the surfacing still proceeds. Perm
@@ -706,7 +730,50 @@ func (c *Channel) dispatchCallback(updateID int64, cq *gotgbot.CallbackQuery) {
 		c.emitPermTap(updateID, in, cq.Id)
 		return
 	}
+	// Generic agent-facing callback (a hand-rolled reply(buttons=…) tap). Collapse
+	// the keyboard to a single inert "✓ <label>" so it can't be pressed again and
+	// the message permanently records the choice. SKIP "ask:" — the ask flow owns
+	// that keyboard (multi-select toggles it live); perm taps already returned above.
+	if !strings.HasPrefix(cq.Data, askTapDataPrefix) {
+		c.collapseCallbackKeyboard(updateID, msg, cq.Data)
+	}
 	c.emitEvent(updateID, in, "callback")
+}
+
+// collapseCallbackKeyboard edits a generic callback message's inline keyboard down
+// to a single inert button showing the tapped option's label ("✓ <label>"), so the
+// keyboard can't be pressed again and the message permanently records the choice.
+// Best-effort: any failure is logged (metadata only) and never blocks surfacing
+// the event. The label is looked up from the message's OWN reply markup by
+// matching the tapped callback_data; a data-only synthetic tap falls back to a
+// generic confirmation.
+func (c *Channel) collapseCallbackKeyboard(updateID int64, msg *gotgbot.Message, data string) {
+	if c.bot == nil || msg == nil || msg.ReplyMarkup == nil {
+		return
+	}
+	label := ""
+	for _, row := range msg.ReplyMarkup.InlineKeyboard {
+		for _, btn := range row {
+			if btn.CallbackData == data {
+				label = btn.Text
+			}
+		}
+	}
+	if label == "" {
+		label = "Selected"
+	}
+	collapsed := gotgbot.InlineKeyboardMarkup{
+		InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{
+			{Text: "✓ " + label, CallbackData: callbackChosenData},
+		}},
+	}
+	if _, _, err := c.bot.EditMessageReplyMarkup(&gotgbot.EditMessageReplyMarkupOpts{
+		ChatId:      msg.Chat.Id,
+		MessageId:   msg.MessageId,
+		ReplyMarkup: collapsed,
+	}); err != nil {
+		c.host.Logf("telegram: callback update=%d collapse keyboard failed: %v", updateID, err)
+	}
 }
 
 // emitPermTap runs a permission-keyboard tap ("perm:" namespace) through the
