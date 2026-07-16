@@ -6,10 +6,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/karthikeyan5/c3/internal/broker"
+	"github.com/karthikeyan5/c3/internal/osutil"
 	"github.com/karthikeyan5/c3/internal/updater"
 	"github.com/karthikeyan5/c3/internal/version"
 )
@@ -131,7 +131,7 @@ func runningBrokerPID() int {
 	if err != nil || pid <= 0 {
 		return 0
 	}
-	if syscall.Kill(pid, 0) != nil {
+	if !osutil.ProcessSignalable(pid) {
 		return 0 // not alive (ESRCH) or not ours (EPERM treated as not-actionable)
 	}
 	return pid

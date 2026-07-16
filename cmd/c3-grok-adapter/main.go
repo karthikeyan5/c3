@@ -37,6 +37,7 @@ import (
 	"github.com/karthikeyan5/c3/internal/ipc"
 	"github.com/karthikeyan5/c3/internal/mcptools"
 	"github.com/karthikeyan5/c3/internal/mode"
+	"github.com/karthikeyan5/c3/internal/osutil"
 	"github.com/karthikeyan5/c3/internal/spawn"
 	"github.com/karthikeyan5/c3/internal/termtitle"
 )
@@ -127,7 +128,7 @@ func run() error {
 // The broker's conn-drop + PID-liveness path reaps this holder's claims.
 func installSignalHandlers(cancel context.CancelFunc) {
 	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	signal.Notify(ch, append([]os.Signal{syscall.SIGTERM, syscall.SIGINT}, osutil.ReloadSignals()...)...)
 	go func() {
 		sig := <-ch
 		log.Printf("adapter: received signal=%v pid=%d", sig, os.Getpid())

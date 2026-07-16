@@ -29,7 +29,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/karthikeyan5/c3/internal/c3types"
@@ -216,15 +215,13 @@ func runHandler(ctx context.Context, host plugin.Host, cfg Config, token, apiBas
 	// cancel (Process.Kill → SIGKILL to the direct child only) orphans those
 	// grandchildren to init, wasting paid API spend after the deadline.
 	// (Precedent: internal/spawn sets Setsid for an analogous detach reason.)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = sttSysProcAttr()
 	cmd.Cancel = func() error {
 		// exec only invokes Cancel after a successful Start, so Process is
-		// non-nil here; guard anyway to match defensive conventions. Negative
-		// PID = signal the whole process group started by Setpgid.
-		if cmd.Process == nil {
-			return nil
-		}
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		// non-nil here; guard anyway to match defensive conventions. On unix
+		// sttKillTree signals the whole process group started by Setpgid; on
+		// Windows it best-effort kills the direct child (see kill_*.go).
+		return sttKillTree(cmd)
 	}
 	// I-7 backstop: the deadline only TRIGGERS the kill — it can't unblock a
 	// cmd.Wait() that's stuck on an inherited stdout pipe held open by a surviving

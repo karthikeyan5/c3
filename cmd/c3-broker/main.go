@@ -30,6 +30,7 @@ import (
 	"github.com/karthikeyan5/c3/internal/broker"
 	"github.com/karthikeyan5/c3/internal/channel/telegram"
 	"github.com/karthikeyan5/c3/internal/mappings"
+	"github.com/karthikeyan5/c3/internal/osutil"
 	"github.com/karthikeyan5/c3/internal/plugin"
 	"github.com/karthikeyan5/c3/internal/plugin/builtins/stt"
 	"github.com/karthikeyan5/c3/internal/sessionhandoff"
@@ -342,14 +343,26 @@ func runDaemon() (err error) {
 	// adapter's answer timeout (FIX-1). Exits on br.Shutdown() (ctx cancel).
 	br.StartAskReaper()
 
+	// Signal handling is registered BEFORE the update checker so the checker's
+	// self-restart callback can post into our own sigC (a portable stand-in for
+	// the old syscall.Kill-self). SIGTERM/SIGINT shut down; reload signals (SIGHUP
+	// on unix, none on Windows) trigger a config reload in the loop below.
+	sigC := make(chan os.Signal, 1)
+	signal.Notify(sigC, append([]os.Signal{syscall.SIGTERM, syscall.SIGINT}, osutil.ReloadSignals()...)...)
+
 	// Auto-update checker: always-on availability check (surfaces the status-line
 	// notice + log), and — when mappings.auto_update is enabled — self-updates and
-	// requests a graceful restart. requestShutdown posts SIGTERM to ourselves so
+	// requests a graceful restart. The callback posts SIGTERM into our own sigC so
 	// the normal signal path below drains (srv.Stop + Shutdown) and exits 0; an
-	// adapter reconnect then auto-spawns the freshly-swapped broker binary. Dev
-	// builds (no injected version) disable the checker. Exits on ctx cancel.
+	// adapter reconnect then auto-spawns the freshly-swapped broker binary. Posting
+	// to our own channel (rather than syscall.Kill) is fully portable — SIGTERM is a
+	// valid value on Windows even though the OS never delivers it. Dev builds (no
+	// injected version) disable the checker. Exits on ctx cancel.
 	br.StartUpdateChecker(func() {
-		_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+		select {
+		case sigC <- syscall.SIGTERM:
+		default:
+		}
 	})
 
 	if cc, ok := mf.Channels["telegram"]; ok && cc.BotToken != "" {
@@ -397,10 +410,8 @@ func runDaemon() (err error) {
 	}
 	fmt.Fprintf(os.Stderr, "c3-broker: listening on %s (pid %d)\n", broker.SocketPath(), os.Getpid())
 
-	sigC := make(chan os.Signal, 1)
-	signal.Notify(sigC, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	for sig := range sigC {
-		if sig == syscall.SIGHUP {
+		if osutil.IsReloadSignal(sig) {
 			// Config reload — re-read mappings.json from disk and swap
 			// the in-memory pointer. The /c3:reload-config slash command
 			// sends this. Replaces the old /c3:restart-broker bounce

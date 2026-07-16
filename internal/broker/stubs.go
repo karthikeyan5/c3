@@ -3,7 +3,6 @@ package broker
 import (
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -138,20 +137,7 @@ func (s *Stub) IsAlive() bool {
 	return isPIDAlive(s.PID)
 }
 
-// isPIDAlive returns true if a process with the given PID exists.
-// Sends signal 0 (a no-op) and checks for ESRCH.
-func isPIDAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	err := syscall.Kill(pid, 0)
-	if err == nil {
-		return true
-	}
-	// ESRCH = no such process. Anything else (e.g. EPERM) means we can't
-	// signal it but it's still alive.
-	return err != syscall.ESRCH
-}
+// isPIDAlive is defined per-OS in pidalive_unix.go / pidalive_windows.go.
 
 // SetRoute atomically sets the stub's current claim. Clearing the route
 // (key==nil, e.g. handleRelease's detach) also clears routeConfirmed — "confirmed"

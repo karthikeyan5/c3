@@ -22,7 +22,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "migrate-legacy: cannot resolve default mappings path: %v\n", err)
 		os.Exit(1)
 	}
-	envPath := flag.String("env", filepath.Join(os.Getenv("HOME"), ".claude", "channels", "telegram", ".env"), "path to legacy .env")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = os.Getenv("HOME")
+	}
+	envPath := flag.String("env", filepath.Join(home, ".claude", "channels", "telegram", ".env"), "path to legacy .env")
 	cfgPath := flag.String("config", "legacy-config.json", "path to legacy JSON config (with group_chat_id, dm_chat_id)")
 	outPath := flag.String("out", defaultOut, "path to write new mappings.json")
 	flag.Parse()

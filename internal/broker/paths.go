@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
 // runtimeDir returns the per-user runtime directory for the broker's socket
@@ -22,6 +23,19 @@ import (
 // convention on every modern Linux distro), independent of env. Only fall
 // back to `/tmp/c3-$UID/` if that path doesn't exist.
 func runtimeDir() string {
+	if runtime.GOOS == "windows" {
+		base := os.Getenv("LOCALAPPDATA")
+		if base == "" {
+			if home, err := os.UserHomeDir(); err == nil {
+				base = filepath.Join(home, "AppData", "Local")
+			} else {
+				base = os.TempDir()
+			}
+		}
+		dir := filepath.Join(base, "c3")
+		_ = os.MkdirAll(dir, 0700)
+		return dir
+	}
 	uid := os.Getuid()
 	if x := os.Getenv("XDG_RUNTIME_DIR"); x != "" {
 		// Use env if set, but check that it exists.

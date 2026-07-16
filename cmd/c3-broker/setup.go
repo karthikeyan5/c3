@@ -24,6 +24,7 @@ import (
 
 	"github.com/karthikeyan5/c3/internal/broker"
 	"github.com/karthikeyan5/c3/internal/mappings"
+	"github.com/karthikeyan5/c3/internal/osutil"
 	"github.com/karthikeyan5/c3/internal/spawn"
 )
 
@@ -760,7 +761,11 @@ func (p setupProgress) summaryLine() string {
 
 // defaultSTTEnvPath is where promptSTTSetup writes the API keys.
 func defaultSTTEnvPath() string {
-	return filepath.Join(os.Getenv("HOME"), ".claude", "stt.env")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = os.Getenv("HOME")
+	}
+	return filepath.Join(home, ".claude", "stt.env")
 }
 
 // applyBotToken upserts the bot token, preserving every other field.
@@ -1364,13 +1369,13 @@ func stopBrokerIfRunning() (bool, string) {
 	if err != nil || pid <= 1 {
 		return false, "note: the broker pid file is malformed — if pairing never sees your code, run `pkill -x c3-broker` and retry"
 	}
-	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+	if err := osutil.TerminateProcess(pid); err != nil {
 		return false, fmt.Sprintf("note: could not stop the running broker (pid %d): %v — if pairing never sees your code, stop it manually", pid, err)
 	}
-	// Wait for the process to actually exit — the singleton flock and the
+	// Wait for the process to actually exit — the singleton lock and the
 	// getUpdates long poll are only released then.
 	for i := 0; i < 50; i++ {
-		if syscall.Kill(pid, 0) != nil { // ESRCH — gone
+		if !osutil.ProcessSignalable(pid) { // gone
 			return true, "(stopped the running C3 broker so pairing codes come straight to setup; it restarts when setup finishes)"
 		}
 		time.Sleep(100 * time.Millisecond)

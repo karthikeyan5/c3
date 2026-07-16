@@ -1,6 +1,9 @@
+//go:build !windows
+
 // codex is the C3 Codex launcher. It wraps interactive Codex sessions in a
 // local app-server so the C3 MCP adapter can forward Telegram inbound messages
-// into the visible Codex TUI.
+// into the visible Codex TUI. Unix-only; the Windows build gets a stub in
+// main_windows.go (the launcher manages a /tmp app-server keyed on the unix uid).
 package main
 
 import (

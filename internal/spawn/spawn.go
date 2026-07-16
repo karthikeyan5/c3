@@ -8,7 +8,6 @@ package spawn
 
 import (
 	"os/exec"
-	"syscall"
 )
 
 // Detached starts cmd in a new session (detached from the caller's process
@@ -43,11 +42,4 @@ func Detached(cmd *exec.Cmd) error {
 	// exits first the broker is reparented to init, which reaps it instead.
 	go func() { _ = cmd.Wait() }()
 	return nil
-}
-
-// sysSetsid returns SysProcAttr with Setsid=true so the spawned child detaches
-// from the caller's process group. Linux/Darwin only — Windows would need a
-// different approach.
-func sysSetsid() *syscall.SysProcAttr {
-	return &syscall.SysProcAttr{Setsid: true}
 }

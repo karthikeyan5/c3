@@ -22,7 +22,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/karthikeyan5/c3/internal/shimconfig"
 )
@@ -53,10 +52,11 @@ func run(argv0AndArgs, env []string) error {
 
 	newArgs := injectC3Plugin(args)
 
-	// syscall.Exec replaces this process, preserving stdin/stdout/stderr/tty
-	// and signal delivery — critical for an interactive TUI launcher.
+	// execReplace replaces this process (unix: syscall.Exec) so signals and the
+	// tty pass through unchanged — critical for an interactive TUI launcher. On
+	// Windows it runs the target as a child and exits with its code (no execve).
 	execArgs := append([]string{realClaude}, newArgs...)
-	return syscall.Exec(realClaude, execArgs, env)
+	return execReplace(realClaude, execArgs, env)
 }
 
 // injectC3Plugin applies the idempotency contract documented in the package
