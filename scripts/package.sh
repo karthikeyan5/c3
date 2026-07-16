@@ -47,11 +47,17 @@ COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 GOVER="$(cd "$ROOT" && go version | awk '{print $3}')"
 BUILT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
+# Windows executables need the .exe suffix — `go build -o <name>` writes the
+# name verbatim (it only appends .exe when -o names a directory), so without
+# this the Windows tarball would ship non-runnable, extension-less binaries.
+EXT=""
+[ "$GOOS" = "windows" ] && EXT=".exe"
+
 echo "==> building $PKG"
 for b in $BINS; do
 	CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
 		go -C "$ROOT" build -trimpath -ldflags "-s -w -X ${VERSIONPKG}=${VERSION}" \
-		-o "$DEST/$b" "./cmd/$b"
+		-o "$DEST/$b$EXT" "./cmd/$b"
 done
 
 cp "$ROOT/LICENSE" "$DEST/LICENSE"
@@ -67,7 +73,7 @@ cp "$ROOT/LICENSE" "$DEST/LICENSE"
 	echo
 	echo "binaries (sha256):"
 	for b in $BINS; do
-		printf '  %s  %s\n' "$(sha256 "$DEST/$b")" "$b"
+		printf '  %s  %s\n' "$(sha256 "$DEST/$b$EXT")" "$b$EXT"
 	done
 	echo
 	echo "Install: place these binaries on your PATH (e.g. ~/.local/bin),"

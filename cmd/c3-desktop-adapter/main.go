@@ -784,12 +784,17 @@ func (a *adapter) toolAttach(ctx context.Context, req *mcp.CallToolRequest) (*mc
 	a.pmu.Lock()
 	a.pending["attached"] = ch
 	a.pmu.Unlock()
-
-	conn := a.currentConn()
-	if conn == nil {
+	// Always clear the pending entry on return (incl. the ctx.Done() path), so a
+	// canceled attach can't leave a stale channel that a later same-key attach's
+	// broker response is misdelivered to. Matches toolForward/toolFetchQueue.
+	defer func() {
 		a.pmu.Lock()
 		delete(a.pending, "attached")
 		a.pmu.Unlock()
+	}()
+
+	conn := a.currentConn()
+	if conn == nil {
 		return toolErrorResult("broker reconnecting — retry attach in a moment"), nil
 	}
 
@@ -799,9 +804,6 @@ func (a *adapter) toolAttach(ctx context.Context, req *mcp.CallToolRequest) (*mc
 	a.fireRecover(ctx, sessionID(), cwd)
 
 	if err := conn.WriteJSON(attachReq); err != nil {
-		a.pmu.Lock()
-		delete(a.pending, "attached")
-		a.pmu.Unlock()
 		return toolErrorResult("broker write: " + err.Error()), nil
 	}
 	select {
@@ -827,17 +829,16 @@ func (a *adapter) toolTopics(ctx context.Context, _ *mcp.CallToolRequest) (*mcp.
 	a.pmu.Lock()
 	a.pending["topics_list"] = ch
 	a.pmu.Unlock()
-	conn := a.currentConn()
-	if conn == nil {
+	defer func() {
 		a.pmu.Lock()
 		delete(a.pending, "topics_list")
 		a.pmu.Unlock()
+	}()
+	conn := a.currentConn()
+	if conn == nil {
 		return toolErrorResult("broker reconnecting — retry topics in a moment"), nil
 	}
 	if err := conn.WriteJSON(ipc.ListTopicsReq{Op: ipc.OpListTopics}); err != nil {
-		a.pmu.Lock()
-		delete(a.pending, "topics_list")
-		a.pmu.Unlock()
 		return toolErrorResult("broker write: " + err.Error()), nil
 	}
 	select {

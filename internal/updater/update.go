@@ -145,11 +145,15 @@ func Update(ctx context.Context, opts Options) (*Result, error) {
 	pkgDir := filepath.Join(extractDir, tarballDir(tarball))
 	srcPaths := map[string]string{}
 	for _, name := range BinaryNames {
-		p := filepath.Join(pkgDir, name)
+		// Resolve the platform filename (adds .exe on Windows). The map is keyed
+		// by the on-disk name so InstallBinaries writes it back with that same
+		// name — a Windows tarball ships c3-broker.exe and installs it as such.
+		fname := BinaryFileName(name)
+		p := filepath.Join(pkgDir, fname)
 		if fi, statErr := os.Stat(p); statErr != nil || fi.IsDir() {
-			return res, fmt.Errorf("release tarball missing binary %q", name)
+			return res, fmt.Errorf("release tarball missing binary %q", fname)
 		}
-		srcPaths[name] = p
+		srcPaths[fname] = p
 	}
 
 	// Resolve the install target and swap.

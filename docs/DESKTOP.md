@@ -38,7 +38,7 @@ c3-broker install-desktop
 
 It writes/merges Claude Desktop's config at `%APPDATA%\Claude\claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`). It **merges** — every other MCP server and every other key in the file is preserved; only the `mcpServers.c3` entry is added/updated. If the file is present but not valid JSON, it refuses to touch it and tells you to fix or remove it.
 
-It resolves `c3-desktop-adapter.exe` on `PATH` and writes its **absolute** path (Claude Desktop requires an absolute command path). If the binary isn't on `PATH` yet, it writes the bare name and warns you to edit it once you've built it.
+It resolves `c3-desktop-adapter.exe` on `PATH` and writes its **absolute** path (Claude Desktop requires an absolute command path). If the binary isn't on `PATH` yet, it writes the bare name and warns you to edit it once you've built it. Re-running the installer **replaces the `c3` entry** (any `args`/`env` you hand-added to it are overwritten); every other server is untouched.
 
 `--config <path>` (or `--path <path>`) overrides the target file on any OS — useful to stage a config on Linux, or to target an MSIX install path (below).
 
@@ -84,6 +84,7 @@ Tool calls surface as a local **Allow / Always allow** approval in the Desktop G
   Re-run `c3-broker install-desktop --config "<that path>"`, or hand-edit the file there.
 - **protocolVersion `2025-11-25`.** The adapter negotiates this MCP protocol version. After restart, confirm the `c3` tools appear in the chat. If they're refused, it's almost always a version-negotiation mismatch — check the adapter and Claude Desktop versions.
 - **Approval is a local GUI tap.** Approving a tool call is a click in the Desktop app; "Always allow" is per-chat. There is **no** Telegram permission relay here (that Allow/Deny-over-Telegram flow is Claude Code-only).
+- **Auto-update is not yet wired for Windows.** `c3-broker update` / the auto-updater cannot replace a running `.exe` on Windows (the OS locks it). Update the Windows box by **rebuilding from source** — `git pull`, then `go install ./cmd/c3-broker ./cmd/c3-desktop-adapter`, then fully quit + restart Claude Desktop. (From-source builds report version `dev` and never auto-update, so the checker stays quiet.)
 
 ## Verify on the box tomorrow
 

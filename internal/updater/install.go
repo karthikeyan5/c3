@@ -54,6 +54,13 @@ func ExecutableDir() (string, error) {
 //
 // destDir must exist and be writable. All sources should be pre-verified present
 // by the caller (Update does this after checksum + extraction).
+//
+// KNOWN LIMITATION (Windows): the Phase-2 os.Rename swaps below cannot replace a
+// binary whose .exe is a currently-running image — Windows locks the file. So
+// self-update of a live broker/adapter fails here on Windows; until that's
+// handled (rename-aside then delete-on-next-start), update the Windows box by
+// rebuilding from source. The auto-update checker is disabled on dev builds, and
+// no Windows release exists yet, so this path is currently unreached on Windows.
 func InstallBinaries(destDir string, srcPaths map[string]string) error {
 	if len(srcPaths) == 0 {
 		return fmt.Errorf("install: no binaries to install")

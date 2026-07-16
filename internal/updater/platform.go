@@ -7,9 +7,11 @@ import (
 )
 
 // BinaryNames are the nine runnable binaries a release tarball carries and
-// the updater installs. MUST stay in sync with scripts/package.sh's BINS list —
-// if package.sh adds/removes a binary, update this too or an install will fail
-// looking for a binary the tarball doesn't contain (or silently skip a new one).
+// the updater installs, WITHOUT a platform extension. MUST stay in sync with
+// scripts/package.sh's BINS list — if package.sh adds/removes a binary, update
+// this too or an install will fail looking for a binary the tarball doesn't
+// contain (or silently skip a new one). Resolve the on-disk filename via
+// BinaryFileName so Windows binaries get their .exe suffix.
 var BinaryNames = []string{
 	"c3-broker",
 	"c3-claude-adapter",
@@ -20,6 +22,18 @@ var BinaryNames = []string{
 	"codex",
 	"claude-shim",
 	"migrate-legacy",
+}
+
+// BinaryFileName returns the on-disk filename for a BinaryNames entry on the
+// CURRENT platform. Windows binaries are built and shipped with a .exe suffix
+// (scripts/package.sh appends it for GOOS=windows), so release lookup and
+// install must resolve name+".exe" there; every other platform uses the bare
+// name. Linux/macOS behaviour is unchanged (identity).
+func BinaryFileName(name string) string {
+	if runtime.GOOS == "windows" {
+		return name + ".exe"
+	}
+	return name
 }
 
 // TarballName returns the release-asset filename for version on the CURRENT

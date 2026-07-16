@@ -445,7 +445,12 @@ func lookPath(file string) (string, error) {
 	path := os.Getenv("PATH")
 	for _, dir := range filepath.SplitList(path) {
 		if dir == "" {
-			dir = "."
+			// Skip empty PATH entries. Resolving "" to "." (CWD) is a footgun:
+			// on Windows an empty element (a trailing/doubled ';') would let a
+			// binary dropped in the current directory be resolved and, for
+			// install-desktop, baked into claude_desktop_config.json as an
+			// auto-run command. A real binary is never in an empty entry.
+			continue
 		}
 		p := filepath.Join(dir, file)
 		if st, err := os.Stat(p); err == nil && !st.IsDir() {

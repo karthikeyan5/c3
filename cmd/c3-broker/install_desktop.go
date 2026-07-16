@@ -76,9 +76,10 @@ func runInstallDesktop(args []string) error {
 		return fmt.Errorf("read %s: %w", cfgPath, rerr)
 	}
 
-	// Ensure an mcpServers object exists, preserving every other server.
+	// Ensure an mcpServers object exists, preserving every other server. A null
+	// mcpServers (valid JSON) is treated as "no servers" rather than an error.
 	var servers map[string]any
-	if existing, ok := cfg["mcpServers"]; ok {
+	if existing, ok := cfg["mcpServers"]; ok && existing != nil {
 		servers, ok = existing.(map[string]any)
 		if !ok {
 			return fmt.Errorf("existing %s has a non-object \"mcpServers\" value; refusing to modify it.\n"+
@@ -97,7 +98,19 @@ func runInstallDesktop(args []string) error {
 		return fmt.Errorf("marshal config: %w", err)
 	}
 	out = append(out, '\n')
-	if err := os.WriteFile(cfgPath, out, 0o644); err != nil {
+	// Preserve the existing file's mode (never widen a secrets-bearing 0600
+	// config); default 0644 for a fresh file. Write to a temp sibling then rename
+	// so a crash/disk-full mid-write can't truncate the config we work to protect.
+	mode := os.FileMode(0o644)
+	if fi, statErr := os.Stat(cfgPath); statErr == nil {
+		mode = fi.Mode().Perm()
+	}
+	tmp := cfgPath + ".c3tmp"
+	if err := os.WriteFile(tmp, out, mode); err != nil {
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, cfgPath); err != nil {
+		_ = os.Remove(tmp)
 		return fmt.Errorf("write %s: %w", cfgPath, err)
 	}
 
