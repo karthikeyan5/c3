@@ -21,6 +21,8 @@ dist/
 /c3-claude-adapter
 /c3-codex-adapter
 /c3-grok-adapter
+/c3-agy-adapter
+/c3-desktop-adapter
 /codex
 /migrate-legacy
 

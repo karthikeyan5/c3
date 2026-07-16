@@ -138,6 +138,12 @@ func main() {
 				os.Exit(exitConfig)
 			}
 			return
+		case "install-desktop":
+			if err := runInstallDesktop(os.Args[2:]); err != nil {
+				fmt.Fprintf(os.Stderr, "c3-broker install-desktop: %v\n", err)
+				os.Exit(exitConfig)
+			}
+			return
 		case "session-hook":
 			// SessionStart hook (c3 plugin). NEVER connects to the broker and is
 			// designed to exit 0 even on bad input — a hook that errors would

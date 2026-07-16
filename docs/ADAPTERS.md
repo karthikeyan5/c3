@@ -1,6 +1,6 @@
 # Writing C3 CLI Adapters
 
-A C3 adapter is the bridge between the broker and a specific CLI's MCP-server expectations. Today there are three: `c3-claude-adapter` (Claude Code), `c3-codex-adapter` (Codex), and `c3-grok-adapter` (Grok Build). If you want to integrate C3 with a CLI we don't yet support — Cursor, Aider, plain shell, your own thing — write an adapter.
+A C3 adapter is the bridge between the broker and a specific CLI's MCP-server expectations. The built-in adapters are `c3-claude-adapter` (Claude Code), `c3-codex-adapter` (Codex), `c3-grok-adapter` (Grok Build), and `c3-desktop-adapter` (Claude Desktop, poll-only — see [`DESKTOP.md`](DESKTOP.md)). If you want to integrate C3 with a CLI we don't yet support — Cursor, Aider, plain shell, your own thing — write an adapter.
 
 Adapters are not channels. Channels move bytes between users and the broker over the network (Telegram, web, voice). Adapters move messages between the broker and a single CLI process over MCP stdio. The two never see each other directly — both talk to the broker.
 
@@ -81,6 +81,8 @@ The broker emits a normalized `Inbound{}` payload. Your adapter has to convert i
 2. **If `C3_CODEX_REMOTE_BRIDGE=1`** is set in env (the C3 launcher sets it), forward the inbound as a real `turn/start` to the running Codex app-server via WebSocket. This is the path that makes a Telegram message appear as a normal turn in the user's TUI.
 
 **Grok Build** has no channel-notification dialect. Live inject **requires leader mode** (`[cli] use_leader = true`). The Grok adapter registers as a client on `$GROK_HOME/leader.sock` and issues ACP `session/prompt` against the TUI session id (see [`GROK-INJECT.md`](GROK-INJECT.md)). Without a leader socket, inbound stays in the durable queue for `fetch_queue`.
+
+**Claude Desktop** has no way for an MCP server to push into a chat at all, so `c3-desktop-adapter` is **pull-only**: inbound never surfaces on its own — it stays in the durable queue and the user drains it by asking Claude to call `fetch_queue` (an optional hourly Cowork Scheduled Task can poll on a timer). See [`DESKTOP.md`](DESKTOP.md).
 
 Held messages — anything that arrived while no session was attached — are **not** buffered in the adapter. They live in the broker's durable per-route queue, and the agent drains them with the universal `fetch_queue` tool (all adapters expose it). An earlier Codex-only in-memory `inbox(limit, ack)` ring was retired in favor of that durable queue.
 

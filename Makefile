@@ -9,7 +9,7 @@ DIST_DIR := dist
 # the update checker with a false "update available" that /c3:update would then
 # DOWNGRADE. Dev builds disable the checker entirely (version.IsDev).
 VERSION ?= $(shell git describe --tags --exact-match 2>/dev/null)
-PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
+PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
 # Inject the build version so a binary knows its own release identity (the
 # auto-updater compares it against the latest GitHub release). Kept in sync with
 # scripts/package.sh's VERSIONPKG. Empty VERSION ⇒ no injection ⇒ dev build.
@@ -22,6 +22,7 @@ build:
 	go build -ldflags "$(VERSION_LDFLAGS)" -o $(BIN_DIR)/c3-codex-adapter ./cmd/c3-codex-adapter
 	go build -ldflags "$(VERSION_LDFLAGS)" -o $(BIN_DIR)/c3-grok-adapter ./cmd/c3-grok-adapter
 	go build -ldflags "$(VERSION_LDFLAGS)" -o $(BIN_DIR)/c3-agy-adapter ./cmd/c3-agy-adapter
+	go build -ldflags "$(VERSION_LDFLAGS)" -o $(BIN_DIR)/c3-desktop-adapter ./cmd/c3-desktop-adapter
 	go build -ldflags "$(VERSION_LDFLAGS)" -o $(BIN_DIR)/codex ./cmd/codex
 	go build -ldflags "$(VERSION_LDFLAGS)" -o $(BIN_DIR)/migrate-legacy ./cmd/migrate-legacy
 

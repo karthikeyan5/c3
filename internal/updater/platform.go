@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// BinaryNames are the seven runnable binaries a release tarball carries and
+// BinaryNames are the nine runnable binaries a release tarball carries and
 // the updater installs. MUST stay in sync with scripts/package.sh's BINS list —
 // if package.sh adds/removes a binary, update this too or an install will fail
 // looking for a binary the tarball doesn't contain (or silently skip a new one).
@@ -15,6 +15,8 @@ var BinaryNames = []string{
 	"c3-claude-adapter",
 	"c3-codex-adapter",
 	"c3-grok-adapter",
+	"c3-agy-adapter",
+	"c3-desktop-adapter",
 	"codex",
 	"claude-shim",
 	"migrate-legacy",
@@ -34,7 +36,7 @@ func TarballNameFor(version, goos, goarch string) string {
 
 // tarballDir returns the top-level directory name inside a release tarball,
 // which package.sh sets to the tarball's basename without ".tar.gz" (PKG). The
-// six binaries live directly under this directory.
+// binaries live directly under this directory.
 func tarballDir(tarballName string) string {
 	return strings.TrimSuffix(tarballName, ".tar.gz")
 }

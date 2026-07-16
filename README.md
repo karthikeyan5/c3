@@ -44,6 +44,8 @@ Delighters — the demo magic, not the headline:
 
 **Codex parity, stated plainly.** Codex sessions get topic routing, the durable queue, `reply`, reactions, edits, polls, and attachments. They do **not** get `ask`, `detach`, or the permission relay — those are Claude Code-only today — and the Codex bridge is heavier (a 4-process launcher → app-server → adapter → TUI chain, with an NVM symlink step). See [`docs/ADAPTERS.md`](docs/ADAPTERS.md) and [`ROADMAP.md`](ROADMAP.md).
 
+**Claude Desktop (Windows), stated plainly.** There's a `c3-desktop-adapter` for Claude Desktop, but it's a **pull bridge, not a push one**: Claude Desktop can't surface a Telegram message on its own, so inbound waits in the durable queue and you pull it by asking Claude to check (it calls `fetch_queue`); replies go out on request. No live `<channel>` rendering and no permission relay — those stay Claude Code-only. Install with `c3-broker install-desktop`; see [`docs/DESKTOP.md`](docs/DESKTOP.md).
+
 ## Install
 
 C3 installs as a Claude Code plugin (marketplace add straight from GitHub) with prebuilt binaries — no toolchain needed; a build-from-source path stays for contributors. In any Claude Code session, paste:

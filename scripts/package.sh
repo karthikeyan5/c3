@@ -5,7 +5,7 @@
 #   e.g. scripts/package.sh linux amd64 v1.0.0 dist
 #
 # Produces: <outdir>/c3_<version>_<goos>_<goarch>.tar.gz
-# Each tarball contains the seven compiled binaries, LICENSE, and a MANIFEST.txt.
+# Each tarball contains the nine compiled binaries, LICENSE, and a MANIFEST.txt.
 # Pure-Go cross-compile (CGO disabled), so every target builds on any host.
 #
 # Shared by .github/workflows/release.yml and the Makefile `dist` target so the
@@ -21,7 +21,7 @@ OUTDIR="${4:?usage: package.sh <goos> <goarch> <version> <outdir>}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Every main package under cmd/ that ships as a runnable binary.
-BINS="c3-broker c3-claude-adapter c3-codex-adapter c3-grok-adapter codex claude-shim migrate-legacy"
+BINS="c3-broker c3-claude-adapter c3-codex-adapter c3-grok-adapter c3-agy-adapter c3-desktop-adapter codex claude-shim migrate-legacy"
 
 # Go package path whose Version var the auto-updater reads; injected at build
 # time via -ldflags -X so a release binary knows its own version (dev builds,
