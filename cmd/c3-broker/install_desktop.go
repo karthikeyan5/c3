@@ -19,8 +19,9 @@ import (
 // Config path is per-OS (runtime.GOOS):
 //   - windows: %APPDATA%\Claude\claude_desktop_config.json
 //   - darwin:  ~/Library/Application Support/Claude/claude_desktop_config.json
-//   - linux:   no Claude Desktop build exists; only a --config/--path override
-//     lets you stage/test a file.
+//   - linux:   $XDG_CONFIG_HOME/Claude/claude_desktop_config.json
+//     (default ~/.config/Claude/...) — the official Claude Desktop Linux beta
+//     (2026-06) is an Electron app whose userData dir follows XDG.
 //
 // An explicit `--config <path>` / `--path <path>` override takes precedence on
 // every OS.
@@ -137,11 +138,13 @@ func runInstallDesktop(args []string) error {
 	fmt.Println("  own — messages wait in C3's durable queue. Ask Claude to \"check messages\"")
 	fmt.Println("  (it calls fetch_queue) to pull them; reply/react to send back.")
 	fmt.Println()
-	fmt.Println("  Microsoft Store (MSIX) install? Edits to %APPDATA%\\Claude\\ are IGNORED —")
-	fmt.Println("  the config that actually loads is under:")
-	fmt.Println("    ...\\Packages\\Claude_*\\LocalCache\\Roaming\\Claude\\claude_desktop_config.json")
-	fmt.Println("  Re-run with --config <that path>, or hand-edit it there.")
-	fmt.Println()
+	if runtime.GOOS == "windows" {
+		fmt.Println("  Microsoft Store (MSIX) install? Edits to %APPDATA%\\Claude\\ are IGNORED —")
+		fmt.Println("  the config that actually loads is under:")
+		fmt.Println("    ...\\Packages\\Claude_*\\LocalCache\\Roaming\\Claude\\claude_desktop_config.json")
+		fmt.Println("  Re-run with --config <that path>, or hand-edit it there.")
+		fmt.Println()
+	}
 
 	// Verify adapter and broker on PATH (mirrors install-agy's tail).
 	if lookErr != nil {
@@ -168,9 +171,9 @@ func exeName(base string) string {
 }
 
 // desktopConfigPath resolves Claude Desktop's config path for the current OS.
-// An explicit override always wins. Returns ("", note, nil) on Linux with no
-// override — Claude Desktop has no Linux build, so there is nothing to write and
-// the note explains why.
+// An explicit override always wins. Windows/macOS/Linux each resolve a real
+// default path; an unrecognized GOOS with no override returns a note asking for
+// --config.
 func desktopConfigPath(override string) (path string, note string, err error) {
 	switch runtime.GOOS {
 	case "windows":
@@ -191,14 +194,30 @@ func desktopConfigPath(override string) (path string, note string, err error) {
 			return "", "", herr
 		}
 		return filepath.Join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json"), "", nil
+	case "linux":
+		if override != "" {
+			return override, "", nil
+		}
+		// The official Claude Desktop Linux beta (2026-06) is an Electron app; its
+		// userData dir follows XDG — $XDG_CONFIG_HOME/Claude, defaulting to
+		// ~/.config/Claude. (Debian/Ubuntu official + the Arch AUR repackages all
+		// land here.)
+		cfgHome := os.Getenv("XDG_CONFIG_HOME")
+		if cfgHome == "" {
+			home, herr := os.UserHomeDir()
+			if herr != nil {
+				return "", "", herr
+			}
+			cfgHome = filepath.Join(home, ".config")
+		}
+		return filepath.Join(cfgHome, "Claude", "claude_desktop_config.json"), "", nil
 	default:
 		if override != "" {
-			return override, "note: Claude Desktop has no Linux build — writing the --config override path\n" +
-				"      for staging/testing only; it won't be read by a Claude Desktop app here.\n\n", nil
+			return override, "", nil
 		}
-		return "", "note: Claude Desktop is Windows/macOS only — there is no Linux build, so there\n" +
-			"      is nothing to configure here. Pass --config <path> (or --path <path>) to\n" +
-			"      stage/test a claude_desktop_config.json at an explicit location.\n", nil
+		return "", "note: no default Claude Desktop config path is known for this OS.\n" +
+			"      Pass --config <path> (or --path <path>) to point at the\n" +
+			"      claude_desktop_config.json to write.\n", nil
 	}
 }
 

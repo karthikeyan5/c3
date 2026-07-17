@@ -36,7 +36,15 @@ You also need a configured `~/.config/c3/mappings.json` (bot token, allowlist). 
 c3-broker install-desktop
 ```
 
-It writes/merges Claude Desktop's config at `%APPDATA%\Claude\claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`). It **merges** — every other MCP server and every other key in the file is preserved; only the `mcpServers.c3` entry is added/updated. If the file is present but not valid JSON, it refuses to touch it and tells you to fix or remove it.
+It writes/merges Claude Desktop's config at the per-OS default:
+
+| OS | Config path |
+|----|-------------|
+| Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
+| macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Linux | `$XDG_CONFIG_HOME/Claude/claude_desktop_config.json` (default `~/.config/Claude/...`) |
+
+(The official Claude Desktop **Linux beta** landed 2026-06 — Debian/Ubuntu via Anthropic's apt repo, Arch via the `claude-desktop` / `claude-desktop-bin` AUR packages that repackage it. All read the XDG path above.) It **merges** — every other MCP server and every other key in the file is preserved; only the `mcpServers.c3` entry is added/updated. If the file is present but not valid JSON, it refuses to touch it and tells you to fix or remove it.
 
 It resolves `c3-desktop-adapter.exe` on `PATH` and writes its **absolute** path (Claude Desktop requires an absolute command path). If the binary isn't on `PATH` yet, it writes the bare name and warns you to edit it once you've built it. Re-running the installer **replaces the `c3` entry** (any `args`/`env` you hand-added to it are overwritten); every other server is untouched.
 
