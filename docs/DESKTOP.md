@@ -80,6 +80,16 @@ In a Desktop chat:
 
 Tool calls surface as a local **Allow / Always allow** approval in the Desktop GUI (see caveats).
 
+## The `/fetchq` slash command (low-ceremony pull)
+
+C3 also exposes an MCP **prompt** named `fetchq`, which Claude Desktop surfaces as a **slash command**. Type `/fetchq` (it may appear namespaced under the `c3` server in the `/` menu) and the queue is pulled and dropped straight into the chat — no "please check my messages" sentence, and no tool-call reasoning turn to trigger the fetch. It's the one-keystroke version of the `fetch_queue` tool.
+
+- **Default** drains the whole queue for the attached topic (consumes it, like `fetch_queue`).
+- `limit=N` pulls the N oldest instead of everything.
+- `ack=false` **peeks** without consuming — the messages stay queued.
+
+It still needs an **attached** topic (run `attach` first); unattached, it reports "no route claimed". This is a *reduced-ceremony pull*, not live push — Desktop still can't surface a message on its own. (If a future test shows Desktop calling `prompts/get` more than once per invocation, the consuming default would need to become peek — verify on first use.)
+
 ## Caveats
 
 > **Telegram is single-consumer — use a separate bot token on Windows.**

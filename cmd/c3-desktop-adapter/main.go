@@ -687,7 +687,59 @@ func (a *adapter) buildMCPServer() *mcp.Server {
 	})
 
 	a.registerTools(srv)
+	a.registerPrompts(srv)
 	return srv
+}
+
+// registerPrompts declares C3's MCP prompts. Claude Desktop surfaces MCP prompts
+// as slash commands, so `fetchq` gives the user a one-keystroke `/fetchq` that
+// pulls the durable queue in a single deterministic step — no "please check my
+// messages" sentence and no tool-call reasoning turn to trigger the fetch. The
+// returned message is injected by the client for the model to read/act on.
+// Registering a prompt auto-advertises the server `prompts` capability.
+func (a *adapter) registerPrompts(srv *mcp.Server) {
+	srv.AddPrompt(&mcp.Prompt{
+		Name:        "fetchq",
+		Title:       "Fetch C3 queue",
+		Description: "Pull inbound Telegram messages held in C3's durable queue for the attached topic and drop them straight into the chat — a one-keystroke alternative to asking Claude to call fetch_queue. Drains everything by default; pass limit=N for the N oldest, or ack=false to peek without consuming.",
+		Arguments: []*mcp.PromptArgument{
+			{Name: "limit", Description: "How many oldest messages to pull: a number, or \"all\" (default)."},
+			{Name: "ack", Description: "\"false\" to peek without consuming (leaves them queued). Default \"true\" — drain."},
+		},
+	}, a.promptFetchq)
+}
+
+// promptFetchq backs the `fetchq` slash command. It defaults to draining the whole
+// queue (a slash command is an explicit "show me what's waiting"); `limit` narrows
+// it and `ack=false` peeks. The queued messages are returned as a user-role prompt
+// message so the client injects them for the model to read and act on.
+func (a *adapter) promptFetchq(ctx context.Context, req *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+	limit, all := 0, true // default: drain all
+	ack := true
+	if req != nil && req.Params != nil {
+		if v, ok := req.Params.Arguments["limit"]; ok {
+			limit, all = parseFetchLimitStr(v)
+		}
+		if v, ok := req.Params.Arguments["ack"]; ok {
+			v = strings.TrimSpace(v)
+			ack = !(strings.EqualFold(v, "false") || v == "0" || strings.EqualFold(v, "no"))
+		}
+	}
+
+	body, _ := a.doFetchQueue(ctx, ack, limit, all)
+	text := "📨 C3 queue (via /fetchq):\n\n" + body
+	if ack {
+		text += "\n\nRead these and respond or act as needed — use the `reply` tool to answer on Telegram."
+	} else {
+		text += "\n\n(peeked — still queued; run without ack=false to consume.)"
+	}
+
+	return &mcp.GetPromptResult{
+		Description: "C3 queued Telegram messages",
+		Messages: []*mcp.PromptMessage{
+			{Role: "user", Content: &mcp.TextContent{Text: text}},
+		},
+	}, nil
 }
 
 func (a *adapter) buildInstructions() string {
@@ -699,7 +751,7 @@ func (a *adapter) buildInstructions() string {
 		// Claude Desktop is poll-only (no per-conversation id, no session-start
 		// hook, cannot render unsolicited pushes), so the NoMapping and mapped
 		// cases collapse to one honest instruction: attach explicitly, then poll.
-		head = "C3 connected. Claude Desktop is POLL-ONLY — it cannot render unsolicited Telegram pushes, so nothing arrives on its own. Attach to a topic explicitly with `attach(name=\"<topic>\")` (or `attach(target=\"dm\")` for your DM); `attach` with no argument returns a picker to surface for the user. Inbound Telegram messages are held in C3's durable queue — call `fetch_queue` to read new/held messages (Desktop will not pop them for you). Send replies and reactions with the `reply`/`react` tools when the user asks."
+		head = "C3 connected. Claude Desktop is POLL-ONLY — it cannot render unsolicited Telegram pushes, so nothing arrives on its own. Attach to a topic explicitly with `attach(name=\"<topic>\")` (or `attach(target=\"dm\")` for your DM); `attach` with no argument returns a picker to surface for the user. Inbound Telegram messages are held in C3's durable queue — call `fetch_queue` to read new/held messages (Desktop will not pop them for you), or the user can run the `/fetchq` slash command to drop the queue straight into the chat without asking. Send replies and reactions with the `reply`/`react` tools when the user asks."
 	}
 	return head + mode.Combined(a.capsOrDefault())
 }
@@ -872,11 +924,32 @@ func (a *adapter) toolFetchQueue(ctx context.Context, req *mcp.CallToolRequest) 
 	if err != nil {
 		return nil, fmt.Errorf("invalid params: %w", err)
 	}
-	fq := ipc.FetchQueueReq{Op: ipc.OpFetchQueue, ID: strconv.FormatUint(a.nextID.Add(1), 10), Ack: true}
+	ack := true
 	if v, ok := args["ack"].(bool); ok {
-		fq.Ack = v
+		ack = v
 	}
-	fq.Limit, fq.All = parseFetchLimit(args["limit"])
+	limit, all := parseFetchLimit(args["limit"])
+
+	text, isErr := a.doFetchQueue(ctx, ack, limit, all)
+	if isErr {
+		return toolErrorResult(text), nil
+	}
+	return toolTextResult(text), nil
+}
+
+// doFetchQueue runs one fetch_queue broker round-trip and returns the rendered
+// text. Shared by the `fetch_queue` TOOL (an LLM-driven call) and the `fetchq`
+// PROMPT (a user-driven slash command) so both consume the queue identically.
+// isErr distinguishes a broker/transport failure (surface as an error) from a
+// successful fetch (which may legitimately be "queue is empty").
+func (a *adapter) doFetchQueue(ctx context.Context, ack bool, limit int, all bool) (text string, isErr bool) {
+	fq := ipc.FetchQueueReq{
+		Op:    ipc.OpFetchQueue,
+		ID:    strconv.FormatUint(a.nextID.Add(1), 10),
+		Ack:   ack,
+		Limit: limit,
+		All:   all,
+	}
 
 	ch := make(chan ipc.FetchQueueResp, 1)
 	a.fqmu.Lock()
@@ -886,21 +959,21 @@ func (a *adapter) toolFetchQueue(ctx context.Context, req *mcp.CallToolRequest) 
 
 	conn := a.currentConn()
 	if conn == nil {
-		return toolErrorResult("broker reconnecting — retry fetch_queue in a moment"), nil
+		return "broker reconnecting — retry in a moment", true
 	}
 	if err := conn.WriteJSON(fq); err != nil {
-		return toolErrorResult("broker write: " + err.Error()), nil
+		return "broker write: " + err.Error(), true
 	}
 	select {
 	case <-ctx.Done():
-		return toolErrorResult("canceled"), nil
+		return "canceled", true
 	case <-time.After(120 * time.Second):
-		return toolErrorResult("fetch_queue timeout"), nil
+		return "fetch_queue timeout", true
 	case resp := <-ch:
 		if resp.Err != "" {
-			return toolErrorResult(resp.Err), nil
+			return resp.Err, true
 		}
-		return toolTextResult(renderFetchedMessages(resp.Messages, resp.Remaining, a.currentTopicName())), nil
+		return renderFetchedMessages(resp.Messages, resp.Remaining, a.currentTopicName()), false
 	}
 }
 
@@ -1104,6 +1177,21 @@ func parseFetchLimit(val any) (int, bool) {
 		return int(f), false
 	}
 	return 3, false
+}
+
+// parseFetchLimitStr parses the `limit` argument of the fetchq PROMPT, whose
+// arguments arrive as strings (MCP prompt args are always strings). Empty or
+// "all" ⇒ drain everything (the slash-command default); a positive integer ⇒ that
+// many oldest; anything else falls back to draining all.
+func parseFetchLimitStr(s string) (limit int, all bool) {
+	s = strings.TrimSpace(s)
+	if s == "" || strings.EqualFold(s, "all") {
+		return 0, true
+	}
+	if n, err := strconv.Atoi(s); err == nil && n > 0 {
+		return n, false
+	}
+	return 0, true
 }
 
 func renderBacklogSummary(count int, items []ipc.QueuedItem, route string) string {
