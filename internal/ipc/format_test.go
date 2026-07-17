@@ -108,6 +108,21 @@ func TestFormatAttached_ProposalParity(t *testing.T) {
 			want:    []string{"steal=true", "claude pid 1234"},
 			wantNot: []string{"unspecified failure"},
 		},
+		{
+			name: "force_steal_desktop",
+			msg: AttachedMsg{
+				NeedsConfirmation: true,
+				Proposal: &Proposal{
+					Action: "force_steal", Name: "tg-mux",
+					Holder: &Holder{CLI: "desktop", PID: 2600598, CWD: "/home/karthi"},
+				},
+			},
+			// A Desktop holder must read as the user's OWN other Desktop chat, with
+			// steal framed as MOVING the topic here — never the raw "desktop pid N
+			// (cwd …)" triple, which is meaningless across Desktop surfaces.
+			want:    []string{"your Claude Desktop C3 session", "steal=true", "move it here"},
+			wantNot: []string{"pid 2600598", "cwd"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

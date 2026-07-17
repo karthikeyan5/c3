@@ -1489,6 +1489,7 @@ const inboxHTML = `<!DOCTYPE html>
   <div class="attachbar" id="attachbar" hidden>
     <input type="text" class="topic" id="topic" placeholder="topic name" autocomplete="off" spellcheck="false">
     <button id="attach">Attach</button>
+    <button id="steal" hidden>Steal it here</button>
   </div>
   <div class="hint" id="attachhint" hidden></div>
   <div class="bar">
@@ -1515,6 +1516,7 @@ const inboxHTML = `<!DOCTYPE html>
   var attaching = false;
   var handing = false;
   var pendingAttachHint = "";
+  var pendingStealName = "";
   var REFRESH_MS = 5000;
   var HAND_PREFIX = "New C3 Telegram message(s):\n\n";
 
@@ -1525,6 +1527,7 @@ const inboxHTML = `<!DOCTYPE html>
   var elAttachBar = document.getElementById("attachbar");
   var elTopic = document.getElementById("topic");
   var elAttach = document.getElementById("attach");
+  var elSteal = document.getElementById("steal");
   var elAttachHint = document.getElementById("attachhint");
   var elHand = document.getElementById("hand");
   var elAutoLabel = document.getElementById("autolabel");
@@ -1617,7 +1620,7 @@ const inboxHTML = `<!DOCTYPE html>
   // when Auto is armed AND we are attached. Called on every render.
   function updateControls() {
     show(elAttachBar, !attached);
-    if (attached) { elAttachHint.hidden = true; elAttachHint.textContent = ""; }
+    if (attached) { elAttachHint.hidden = true; elAttachHint.textContent = ""; show(elSteal, false); pendingStealName = ""; }
     show(elHand, attached);
     show(elAutoLabel, attached);
     show(elAutoNote, attached && elAuto.checked);
@@ -1643,15 +1646,20 @@ const inboxHTML = `<!DOCTYPE html>
   // hint (covers "topic doesn't exist / needs create"). The double loadQueue
   // guarantees a post-attach peek even if a timer peek was mid-flight: the first
   // call coalesces onto that (possibly pre-attach) peek, the second is fresh.
-  function doAttach() {
+  function doAttach(steal) {
     if (attaching) { return; }
-    var name = (elTopic.value || "").replace(/^\s+|\s+$/g, "");
+    // A steal re-attaches the SAME topic the broker said is held by the user's
+    // other Desktop chat; a normal attach uses the typed name.
+    var name = steal ? pendingStealName : (elTopic.value || "").replace(/^\s+|\s+$/g, "");
     if (!name) { return; }
     attaching = true;
     elAttach.disabled = true;
+    if (elSteal) { elSteal.disabled = true; }
     elAttachHint.hidden = true;
     elAttachHint.textContent = "";
-    request("tools/call", { name: "attach", arguments: { name: name } }).then(function (result) {
+    var args = { name: name };
+    if (steal) { args.steal = true; }
+    request("tools/call", { name: "attach", arguments: args }).then(function (result) {
       pendingAttachHint = extractText(result);
       return loadQueue().then(function () { return loadQueue(); });
     }).catch(function (err) {
@@ -1659,9 +1667,22 @@ const inboxHTML = `<!DOCTYPE html>
     }).then(function () {
       attaching = false;
       elAttach.disabled = false;
+      if (elSteal) { elSteal.disabled = false; }
       if (!attached && pendingAttachHint) {
         elAttachHint.textContent = pendingAttachHint;
         elAttachHint.hidden = false;
+      }
+      // If the broker offered a force_steal (topic held by the user's OTHER
+      // Desktop chat), reveal the Steal button and remember which topic to move
+      // here. Keyed on the exact steal instruction so it fires for a real
+      // force_steal, not e.g. the disambiguate_dm hint.
+      var canSteal = !attached && pendingAttachHint.indexOf("Re-invoke attach with steal=true") !== -1;
+      if (canSteal) {
+        pendingStealName = name;
+        show(elSteal, true);
+      } else {
+        pendingStealName = "";
+        show(elSteal, false);
       }
       pendingAttachHint = "";
       reportSize();
@@ -1789,8 +1810,9 @@ const inboxHTML = `<!DOCTYPE html>
   }
 
   elRefresh.addEventListener("click", loadQueue);
-  elAttach.addEventListener("click", doAttach);
-  elTopic.addEventListener("keydown", function (e) { if (e.key === "Enter") { doAttach(); } });
+  elAttach.addEventListener("click", function () { doAttach(false); });
+  elTopic.addEventListener("keydown", function (e) { if (e.key === "Enter") { doAttach(false); } });
+  if (elSteal) { elSteal.addEventListener("click", function () { doAttach(true); }); }
   elHand.addEventListener("click", handToClaude);
   elAuto.addEventListener("change", function () {
     updateControls();

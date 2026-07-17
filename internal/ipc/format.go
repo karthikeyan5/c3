@@ -56,6 +56,17 @@ func FormatAttached(a *AttachedMsg) string {
 				ex.Name, ex.Group, ex.TopicID, ex.TopicID)
 		case "force_steal":
 			h := a.Proposal.Holder
+			if h.CLI == "desktop" {
+				// A Claude Desktop holder has no user-meaningful pid/cwd: every
+				// Desktop surface (Chat / Code / Cowork) is a SEPARATE process with
+				// an IDENTICAL cwd, so "held by desktop pid N (cwd …)" reads as
+				// gibberish. Name it as what it is — the user's own other Desktop C3
+				// chat — and frame steal as MOVING the topic here, not evicting a
+				// stranger. (2026-07-17: this was the whole of the multi-surface
+				// "already attached" confusion; the routing underneath is correct.)
+				return fmt.Sprintf("Topic %q is currently held by your Claude Desktop C3 session in another chat/surface. Re-invoke attach with steal=true to move it here.",
+					a.Proposal.Name)
+			}
 			return fmt.Sprintf("Topic %q is currently held by %s pid %d (cwd %q). Re-invoke attach with steal=true to evict that session and take the claim. Only do this if the user explicitly confirms.",
 				a.Proposal.Name, h.CLI, h.PID, h.CWD)
 		case "pick_topic":
