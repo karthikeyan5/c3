@@ -1471,6 +1471,9 @@ const inboxHTML = `<!DOCTYPE html>
   var pending = {};
   var connected = false;
   var lastW = -1, lastH = -1;
+  var refreshTimer = null;
+  var inFlight = false;
+  var REFRESH_MS = 5000;
 
   var elHost = document.getElementById("host");
   var elStatus = document.getElementById("status");
@@ -1556,38 +1559,44 @@ const inboxHTML = `<!DOCTYPE html>
     return parts.join("\n\n");
   }
 
-  function render(text) {
+  function renderQueue(text, isError) {
     elList.innerHTML = "";
     var trimmed = (text || "").replace(/^\s+|\s+$/g, "");
-    if (!trimmed) {
-      var empty = document.createElement("div");
-      empty.className = "empty";
-      empty.textContent = "No queued messages for the attached topic.";
-      elList.appendChild(empty);
+    var lower = trimmed.toLowerCase();
+    var notAttached = lower.indexOf("no route claimed") !== -1 || lower.indexOf("before attach") !== -1;
+    var box = document.createElement("div");
+    if (notAttached) {
+      box.className = "empty";
+      box.textContent = "Not attached to a topic yet. Attach this session to a Telegram topic (the attach tool), then messages appear here live.";
+    } else if (isError) {
+      box.className = "msg";
+      var e = document.createElement("pre"); e.className = "raw"; e.textContent = trimmed || "(error)";
+      box.appendChild(e);
+    } else if (!trimmed || lower === "c3 queue is empty") {
+      box.className = "empty";
+      box.textContent = "No queued messages — you're all caught up.";
     } else {
-      var card = document.createElement("div");
-      card.className = "msg";
-      var pre = document.createElement("pre");
-      pre.className = "raw";
-      pre.textContent = trimmed;
-      card.appendChild(pre);
-      elList.appendChild(card);
+      box.className = "msg";
+      var pre = document.createElement("pre"); pre.className = "raw"; pre.textContent = trimmed;
+      box.appendChild(pre);
     }
+    elList.appendChild(box);
     reportSize();
   }
 
   function loadQueue() {
-    if (!connected) { return; }
+    if (!connected || inFlight) { return; }
+    inFlight = true;
     elRefresh.disabled = true;
-    elStatus.textContent = "Fetching queue…";
     request("tools/call", { name: "fetch_queue", arguments: { ack: false } }).then(function (result) {
-      render(extractText(result));
-      elStatus.textContent = "Peeked (not consumed) · " + new Date().toLocaleTimeString();
-      elRefresh.disabled = false;
+      renderQueue(extractText(result), result && result.isError);
+      elStatus.textContent = "🟢 live · updated " + new Date().toLocaleTimeString();
     }).catch(function (err) {
-      elStatus.textContent = "Fetch failed: " + err.message;
-      elRefresh.disabled = false;
+      elStatus.textContent = "Fetch failed (retrying): " + err.message;
       reportSize();
+    }).then(function () {
+      inFlight = false;
+      elRefresh.disabled = false;
     });
   }
 
@@ -1609,9 +1618,10 @@ const inboxHTML = `<!DOCTYPE html>
     applyTheme(result && result.hostContext);
     notify("ui/notifications/initialized");
     elRefresh.disabled = false;
-    elStatus.textContent = "Connected.";
+    elStatus.textContent = "🟢 live";
     reportSize();
     loadQueue();
+    if (!refreshTimer) { refreshTimer = setInterval(loadQueue, REFRESH_MS); }
   }).catch(function (err) {
     elHost.textContent = "Handshake failed";
     elStatus.textContent = "Could not reach host: " + err.message;
