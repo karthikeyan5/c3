@@ -56,6 +56,15 @@ const (
 	idleStartupTimeout = 60 * time.Second // mirror cmd/c3-claude-adapter behavior
 )
 
+// MCP Apps (SEP-1865, modelcontextprotocol/ext-apps spec 2026-01-26) wiring for
+// the inline "C3 Inbox" panel. See registerInboxApp / inboxHTML at the bottom of
+// this file. Cited to ext-apps at specification/2026-01-26/apps.mdx.
+const (
+	uiExtensionID  = "io.modelcontextprotocol/ui" // extension identifier — apps.mdx:40
+	uiResourceMIME = "text/html;profile=mcp-app"  // required UI resource mimeType — apps.mdx:268
+	uiInboxURI     = "ui://c3/inbox.html"         // ui:// view URI (scheme required) — apps.mdx:267
+)
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "c3-desktop-adapter: %v\n", err)
@@ -674,6 +683,15 @@ func (a *adapter) buildMCPServer() *mcp.Server {
 			Logging: &mcp.LoggingCapabilities{},
 		},
 	}
+	// Advertise the MCP Apps UI extension (SEP-1724 extensions mechanism) so hosts
+	// that gate on server-advertised capabilities know we serve
+	// text/html;profile=mcp-app views. The host declares the same key on its side
+	// (apps.mdx:1500-1518); this is the symmetric server declaration. It surfaces
+	// in the initialize response because s.capabilities() clones Extensions
+	// (go-sdk mcp/server.go:565).
+	opts.Capabilities.AddExtension(uiExtensionID, map[string]any{
+		"mimeTypes": []string{uiResourceMIME},
+	})
 	srv := mcp.NewServer(&mcp.Implementation{
 		Name:    adapterName,
 		Version: adapterVersion,
@@ -688,6 +706,7 @@ func (a *adapter) buildMCPServer() *mcp.Server {
 
 	a.registerTools(srv)
 	a.registerPrompts(srv)
+	a.registerInboxApp(srv)
 	return srv
 }
 
@@ -1062,8 +1081,36 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 						"ack":   map[string]any{"type": "boolean", "default": true},
 					},
 				},
+				// Make fetch_queue callable by the MCP App panel. A host MUST reject
+				// tools/call from an app for tools whose visibility omits "app"
+				// (apps.mdx:399-401). The default is ["model","app"] (apps.mdx:397),
+				// but we set it explicitly to de-risk hosts that don't apply the
+				// default. No resourceUri here — fetch_queue renders as text, not a
+				// panel; only open_inbox carries a resourceUri.
+				Meta: mcp.Meta{"ui": map[string]any{"visibility": []string{"model", "app"}}},
 			},
 			handler: a.toolFetchQueue,
+		},
+		{
+			tool: &mcp.Tool{
+				Name:        "open_inbox",
+				Description: "Open the C3 Inbox — an inline panel that renders the inbound Telegram messages held in C3's durable queue for the attached topic. The panel PEEKS the queue (does not consume); use fetch_queue to actually drain it. Requires an attached topic.",
+				InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+				// Link this tool to its UI resource so a host that supports MCP Apps
+				// fetches and renders the panel when the tool is called (apps.mdx:363,
+				// 388). Nested `ui.resourceUri` is the current form (src/app-bridge.ts:
+				// 125-133); the flat `ui/resourceUri` is the deprecated fallback some
+				// hosts still read (examples/qr-server/server.py:104). visibility
+				// ["model","app"] keeps it callable by both the model and the app.
+				Meta: mcp.Meta{
+					"ui": map[string]any{
+						"resourceUri": uiInboxURI,
+						"visibility":  []string{"model", "app"},
+					},
+					"ui/resourceUri": uiInboxURI,
+				},
+			},
+			handler: a.toolOpenInbox,
 		},
 		{
 			tool: &mcp.Tool{
@@ -1313,3 +1360,274 @@ func mapResult(m map[string]any) *mcp.CallToolResult {
 	}
 	return &mcp.CallToolResult{Content: content}
 }
+
+// --- MCP Apps: minimal "C3 Inbox" inline panel -----------------------------
+//
+// SEP-1865 (MCP Apps, spec 2026-01-26 in modelcontextprotocol/ext-apps). The
+// open_inbox tool carries _meta.ui.resourceUri pointing at the ui:// resource
+// below; a host that supports MCP Apps fetches inboxHTML and renders it in a
+// sandboxed iframe when the tool is called. The panel handshakes with the host
+// (ui/initialize -> ui/notifications/initialized, per src/app.ts:1959-1982) and
+// then calls the existing fetch_queue tool through the host bridge to render the
+// durable queue inline. Deliberately minimal — a render probe for the
+// stdio+iframe MCP-App shape (de-risks claude-ai-mcp#165), not a full inbox.
+
+// registerInboxApp declares the ui:// HTML resource that backs open_inbox.
+// Registering a resource auto-advertises the server `resources` capability
+// (go-sdk mcp/server.go:588), so no ServerOptions change is needed for it.
+func (a *adapter) registerInboxApp(srv *mcp.Server) {
+	srv.AddResource(&mcp.Resource{
+		URI:         uiInboxURI,
+		Name:        "C3 Inbox",
+		Description: "Inline panel that renders C3's durable queue for the attached topic.",
+		MIMEType:    uiResourceMIME,
+	}, a.resourceInbox)
+}
+
+// resourceInbox serves the self-contained inbox HTML. mimeType MUST be
+// text/html;profile=mcp-app for the host to treat it as an MCP App view
+// (apps.mdx:268, src/app.ts:158). The HTML is fully inline (no external network)
+// so it renders under the host's restrictive default CSP (apps.mdx:275-284) —
+// hence no _meta.ui.csp is declared.
+func (a *adapter) resourceInbox(_ context.Context, _ *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+	return &mcp.ReadResourceResult{
+		Contents: []*mcp.ResourceContents{{
+			URI:      uiInboxURI,
+			MIMEType: uiResourceMIME,
+			Text:     inboxHTML,
+		}},
+	}, nil
+}
+
+// toolOpenInbox is the tool the host calls to open the panel; the panel itself
+// does the real work. This text is the graceful-degradation fallback for hosts
+// that do not render MCP Apps — a UI-linked tool MUST still return meaningful
+// content (apps.mdx:1556-1559).
+func (a *adapter) toolOpenInbox(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return toolTextResult("Opening the C3 inbox panel — it peeks the durable queue for the attached topic (does not consume). Use fetch_queue to actually drain messages."), nil
+}
+
+// inboxHTML is the self-contained MCP App view. All CSS+JS are inline (no
+// external network) so it satisfies the host's default CSP. The JS speaks the
+// raw postMessage JSON-RPC dialect directly (no SDK) so nothing is fetched:
+//   - ui/initialize request -> await result -> ui/notifications/initialized
+//     notification (src/app.ts:1959-1982); protocolVersion 2026-01-26
+//     (src/spec.types.ts:29).
+//   - tools/call { name:"fetch_queue", arguments:{ack:false} } to PEEK the queue
+//     (apps.mdx:495, 1483; App.callServerTool src/app.ts:1246).
+//   - ui/notifications/size-changed so a flexible-height host sizes the iframe to
+//     the content (apps.mdx:718; src/app.ts:1859-1907).
+//
+// NOTE: this string is a Go raw literal (backticks) — it must contain no
+// backtick characters, so the JS uses string concatenation, not template
+// literals.
+const inboxHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="light dark">
+<title>C3 Inbox</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --c3-bg: var(--color-background-primary, light-dark(#ffffff, #1a1a1a));
+    --c3-fg: var(--color-text-primary, light-dark(#1a1a1a, #f4f4f4));
+    --c3-muted: var(--color-text-secondary, light-dark(#5c5c5c, #a6a6a6));
+    --c3-border: var(--color-border-primary, light-dark(#e4e4e4, #333333));
+    --c3-ok: var(--color-text-success, light-dark(#0f7a34, #4ade80));
+    --c3-card: var(--color-background-secondary, light-dark(#f7f7f7, #232323));
+    --c3-radius: var(--border-radius-md, 10px);
+    --c3-font: var(--font-sans, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--c3-bg); color: var(--c3-fg); font-family: var(--c3-font); }
+  body { padding: 16px; -webkit-font-smoothing: antialiased; }
+  .banner { display: flex; align-items: center; gap: 8px; font-size: 18px; font-weight: 700; color: var(--c3-ok); }
+  .sub { color: var(--c3-muted); font-size: 12px; margin: 4px 0 14px; }
+  .bar { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+  button { font: inherit; font-size: 13px; font-weight: 600; padding: 7px 14px; border-radius: var(--c3-radius); border: 1px solid var(--c3-border); background: var(--c3-card); color: var(--c3-fg); cursor: pointer; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .status { color: var(--c3-muted); font-size: 12px; }
+  .msg { border: 1px solid var(--c3-border); border-radius: var(--c3-radius); background: var(--c3-card); padding: 12px 14px; margin-bottom: 10px; }
+  pre.raw { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; font: inherit; font-size: 13px; line-height: 1.5; margin: 0; }
+  .empty { color: var(--c3-muted); font-size: 13px; padding: 6px 0; }
+</style>
+</head>
+<body>
+  <div class="banner"><span>&#9989; C3 Inbox connected</span></div>
+  <div class="sub" id="host">Initializing&hellip;</div>
+  <div class="bar">
+    <button id="refresh" disabled>Refresh</button>
+    <span class="status" id="status">Connecting to host&hellip;</span>
+  </div>
+  <div id="list"><div class="empty">Loading queued messages&hellip;</div></div>
+<script>
+(function () {
+  "use strict";
+  var PROTOCOL_VERSION = "2026-01-26";
+  var parentWin = window.parent;
+  var nextId = 1;
+  var pending = {};
+  var connected = false;
+  var lastW = -1, lastH = -1;
+
+  var elHost = document.getElementById("host");
+  var elStatus = document.getElementById("status");
+  var elRefresh = document.getElementById("refresh");
+  var elList = document.getElementById("list");
+
+  function send(obj) { parentWin.postMessage(obj, "*"); }
+
+  function request(method, params) {
+    var id = nextId++;
+    var msg = { jsonrpc: "2.0", id: id, method: method };
+    if (params !== undefined) { msg.params = params; }
+    return new Promise(function (resolve, reject) {
+      pending[id] = { resolve: resolve, reject: reject };
+      send(msg);
+    });
+  }
+
+  function notify(method, params) {
+    var msg = { jsonrpc: "2.0", method: method };
+    if (params !== undefined) { msg.params = params; }
+    send(msg);
+  }
+
+  function respond(id, result) { send({ jsonrpc: "2.0", id: id, result: result }); }
+
+  // Measure true content height with the max-content trick (mirrors the SDK,
+  // src/app.ts:1883-1886); width is the viewport width. Only emit when it
+  // actually changed to avoid a resize feedback loop.
+  function reportSize() {
+    var html = document.documentElement;
+    var prev = html.style.height;
+    html.style.height = "max-content";
+    var h = Math.ceil(html.getBoundingClientRect().height);
+    html.style.height = prev;
+    var w = Math.ceil(window.innerWidth);
+    if (w === lastW && h === lastH) { return; }
+    lastW = w; lastH = h;
+    notify("ui/notifications/size-changed", { width: w, height: h });
+  }
+
+  function applyTheme(ctx) {
+    if (!ctx) { return; }
+    if (ctx.theme) { document.documentElement.setAttribute("data-theme", ctx.theme); }
+    var vars = ctx.styles && ctx.styles.variables;
+    if (vars) {
+      for (var k in vars) {
+        if (Object.prototype.hasOwnProperty.call(vars, k) && vars[k] != null) {
+          document.documentElement.style.setProperty(k, vars[k]);
+        }
+      }
+    }
+  }
+
+  window.addEventListener("message", function (event) {
+    var data = event.data;
+    if (!data || data.jsonrpc !== "2.0") { return; }
+    // Response to one of our requests (has id, no method).
+    if (data.id !== undefined && data.method === undefined) {
+      var p = pending[data.id];
+      if (!p) { return; }
+      delete pending[data.id];
+      if (data.error) { p.reject(new Error((data.error && data.error.message) || "host error")); }
+      else { p.resolve(data.result); }
+      return;
+    }
+    // Request from the host to us (has id and method). Answer politely so the
+    // host never hangs; ping and teardown both take an empty result.
+    if (data.id !== undefined && data.method) {
+      respond(data.id, {});
+      return;
+    }
+    // Host notifications (no id) are ignored in this minimal probe.
+  });
+
+  function extractText(result) {
+    if (!result || !result.content || !result.content.length) { return ""; }
+    var parts = [];
+    for (var i = 0; i < result.content.length; i++) {
+      var c = result.content[i];
+      if (c && c.type === "text" && typeof c.text === "string") { parts.push(c.text); }
+    }
+    return parts.join("\n\n");
+  }
+
+  function render(text) {
+    elList.innerHTML = "";
+    var trimmed = (text || "").replace(/^\s+|\s+$/g, "");
+    if (!trimmed) {
+      var empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "No queued messages for the attached topic.";
+      elList.appendChild(empty);
+    } else {
+      var card = document.createElement("div");
+      card.className = "msg";
+      var pre = document.createElement("pre");
+      pre.className = "raw";
+      pre.textContent = trimmed;
+      card.appendChild(pre);
+      elList.appendChild(card);
+    }
+    reportSize();
+  }
+
+  function loadQueue() {
+    if (!connected) { return; }
+    elRefresh.disabled = true;
+    elStatus.textContent = "Fetching queue…";
+    request("tools/call", { name: "fetch_queue", arguments: { ack: false } }).then(function (result) {
+      render(extractText(result));
+      elStatus.textContent = "Peeked (not consumed) · " + new Date().toLocaleTimeString();
+      elRefresh.disabled = false;
+    }).catch(function (err) {
+      elStatus.textContent = "Fetch failed: " + err.message;
+      elRefresh.disabled = false;
+      reportSize();
+    });
+  }
+
+  elRefresh.addEventListener("click", loadQueue);
+
+  if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(function () { reportSize(); }).observe(document.documentElement);
+  }
+
+  // Handshake, then first (peeking) fetch.
+  request("ui/initialize", {
+    appCapabilities: { availableDisplayModes: ["inline"] },
+    appInfo: { name: "C3 Inbox", version: "0.1.0" },
+    protocolVersion: PROTOCOL_VERSION
+  }).then(function (result) {
+    connected = true;
+    var host = (result && result.hostInfo && result.hostInfo.name) ? result.hostInfo.name : "host";
+    elHost.textContent = "Connected to " + host + " · peeking the durable queue (not consuming)";
+    applyTheme(result && result.hostContext);
+    notify("ui/notifications/initialized");
+    elRefresh.disabled = false;
+    elStatus.textContent = "Connected.";
+    reportSize();
+    loadQueue();
+  }).catch(function (err) {
+    elHost.textContent = "Handshake failed";
+    elStatus.textContent = "Could not reach host: " + err.message;
+    reportSize();
+  });
+
+  setTimeout(function () {
+    if (!connected) {
+      elStatus.textContent = "No response from host after 8s — this view may not be running inside an MCP Apps host.";
+      reportSize();
+    }
+  }, 8000);
+
+  reportSize();
+})();
+</script>
+</body>
+</html>
+`

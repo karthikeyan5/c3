@@ -164,6 +164,7 @@ func TestServerInfoAndTools(t *testing.T) {
 	wantTools := []string{
 		"attach", "detach", "topics", "fetch_queue", "retranscribe",
 		"reply", "react", "edit_message", "poll", "stop_poll", "download_attachment",
+		"open_inbox",
 	}
 	for _, name := range wantTools {
 		if !got[name] {
@@ -179,6 +180,52 @@ func TestServerInfoAndTools(t *testing.T) {
 		if got[banned] {
 			t.Errorf("tool %q must NOT be registered on the Desktop adapter", banned)
 		}
+	}
+
+	// --- MCP Apps ("C3 Inbox") contract -------------------------------------
+	// The adapter must advertise the io.modelcontextprotocol/ui extension, link
+	// open_inbox to its ui:// resource via _meta.ui.resourceUri, and serve that
+	// resource as text/html;profile=mcp-app.
+	if params.Capabilities.Extensions == nil {
+		t.Error("capabilities.extensions missing; MCP Apps hosts gate on it")
+	} else if ext, ok := params.Capabilities.Extensions[uiExtensionID].(map[string]any); !ok {
+		t.Errorf("capabilities.extensions[%q] missing or not an object; got %v", uiExtensionID, params.Capabilities.Extensions)
+	} else if mimes, _ := ext["mimeTypes"].([]any); len(mimes) == 0 || mimes[0] != uiResourceMIME {
+		t.Errorf("extension mimeTypes = %v; want [%q]", ext["mimeTypes"], uiResourceMIME)
+	}
+
+	var openInbox *mcp.Tool
+	for _, tool := range listResult.Tools {
+		if tool.Name == "open_inbox" {
+			openInbox = tool
+		}
+	}
+	if openInbox == nil {
+		t.Fatal("open_inbox tool not found in tools/list")
+	}
+	if uiMeta, _ := openInbox.Meta["ui"].(map[string]any); uiMeta == nil || uiMeta["resourceUri"] != uiInboxURI {
+		t.Errorf("open_inbox _meta.ui.resourceUri = %v; want %q", openInbox.Meta["ui"], uiInboxURI)
+	}
+	if openInbox.Meta["ui/resourceUri"] != uiInboxURI {
+		t.Errorf("open_inbox deprecated _meta[ui/resourceUri] = %v; want %q (host back-compat)", openInbox.Meta["ui/resourceUri"], uiInboxURI)
+	}
+
+	rr, err := sess.ReadResource(ctx, &mcp.ReadResourceParams{URI: uiInboxURI})
+	if err != nil {
+		t.Fatalf("ReadResource(%s): %v", uiInboxURI, err)
+	}
+	if len(rr.Contents) == 0 {
+		t.Fatalf("ReadResource(%s) returned no contents", uiInboxURI)
+	}
+	rc := rr.Contents[0]
+	if rc.MIMEType != uiResourceMIME {
+		t.Errorf("inbox resource mimeType = %q; want %q", rc.MIMEType, uiResourceMIME)
+	}
+	if !strings.Contains(rc.Text, "C3 Inbox connected") {
+		t.Error("inbox HTML missing the '✅ C3 Inbox connected' banner")
+	}
+	if !strings.Contains(rc.Text, "ui/initialize") || !strings.Contains(rc.Text, "fetch_queue") {
+		t.Error("inbox HTML missing the ui/initialize handshake or the fetch_queue call")
 	}
 }
 
