@@ -1059,6 +1059,11 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 						"policy_rejected": map[string]any{"type": "boolean"},
 					},
 				},
+				// App-callable so the C3 Inbox panel can attach in-panel via the
+				// host bridge (a host MUST reject tools/call from an app for tools
+				// whose visibility omits "app" — apps.mdx:399-401). No resourceUri:
+				// attach renders as text, it is not itself a panel.
+				Meta: mcp.Meta{"ui": map[string]any{"visibility": []string{"model", "app"}}},
 			},
 			handler: a.toolAttach,
 		},
@@ -1067,6 +1072,10 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 				Name:        "topics",
 				Description: "List known Telegram topics + claim state.",
 				InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+				// App-callable groundwork: the panel marks topics visible now so a
+				// later increment can list topics in-panel. `topics` returns formatted
+				// text (not structured data), so this version renders no topic buttons.
+				Meta: mcp.Meta{"ui": map[string]any{"visibility": []string{"model", "app"}}},
 			},
 			handler: a.toolTopics,
 		},
@@ -1415,8 +1424,19 @@ func (a *adapter) toolOpenInbox(_ context.Context, _ *mcp.CallToolRequest) (*mcp
 //     (src/spec.types.ts:29).
 //   - tools/call { name:"fetch_queue", arguments:{ack:false} } to PEEK the queue
 //     (apps.mdx:495, 1483; App.callServerTool src/app.ts:1246).
+//   - tools/call { name:"attach", arguments:{name} } to attach in-panel when not
+//     yet attached; a re-peek RELOAD HEURISTIC decides whether it worked (the
+//     result text is not parsed) — apps.mdx:399-401 gates app-callable tools.
+//   - tools/call { name:"fetch_queue", arguments:{ack:true} } to DRAIN (consume)
+//     for "Hand to Claude" / the Auto toggle.
+//   - ui/message { role:"user", content:{type:"text", text} } to hand the drained
+//     messages to Claude and start a turn (apps.mdx:998-1034; the host MAY prompt
+//     for consent).
 //   - ui/notifications/size-changed so a flexible-height host sizes the iframe to
 //     the content (apps.mdx:718; src/app.ts:1859-1907).
+//
+// The panel is delivery/awareness only — it deliberately exposes NO reply/send
+// affordance; composing replies stays the model's job.
 //
 // NOTE: this string is a Go raw literal (backticks) — it must contain no
 // backtick characters, so the JS uses string concatenation, not template
@@ -1452,15 +1472,29 @@ const inboxHTML = `<!DOCTYPE html>
   .msg { border: 1px solid var(--c3-border); border-radius: var(--c3-radius); background: var(--c3-card); padding: 12px 14px; margin-bottom: 10px; }
   pre.raw { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; font: inherit; font-size: 13px; line-height: 1.5; margin: 0; }
   .empty { color: var(--c3-muted); font-size: 13px; padding: 6px 0; }
+  [hidden] { display: none !important; }
+  .attachbar { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+  input.topic { font: inherit; font-size: 13px; padding: 7px 10px; border-radius: var(--c3-radius); border: 1px solid var(--c3-border); background: var(--c3-bg); color: var(--c3-fg); flex: 1 1 160px; min-width: 120px; }
+  .hint { color: var(--c3-muted); font-size: 12px; margin: -2px 0 12px; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+  .note { color: var(--c3-muted); font-size: 12px; margin: -2px 0 12px; font-style: italic; }
+  label.auto { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--c3-fg); cursor: pointer; user-select: none; }
 </style>
 </head>
 <body>
   <div class="banner"><span>&#9989; C3 Inbox connected</span></div>
   <div class="sub" id="host">Initializing&hellip;</div>
+  <div class="attachbar" id="attachbar" hidden>
+    <input type="text" class="topic" id="topic" placeholder="topic name" autocomplete="off" spellcheck="false">
+    <button id="attach">Attach</button>
+  </div>
+  <div class="hint" id="attachhint" hidden></div>
   <div class="bar">
     <button id="refresh" disabled>Refresh</button>
+    <button id="hand" hidden>Hand to Claude</button>
+    <label class="auto" id="autolabel" hidden><input type="checkbox" id="auto"> Auto</label>
     <span class="status" id="status">Connecting to host&hellip;</span>
   </div>
+  <div class="note" id="autonote" hidden>Auto: new messages are handed to Claude automatically while this panel is open.</div>
   <div id="list"><div class="empty">Loading queued messages&hellip;</div></div>
 <script>
 (function () {
@@ -1473,12 +1507,26 @@ const inboxHTML = `<!DOCTYPE html>
   var lastW = -1, lastH = -1;
   var refreshTimer = null;
   var inFlight = false;
+  var inFlightP = null;
+  var attached = false;
+  var attaching = false;
+  var handing = false;
+  var pendingAttachHint = "";
   var REFRESH_MS = 5000;
+  var HAND_PREFIX = "New C3 Telegram message(s):\n\n";
 
   var elHost = document.getElementById("host");
   var elStatus = document.getElementById("status");
   var elRefresh = document.getElementById("refresh");
   var elList = document.getElementById("list");
+  var elAttachBar = document.getElementById("attachbar");
+  var elTopic = document.getElementById("topic");
+  var elAttach = document.getElementById("attach");
+  var elAttachHint = document.getElementById("attachhint");
+  var elHand = document.getElementById("hand");
+  var elAutoLabel = document.getElementById("autolabel");
+  var elAuto = document.getElementById("auto");
+  var elAutoNote = document.getElementById("autonote");
 
   function send(obj) { parentWin.postMessage(obj, "*"); }
 
@@ -1559,15 +1607,128 @@ const inboxHTML = `<!DOCTYPE html>
     return parts.join("\n\n");
   }
 
+  function show(el, on) { if (el) { el.hidden = !on; } }
+
+  // updateControls swaps the not-attached affordance (topic form) for the
+  // attached affordances (Hand to Claude + Auto), and shows the Auto note only
+  // when Auto is armed AND we are attached. Called on every render.
+  function updateControls() {
+    show(elAttachBar, !attached);
+    if (attached) { elAttachHint.hidden = true; elAttachHint.textContent = ""; }
+    show(elHand, attached);
+    show(elAutoLabel, attached);
+    show(elAutoNote, attached && elAuto.checked);
+  }
+
+  // shouldHand decides whether a fetched blob is real Telegram content worth
+  // handing to Claude — not an error, not the empty-queue line, not the
+  // not-attached sentinel.
+  function shouldHand(text, isError) {
+    if (isError) { return false; }
+    var trimmed = (text || "").replace(/^\s+|\s+$/g, "");
+    if (!trimmed) { return false; }
+    var lower = trimmed.toLowerCase();
+    if (lower === "c3 queue is empty") { return false; }
+    if (lower.indexOf("no route claimed") !== -1 || lower.indexOf("before attach") !== -1) { return false; }
+    return true;
+  }
+
+  // doAttach attaches this session to the typed topic, then re-peeks. It does
+  // NOT parse the attach result — the RELOAD HEURISTIC: after attach, loadQueue
+  // re-peeks and renderQueue flips attached off the not-attached sentinel. If
+  // still not attached, the attach tool's text is surfaced under the form as a
+  // hint (covers "topic doesn't exist / needs create"). The double loadQueue
+  // guarantees a post-attach peek even if a timer peek was mid-flight: the first
+  // call coalesces onto that (possibly pre-attach) peek, the second is fresh.
+  function doAttach() {
+    if (attaching) { return; }
+    var name = (elTopic.value || "").replace(/^\s+|\s+$/g, "");
+    if (!name) { return; }
+    attaching = true;
+    elAttach.disabled = true;
+    elAttachHint.hidden = true;
+    elAttachHint.textContent = "";
+    request("tools/call", { name: "attach", arguments: { name: name } }).then(function (result) {
+      pendingAttachHint = extractText(result);
+      return loadQueue().then(function () { return loadQueue(); });
+    }).catch(function (err) {
+      pendingAttachHint = "Attach failed: " + err.message;
+    }).then(function () {
+      attaching = false;
+      elAttach.disabled = false;
+      if (!attached && pendingAttachHint) {
+        elAttachHint.textContent = pendingAttachHint;
+        elAttachHint.hidden = false;
+      }
+      pendingAttachHint = "";
+      reportSize();
+    });
+  }
+
+  // handToClaude hands the waiting messages to Claude (ui/message → starts a
+  // turn) and only THEN consumes them. Ordering is deliberate and load-bearing:
+  // PEEK (ack:false, no consume) → ui/message → DRAIN (ack:true) only after the
+  // host accepts. A declined or failed hand therefore never drops messages from
+  // the durable queue — they stay queued and re-appear on the next peek. (C3's
+  // whole contract is a no-loss queue; drain-first would lose messages on every
+  // decline.) On decline we also disarm Auto so a persistent "no" can't re-prompt
+  // every refresh. Residual edge: messages arriving WHILE a consent prompt is open
+  // get consumed by the post-accept drain without being handed — harmless under
+  // "always allow" (ui/message resolves instantly), the expected Desktop case.
+  function handToClaude() {
+    if (handing || !attached) { return; }
+    handing = true;
+    elHand.disabled = true;
+    request("tools/call", { name: "fetch_queue", arguments: { ack: false } }).then(function (result) {
+      var text = extractText(result);
+      if (!shouldHand(text, result && result.isError)) {
+        elStatus.textContent = "Nothing new to hand · " + new Date().toLocaleTimeString();
+        return;
+      }
+      return request("ui/message", { role: "user", content: { type: "text", text: HAND_PREFIX + text } }).then(function () {
+        elStatus.textContent = "📤 handed to Claude · " + new Date().toLocaleTimeString();
+        // Accepted → consume so it won't re-hand or re-show. Best-effort.
+        return request("tools/call", { name: "fetch_queue", arguments: { ack: true } }).then(function () {}, function () {});
+      }, function () {
+        // Declined/failed → leave queued; disarm Auto to stop re-prompting.
+        if (elAuto.checked) { elAuto.checked = false; updateControls(); }
+        elStatus.textContent = "Hand not accepted — left in queue (Auto off)";
+      });
+    }).catch(function (err) {
+      elStatus.textContent = "Hand failed: " + (err && err.message ? err.message : "error");
+    }).then(function () {
+      handing = false;
+      elHand.disabled = false;
+      loadQueue();
+      reportSize();
+    });
+  }
+
+  // autoMaybe auto-hands when Auto is armed and a peek surfaced real content.
+  // Loop-avoidance: handing drains (ack:true), so the next peek is empty and
+  // shouldHand is false; the single handing flag blocks re-entry while a hand
+  // (incl. its ui/message consent round-trip) is outstanding.
+  function autoMaybe(text, isError) {
+    if (!elAuto.checked || !attached || handing) { return; }
+    if (!shouldHand(text, isError)) { return; }
+    handToClaude();
+  }
+
   function renderQueue(text, isError) {
     elList.innerHTML = "";
     var trimmed = (text || "").replace(/^\s+|\s+$/g, "");
     var lower = trimmed.toLowerCase();
     var notAttached = lower.indexOf("no route claimed") !== -1 || lower.indexOf("before attach") !== -1;
+    // Update attach state on definitive signals only: the not-attached sentinel
+    // flips it off; any successful (non-error) peek — content OR empty queue —
+    // flips it on. A generic transport/broker error leaves the state unchanged.
+    if (notAttached) { attached = false; }
+    else if (!isError) { attached = true; }
+    updateControls();
     var box = document.createElement("div");
     if (notAttached) {
       box.className = "empty";
-      box.textContent = "Not attached to a topic yet. Attach this session to a Telegram topic (the attach tool), then messages appear here live.";
+      box.textContent = "Not attached to a topic yet — enter a topic name above and click Attach.";
     } else if (isError) {
       box.className = "msg";
       var e = document.createElement("pre"); e.className = "raw"; e.textContent = trimmed || "(error)";
@@ -1584,23 +1745,42 @@ const inboxHTML = `<!DOCTYPE html>
     reportSize();
   }
 
+  // loadQueue PEEKS (ack:false — never consumes) and renders. It returns a
+  // promise and coalesces concurrent callers onto the in-flight peek, so the
+  // attach reload heuristic can await a real result. Skipped while a hand is in
+  // flight (handing drains; a racing peek would show rows that are being drained).
   function loadQueue() {
-    if (!connected || inFlight) { return; }
+    if (!connected) { return Promise.resolve(); }
+    if (inFlight) { return inFlightP || Promise.resolve(); }
+    if (handing) { return Promise.resolve(); }
     inFlight = true;
     elRefresh.disabled = true;
-    request("tools/call", { name: "fetch_queue", arguments: { ack: false } }).then(function (result) {
-      renderQueue(extractText(result), result && result.isError);
+    inFlightP = request("tools/call", { name: "fetch_queue", arguments: { ack: false } }).then(function (result) {
+      var text = extractText(result);
+      var isErr = result && result.isError;
+      renderQueue(text, isErr);
       elStatus.textContent = "🟢 live · updated " + new Date().toLocaleTimeString();
+      autoMaybe(text, isErr);
     }).catch(function (err) {
       elStatus.textContent = "Fetch failed (retrying): " + err.message;
       reportSize();
     }).then(function () {
       inFlight = false;
+      inFlightP = null;
       elRefresh.disabled = false;
     });
+    return inFlightP;
   }
 
   elRefresh.addEventListener("click", loadQueue);
+  elAttach.addEventListener("click", doAttach);
+  elTopic.addEventListener("keydown", function (e) { if (e.key === "Enter") { doAttach(); } });
+  elHand.addEventListener("click", handToClaude);
+  elAuto.addEventListener("change", function () {
+    updateControls();
+    reportSize();
+    if (elAuto.checked) { loadQueue(); }
+  });
 
   if (typeof ResizeObserver !== "undefined") {
     new ResizeObserver(function () { reportSize(); }).observe(document.documentElement);

@@ -210,6 +210,24 @@ func TestServerInfoAndTools(t *testing.T) {
 		t.Errorf("open_inbox deprecated _meta[ui/resourceUri] = %v; want %q (host back-compat)", openInbox.Meta["ui/resourceUri"], uiInboxURI)
 	}
 
+	// attach and topics are marked app-callable (visibility ["model","app"]) so
+	// the C3 Inbox panel can call them through the host bridge (apps.mdx:399-401).
+	for _, name := range []string{"attach", "topics"} {
+		var tool *mcp.Tool
+		for _, tl := range listResult.Tools {
+			if tl.Name == name {
+				tool = tl
+			}
+		}
+		if tool == nil {
+			t.Fatalf("%s tool not found in tools/list", name)
+		}
+		vis := uiVisibility(tool)
+		if !containsStr(vis, "model") || !containsStr(vis, "app") {
+			t.Errorf("%s _meta.ui.visibility = %v; want to contain \"model\" and \"app\"", name, vis)
+		}
+	}
+
 	rr, err := sess.ReadResource(ctx, &mcp.ReadResourceParams{URI: uiInboxURI})
 	if err != nil {
 		t.Fatalf("ReadResource(%s): %v", uiInboxURI, err)
@@ -226,6 +244,13 @@ func TestServerInfoAndTools(t *testing.T) {
 	}
 	if !strings.Contains(rc.Text, "ui/initialize") || !strings.Contains(rc.Text, "fetch_queue") {
 		t.Error("inbox HTML missing the ui/initialize handshake or the fetch_queue call")
+	}
+	// Interactive inbox: in-panel attach form, Hand to Claude + Auto, and the
+	// ui/message turn-start call must all be present in the served HTML.
+	for _, want := range []string{"ui/message", "Hand to Claude", "Auto", "placeholder=\"topic name\"", "name: \"attach\""} {
+		if !strings.Contains(rc.Text, want) {
+			t.Errorf("inbox HTML missing %q (interactive-inbox extension)", want)
+		}
 	}
 }
 
@@ -259,6 +284,24 @@ func TestDesktopCWD(t *testing.T) {
 	if got := desktopCWD(); got == "" {
 		t.Error("desktopCWD() empty with no override; want os.Getwd fallback")
 	}
+}
+
+func uiVisibility(tool *mcp.Tool) []string {
+	if tool == nil || tool.Meta == nil {
+		return nil
+	}
+	ui, _ := tool.Meta["ui"].(map[string]any)
+	if ui == nil {
+		return nil
+	}
+	raw, _ := ui["visibility"].([]any)
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func containsStr(ss []string, want string) bool {
