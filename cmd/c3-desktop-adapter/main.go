@@ -692,28 +692,30 @@ func (a *adapter) buildMCPServer() *mcp.Server {
 }
 
 // registerPrompts declares C3's MCP prompts. Claude Desktop surfaces MCP prompts
-// as slash commands, so `fetchq` gives the user a one-keystroke `/fetchq` that
-// pulls the durable queue in a single deterministic step — no "please check my
+// as slash commands, so `fetch-queue` gives the user a one-keystroke `/fetch-queue`
+// that pulls the durable queue in a single deterministic step — no "please check my
 // messages" sentence and no tool-call reasoning turn to trigger the fetch. The
 // returned message is injected by the client for the model to read/act on.
-// Registering a prompt auto-advertises the server `prompts` capability.
+// Registering a prompt auto-advertises the server `prompts` capability. The name is
+// kebab-case (Claude's slash-command convention, e.g. /add-dir) and deliberately
+// distinct from the underscore `fetch_queue` TOOL so the two don't collide.
 func (a *adapter) registerPrompts(srv *mcp.Server) {
 	srv.AddPrompt(&mcp.Prompt{
-		Name:        "fetchq",
+		Name:        "fetch-queue",
 		Title:       "Fetch C3 queue",
 		Description: "Pull inbound Telegram messages held in C3's durable queue for the attached topic and drop them straight into the chat — a one-keystroke alternative to asking Claude to call fetch_queue. Drains everything by default; pass limit=N for the N oldest, or ack=false to peek without consuming.",
 		Arguments: []*mcp.PromptArgument{
 			{Name: "limit", Description: "How many oldest messages to pull: a number, or \"all\" (default)."},
 			{Name: "ack", Description: "\"false\" to peek without consuming (leaves them queued). Default \"true\" — drain."},
 		},
-	}, a.promptFetchq)
+	}, a.promptFetchQueue)
 }
 
-// promptFetchq backs the `fetchq` slash command. It defaults to draining the whole
-// queue (a slash command is an explicit "show me what's waiting"); `limit` narrows
-// it and `ack=false` peeks. The queued messages are returned as a user-role prompt
-// message so the client injects them for the model to read and act on.
-func (a *adapter) promptFetchq(ctx context.Context, req *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+// promptFetchQueue backs the `/fetch-queue` slash command. It defaults to draining
+// the whole queue (a slash command is an explicit "show me what's waiting"); `limit`
+// narrows it and `ack=false` peeks. The queued messages are returned as a user-role
+// prompt message so the client injects them for the model to read and act on.
+func (a *adapter) promptFetchQueue(ctx context.Context, req *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
 	limit, all := 0, true // default: drain all
 	ack := true
 	if req != nil && req.Params != nil {
@@ -727,7 +729,7 @@ func (a *adapter) promptFetchq(ctx context.Context, req *mcp.GetPromptRequest) (
 	}
 
 	body, _ := a.doFetchQueue(ctx, ack, limit, all)
-	text := "📨 C3 queue (via /fetchq):\n\n" + body
+	text := "📨 C3 queue (via /fetch-queue):\n\n" + body
 	if ack {
 		text += "\n\nRead these and respond or act as needed — use the `reply` tool to answer on Telegram."
 	} else {
@@ -751,7 +753,7 @@ func (a *adapter) buildInstructions() string {
 		// Claude Desktop is poll-only (no per-conversation id, no session-start
 		// hook, cannot render unsolicited pushes), so the NoMapping and mapped
 		// cases collapse to one honest instruction: attach explicitly, then poll.
-		head = "C3 connected. Claude Desktop is POLL-ONLY — it cannot render unsolicited Telegram pushes, so nothing arrives on its own. Attach to a topic explicitly with `attach(name=\"<topic>\")` (or `attach(target=\"dm\")` for your DM); `attach` with no argument returns a picker to surface for the user. Inbound Telegram messages are held in C3's durable queue — call `fetch_queue` to read new/held messages (Desktop will not pop them for you), or the user can run the `/fetchq` slash command to drop the queue straight into the chat without asking. Send replies and reactions with the `reply`/`react` tools when the user asks."
+		head = "C3 connected. Claude Desktop is POLL-ONLY — it cannot render unsolicited Telegram pushes, so nothing arrives on its own. Attach to a topic explicitly with `attach(name=\"<topic>\")` (or `attach(target=\"dm\")` for your DM); `attach` with no argument returns a picker to surface for the user. Inbound Telegram messages are held in C3's durable queue — call `fetch_queue` to read new/held messages (Desktop will not pop them for you), or the user can run the `/fetch-queue` slash command to drop the queue straight into the chat without asking. Send replies and reactions with the `reply`/`react` tools when the user asks."
 	}
 	return head + mode.Combined(a.capsOrDefault())
 }
@@ -938,7 +940,7 @@ func (a *adapter) toolFetchQueue(ctx context.Context, req *mcp.CallToolRequest) 
 }
 
 // doFetchQueue runs one fetch_queue broker round-trip and returns the rendered
-// text. Shared by the `fetch_queue` TOOL (an LLM-driven call) and the `fetchq`
+// text. Shared by the `fetch_queue` TOOL (an LLM-driven call) and the `fetch-queue`
 // PROMPT (a user-driven slash command) so both consume the queue identically.
 // isErr distinguishes a broker/transport failure (surface as an error) from a
 // successful fetch (which may legitimately be "queue is empty").
@@ -1179,7 +1181,7 @@ func parseFetchLimit(val any) (int, bool) {
 	return 3, false
 }
 
-// parseFetchLimitStr parses the `limit` argument of the fetchq PROMPT, whose
+// parseFetchLimitStr parses the `limit` argument of the fetch-queue PROMPT, whose
 // arguments arrive as strings (MCP prompt args are always strings). Empty or
 // "all" ⇒ drain everything (the slash-command default); a positive integer ⇒ that
 // many oldest; anything else falls back to draining all.

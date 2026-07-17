@@ -80,9 +80,9 @@ In a Desktop chat:
 
 Tool calls surface as a local **Allow / Always allow** approval in the Desktop GUI (see caveats).
 
-## The `/fetchq` slash command (low-ceremony pull)
+## The `/fetch-queue` slash command (low-ceremony pull)
 
-C3 also exposes an MCP **prompt** named `fetchq`, which Claude Desktop surfaces as a **slash command**. Type `/fetchq` (it may appear namespaced under the `c3` server in the `/` menu) and the queue is pulled and dropped straight into the chat — no "please check my messages" sentence, and no tool-call reasoning turn to trigger the fetch. It's the one-keystroke version of the `fetch_queue` tool.
+C3 also exposes an MCP **prompt** named `fetch-queue`, which Claude Desktop surfaces as a **slash command**. Type `/fetch-queue` (it may appear namespaced under the `c3` server in the `/` menu) and the queue is pulled and dropped straight into the chat — no "please check my messages" sentence, and no tool-call reasoning turn to trigger the fetch. It's the one-keystroke version of the `fetch_queue` tool. (Kebab-case matches Claude's slash-command convention and keeps it distinct from the underscore `fetch_queue` *tool*.)
 
 - **Default** drains the whole queue for the attached topic (consumes it, like `fetch_queue`).
 - `limit=N` pulls the N oldest instead of everything.
