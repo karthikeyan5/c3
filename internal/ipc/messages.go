@@ -76,6 +76,52 @@ type FetchQueueResp struct {
 	Err       string            `json:"err,omitempty"`
 }
 
+// ObserveReq is the adapter → broker READ-ONLY peek of a topic's held inbound,
+// resolved by Name / Target="dm" / TopicID(+Group) exactly like attach, but
+// WITHOUT claiming the route. It is the panel's "Watch" primitive: it never
+// consumes and never steals, so a Claude Code session can keep the exclusive
+// claim (and keep replying) while the panel displays the same inbox. Limit/All
+// mirror FetchQueueReq; Ack is implicitly false (there is no consuming observe).
+type ObserveReq struct {
+	Op      Op     `json:"op"` // = OpObserve
+	ID      string `json:"id"`
+	Channel string `json:"channel,omitempty"` // "" → broker default channel
+	Name    string `json:"name,omitempty"`
+	Target  string `json:"target,omitempty"` // "dm"
+	TopicID *int64 `json:"topic_id,omitempty"`
+	Group   string `json:"group,omitempty"`
+	Limit   int    `json:"limit,omitempty"`
+	All     bool   `json:"all,omitempty"`
+}
+
+// ObserveResp is the broker → adapter response to ObserveReq: the peeked
+// Messages (oldest up-to-Limit/all, full content — same shape as
+// FetchQueueResp) PLUS the resolved topic identity and its current Holder.
+//
+// Status distinguishes a clean peek ("ok") from a resolution outcome the panel
+// renders differently: "not_found" (offer take-over-creates), "ambiguous",
+// "dm_unconfigured", "no_channel". Holder is nil when the topic is unclaimed
+// (or held only by a dead session); HeldByYou is true when the CALLING stub is
+// the live holder (so the panel can enable the owner-only consume affordances).
+// Err carries a transient peek failure (worker busy/stopped) without changing
+// the resolved identity.
+type ObserveResp struct {
+	Op        Op                `json:"op"` // = OpObserveResult
+	ID        string            `json:"id"`
+	OK        bool              `json:"ok"`
+	Status    string            `json:"status"` // "ok" | "not_found" | "ambiguous" | "dm_unconfigured" | "no_channel"
+	Channel   string            `json:"channel,omitempty"`
+	ChatID    int64             `json:"chat_id,omitempty"`
+	TopicID   *int64            `json:"topic_id,omitempty"`
+	Name      string            `json:"name,omitempty"`
+	Group     string            `json:"group,omitempty"`
+	Holder    *Holder           `json:"holder,omitempty"`      // nil = unclaimed (or dead holder)
+	HeldByYou bool              `json:"held_by_you,omitempty"` // the calling stub is the live holder
+	Messages  []c3types.Inbound `json:"messages,omitempty"`
+	Remaining int               `json:"remaining,omitempty"`
+	Err       string            `json:"err,omitempty"`
+}
+
 // InboundDeliveredMsg is the Claude adapter → broker live-push ack. The broker
 // Consumes the queued line(s) the push covered only after OK=true, so a push the
 // adapter never accepted stays queued (backlog + recovery nudge). OK=false is a

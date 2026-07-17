@@ -23,6 +23,14 @@ const (
 	OpPingThisSession  Op = "ping_this_session"
 	OpListSessions     Op = "list_sessions"
 	OpFetchQueue       Op = "fetch_queue"
+	// OpObserve asks the broker to PEEK a topic's durable queue READ-ONLY,
+	// resolving the topic by name/target/topic_id WITHOUT claiming it and
+	// WITHOUT mutating any route. It is the no-loss-safe, no-steal counterpart
+	// to fetch_queue(ack=false): the Desktop inbox panel uses it to display any
+	// topic's inbox while a Claude Code session keeps the exclusive claim (and
+	// keeps replying). Carries its own topic reference — it does NOT derive the
+	// route from the stub's claim. Never consumes; safe to call on a timer.
+	OpObserve          Op = "observe"
 	OpInboundDelivered Op = "inbound_delivered"
 	OpRetranscribe     Op = "retranscribe"
 	OpRecoverSession   Op = "recover_session"
@@ -52,6 +60,11 @@ const (
 	OpPingThisSessionReply Op = "ping_this_session_reply"
 	OpListSessionsReply    Op = "list_sessions_reply"
 	OpFetchQueueResult     Op = "fetch_queue_result"
+	// OpObserveResult is the broker's response to OpObserve: the peeked
+	// messages plus the resolved topic identity and its CURRENT holder (who,
+	// if anyone, owns the exclusive claim) — so the panel can show "held by
+	// claude-code · read-only" and offer an explicit take-over.
+	OpObserveResult        Op = "observe_result"
 	OpRetranscribeResult   Op = "retranscribe_result"
 	OpRecoverSessionResult Op = "recover_session_result"
 	// OpAskRegistered is the broker's SYNCHRONOUS ack to OpAskRegister: OK=true

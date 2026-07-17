@@ -92,11 +92,11 @@ It still needs an **attached** topic (run `attach` first); unattached, it report
 
 ## The C3 Inbox panel (live view)
 
-Ask Claude to **"open the c3 inbox"** and it calls the `open_inbox` tool, which renders an MCP-App HTML panel inline in the chat. The panel:
+Ask Claude to **"open the c3 inbox"** and it calls the `open_inbox` tool, which renders an MCP-App HTML panel inline in the chat. The panel splits **watching** a topic (read-only) from **owning** it (the exclusive claim), so it never fights a Claude Code session for a topic:
 
-- **peeks** the durable queue every ~5s and shows what's waiting (never consumes on its own);
-- lets you **attach** in-panel (type a topic → **Attach**; a brand-new name offers **Create it**; a topic held by another Desktop chat offers **Steal it here**);
-- **Hand to Claude** / **Auto** feed the waiting messages to Claude via `ui/message`.
+- **Watch** (default) — type a topic and click **Watch**. The panel calls the `observe` tool, a **read-only peek** that shows the durable queue every ~5s **without claiming the topic** and **without stealing it** from whoever owns it. A holder line names the current owner ("held by claude-code (pid N) — read-only" / "unclaimed" / "you own it"). This is the fix for the old tug-of-war: a Claude Code session in Telegram mode keeps its claim (and keeps replying to you) while the panel shows you the same inbox live. Merely opening the panel never steals anything.
+- **Take over here** (explicit) — the *only* button that touches the exclusive claim. It appears when the watched topic is not owned by this Desktop session, and makes Desktop the owner so it can receive/consume/reply. The `attach` mode follows the observed state: held by another session → **steal** (evicts that holder — a deliberate one-tap decision, never automatic); unclaimed → plain attach; brand-new name → **create**.
+- **Hand to Claude** / **Auto** — feed the waiting messages to Claude via `ui/message`. These **consume** the queue, so they are **owner-only**: they appear only once you've taken the topic over (a non-owner can't drain another agent's queue — that's the single-consumer no-loss invariant).
 
 Two host behaviors are worth knowing (they are Claude Desktop limits, not C3 bugs — verified against the MCP-Apps `ext-apps` spec and the shipped app SDK):
 

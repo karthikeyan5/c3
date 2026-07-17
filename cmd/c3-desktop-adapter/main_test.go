@@ -162,7 +162,7 @@ func TestServerInfoAndTools(t *testing.T) {
 		got[tool.Name] = true
 	}
 	wantTools := []string{
-		"attach", "detach", "topics", "fetch_queue", "retranscribe",
+		"attach", "detach", "topics", "fetch_queue", "observe", "retranscribe",
 		"reply", "react", "edit_message", "poll", "stop_poll", "download_attachment",
 		"open_inbox",
 	}
@@ -210,9 +210,10 @@ func TestServerInfoAndTools(t *testing.T) {
 		t.Errorf("open_inbox deprecated _meta[ui/resourceUri] = %v; want %q (host back-compat)", openInbox.Meta["ui/resourceUri"], uiInboxURI)
 	}
 
-	// attach and topics are marked app-callable (visibility ["model","app"]) so
-	// the C3 Inbox panel can call them through the host bridge (apps.mdx:399-401).
-	for _, name := range []string{"attach", "topics"} {
+	// attach, topics, and observe are marked app-callable (visibility
+	// ["model","app"]) so the C3 Inbox panel can call them through the host bridge
+	// (apps.mdx:399-401). observe is the panel's read-only Watch peek.
+	for _, name := range []string{"attach", "topics", "observe"} {
 		var tool *mcp.Tool
 		for _, tl := range listResult.Tools {
 			if tl.Name == name {
@@ -245,15 +246,22 @@ func TestServerInfoAndTools(t *testing.T) {
 	if !strings.Contains(rc.Text, "ui/initialize") || !strings.Contains(rc.Text, "fetch_queue") {
 		t.Error("inbox HTML missing the ui/initialize handshake or the fetch_queue call")
 	}
-	// Interactive inbox: in-panel attach form, Hand to Claude + Auto, the
-	// ui/message turn-start call, the multi-surface "Steal it here" affordance
-	// (Bug 2, one-owner model), and the "Create it" affordance for the
-	// unmapped-topic create proposal (2026-07-17: a named attach to a brand-new
-	// topic returned the "No mapping" proposal with no way to act on it) must all
-	// be present in the served HTML.
-	for _, want := range []string{"ui/message", "Hand to Claude", "Auto", "placeholder=\"topic name\"", "name: \"attach\"", "Steal it here", "args.steal = true", "Create it", "args.create = true", "Pop out", "ui/request-display-mode", "press <b>Enter</b>"} {
+	// Interactive inbox (2026-07-17 Watch/Take-over rework): the panel splits
+	// read-only WATCH (an `observe` peek that never claims — parsed via the
+	// ⟦c3 owner=…⟧ sentinel) from explicit TAKE-OVER (the only action that claims/
+	// steals, via `attach`). Owner-only Hand to Claude + Auto + the ui/message
+	// turn-start call remain; the take-over still carries args.steal/args.create
+	// selected by the observed owner state. All must be present in the served HTML.
+	for _, want := range []string{
+		"ui/message", "Hand to Claude", "Auto",
+		"placeholder=\"topic to watch\"", "name: \"observe\"", "name: \"attach\"",
+		"parseObserve", "⟦c3", "watchTopic", "doTakeOver",
+		"Watch", "Take over here", "Create & take over",
+		"args.steal = true", "args.create = true", "args.topic_id",
+		"Pop out", "ui/request-display-mode", "press <b>Enter</b>",
+	} {
 		if !strings.Contains(rc.Text, want) {
-			t.Errorf("inbox HTML missing %q (interactive-inbox extension)", want)
+			t.Errorf("inbox HTML missing %q (Watch/Take-over inbox)", want)
 		}
 	}
 	// ui/message params contract (SEP-1865 McpUiMessageRequest): content MUST be

@@ -185,6 +185,8 @@ type adapter struct {
 
 	fqmu      sync.Mutex
 	fqPending map[string]chan ipc.FetchQueueResp
+	obmu      sync.Mutex
+	obPending map[string]chan ipc.ObserveResp
 	rtmu      sync.Mutex
 	rtPending map[string]chan ipc.RetranscribeResp
 
@@ -208,6 +210,7 @@ func newAdapter() *adapter {
 	return &adapter{
 		pending:   map[string]chan ipc.ToolResultMsg{},
 		fqPending: map[string]chan ipc.FetchQueueResp{},
+		obPending: map[string]chan ipc.ObserveResp{},
 		rtPending: map[string]chan ipc.RetranscribeResp{},
 	}
 }
@@ -288,6 +291,8 @@ func (a *adapter) brokerReader(ctx context.Context) {
 			a.dispatchTopicsList(raw)
 		case ipc.OpFetchQueueResult:
 			a.dispatchFetchQueueResult(raw)
+		case ipc.OpObserveResult:
+			a.dispatchObserveResult(raw)
 		case ipc.OpRetranscribeResult:
 			a.dispatchRetranscribeResult(raw)
 		case ipc.OpRecoverSessionResult:
@@ -624,6 +629,20 @@ func (a *adapter) dispatchFetchQueueResult(raw []byte) {
 	ch, ok := a.fqPending[resp.ID]
 	delete(a.fqPending, resp.ID)
 	a.fqmu.Unlock()
+	if ok {
+		ch <- resp
+	}
+}
+
+func (a *adapter) dispatchObserveResult(raw []byte) {
+	var resp ipc.ObserveResp
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return
+	}
+	a.obmu.Lock()
+	ch, ok := a.obPending[resp.ID]
+	delete(a.obPending, resp.ID)
+	a.obmu.Unlock()
 	if ok {
 		ch <- resp
 	}
@@ -998,6 +1017,131 @@ func (a *adapter) doFetchQueue(ctx context.Context, ack bool, limit int, all boo
 	}
 }
 
+// toolObserve peeks a topic's inbox READ-ONLY without claiming it — the panel's
+// "Watch" primitive and an honest LLM peek ("what's waiting on topic X, and who
+// owns it?"). It never consumes and never steals. The rendered text carries a
+// machine-readable ⟦c3 …⟧ status line (owner=you|other|none / status=…) the
+// panel parses to pick the right affordances (Take over vs Hand/Auto); the line
+// is also human-readable if it ever surfaces to the model.
+func (a *adapter) toolObserve(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args, err := decodeArgs(req.Params.Arguments)
+	if err != nil {
+		return nil, fmt.Errorf("invalid params: %w", err)
+	}
+	ob := ipc.ObserveReq{Op: ipc.OpObserve, ID: strconv.FormatUint(a.nextID.Add(1), 10)}
+	if v, ok := args["name"].(string); ok {
+		ob.Name = v
+	}
+	if v, ok := args["target"].(string); ok {
+		ob.Target = v
+	}
+	if v, ok := args["group"].(string); ok {
+		ob.Group = v
+	}
+	if v, ok := args["topic_id"].(float64); ok {
+		id := int64(v)
+		ob.TopicID = &id
+	}
+	// Limit: absent → 0 (the broker shows the whole inbox — a display peek wants
+	// everything). "all" is explicit; a number windows it.
+	if v, ok := args["limit"]; ok {
+		if s, ok := v.(string); ok && s == "all" {
+			ob.All = true
+		} else if f, ok := v.(float64); ok {
+			ob.Limit = int(f)
+		}
+	}
+
+	text, isErr := a.doObserve(ctx, ob)
+	if isErr {
+		return toolErrorResult(text), nil
+	}
+	return toolTextResult(text), nil
+}
+
+// doObserve runs one observe broker round-trip and renders the result. isErr is
+// true only for a transport/broker failure (not for a resolved-but-not_found
+// topic, which renders as normal content the panel acts on).
+func (a *adapter) doObserve(ctx context.Context, ob ipc.ObserveReq) (text string, isErr bool) {
+	ch := make(chan ipc.ObserveResp, 1)
+	a.obmu.Lock()
+	a.obPending[ob.ID] = ch
+	a.obmu.Unlock()
+	defer func() { a.obmu.Lock(); delete(a.obPending, ob.ID); a.obmu.Unlock() }()
+
+	conn := a.currentConn()
+	if conn == nil {
+		return "broker reconnecting — retry in a moment", true
+	}
+	if err := conn.WriteJSON(ob); err != nil {
+		return "broker write: " + err.Error(), true
+	}
+	select {
+	case <-ctx.Done():
+		return "canceled", true
+	case <-time.After(120 * time.Second):
+		return "observe timeout", true
+	case resp := <-ch:
+		return renderObserve(&resp), false
+	}
+}
+
+// renderObserve builds the panel/LLM text: a machine-readable ⟦c3 …⟧ status line
+// (parsed by the panel to choose Watch vs Take-over vs Hand/Auto), a blank line,
+// then either the queued messages (SAME clean render as fetch_queue, via
+// renderFetchedMessages) or a human note for the non-ok resolution states.
+func renderObserve(resp *ipc.ObserveResp) string {
+	name := resp.Name
+	switch resp.Status {
+	case "not_found":
+		return "⟦c3 status=not_found name=" + name + "⟧\n\nNo topic named «" + name + "» yet. Take over to create it."
+	case "ambiguous":
+		return "⟦c3 status=ambiguous name=" + name + "⟧\n\nMore than one topic is named «" + name + "» — open the one you want by its full name."
+	case "dm_unconfigured":
+		return "⟦c3 status=dm_unconfigured⟧\n\nThe DM route isn't configured (run c3-broker setup)."
+	case "ok":
+		// fallthrough to the owner sentinel below
+	default: // no_channel / anything else
+		return "⟦c3 status=" + resp.Status + " name=" + name + "⟧\n\nCan't watch that topic here."
+	}
+	// OK: build the owner sentinel. Carry topic_id + group so the panel's take-over
+	// can claim BY ID — a plain name-attach only silently claims default-group
+	// names (a non-default-group name returns a use_existing_other_group proposal
+	// and never claims), so id-based take-over is what makes take-over work for
+	// EVERY watchable topic, not just default-group ones.
+	var sb strings.Builder
+	sb.WriteString("⟦c3")
+	switch {
+	case resp.HeldByYou:
+		sb.WriteString(" owner=you")
+	case resp.Holder != nil:
+		fmt.Fprintf(&sb, " owner=other cli=%s pid=%d", sanitizeToken(resp.Holder.CLI), resp.Holder.PID)
+	default:
+		sb.WriteString(" owner=none")
+	}
+	if resp.TopicID != nil {
+		fmt.Fprintf(&sb, " topic_id=%d", *resp.TopicID)
+	}
+	if resp.Group != "" {
+		sb.WriteString(" group=" + sanitizeToken(resp.Group))
+	}
+	sb.WriteString(" name=" + name + "⟧")
+	body := renderFetchedMessages(resp.Messages, resp.Remaining, name)
+	if resp.Err != "" {
+		body = "(couldn't read the queue: " + resp.Err + ")"
+	}
+	return sb.String() + "\n\n" + body
+}
+
+// sanitizeToken strips whitespace and the sentinel brackets from a value going
+// into a single-token ⟦c3 …⟧ field (cli, group), so the panel's space-delimited
+// key=value parse stays unambiguous and a stray newline/bracket can't split or
+// truncate the status line. The trailing name= field may contain spaces (it is
+// read to end-of-line), so it is not sanitized here.
+func sanitizeToken(s string) string {
+	return strings.NewReplacer(" ", "_", "\t", "_", "\n", "_", "\r", "_", "⟦", "", "⟧", "").Replace(s)
+}
+
 func (a *adapter) toolRetranscribe(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args, err := decodeArgs(req.Params.Arguments)
 	if err != nil {
@@ -1099,6 +1243,28 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 				Meta: mcp.Meta{"ui": map[string]any{"visibility": []string{"model", "app"}}},
 			},
 			handler: a.toolFetchQueue,
+		},
+		{
+			tool: &mcp.Tool{
+				Name:        "observe",
+				Description: "Peek a topic's live inbox READ-ONLY, WITHOUT claiming it (never steals). Returns the messages waiting in C3's durable queue plus who currently owns the topic. Use this to WATCH a topic another session (e.g. a Claude Code CLI in Telegram mode) is holding — it keeps its claim and keeps replying while you see the same inbox. To actually receive/reply/consume, use `attach` to take the topic over. Select the topic with `name`, `target=\"dm\"`, or `topic_id`.",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"name":     map[string]any{"type": "string"},
+						"target":   map[string]any{"type": "string"},
+						"topic_id": map[string]any{"type": "integer"},
+						"group":    map[string]any{"type": "string"},
+						"limit":    map[string]any{"description": "integer window, or the string \"all\"; absent shows everything waiting"},
+					},
+				},
+				// App-callable so the C3 Inbox panel can peek in-panel without owning
+				// the topic (a host MUST reject tools/call from an app for tools whose
+				// visibility omits "app" — apps.mdx:399-401). No resourceUri: observe
+				// renders as text, it is not itself a panel.
+				Meta: mcp.Meta{"ui": map[string]any{"visibility": []string{"model", "app"}}},
+			},
+			handler: a.toolObserve,
 		},
 		{
 			tool: &mcp.Tool{
@@ -1446,7 +1612,7 @@ func (a *adapter) resourceInbox(_ context.Context, _ *mcp.ReadResourceRequest) (
 // that do not render MCP Apps — a UI-linked tool MUST still return meaningful
 // content (apps.mdx:1556-1559).
 func (a *adapter) toolOpenInbox(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return toolTextResult("Opening the C3 inbox panel — it peeks the durable queue for the attached topic (does not consume). Use fetch_queue to actually drain messages."), nil
+	return toolTextResult("Opening the C3 inbox panel — type a topic and Watch to see its inbox READ-ONLY (a no-claim peek that never steals it from a Claude Code session). Take over only if you want Desktop to receive/reply; use fetch_queue to drain."), nil
 }
 
 // inboxHTML is the self-contained MCP App view. All CSS+JS are inline (no
@@ -1455,13 +1621,18 @@ func (a *adapter) toolOpenInbox(_ context.Context, _ *mcp.CallToolRequest) (*mcp
 //   - ui/initialize request -> await result -> ui/notifications/initialized
 //     notification (src/app.ts:1959-1982); protocolVersion 2026-01-26
 //     (src/spec.types.ts:29).
-//   - tools/call { name:"fetch_queue", arguments:{ack:false} } to PEEK the queue
-//     (apps.mdx:495, 1483; App.callServerTool src/app.ts:1246).
-//   - tools/call { name:"attach", arguments:{name} } to attach in-panel when not
-//     yet attached; a re-peek RELOAD HEURISTIC decides whether it worked (the
-//     result text is not parsed) — apps.mdx:399-401 gates app-callable tools.
-//   - tools/call { name:"fetch_queue", arguments:{ack:true} } to DRAIN (consume)
-//     for "Hand to Claude" / the Auto toggle.
+//   - tools/call { name:"observe", arguments:{name} } to WATCH — a READ-ONLY peek
+//     that resolves the topic and returns its queue + current holder WITHOUT
+//     claiming it. The result's leading ⟦c3 owner=…⟧ sentinel is parsed
+//     (parseObserve) to pick affordances; this is the default 5s refresh, so
+//     merely having the panel open never steals a topic from a Claude Code
+//     session (apps.mdx:495, 1483; App.callServerTool src/app.ts:1246).
+//   - tools/call { name:"attach", arguments:{name[,steal|create]} } ONLY on an
+//     explicit "Take over" — the sole action that claims/steals; the mode follows
+//     the observed owner state (apps.mdx:399-401 gates app-callable tools).
+//   - tools/call { name:"fetch_queue", arguments:{ack:false→peek, ack:true→drain} }
+//     for "Hand to Claude" / Auto — owner-only (a non-owner can't consume), so
+//     these appear only once Desktop owns the topic.
 //   - ui/message { role:"user", content:[{type:"text", text}] } to hand the
 //     drained messages to Claude and start a turn (apps.mdx:998-1034; the host
 //     MAY prompt for consent). content is a ContentBlock ARRAY per SEP-1865
@@ -1471,8 +1642,9 @@ func (a *adapter) toolOpenInbox(_ context.Context, _ *mcp.CallToolRequest) (*mcp
 //   - ui/notifications/size-changed so a flexible-height host sizes the iframe to
 //     the content (apps.mdx:718; src/app.ts:1859-1907).
 //
-// The panel is delivery/awareness only — it deliberately exposes NO reply/send
-// affordance; composing replies stays the model's job.
+// The panel WATCHES read-only by default and consumes/hands only when it owns the
+// topic — it still exposes NO reply/send affordance; composing replies stays the
+// model's job.
 //
 // NOTE: this string is a Go raw literal (backticks) — it must contain no
 // backtick characters, so the JS uses string concatenation, not template
@@ -1519,13 +1691,13 @@ const inboxHTML = `<!DOCTYPE html>
 <body>
   <div class="banner"><span>&#9989; C3 Inbox connected</span></div>
   <div class="sub" id="host">Initializing&hellip;</div>
-  <div class="attachbar" id="attachbar" hidden>
-    <input type="text" class="topic" id="topic" placeholder="topic name" autocomplete="off" spellcheck="false">
-    <button id="attach">Attach</button>
-    <button id="steal" hidden>Steal it here</button>
-    <button id="create" hidden>Create it</button>
+  <div class="attachbar" id="attachbar">
+    <input type="text" class="topic" id="topic" placeholder="topic to watch" autocomplete="off" spellcheck="false">
+    <button id="watch">Watch</button>
+    <button id="takeover" hidden>Take over here</button>
   </div>
   <div class="hint" id="attachhint" hidden></div>
+  <div class="note" id="holderline" hidden></div>
   <div class="bar">
     <button id="refresh" disabled>Refresh</button>
     <button id="hand" hidden>Hand to Claude</button>
@@ -1535,7 +1707,7 @@ const inboxHTML = `<!DOCTYPE html>
   </div>
   <div class="note" id="composernote" hidden>Handed messages land in the composer &mdash; press <b>Enter</b> to send. On the Code tab that&rsquo;s a review step; the host drafts, it can&rsquo;t auto-send.</div>
   <div class="note" id="autonote" hidden>Auto: each new Telegram message is fed into the composer as you clear the last &mdash; works only while this panel is open.</div>
-  <div id="list"><div class="empty">Loading queued messages&hellip;</div></div>
+  <div id="list"><div class="empty">Enter a topic name above and click <b>Watch</b> to see its inbox (read-only &mdash; no stealing).</div></div>
 <script>
 (function () {
   "use strict";
@@ -1548,12 +1720,14 @@ const inboxHTML = `<!DOCTYPE html>
   var refreshTimer = null;
   var inFlight = false;
   var inFlightP = null;
-  var attached = false;
-  var attaching = false;
+  var watchName = "";        // the topic being watched (peeked read-only)
+  var ownerState = "";       // "you" | "other" | "none" | "not_found" | "unavailable"
+  var holderLabel = "";      // e.g. "claude (pid 1234)" for the read-only note
+  var takeoverTopicId = "";  // resolved topic id → take over BY ID (default & non-default groups)
+  var takeoverGroup = "";    // resolved group → threaded into the id-based take-over
+  var owned = false;         // ownerState === "you": this Desktop session holds the claim
+  var acting = false;        // a watch / take-over round-trip is in flight
   var handing = false;
-  var pendingAttachHint = "";
-  var pendingStealName = "";
-  var pendingCreateName = "";
   var REFRESH_MS = 5000;
   var HAND_PREFIX = "New C3 Telegram message(s):\n\n";
   var autoSkipCycles = 0;   // skip this many auto-poll cycles after a failed hand
@@ -1567,9 +1741,9 @@ const inboxHTML = `<!DOCTYPE html>
   var elList = document.getElementById("list");
   var elAttachBar = document.getElementById("attachbar");
   var elTopic = document.getElementById("topic");
-  var elAttach = document.getElementById("attach");
-  var elSteal = document.getElementById("steal");
-  var elCreate = document.getElementById("create");
+  var elWatch = document.getElementById("watch");
+  var elTakeover = document.getElementById("takeover");
+  var elHolderLine = document.getElementById("holderline");
   var elAttachHint = document.getElementById("attachhint");
   var elHand = document.getElementById("hand");
   var elAutoLabel = document.getElementById("autolabel");
@@ -1659,16 +1833,34 @@ const inboxHTML = `<!DOCTYPE html>
 
   function show(el, on) { if (el) { el.hidden = !on; } }
 
-  // updateControls swaps the not-attached affordance (topic form) for the
-  // attached affordances (Hand to Claude + Auto), and shows the Auto note only
-  // when Auto is armed AND we are attached. Called on every render.
+  // updateControls reflects ownerState into the affordances. The watch bar is
+  // ALWAYS available (watch / switch topics freely). "Take over here" appears only
+  // when the topic is watchable-but-not-owned; Hand to Claude + Auto (which
+  // CONSUME) appear only when THIS session owns the claim. A holder line names who
+  // owns it so read-only mode is never a mystery. Called on every render.
   function updateControls() {
-    show(elAttachBar, !attached);
-    if (attached) { elAttachHint.hidden = true; elAttachHint.textContent = ""; show(elSteal, false); pendingStealName = ""; show(elCreate, false); pendingCreateName = ""; }
-    show(elHand, attached);
-    show(elAutoLabel, attached);
-    show(elComposerNote, attached);
-    show(elAutoNote, attached && elAuto.checked);
+    owned = ownerState === "you";
+    var canTakeOver = ownerState === "other" || ownerState === "none" || ownerState === "not_found";
+    show(elAttachBar, true);
+    show(elTakeover, canTakeOver);
+    if (canTakeOver && elTakeover) {
+      elTakeover.textContent = ownerState === "not_found" ? "Create & take over"
+        : ownerState === "other" ? "Take over here"
+        : "Attach here";
+    }
+    show(elHand, owned);
+    show(elAutoLabel, owned);
+    show(elComposerNote, owned);
+    show(elAutoNote, owned && elAuto.checked);
+    var hl = "";
+    if (watchName) {
+      if (owned) { hl = "👀 Watching «" + watchName + "» · you own it — Hand/Auto enabled"; }
+      else if (ownerState === "other") { hl = "👀 Watching «" + watchName + "» · held by " + (holderLabel || "another session") + " — read-only"; }
+      else if (ownerState === "none") { hl = "👀 Watching «" + watchName + "» · unclaimed — take over to receive/reply"; }
+      else if (ownerState === "not_found") { hl = "«" + watchName + "» doesn't exist yet — take over to create it"; }
+    }
+    if (hl) { elHolderLine.textContent = hl; elHolderLine.hidden = false; }
+    else { elHolderLine.hidden = true; elHolderLine.textContent = ""; }
   }
 
   // shouldHand decides whether a fetched blob is real Telegram content worth
@@ -1684,64 +1876,65 @@ const inboxHTML = `<!DOCTYPE html>
     return true;
   }
 
-  // doAttach attaches this session to the typed topic, then re-peeks. It does
-  // NOT parse the attach result — the RELOAD HEURISTIC: after attach, loadQueue
-  // re-peeks and renderQueue flips attached off the not-attached sentinel. If
-  // still not attached, the attach tool's text is surfaced under the form as a
-  // hint (covers "topic doesn't exist / needs create"). The double loadQueue
-  // guarantees a post-attach peek even if a timer peek was mid-flight: the first
-  // call coalesces onto that (possibly pre-attach) peek, the second is fresh.
-  // doAttach drives all three panel attach outcomes via a mode string:
-  //   ""       — attach the typed topic name (may yield a create/steal proposal)
-  //   "steal"  — re-attach the held topic with steal=true (topic held by the
-  //              user's OTHER Desktop chat; "Steal it here" button)
-  //   "create" — confirm creation of the typed-but-unmapped topic with
-  //              create=true (broker returned the "No mapping" proposal;
-  //              "Create it" button)
-  // The follow-up buttons are revealed by matching the broker's proposal text —
-  // a named attach only ever yields create / use_existing / force_steal, so the
-  // two keys below are unambiguous here.
-  function doAttach(mode) {
-    if (attaching) { return; }
-    var name;
-    if (mode === "steal") { name = pendingStealName; }
-    else if (mode === "create") { name = pendingCreateName; }
-    else { name = (elTopic.value || "").replace(/^\s+|\s+$/g, ""); }
+  var pendingTakeoverHint = "";
+
+  // watchTopic starts watching the typed topic — a READ-ONLY observe. It never
+  // claims, so it can never steal the topic from a Claude Code session that owns
+  // it; that session keeps its claim and keeps replying while this panel shows the
+  // same inbox.
+  function watchTopic() {
+    var name = (elTopic.value || "").replace(/^\s+|\s+$/g, "");
     if (!name) { return; }
-    attaching = true;
-    elAttach.disabled = true;
-    if (elSteal) { elSteal.disabled = true; }
-    if (elCreate) { elCreate.disabled = true; }
-    elAttachHint.hidden = true;
-    elAttachHint.textContent = "";
-    var args = { name: name };
-    if (mode === "steal") { args.steal = true; }
-    if (mode === "create") { args.create = true; }
+    watchName = name;
+    elAttachHint.hidden = true; elAttachHint.textContent = "";
+    loadQueue();
+  }
+
+  // doTakeOver is the ONLY action that touches the exclusive claim: it makes THIS
+  // Desktop session the owner so Hand/Auto/reply become possible. The attach mode
+  // follows the observed ownerState — held-by-another → steal, unclaimed → plain
+  // attach, not_found → create. A steal deliberately evicts the current holder
+  // (e.g. a Claude Code session), so it is an explicit, one-tap decision, never
+  // automatic. After it lands the next observe reports owner=you and the owner-only
+  // affordances appear.
+  function doTakeOver() {
+    if (acting || !watchName) { return; }
+    // Prefer claiming BY ID (unambiguous, and the only form that claims a
+    // non-default-group topic — a plain name-attach there returns a proposal and
+    // never claims). Fall back to name for a brand-new topic (create) or when no
+    // id resolved (e.g. a DM route).
+    var args = {};
+    if (ownerState === "not_found") {
+      args.name = watchName;
+      args.create = true;
+    } else if (takeoverTopicId) {
+      args.topic_id = parseInt(takeoverTopicId, 10);
+      if (takeoverGroup) { args.group = takeoverGroup; }
+      if (ownerState === "other") { args.steal = true; }
+    } else {
+      args.name = watchName;
+      if (ownerState === "other") { args.steal = true; }
+    }
+    acting = true;
+    elTakeover.disabled = true;
+    elAttachHint.hidden = true; elAttachHint.textContent = "";
     request("tools/call", { name: "attach", arguments: args }).then(function (result) {
-      pendingAttachHint = extractText(result);
+      // Surface the attach text only if we STILL don't own it afterwards (a
+      // create that needs confirmation, a re-collision, or a plain failure). The
+      // double observe guarantees a fresh post-attach peek even if a timer peek
+      // was mid-flight.
+      pendingTakeoverHint = extractText(result);
       return loadQueue().then(function () { return loadQueue(); });
     }).catch(function (err) {
-      pendingAttachHint = "Attach failed: " + err.message;
+      pendingTakeoverHint = "Take-over failed: " + (err && err.message ? err.message : "error");
     }).then(function () {
-      attaching = false;
-      elAttach.disabled = false;
-      if (elSteal) { elSteal.disabled = false; }
-      if (elCreate) { elCreate.disabled = false; }
-      if (!attached && pendingAttachHint) {
-        elAttachHint.textContent = pendingAttachHint;
+      acting = false;
+      elTakeover.disabled = false;
+      if (!owned && pendingTakeoverHint) {
+        elAttachHint.textContent = pendingTakeoverHint;
         elAttachHint.hidden = false;
       }
-      // Reveal whichever follow-up the broker's proposal calls for. force_steal →
-      // Steal (topic held by the user's other Desktop chat); "No mapping" create
-      // proposal → Create (brand-new topic). Both hide once attached (see
-      // updateControls) or on any other outcome.
-      var canSteal = !attached && pendingAttachHint.indexOf("Re-invoke attach with steal=true") !== -1;
-      var canCreate = !attached && pendingAttachHint.indexOf("No mapping for this directory") !== -1;
-      if (canSteal) { pendingStealName = name; show(elSteal, true); }
-      else { pendingStealName = ""; show(elSteal, false); }
-      if (canCreate) { pendingCreateName = name; show(elCreate, true); }
-      else { pendingCreateName = ""; show(elCreate, false); }
-      pendingAttachHint = "";
+      pendingTakeoverHint = "";
       reportSize();
     });
   }
@@ -1768,7 +1961,7 @@ const inboxHTML = `<!DOCTYPE html>
   // silently retry forever. (There is no send-vs-draft param and no gesture-free
   // turn-start primitive — verified against the ext-apps spec + shipped app SDK.)
   function handToClaude(isAuto) {
-    if (handing || !attached) { return; }
+    if (handing || !owned) { return; }
     handing = true;
     elHand.disabled = true;
     request("tools/call", { name: "fetch_queue", arguments: { ack: false } }).then(function (result) {
@@ -1829,28 +2022,53 @@ const inboxHTML = `<!DOCTYPE html>
   // shouldHand is false; the single handing flag blocks re-entry while a hand
   // (incl. its ui/message consent round-trip) is outstanding.
   function autoMaybe(text, isError) {
-    if (!elAuto.checked || !attached || handing) { return; }
+    if (!elAuto.checked || !owned || handing) { return; }
     if (autoSkipCycles > 0) { autoSkipCycles--; return; }
     if (!shouldHand(text, isError)) { return; }
     handToClaude(true);
   }
 
-  function renderQueue(text, isError) {
+  // parseObserve splits an observe result into its ⟦c3 …⟧ status line and the
+  // message body. Parsed from the ORIGINAL-CASE text (never a lowercased copy —
+  // topic names and cli values are case-sensitive). The status line is the FIRST
+  // line; name= is TERMINAL (it may contain spaces, so it is split off first);
+  // cli is space-free by construction (the adapter sanitizes it). Returns
+  // { ownerState, holderLabel, body }.
+  function parseObserve(text) {
+    var out = { ownerState: "unavailable", holderLabel: "", topicId: "", group: "", body: text || "" };
+    var s = text || "";
+    var nl = s.indexOf("\n");
+    var first = (nl >= 0 ? s.slice(0, nl) : s).replace(/^\s+|\s+$/g, "");
+    if (first.indexOf("⟦c3") !== 0) { return out; } // no sentinel → leave defaults
+    var end = first.indexOf("⟧");
+    if (end < 0) { return out; }
+    var inner = first.slice(3, end).replace(/^\s+|\s+$/g, "");
+    out.body = (nl >= 0 ? s.slice(nl + 1) : "").replace(/^\s+/, "");
+    var ni = inner.indexOf("name=");
+    var head = ni >= 0 ? inner.slice(0, ni) : inner;
+    var cli = "", pid = "";
+    var toks = head.split(/\s+/);
+    for (var i = 0; i < toks.length; i++) {
+      var t = toks[i];
+      if (t.indexOf("owner=") === 0) { out.ownerState = t.slice(6); }
+      else if (t.indexOf("status=") === 0) { out.ownerState = t.slice(7) === "not_found" ? "not_found" : "unavailable"; }
+      else if (t.indexOf("cli=") === 0) { cli = t.slice(4); }
+      else if (t.indexOf("pid=") === 0) { pid = t.slice(4); }
+      else if (t.indexOf("topic_id=") === 0) { out.topicId = t.slice(9); }
+      else if (t.indexOf("group=") === 0) { out.group = t.slice(6); }
+    }
+    if (cli) { out.holderLabel = pid ? (cli + " (pid " + pid + ")") : cli; }
+    return out;
+  }
+
+  // renderBody renders the message body (the observe result with the sentinel
+  // stripped) into the list. Owner state is applied by loadQueue via updateControls.
+  function renderBody(body, isError) {
     elList.innerHTML = "";
-    var trimmed = (text || "").replace(/^\s+|\s+$/g, "");
+    var trimmed = (body || "").replace(/^\s+|\s+$/g, "");
     var lower = trimmed.toLowerCase();
-    var notAttached = lower.indexOf("no route claimed") !== -1 || lower.indexOf("before attach") !== -1;
-    // Update attach state on definitive signals only: the not-attached sentinel
-    // flips it off; any successful (non-error) peek — content OR empty queue —
-    // flips it on. A generic transport/broker error leaves the state unchanged.
-    if (notAttached) { attached = false; }
-    else if (!isError) { attached = true; }
-    updateControls();
     var box = document.createElement("div");
-    if (notAttached) {
-      box.className = "empty";
-      box.textContent = "Not attached to a topic yet — enter a topic name above and click Attach.";
-    } else if (isError) {
+    if (isError) {
       box.className = "msg";
       var e = document.createElement("pre"); e.className = "raw"; e.textContent = trimmed || "(error)";
       box.appendChild(e);
@@ -1863,41 +2081,56 @@ const inboxHTML = `<!DOCTYPE html>
       box.appendChild(pre);
     }
     elList.appendChild(box);
-    reportSize();
   }
 
-  // loadQueue PEEKS (ack:false — never consumes) and renders. It returns a
-  // promise and coalesces concurrent callers onto the in-flight peek, so the
-  // attach reload heuristic can await a real result. Skipped while a hand is in
-  // flight (handing drains; a racing peek would show rows that are being drained).
+  // loadQueue OBSERVES the watched topic — a READ-ONLY peek (never claims, never
+  // consumes, never steals) — parses the owner state, and renders. Coalesces
+  // concurrent callers so the take-over reload can await a real result. Skipped
+  // while a hand is in flight (Hand drains the OWNED route; a racing peek would
+  // show rows being drained). No watched topic → the "pick a topic" placeholder.
   function loadQueue() {
     if (!connected) { return Promise.resolve(); }
+    if (!watchName) {
+      ownerState = ""; holderLabel = ""; owned = false; takeoverTopicId = ""; takeoverGroup = "";
+      updateControls();
+      elList.innerHTML = "";
+      var b = document.createElement("div"); b.className = "empty";
+      b.textContent = "Enter a topic name above and click Watch to see its inbox.";
+      elList.appendChild(b);
+      elStatus.textContent = "Idle — nothing watched";
+      reportSize();
+      return Promise.resolve();
+    }
     if (inFlight) { return inFlightP || Promise.resolve(); }
     if (handing) { return Promise.resolve(); }
     inFlight = true;
     elRefresh.disabled = true;
-    inFlightP = request("tools/call", { name: "fetch_queue", arguments: { ack: false } }).then(function (result) {
-      var text = extractText(result);
+    inFlightP = request("tools/call", { name: "observe", arguments: { name: watchName } }).then(function (result) {
       var isErr = result && result.isError;
-      renderQueue(text, isErr);
+      var parsed = parseObserve(extractText(result));
+      ownerState = parsed.ownerState;
+      holderLabel = parsed.holderLabel;
+      takeoverTopicId = parsed.topicId;
+      takeoverGroup = parsed.group;
+      renderBody(parsed.body, isErr);
+      updateControls();
       elStatus.textContent = "🟢 live · updated " + new Date().toLocaleTimeString();
-      autoMaybe(text, isErr);
+      autoMaybe(parsed.body, isErr);
     }).catch(function (err) {
-      elStatus.textContent = "Fetch failed (retrying): " + err.message;
-      reportSize();
+      elStatus.textContent = "Watch failed (retrying): " + err.message;
     }).then(function () {
       inFlight = false;
       inFlightP = null;
       elRefresh.disabled = false;
+      reportSize();
     });
     return inFlightP;
   }
 
   elRefresh.addEventListener("click", loadQueue);
-  elAttach.addEventListener("click", function () { doAttach(""); });
-  elTopic.addEventListener("keydown", function (e) { if (e.key === "Enter") { doAttach(""); } });
-  if (elSteal) { elSteal.addEventListener("click", function () { doAttach("steal"); }); }
-  if (elCreate) { elCreate.addEventListener("click", function () { doAttach("create"); }); }
+  elWatch.addEventListener("click", watchTopic);
+  elTopic.addEventListener("keydown", function (e) { if (e.key === "Enter") { watchTopic(); } });
+  if (elTakeover) { elTakeover.addEventListener("click", doTakeOver); }
   elHand.addEventListener("click", function () { handToClaude(false); });
   elAuto.addEventListener("change", function () {
     updateControls();

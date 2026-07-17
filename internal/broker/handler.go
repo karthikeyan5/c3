@@ -152,6 +152,8 @@ func (b *Broker) HandleConn(nc net.Conn) {
 			b.handlePermissionRequest(conn, stub, raw)
 		case ipc.OpFetchQueue:
 			b.handleFetchQueue(conn, stub, raw)
+		case ipc.OpObserve:
+			b.handleObserve(conn, stub, raw)
 		case ipc.OpRetranscribe:
 			b.handleRetranscribe(conn, stub, raw)
 		case ipc.OpRecoverSession:
