@@ -251,7 +251,7 @@ func TestServerInfoAndTools(t *testing.T) {
 	// unmapped-topic create proposal (2026-07-17: a named attach to a brand-new
 	// topic returned the "No mapping" proposal with no way to act on it) must all
 	// be present in the served HTML.
-	for _, want := range []string{"ui/message", "Hand to Claude", "Auto", "placeholder=\"topic name\"", "name: \"attach\"", "Steal it here", "args.steal = true", "Create it", "args.create = true"} {
+	for _, want := range []string{"ui/message", "Hand to Claude", "Auto", "placeholder=\"topic name\"", "name: \"attach\"", "Steal it here", "args.steal = true", "Create it", "args.create = true", "Pop out", "ui/request-display-mode", "press <b>Enter</b>"} {
 		if !strings.Contains(rc.Text, want) {
 			t.Errorf("inbox HTML missing %q (interactive-inbox extension)", want)
 		}
@@ -267,12 +267,17 @@ func TestServerInfoAndTools(t *testing.T) {
 		t.Error("inbox HTML ui/message uses the single-object content shape the host rejects")
 	}
 	// McpUiMessageResult carries isError — a host can accept the RPC yet fail
-	// delivery. The panel MUST check it before draining, or a failed hand would
-	// consume queued messages (no-loss contract violation). "Hand not delivered"
-	// is the status string of that guard branch — specific to the hand flow
-	// (loadQueue also mentions isError, so match the branch, not the token).
-	if !strings.Contains(rc.Text, "Hand not delivered") {
+	// delivery (e.g. the composer already holds an unsent draft). The panel MUST
+	// check it before draining, or a failed hand would consume queued messages
+	// (no-loss contract violation). The guard routes to handFailed(); match that.
+	if !strings.Contains(rc.Text, "result && result.isError") || !strings.Contains(rc.Text, "handFailed(isAuto") {
 		t.Error("inbox HTML hand flow does not guard on ui/message result.isError before draining")
+	}
+	// A failed hand must NOT disarm Auto on the first failure (that was the
+	// 2026-07-17 bug: a composer-busy reject killed Auto). Auto only disarms after
+	// a persistent streak (the circuit breaker), and a failed hand backs off.
+	if !strings.Contains(rc.Text, "autoFailStreak") || !strings.Contains(rc.Text, "AUTO_FAIL_LIMIT") || !strings.Contains(rc.Text, "autoSkipCycles") {
+		t.Error("inbox HTML hand flow missing the keep-Auto-armed backoff / circuit-breaker (composer-busy must not disarm Auto)")
 	}
 }
 
@@ -341,4 +346,50 @@ func keys(m map[string]bool) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestRenderQueuedInbound_CleanShape locks the human-facing render (2026-07-17,
+// Karthi): the message TEXT stands alone at the top, then a blank line, then a
+// compact "↳ from … · reply to … · msg N" trailer — NOT the old one-line
+// `from=@u message_id=N text=%q` clutter. Attachment file_id/mime stay present
+// (load-bearing for download_attachment) but on their own line under the trailer.
+func TestRenderQueuedInbound_CleanShape(t *testing.T) {
+	in := c3types.Inbound{
+		MessageID: 5738,
+		Sender:    c3types.Sender{Username: "skarthi"},
+		Text:      "hey, check the queue",
+		ReplyTo:   &c3types.ReplyContext{MessageID: 900, User: c3types.Sender{Username: "bot"}},
+	}
+	got := renderQueuedInbound(&in)
+
+	// Text must be alone at the very top, followed by a blank line.
+	if !strings.HasPrefix(got, "hey, check the queue\n\n") {
+		t.Errorf("text is not alone-at-top with a blank line after; got:\n%s", got)
+	}
+	// Metadata rides in a compact trailer, not inline with the text.
+	for _, want := range []string{"↳ ", "from @skarthi", "reply to @bot", "msg 5738"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("render missing trailer part %q; got:\n%s", want, got)
+		}
+	}
+	// The old noisy key=value shapes must be gone.
+	for _, gone := range []string{"from=@", "message_id=", "text=\"", "reply_to="} {
+		if strings.Contains(got, gone) {
+			t.Errorf("render still contains old noisy token %q; got:\n%s", gone, got)
+		}
+	}
+
+	// An attachment keeps its full metadata (file_id load-bearing) on its own line.
+	in2 := c3types.Inbound{
+		MessageID:   42,
+		Sender:      c3types.Sender{Username: "skarthi"},
+		Attachments: []c3types.Attachment{{Kind: "photo", FileID: "ABC123", MIME: "image/jpeg", Size: 88352}},
+	}
+	got2 := renderQueuedInbound(&in2)
+	if !strings.Contains(got2, "file_id=\"ABC123\"") {
+		t.Errorf("attachment render dropped the load-bearing file_id; got:\n%s", got2)
+	}
+	if !strings.Contains(got2, "from @skarthi") {
+		t.Errorf("attachment-only render missing sender trailer; got:\n%s", got2)
+	}
 }

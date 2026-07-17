@@ -90,6 +90,19 @@ C3 also exposes an MCP **prompt** named `fetch-queue`, which Claude Desktop surf
 
 It still needs an **attached** topic (run `attach` first); unattached, it reports "no route claimed". This is a *reduced-ceremony pull*, not live push — Desktop still can't surface a message on its own. (If a future test shows Desktop calling `prompts/get` more than once per invocation, the consuming default would need to become peek — verify on first use.)
 
+## The C3 Inbox panel (live view)
+
+Ask Claude to **"open the c3 inbox"** and it calls the `open_inbox` tool, which renders an MCP-App HTML panel inline in the chat. The panel:
+
+- **peeks** the durable queue every ~5s and shows what's waiting (never consumes on its own);
+- lets you **attach** in-panel (type a topic → **Attach**; a brand-new name offers **Create it**; a topic held by another Desktop chat offers **Steal it here**);
+- **Hand to Claude** / **Auto** feed the waiting messages to Claude via `ui/message`.
+
+Two host behaviors are worth knowing (they are Claude Desktop limits, not C3 bugs — verified against the MCP-Apps `ext-apps` spec and the shipped app SDK):
+
+- **`ui/message` DRAFTS into the composer on the Code tab — it does not auto-send.** Handed messages land in the message box; **press Enter** to send. There is no send/submit parameter and no gesture-free "start a turn" primitive, so this can't be forced. (The Cowork tab tends to send immediately.) **Auto** therefore means "feed the next message into the composer as you clear the last": if the composer already holds an unsent draft, the host rejects the next hand, so C3 leaves it queued and retries once you send — Auto stays armed (a long failure streak trips a circuit-breaker that disarms it with a reason).
+- **The panel is inline and scrolls with the chat.** MCP Apps has no docked/side pane — only `inline`, `fullscreen`, `pip`. The panel offers a best-effort **Pop out** button (requests a floating picture-in-picture overlay so it stays visible); if the host doesn't support `pip` it says so. The reliable way to bring it back is to **re-summon it: "open the c3 inbox"** drops a fresh live panel at the bottom.
+
 ## Caveats
 
 > **Telegram is single-consumer — use a separate bot token on Windows.**

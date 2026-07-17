@@ -1297,31 +1297,64 @@ func renderFetchedMessages(msgs []c3types.Inbound, remaining int, route string) 
 	return out
 }
 
+// renderQueuedInbound renders one queued message as a human-facing block for the
+// Desktop chat surface. Karthi (2026-07-17): the old one-line
+// `from=@u message_id=N text=%q reply_to=N` render buried the message in metadata
+// and read as clutter when handed into the composer. New shape: the message TEXT
+// stands alone and prominent, followed by a blank line and a compact
+// "↳ from … · reply to … · msg N" trailer. The trailer keeps the attribution and
+// ids (Claude still needs message_id/sender for reply/react targeting; the reader
+// still sees who sent it) out of the way of the text. Attachments keep their FULL
+// metadata (file_id/mime are load-bearing for download_attachment/retranscribe)
+// on their own indented line beneath the trailer. This render feeds three places:
+// the panel inbox display, the /fetch-queue slash dump, and the Hand-to-Claude
+// injection — all human-facing on Desktop, so all benefit from the clean shape.
 func renderQueuedInbound(in *c3types.Inbound) string {
-	var parts []string
+	var meta []string
 	switch {
 	case in.Sender.Username != "":
-		parts = append(parts, "from=@"+in.Sender.Username)
+		meta = append(meta, "from @"+in.Sender.Username)
 	case in.Sender.UserID != 0:
-		parts = append(parts, fmt.Sprintf("from=uid=%d", in.Sender.UserID))
+		meta = append(meta, fmt.Sprintf("from uid %d", in.Sender.UserID))
+	}
+	if in.ReplyTo != nil {
+		switch {
+		case in.ReplyTo.User.Username != "":
+			meta = append(meta, "reply to @"+in.ReplyTo.User.Username)
+		case in.ReplyTo.User.UserID != 0:
+			meta = append(meta, fmt.Sprintf("reply to uid %d", in.ReplyTo.User.UserID))
+		default:
+			meta = append(meta, fmt.Sprintf("reply to msg %d", in.ReplyTo.MessageID))
+		}
 	}
 	if in.MessageID != 0 {
-		parts = append(parts, fmt.Sprintf("message_id=%d", in.MessageID))
-	}
-	if in.Text != "" {
-		parts = append(parts, fmt.Sprintf("text=%q", in.Text))
-	}
-	parts = append(parts, c3types.ReplyContextFields(in.ReplyTo)...)
-	for _, att := range in.Attachments {
-		parts = append(parts, c3types.AttachmentField(att))
+		meta = append(meta, fmt.Sprintf("msg %d", in.MessageID))
 	}
 	if in.IsEvent() {
-		parts = append(parts, fmt.Sprintf("event=%s", in.Kind))
+		meta = append(meta, "event="+string(in.Kind))
 	}
-	if len(parts) == 0 {
-		return "(no content)"
+
+	body := in.Text
+	if body == "" && in.IsEvent() {
+		body = fmt.Sprintf("(%s event)", in.Kind)
 	}
-	return strings.Join(parts, " ")
+
+	var b strings.Builder
+	if body != "" {
+		b.WriteString(body)
+		b.WriteString("\n\n")
+	}
+	b.WriteString("↳ ")
+	if len(meta) == 0 {
+		b.WriteString("from unknown")
+	} else {
+		b.WriteString(strings.Join(meta, " · "))
+	}
+	for _, att := range in.Attachments {
+		b.WriteString("\n   ")
+		b.WriteString(c3types.AttachmentField(att))
+	}
+	return b.String()
 }
 
 func decodeArgs(raw json.RawMessage) (map[string]any, error) {
@@ -1497,9 +1530,11 @@ const inboxHTML = `<!DOCTYPE html>
     <button id="refresh" disabled>Refresh</button>
     <button id="hand" hidden>Hand to Claude</button>
     <label class="auto" id="autolabel" hidden><input type="checkbox" id="auto"> Auto</label>
+    <button id="popout" hidden>Pop out</button>
     <span class="status" id="status">Connecting to host&hellip;</span>
   </div>
-  <div class="note" id="autonote" hidden>Auto: new messages are handed to Claude automatically while this panel is open.</div>
+  <div class="note" id="composernote" hidden>Handed messages land in the composer &mdash; press <b>Enter</b> to send. On the Code tab that&rsquo;s a review step; the host drafts, it can&rsquo;t auto-send.</div>
+  <div class="note" id="autonote" hidden>Auto: each new Telegram message is fed into the composer as you clear the last &mdash; works only while this panel is open.</div>
   <div id="list"><div class="empty">Loading queued messages&hellip;</div></div>
 <script>
 (function () {
@@ -1521,6 +1556,10 @@ const inboxHTML = `<!DOCTYPE html>
   var pendingCreateName = "";
   var REFRESH_MS = 5000;
   var HAND_PREFIX = "New C3 Telegram message(s):\n\n";
+  var autoSkipCycles = 0;   // skip this many auto-poll cycles after a failed hand
+  var autoFailStreak = 0;   // consecutive auto-hand failures; trips the breaker
+  var AUTO_BACKOFF = 2;     // polls to skip after a failed auto-hand (~10s)
+  var AUTO_FAIL_LIMIT = 5;  // disarm Auto after this many consecutive failures
 
   var elHost = document.getElementById("host");
   var elStatus = document.getElementById("status");
@@ -1536,6 +1575,8 @@ const inboxHTML = `<!DOCTYPE html>
   var elAutoLabel = document.getElementById("autolabel");
   var elAuto = document.getElementById("auto");
   var elAutoNote = document.getElementById("autonote");
+  var elComposerNote = document.getElementById("composernote");
+  var elPopout = document.getElementById("popout");
 
   function send(obj) { parentWin.postMessage(obj, "*"); }
 
@@ -1626,6 +1667,7 @@ const inboxHTML = `<!DOCTYPE html>
     if (attached) { elAttachHint.hidden = true; elAttachHint.textContent = ""; show(elSteal, false); pendingStealName = ""; show(elCreate, false); pendingCreateName = ""; }
     show(elHand, attached);
     show(elAutoLabel, attached);
+    show(elComposerNote, attached);
     show(elAutoNote, attached && elAuto.checked);
   }
 
@@ -1704,17 +1746,28 @@ const inboxHTML = `<!DOCTYPE html>
     });
   }
 
-  // handToClaude hands the waiting messages to Claude (ui/message → starts a
-  // turn) and only THEN consumes them. Ordering is deliberate and load-bearing:
-  // PEEK (ack:false, no consume) → ui/message → DRAIN (ack:true) only after the
-  // host accepts. A declined or failed hand therefore never drops messages from
-  // the durable queue — they stay queued and re-appear on the next peek. (C3's
-  // whole contract is a no-loss queue; drain-first would lose messages on every
-  // decline.) On decline we also disarm Auto so a persistent "no" can't re-prompt
-  // every refresh. Residual edge: messages arriving WHILE a consent prompt is open
-  // get consumed by the post-accept drain without being handed — harmless under
-  // "always allow" (ui/message resolves instantly), the expected Desktop case.
-  function handToClaude() {
+  // handToClaude hands the waiting messages to Claude (ui/message) and only THEN
+  // consumes them. Ordering is deliberate and load-bearing: PEEK (ack:false, no
+  // consume) → ui/message → DRAIN (ack:true) only after the host accepts. A failed
+  // hand therefore never drops messages from the durable queue — they stay queued
+  // and re-appear on the next peek (C3's whole contract is a no-loss queue).
+  //
+  // FAILURE HANDLING (revised 2026-07-17, after Karthi's on-device tests + a
+  // Desktop-internals probe): on the Code tab ui/message DRAFTS into the
+  // composer rather than sending — an empty composer accepts the draft, a
+  // non-empty one (a prior unsent draft) makes the host REJECT the call. The old
+  // code treated that reject as a user "decline" and disarmed Auto, so Auto died
+  // the moment a second message arrived before the user pressed Enter. It is NOT a
+  // decline. So: a failed hand now KEEPS Auto armed, leaves the messages queued,
+  // and backs off a couple of poll cycles (autoSkipCycles) so we don't hammer the
+  // composer-busy reject every 5s. Once the user sends the drafted message the
+  // composer clears and the next cycle drafts the next one — Auto becomes
+  // "feed the queue into the composer one at a time as you clear it". A genuine
+  // persistent failure (AUTO_FAIL_LIMIT consecutive) trips a circuit breaker that
+  // finally disarms Auto with an explicit reason, so a truly broken host can't
+  // silently retry forever. (There is no send-vs-draft param and no gesture-free
+  // turn-start primitive — verified against the ext-apps spec + shipped app SDK.)
+  function handToClaude(isAuto) {
     if (handing || !attached) { return; }
     handing = true;
     elHand.disabled = true;
@@ -1727,24 +1780,18 @@ const inboxHTML = `<!DOCTYPE html>
       // content MUST be a ContentBlock ARRAY (SEP-1865 McpUiMessageRequest) —
       // the single-object shape is rejected by Claude Desktop as invalid params.
       return request("ui/message", { role: "user", content: [{ type: "text", text: HAND_PREFIX + text }] }).then(function (result) {
-        // McpUiMessageResult.isError: host accepted the RPC but did not deliver.
-        // Treat exactly like a decline — leave queued, disarm Auto. Draining
-        // here would consume messages that never reached Claude (no-loss
-        // contract violation).
-        if (result && result.isError) {
-          if (elAuto.checked) { elAuto.checked = false; updateControls(); }
-          elStatus.textContent = "Hand not delivered (host reported an error) — left in queue (Auto off)";
-          return;
-        }
-        elStatus.textContent = "📤 handed to Claude · " + new Date().toLocaleTimeString();
+        // McpUiMessageResult.isError: host accepted the RPC but did not deliver
+        // (e.g. composer already holds an unsent draft). Leave queued and, if this
+        // was an auto-hand, back off — but do NOT disarm Auto.
+        if (result && result.isError) { handFailed(isAuto, "host busy (a draft may be waiting — press Enter to send it)"); return; }
+        autoFailStreak = 0;
+        elStatus.textContent = "📤 handed to Claude — press Enter in the composer to send · " + new Date().toLocaleTimeString();
         // Accepted → consume so it won't re-hand or re-show. Best-effort.
         return request("tools/call", { name: "fetch_queue", arguments: { ack: true } }).then(function () {}, function () {});
       }, function (err) {
-        // Declined/failed → leave queued; disarm Auto to stop re-prompting.
-        // Surface the actual reason — a mute failure here cost a debugging
-        // round-trip (2026-07-17).
-        if (elAuto.checked) { elAuto.checked = false; updateControls(); }
-        elStatus.textContent = "Hand not accepted (" + (err && err.message ? err.message : "declined") + ") — left in queue (Auto off)";
+        // Rejected/failed → leave queued; back off Auto (don't disarm). The reject
+        // reason is surfaced so a genuine problem isn't mute (2026-07-17).
+        handFailed(isAuto, (err && err.message) ? err.message : "rejected");
       });
     }).catch(function (err) {
       elStatus.textContent = "Hand failed: " + (err && err.message ? err.message : "error");
@@ -1756,14 +1803,36 @@ const inboxHTML = `<!DOCTYPE html>
     });
   }
 
+  // handFailed records a failed hand without dropping messages. Auto stays armed
+  // (the common cause is a composer already holding an unsent draft, not a
+  // decline) and simply backs off a few cycles; only a long streak of consecutive
+  // failures trips the breaker and disarms Auto with an explicit reason.
+  function handFailed(isAuto, reason) {
+    if (isAuto) {
+      autoFailStreak++;
+      autoSkipCycles = AUTO_BACKOFF;
+      if (autoFailStreak >= AUTO_FAIL_LIMIT && elAuto.checked) {
+        elAuto.checked = false;
+        autoFailStreak = 0;
+        updateControls();
+        elStatus.textContent = "Auto off — handing kept failing (" + reason + "). Clear the composer and re-arm.";
+        return;
+      }
+      elStatus.textContent = "Left in queue (" + reason + ") — Auto will retry when the composer clears";
+      return;
+    }
+    elStatus.textContent = "Not handed (" + reason + "). Press Enter to send any waiting draft, then try again.";
+  }
+
   // autoMaybe auto-hands when Auto is armed and a peek surfaced real content.
   // Loop-avoidance: handing drains (ack:true), so the next peek is empty and
   // shouldHand is false; the single handing flag blocks re-entry while a hand
   // (incl. its ui/message consent round-trip) is outstanding.
   function autoMaybe(text, isError) {
     if (!elAuto.checked || !attached || handing) { return; }
+    if (autoSkipCycles > 0) { autoSkipCycles--; return; }
     if (!shouldHand(text, isError)) { return; }
-    handToClaude();
+    handToClaude(true);
   }
 
   function renderQueue(text, isError) {
@@ -1829,12 +1898,27 @@ const inboxHTML = `<!DOCTYPE html>
   elTopic.addEventListener("keydown", function (e) { if (e.key === "Enter") { doAttach(""); } });
   if (elSteal) { elSteal.addEventListener("click", function () { doAttach("steal"); }); }
   if (elCreate) { elCreate.addEventListener("click", function () { doAttach("create"); }); }
-  elHand.addEventListener("click", handToClaude);
+  elHand.addEventListener("click", function () { handToClaude(false); });
   elAuto.addEventListener("change", function () {
     updateControls();
     reportSize();
-    if (elAuto.checked) { loadQueue(); }
+    if (elAuto.checked) { autoFailStreak = 0; autoSkipCycles = 0; loadQueue(); }
   });
+  // Pop out: best-effort request for a floating (picture-in-picture) overlay so
+  // the panel stays visible as the chat scrolls. This is the ONLY spec'd
+  // stays-visible placement — there is no docked/side pane in MCP Apps — and it
+  // needs a user gesture (this click supplies it). Degrades honestly if the host
+  // doesn't support pip; the reliable fallback is re-summoning via "open the c3
+  // inbox".
+  if (elPopout) {
+    elPopout.addEventListener("click", function () {
+      request("ui/request-display-mode", { mode: "pip" }).then(function () {
+        elStatus.textContent = "↗ popped out — floating overlay";
+      }, function () {
+        elStatus.textContent = "Pop-out not supported here — ask Claude to \"open the c3 inbox\" to re-summon it";
+      });
+    });
+  }
 
   if (typeof ResizeObserver !== "undefined") {
     new ResizeObserver(function () { reportSize(); }).observe(document.documentElement);
@@ -1842,7 +1926,7 @@ const inboxHTML = `<!DOCTYPE html>
 
   // Handshake, then first (peeking) fetch.
   request("ui/initialize", {
-    appCapabilities: { availableDisplayModes: ["inline"] },
+    appCapabilities: { availableDisplayModes: ["inline", "pip"] },
     appInfo: { name: "C3 Inbox", version: "0.1.0" },
     protocolVersion: PROTOCOL_VERSION
   }).then(function (result) {
@@ -1852,6 +1936,7 @@ const inboxHTML = `<!DOCTYPE html>
     applyTheme(result && result.hostContext);
     notify("ui/notifications/initialized");
     elRefresh.disabled = false;
+    show(elPopout, true);
     elStatus.textContent = "🟢 live";
     reportSize();
     loadQueue();
