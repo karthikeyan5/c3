@@ -1429,9 +1429,12 @@ func (a *adapter) toolOpenInbox(_ context.Context, _ *mcp.CallToolRequest) (*mcp
 //     result text is not parsed) — apps.mdx:399-401 gates app-callable tools.
 //   - tools/call { name:"fetch_queue", arguments:{ack:true} } to DRAIN (consume)
 //     for "Hand to Claude" / the Auto toggle.
-//   - ui/message { role:"user", content:{type:"text", text} } to hand the drained
-//     messages to Claude and start a turn (apps.mdx:998-1034; the host MAY prompt
-//     for consent).
+//   - ui/message { role:"user", content:[{type:"text", text}] } to hand the
+//     drained messages to Claude and start a turn (apps.mdx:998-1034; the host
+//     MAY prompt for consent). content is a ContentBlock ARRAY per SEP-1865
+//     (spec.types.ts McpUiMessageRequest) — Claude Desktop rejects the
+//     single-object shape as invalid params, and its result may carry isError
+//     (McpUiMessageResult), which MUST be treated as not-delivered.
 //   - ui/notifications/size-changed so a flexible-height host sizes the iframe to
 //     the content (apps.mdx:718; src/app.ts:1859-1907).
 //
@@ -1685,14 +1688,27 @@ const inboxHTML = `<!DOCTYPE html>
         elStatus.textContent = "Nothing new to hand · " + new Date().toLocaleTimeString();
         return;
       }
-      return request("ui/message", { role: "user", content: { type: "text", text: HAND_PREFIX + text } }).then(function () {
+      // content MUST be a ContentBlock ARRAY (SEP-1865 McpUiMessageRequest) —
+      // the single-object shape is rejected by Claude Desktop as invalid params.
+      return request("ui/message", { role: "user", content: [{ type: "text", text: HAND_PREFIX + text }] }).then(function (result) {
+        // McpUiMessageResult.isError: host accepted the RPC but did not deliver.
+        // Treat exactly like a decline — leave queued, disarm Auto. Draining
+        // here would consume messages that never reached Claude (no-loss
+        // contract violation).
+        if (result && result.isError) {
+          if (elAuto.checked) { elAuto.checked = false; updateControls(); }
+          elStatus.textContent = "Hand not delivered (host reported an error) — left in queue (Auto off)";
+          return;
+        }
         elStatus.textContent = "📤 handed to Claude · " + new Date().toLocaleTimeString();
         // Accepted → consume so it won't re-hand or re-show. Best-effort.
         return request("tools/call", { name: "fetch_queue", arguments: { ack: true } }).then(function () {}, function () {});
-      }, function () {
+      }, function (err) {
         // Declined/failed → leave queued; disarm Auto to stop re-prompting.
+        // Surface the actual reason — a mute failure here cost a debugging
+        // round-trip (2026-07-17).
         if (elAuto.checked) { elAuto.checked = false; updateControls(); }
-        elStatus.textContent = "Hand not accepted — left in queue (Auto off)";
+        elStatus.textContent = "Hand not accepted (" + (err && err.message ? err.message : "declined") + ") — left in queue (Auto off)";
       });
     }).catch(function (err) {
       elStatus.textContent = "Hand failed: " + (err && err.message ? err.message : "error");

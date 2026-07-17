@@ -252,6 +252,24 @@ func TestServerInfoAndTools(t *testing.T) {
 			t.Errorf("inbox HTML missing %q (interactive-inbox extension)", want)
 		}
 	}
+	// ui/message params contract (SEP-1865 McpUiMessageRequest): content MUST be
+	// an ARRAY of content blocks. The single-object shape was rejected by Claude
+	// Desktop as invalid params (~10ms), which surfaced as "Hand to Claude / Auto
+	// does nothing" (2026-07-17). Guard both directions.
+	if !strings.Contains(rc.Text, "content: [{ type: \"text\"") {
+		t.Error("inbox HTML ui/message content is not a ContentBlock ARRAY (spec.types.ts McpUiMessageRequest)")
+	}
+	if strings.Contains(rc.Text, "content: { type: \"text\"") {
+		t.Error("inbox HTML ui/message uses the single-object content shape the host rejects")
+	}
+	// McpUiMessageResult carries isError — a host can accept the RPC yet fail
+	// delivery. The panel MUST check it before draining, or a failed hand would
+	// consume queued messages (no-loss contract violation). "Hand not delivered"
+	// is the status string of that guard branch — specific to the hand flow
+	// (loadQueue also mentions isError, so match the branch, not the token).
+	if !strings.Contains(rc.Text, "Hand not delivered") {
+		t.Error("inbox HTML hand flow does not guard on ui/message result.isError before draining")
+	}
 }
 
 // TestSessionID covers the C3_DESKTOP_SESSION contract: an explicit (trimmed)
