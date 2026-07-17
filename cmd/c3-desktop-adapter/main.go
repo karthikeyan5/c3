@@ -1490,6 +1490,7 @@ const inboxHTML = `<!DOCTYPE html>
     <input type="text" class="topic" id="topic" placeholder="topic name" autocomplete="off" spellcheck="false">
     <button id="attach">Attach</button>
     <button id="steal" hidden>Steal it here</button>
+    <button id="create" hidden>Create it</button>
   </div>
   <div class="hint" id="attachhint" hidden></div>
   <div class="bar">
@@ -1517,6 +1518,7 @@ const inboxHTML = `<!DOCTYPE html>
   var handing = false;
   var pendingAttachHint = "";
   var pendingStealName = "";
+  var pendingCreateName = "";
   var REFRESH_MS = 5000;
   var HAND_PREFIX = "New C3 Telegram message(s):\n\n";
 
@@ -1528,6 +1530,7 @@ const inboxHTML = `<!DOCTYPE html>
   var elTopic = document.getElementById("topic");
   var elAttach = document.getElementById("attach");
   var elSteal = document.getElementById("steal");
+  var elCreate = document.getElementById("create");
   var elAttachHint = document.getElementById("attachhint");
   var elHand = document.getElementById("hand");
   var elAutoLabel = document.getElementById("autolabel");
@@ -1620,7 +1623,7 @@ const inboxHTML = `<!DOCTYPE html>
   // when Auto is armed AND we are attached. Called on every render.
   function updateControls() {
     show(elAttachBar, !attached);
-    if (attached) { elAttachHint.hidden = true; elAttachHint.textContent = ""; show(elSteal, false); pendingStealName = ""; }
+    if (attached) { elAttachHint.hidden = true; elAttachHint.textContent = ""; show(elSteal, false); pendingStealName = ""; show(elCreate, false); pendingCreateName = ""; }
     show(elHand, attached);
     show(elAutoLabel, attached);
     show(elAutoNote, attached && elAuto.checked);
@@ -1646,19 +1649,32 @@ const inboxHTML = `<!DOCTYPE html>
   // hint (covers "topic doesn't exist / needs create"). The double loadQueue
   // guarantees a post-attach peek even if a timer peek was mid-flight: the first
   // call coalesces onto that (possibly pre-attach) peek, the second is fresh.
-  function doAttach(steal) {
+  // doAttach drives all three panel attach outcomes via a mode string:
+  //   ""       — attach the typed topic name (may yield a create/steal proposal)
+  //   "steal"  — re-attach the held topic with steal=true (topic held by the
+  //              user's OTHER Desktop chat; "Steal it here" button)
+  //   "create" — confirm creation of the typed-but-unmapped topic with
+  //              create=true (broker returned the "No mapping" proposal;
+  //              "Create it" button)
+  // The follow-up buttons are revealed by matching the broker's proposal text —
+  // a named attach only ever yields create / use_existing / force_steal, so the
+  // two keys below are unambiguous here.
+  function doAttach(mode) {
     if (attaching) { return; }
-    // A steal re-attaches the SAME topic the broker said is held by the user's
-    // other Desktop chat; a normal attach uses the typed name.
-    var name = steal ? pendingStealName : (elTopic.value || "").replace(/^\s+|\s+$/g, "");
+    var name;
+    if (mode === "steal") { name = pendingStealName; }
+    else if (mode === "create") { name = pendingCreateName; }
+    else { name = (elTopic.value || "").replace(/^\s+|\s+$/g, ""); }
     if (!name) { return; }
     attaching = true;
     elAttach.disabled = true;
     if (elSteal) { elSteal.disabled = true; }
+    if (elCreate) { elCreate.disabled = true; }
     elAttachHint.hidden = true;
     elAttachHint.textContent = "";
     var args = { name: name };
-    if (steal) { args.steal = true; }
+    if (mode === "steal") { args.steal = true; }
+    if (mode === "create") { args.create = true; }
     request("tools/call", { name: "attach", arguments: args }).then(function (result) {
       pendingAttachHint = extractText(result);
       return loadQueue().then(function () { return loadQueue(); });
@@ -1668,22 +1684,21 @@ const inboxHTML = `<!DOCTYPE html>
       attaching = false;
       elAttach.disabled = false;
       if (elSteal) { elSteal.disabled = false; }
+      if (elCreate) { elCreate.disabled = false; }
       if (!attached && pendingAttachHint) {
         elAttachHint.textContent = pendingAttachHint;
         elAttachHint.hidden = false;
       }
-      // If the broker offered a force_steal (topic held by the user's OTHER
-      // Desktop chat), reveal the Steal button and remember which topic to move
-      // here. Keyed on the exact steal instruction so it fires for a real
-      // force_steal, not e.g. the disambiguate_dm hint.
+      // Reveal whichever follow-up the broker's proposal calls for. force_steal →
+      // Steal (topic held by the user's other Desktop chat); "No mapping" create
+      // proposal → Create (brand-new topic). Both hide once attached (see
+      // updateControls) or on any other outcome.
       var canSteal = !attached && pendingAttachHint.indexOf("Re-invoke attach with steal=true") !== -1;
-      if (canSteal) {
-        pendingStealName = name;
-        show(elSteal, true);
-      } else {
-        pendingStealName = "";
-        show(elSteal, false);
-      }
+      var canCreate = !attached && pendingAttachHint.indexOf("No mapping for this directory") !== -1;
+      if (canSteal) { pendingStealName = name; show(elSteal, true); }
+      else { pendingStealName = ""; show(elSteal, false); }
+      if (canCreate) { pendingCreateName = name; show(elCreate, true); }
+      else { pendingCreateName = ""; show(elCreate, false); }
       pendingAttachHint = "";
       reportSize();
     });
@@ -1810,9 +1825,10 @@ const inboxHTML = `<!DOCTYPE html>
   }
 
   elRefresh.addEventListener("click", loadQueue);
-  elAttach.addEventListener("click", function () { doAttach(false); });
-  elTopic.addEventListener("keydown", function (e) { if (e.key === "Enter") { doAttach(false); } });
-  if (elSteal) { elSteal.addEventListener("click", function () { doAttach(true); }); }
+  elAttach.addEventListener("click", function () { doAttach(""); });
+  elTopic.addEventListener("keydown", function (e) { if (e.key === "Enter") { doAttach(""); } });
+  if (elSteal) { elSteal.addEventListener("click", function () { doAttach("steal"); }); }
+  if (elCreate) { elCreate.addEventListener("click", function () { doAttach("create"); }); }
   elHand.addEventListener("click", handToClaude);
   elAuto.addEventListener("change", function () {
     updateControls();

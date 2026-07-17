@@ -246,9 +246,12 @@ func TestServerInfoAndTools(t *testing.T) {
 		t.Error("inbox HTML missing the ui/initialize handshake or the fetch_queue call")
 	}
 	// Interactive inbox: in-panel attach form, Hand to Claude + Auto, the
-	// ui/message turn-start call, and the multi-surface "Steal it here" affordance
-	// (Bug 2, one-owner model) must all be present in the served HTML.
-	for _, want := range []string{"ui/message", "Hand to Claude", "Auto", "placeholder=\"topic name\"", "name: \"attach\"", "Steal it here", "args.steal = true"} {
+	// ui/message turn-start call, the multi-surface "Steal it here" affordance
+	// (Bug 2, one-owner model), and the "Create it" affordance for the
+	// unmapped-topic create proposal (2026-07-17: a named attach to a brand-new
+	// topic returned the "No mapping" proposal with no way to act on it) must all
+	// be present in the served HTML.
+	for _, want := range []string{"ui/message", "Hand to Claude", "Auto", "placeholder=\"topic name\"", "name: \"attach\"", "Steal it here", "args.steal = true", "Create it", "args.create = true"} {
 		if !strings.Contains(rc.Text, want) {
 			t.Errorf("inbox HTML missing %q (interactive-inbox extension)", want)
 		}
