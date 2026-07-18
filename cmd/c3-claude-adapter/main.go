@@ -319,11 +319,15 @@ type adapter struct {
 	// (right after the handshake, before the first user turn) is dropped by
 	// Claude Code rather than buffered (2026-06-24). The receiving middleware
 	// flushes it on the first tools/call — an active turn, where the frame
-	// renders. The Telegram recover-welcome is the GUARANTEED signal; this is
-	// the best-effort CLI echo. Guarded by pnmu.
+	// renders. At flush the adapter live re-peeks the held count (fetch_queue,
+	// Ack=false) and emits an accurate frame; this stored text is the FALLBACK
+	// used when that re-peek times out / errors. It persists until the first
+	// tools/call however late (NO TTL): the live re-peek makes a stale stored
+	// count impossible, so the old 5-minute drop — a silent-loss-of-awareness
+	// bug on a resume idle >5min — is gone. The Telegram recover-welcome is the
+	// GUARANTEED signal; this is the best-effort CLI echo. Guarded by pnmu.
 	pnmu                 sync.Mutex
 	pendingRecoverNotice string
-	pendingRecoverAt     time.Time
 }
 
 func newAdapter() *adapter {
@@ -1918,12 +1922,13 @@ const (
 	// fixed window that used to silently lose it. Purely diagnostic.
 	recoverLateThreshold = 10 * time.Second
 	recoverRespTimeout   = 10 * time.Second
-	// pendingRecoverTTL bounds how long the deferred auto-attach CLI notice
-	// waits for the first active turn before being dropped. The Telegram
-	// recover-welcome already informed the user; a minutes-late CLI block would
-	// just confuse.
-	pendingRecoverTTL = 5 * time.Minute
 )
+
+// livePeekTimeout bounds the flush-time live re-peek of the held count so the
+// deferred notice never delays the first tools/call beyond a moment; on timeout
+// the flush falls back to the stored at-recover text. A var (not a const) so
+// tests can shorten/lengthen it.
+var livePeekTimeout = 2 * time.Second
 
 // recoverSessionOnResume runs in a goroutine after hello. It WATCHES (in the
 // background, for recoverWatchBudget) for this adapter's SessionStart-hook
@@ -2277,38 +2282,98 @@ func (a *adapter) emitRecoverNotice(text string) {
 	}
 }
 
-// setPendingRecoverNotice stores the auto-attach-on-resume CLI notice to be
-// flushed on the first active turn (see the adapter.pendingRecoverNotice doc).
+// setPendingRecoverNotice stores the auto-attach-on-resume CLI notice (the
+// fallback text) to be flushed on the first active turn (see the
+// adapter.pendingRecoverNotice doc).
 func (a *adapter) setPendingRecoverNotice(text string) {
 	a.pnmu.Lock()
 	a.pendingRecoverNotice = text
-	a.pendingRecoverAt = time.Now()
 	a.pnmu.Unlock()
 }
 
 // takePendingRecoverNotice atomically clears and returns the pending notice when
-// one is set AND still fresh (within pendingRecoverTTL). A stale or absent
-// notice returns ("", false) and is cleared either way, so it never re-emits.
-// Split out from flush so the once-only + staleness logic is unit-testable
-// without a live notify transport.
+// one is set. Returns ("", false) when none is pending. Once-only: a second take
+// after a successful first returns ("", false), so the notice never re-emits.
+// NO staleness drop — the notice persists until the first tools/call however
+// late; the flush live re-peeks the count, so a stale stored count is
+// impossible (the removed pendingRecoverTTL was a silent-loss-of-awareness bug).
+// Split out from flush so the once-only logic is unit-testable without a live
+// notify transport.
 func (a *adapter) takePendingRecoverNotice() (string, bool) {
 	a.pnmu.Lock()
 	defer a.pnmu.Unlock()
-	text, at := a.pendingRecoverNotice, a.pendingRecoverAt
+	text := a.pendingRecoverNotice
 	a.pendingRecoverNotice = ""
-	if text == "" || time.Since(at) > pendingRecoverTTL {
+	if text == "" {
 		return "", false
 	}
 	return text, true
 }
 
-// flushPendingRecoverNotice emits the deferred auto-attach notice once, if one
-// is pending and fresh. Called from the receiving middleware on the first
-// tools/call.
-func (a *adapter) flushPendingRecoverNotice() {
-	if text, ok := a.takePendingRecoverNotice(); ok {
-		a.emitRecoverNotice(text)
+// peekPendingCount does a NON-DESTRUCTIVE (Ack=false) fetch_queue round-trip to
+// learn the live held count on the recovered route, reusing the fqPending
+// dispatch plumbing (same fire-then-push pattern as toolFetchQueue). Returns
+// (n, true) on success — n = returned + Remaining, robust for any limit — and
+// (0, false) on a reconnecting/absent conn, write error, or timeout. Ack=false
+// consumes nothing, so this preserves the pull-not-push invariant.
+func (a *adapter) peekPendingCount(timeout time.Duration) (int, bool) {
+	fq := ipc.FetchQueueReq{Op: ipc.OpFetchQueue, ID: strconv.FormatUint(a.nextID.Add(1), 10), Ack: false}
+	ch := make(chan ipc.FetchQueueResp, 1)
+	a.fqmu.Lock()
+	a.fqPending[fq.ID] = ch
+	a.fqmu.Unlock()
+	defer func() { a.fqmu.Lock(); delete(a.fqPending, fq.ID); a.fqmu.Unlock() }()
+
+	conn := a.currentConn()
+	if conn == nil {
+		return 0, false
 	}
+	if err := conn.WriteJSON(fq); err != nil {
+		return 0, false
+	}
+	select {
+	case <-time.After(timeout):
+		return 0, false
+	case resp := <-ch:
+		if resp.Err != "" {
+			return 0, false
+		}
+		return len(resp.Messages) + resp.Remaining, true
+	}
+}
+
+// renderResumeReattachFrame builds the live-accurate first-turn notice from a
+// fresh count. N>0 is IMPERATIVE to the agent (surface now, call fetch_queue
+// before continuing); N==0 is the bare re-attach note.
+func renderResumeReattachFrame(name string, n int) string {
+	if n <= 0 {
+		return fmt.Sprintf("📨 Re-attached to %q (resumed session). Inbound messages render here as `<channel>` blocks.", name)
+	}
+	noun := "message"
+	if n > 1 {
+		noun = "messages"
+	}
+	return fmt.Sprintf("📨 Re-attached to %q (resumed session) — %d held %s. Surface them to the user now — call `fetch_queue` — before continuing with the user's request.", name, n, noun)
+}
+
+// flushPendingRecoverNotice emits the deferred auto-attach notice once, on the
+// first tools/call (an active turn — the one moment Claude Code renders channel
+// frames). It LIVE re-peeks the held count so the surfaced number is accurate at
+// flush time, not frozen at recover time (which can be minutes stale). On a
+// conn/timeout/error it falls back to the stored at-recover text so the flush
+// never blocks the tools/call beyond livePeekTimeout. Called from the receiving
+// middleware; self-clears so it only emits once.
+func (a *adapter) flushPendingRecoverNotice() {
+	stored, ok := a.takePendingRecoverNotice()
+	if !ok {
+		return
+	}
+	name := a.currentTopicName()
+	if n, ok := a.peekPendingCount(livePeekTimeout); ok && name != "" {
+		a.emitRecoverNotice(renderResumeReattachFrame(name, n))
+		return
+	}
+	a.emitRecoverNotice(stored)
 }
 
 // handlePermissionRequest is the receive interceptor's callback (notify_transport

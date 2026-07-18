@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/karthikeyan5/c3/internal/mappings"
+	"github.com/karthikeyan5/c3/internal/queue"
 	"github.com/karthikeyan5/c3/internal/sessionhandoff"
 )
 
@@ -119,5 +121,58 @@ func runSessionHook() error {
 		fmt.Fprintf(os.Stderr, "c3-broker session-hook: write handoff: %v (ignoring)\n", err)
 		return nil
 	}
+
+	// On a RESUMED session ONLY (never startup/clear/compact), surface any held
+	// backlog into the agent's first-turn context so the durable queue drains
+	// without waiting for the user to ask. Best-effort; failures print nothing.
+	if in.Source == "resume" {
+		printResumeBacklogHint(in.SessionID)
+	}
 	return nil
+}
+
+// printResumeBacklogHint prints ONE SessionStart-context line when the resumed
+// session's last-attached topic still has held messages in the durable queue,
+// telling the agent to call fetch_queue at the start of its first reply.
+//
+// It is a filesystem-only HINT — mappings.json plus the lock-free queue store —
+// and NEVER touches the broker socket (session_hook's load-bearing invariant,
+// see the runSessionHook doc): any error (unresolvable path, unreadable mappings,
+// no attachment, empty queue) prints nothing and returns. Slight staleness is
+// acceptable: the append-only store tolerates concurrent broker writes, and this
+// is only a hint. A SessionStart hook's stdout is added to the model's context
+// (Claude Code hooks contract, verified 2026-07-18), so one plain line suffices —
+// no structured JSON needed.
+func printResumeBacklogHint(stableID string) {
+	path, err := mappings.DefaultPath()
+	if err != nil {
+		return
+	}
+	mf, err := mappings.Read(path)
+	if err != nil {
+		return
+	}
+	sa, ok := mf.LookupSessionAttachment(stableID)
+	if !ok {
+		return
+	}
+	store, err := queue.NewStore(queue.QueueDir())
+	if err != nil {
+		return
+	}
+	// Mirror routeKeyFromSessionAttachment (internal/broker/attach.go), but produce
+	// a queue.RouteKey directly. sa.TopicID nil ⇒ DM/no-topic (File() → "…__none").
+	n, _ := store.Pending(queue.RouteKey{Channel: sa.Channel, ChatID: sa.ChatID, TopicID: sa.TopicID})
+	if n <= 0 {
+		return
+	}
+	name := sa.Name
+	if name == "" {
+		name = "the last topic"
+	}
+	noun := "message"
+	if n > 1 {
+		noun = "messages"
+	}
+	fmt.Printf("C3: this resumed session re-attaches to Telegram topic %q — %d held %s waiting in the durable queue. At the start of your first reply, call fetch_queue to surface them to the user before proceeding.\n", name, n, noun)
 }

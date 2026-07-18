@@ -10,19 +10,19 @@ type Op string
 
 const (
 	// adapter → broker
-	OpHello            Op = "hello"
-	OpServerInfo       Op = "server_info"
-	OpToolsList        Op = "tools_list"
-	OpAttach           Op = "attach"
-	OpRelease          Op = "release"
-	OpListTopics       Op = "list_topics"
-	OpListClaims       Op = "list_claims"
-	OpListHealth       Op = "list_health"
-	OpToolCall         Op = "tool_call"
-	OpPairModeStart    Op = "pair_mode_start"
-	OpPingThisSession  Op = "ping_this_session"
-	OpListSessions     Op = "list_sessions"
-	OpFetchQueue       Op = "fetch_queue"
+	OpHello           Op = "hello"
+	OpServerInfo      Op = "server_info"
+	OpToolsList       Op = "tools_list"
+	OpAttach          Op = "attach"
+	OpRelease         Op = "release"
+	OpListTopics      Op = "list_topics"
+	OpListClaims      Op = "list_claims"
+	OpListHealth      Op = "list_health"
+	OpToolCall        Op = "tool_call"
+	OpPairModeStart   Op = "pair_mode_start"
+	OpPingThisSession Op = "ping_this_session"
+	OpListSessions    Op = "list_sessions"
+	OpFetchQueue      Op = "fetch_queue"
 	// OpObserve asks the broker to PEEK a topic's durable queue READ-ONLY,
 	// resolving the topic by name/target/topic_id WITHOUT claiming it and
 	// WITHOUT mutating any route. It is the no-loss-safe, no-steal counterpart

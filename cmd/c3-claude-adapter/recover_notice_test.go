@@ -3,7 +3,6 @@ package main
 import (
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/karthikeyan5/c3/internal/ipc"
 )
@@ -80,10 +79,11 @@ func TestResolvedAttachReq_ExplicitRememberedVerbatim(t *testing.T) {
 	}
 }
 
-// TestTakePendingRecoverNotice covers the deferred-CLI-notice logic added for
-// auto-attach-on-resume (2026-06-24): the notice must emit at most once, and a
-// notice that waited longer than pendingRecoverTTL must be dropped rather than
-// surfaced minutes late.
+// TestTakePendingRecoverNotice covers the deferred-CLI-notice logic (task #47):
+// the notice must emit at most once, and — with the pendingRecoverTTL drop
+// REMOVED — it must persist until the first take however long it waited (the
+// flush's live re-peek makes a stale count impossible, so the old minutes-late
+// drop was a silent-loss-of-awareness bug).
 func TestTakePendingRecoverNotice(t *testing.T) {
 	a := &adapter{}
 
@@ -101,18 +101,9 @@ func TestTakePendingRecoverNotice(t *testing.T) {
 		t.Fatalf("second take must not re-emit: got (%q, %v), want (\"\", false)", text, ok)
 	}
 
-	// Stale pending → dropped (not returned) and cleared.
-	a.setPendingRecoverNotice("stale")
-	a.pnmu.Lock()
-	a.pendingRecoverAt = time.Now().Add(-pendingRecoverTTL - time.Second)
-	a.pnmu.Unlock()
-	if text, ok := a.takePendingRecoverNotice(); ok || text != "" {
-		t.Fatalf("stale: got (%q, %v), want (\"\", false)", text, ok)
-	}
-	a.pnmu.Lock()
-	leftover := a.pendingRecoverNotice
-	a.pnmu.Unlock()
-	if leftover != "" {
-		t.Fatalf("stale notice not cleared: %q", leftover)
+	// A notice that has waited a long time is STILL returned (no TTL drop).
+	a.setPendingRecoverNotice("late")
+	if text, ok := a.takePendingRecoverNotice(); !ok || text != "late" {
+		t.Fatalf("long-delayed notice must still emit (no TTL): got (%q, %v), want (\"late\", true)", text, ok)
 	}
 }
