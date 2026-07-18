@@ -180,11 +180,17 @@ type Channel struct {
 
 	// Persisted-offset wiring (Component 2). offTrk advances the committed
 	// offset only over durably-persisted (or no-op) updates. msgToUpdate maps a
-	// stored inbound's MessageID back to its source update_id so the broker's
-	// persist callback can MarkDone the right update. mu guards msgToUpdate.
+	// stored inbound's MessageID back to the source update_id(s) so the broker's
+	// persist callback can MarkDone the right update. It is a FIFO SLICE per
+	// message_id, not a scalar: two in-flight updates can share a message_id (an
+	// edited_message arriving during the original's persist window), and a scalar
+	// map would overwrite — the first update would never mark done (wedge) and the
+	// callback could mark a not-yet-persisted second update done (latent loss).
+	// Staging appends; the persist callbacks pop-front, resolving them in stage
+	// order. mu guards msgToUpdate.
 	mu          sync.Mutex
 	offTrk      *offsetTracker
-	msgToUpdate map[int64]int64
+	msgToUpdate map[int64][]int64
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -338,21 +344,16 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 		loaded, _ = c.offsets.Load()
 	}
 	c.offTrk = newOffsetTracker(loaded)
-	c.msgToUpdate = map[int64]int64{}
+	c.msgToUpdate = map[int64][]int64{}
 	if bh, ok := host.(interface {
 		SetPersistedCallback(func(*c3types.Inbound))
 	}); ok {
-		bh.SetPersistedCallback(func(in *c3types.Inbound) {
-			c.mu.Lock()
-			uid, found := c.msgToUpdate[in.MessageID]
-			if found {
-				delete(c.msgToUpdate, in.MessageID)
-			}
-			c.mu.Unlock()
-			if found {
-				c.offTrk.MarkDone(uid)
-			}
-		})
+		bh.SetPersistedCallback(c.onPersisted)
+	}
+	if bh, ok := host.(interface {
+		SetPersistFailedCallback(func(*c3types.Inbound))
+	}); ok {
+		bh.SetPersistFailedCallback(c.onPersistFailed)
 	}
 
 	c.ctx, c.cancel = context.WithCancel(ctx)
@@ -402,6 +403,83 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 	go c.superviseLoop("silenceWatchdog", superviseRestartBackoff, c.silenceWatchdog)
 	go c.superviseLoop("heartbeat", superviseRestartBackoff, c.heartbeat)
 	return nil
+}
+
+// seamStageLocked appends update_id to the FIFO of in-flight update_ids awaiting
+// a persist outcome for message_id. Caller holds c.mu. FIFO (append here,
+// pop-front in the persist callbacks) because two updates can share a message_id
+// (an edited_message arriving during the original's persist window); staging in
+// order lets the callbacks resolve them in the SAME order, so the first-staged
+// update is the first marked — never the overwrite bug of the old scalar map.
+func (c *Channel) seamStageLocked(msgID, updateID int64) {
+	c.msgToUpdate[msgID] = append(c.msgToUpdate[msgID], updateID)
+}
+
+// seamPopFrontLocked removes and returns the oldest staged update_id for
+// message_id (FIFO). Caller holds c.mu. Returns (0,false) if none staged. The key
+// is deleted when its slice empties so an absent key reads as "nothing staged".
+func (c *Channel) seamPopFrontLocked(msgID int64) (int64, bool) {
+	ids := c.msgToUpdate[msgID]
+	if len(ids) == 0 {
+		return 0, false
+	}
+	uid := ids[0]
+	if len(ids) == 1 {
+		delete(c.msgToUpdate, msgID)
+	} else {
+		c.msgToUpdate[msgID] = ids[1:]
+	}
+	return uid, true
+}
+
+// seamRemoveLocked removes the first staged entry equal to updateID for
+// message_id. Caller holds c.mu. Used by the Emit-DROP cleanup, which must drop
+// exactly the entry it JUST staged — not the front, which may belong to an
+// earlier still-in-flight update sharing the message_id. Returns true if removed.
+func (c *Channel) seamRemoveLocked(msgID, updateID int64) bool {
+	ids := c.msgToUpdate[msgID]
+	for i, id := range ids {
+		if id == updateID {
+			ids = append(ids[:i], ids[i+1:]...)
+			if len(ids) == 0 {
+				delete(c.msgToUpdate, msgID)
+			} else {
+				c.msgToUpdate[msgID] = ids
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// onPersisted is the durable-persist callback registered with the broker
+// (SetPersistedCallback). When an inbound's source update is durably appended,
+// resolve its update_id via the FIFO seam (pop-front) and MarkDone it, advancing
+// the committed offset over it.
+func (c *Channel) onPersisted(in *c3types.Inbound) {
+	c.mu.Lock()
+	uid, found := c.seamPopFrontLocked(in.MessageID)
+	c.mu.Unlock()
+	if found && c.offTrk != nil {
+		c.offTrk.MarkDone(uid)
+	}
+}
+
+// onPersistFailed is the durable-persist-FAILURE callback (SetPersistFailedCallback).
+// A failed Append deliberately does NOT advance the offset — the update stays
+// in-flight so Telegram redelivers it (loss-free). But the poll-side dedup
+// recorded that update at first dispatch (5-min TTL), so without eviction the
+// redelivery is dedup-skipped and the "loss-free retry" never actually retries
+// (item 1). So: pop the seam entry (the redelivery re-stages it fresh) and forget
+// its dedup entry so the redelivery genuinely re-dispatches + re-Appends. The
+// committed offset is intentionally left un-advanced.
+func (c *Channel) onPersistFailed(in *c3types.Inbound) {
+	c.mu.Lock()
+	uid, found := c.seamPopFrontLocked(in.MessageID)
+	c.mu.Unlock()
+	if found && c.dedup != nil {
+		c.dedup.forget(uid)
+	}
 }
 
 // superviseRestartBackoff is the pause before a panicked long-lived goroutine

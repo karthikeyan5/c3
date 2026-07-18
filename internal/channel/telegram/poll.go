@@ -1191,11 +1191,14 @@ func (c *Channel) dispatchMessage(updateID int64, msg *gotgbot.Message, edited b
 		updateID, msg.MessageId, msg.Chat.Id, msg.MessageThreadId, kind, edited)
 	// Record the message_id → update_id seam BEFORE Emit so the broker's persist
 	// callback (fired after Append+fsync) can MarkDone the right source update.
-	// Guarded on the tracker being live (Start seeds msgToUpdate alongside it);
-	// unit tests that leave offTrk nil never persist, so the seam is unused.
+	// FIFO-append (not overwrite): two in-flight updates can share a message_id
+	// (an edited_message during the persist window), and each must resolve its own
+	// persist outcome in order. Guarded on the tracker being live (Start seeds
+	// msgToUpdate alongside it); unit tests that leave offTrk nil never persist, so
+	// the seam is unused.
 	if c.offTrk != nil {
 		c.mu.Lock()
-		c.msgToUpdate[in.MessageID] = updateID
+		c.seamStageLocked(in.MessageID, updateID)
 		c.mu.Unlock()
 	}
 	// I4: Emit reports false when the worker queue is full/stopped and the inbound
@@ -1209,7 +1212,7 @@ func (c *Channel) dispatchMessage(updateID int64, msg *gotgbot.Message, edited b
 	// loudly by Emit, not a silent loss-of-offset wedge.)
 	if !c.host.Emit(in) && c.offTrk != nil {
 		c.mu.Lock()
-		delete(c.msgToUpdate, in.MessageID)
+		c.seamRemoveLocked(in.MessageID, updateID)
 		c.mu.Unlock()
 		c.markUpdateDone(updateID)
 	}

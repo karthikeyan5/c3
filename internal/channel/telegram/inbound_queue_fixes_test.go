@@ -2,7 +2,11 @@ package telegram
 
 import (
 	"testing"
+	"time"
 
+	"github.com/PaulSonOfLars/gotgbot/v2"
+
+	"github.com/karthikeyan5/c3/internal/c3types"
 	"github.com/karthikeyan5/c3/internal/channel"
 )
 
@@ -15,7 +19,7 @@ func TestDispatchMessage_EmitDrop_DoesNotStrandOffset(t *testing.T) {
 	h := &fakeHost{decision: channel.GateInboundAllow, emitDrops: true}
 	c := makeChannel(h)
 	c.offTrk = newOffsetTracker(100)
-	c.msgToUpdate = map[int64]int64{}
+	c.msgToUpdate = map[int64][]int64{}
 
 	// Update 101 is the next contiguous id; its Emit will be DROPPED.
 	c.offTrk.Register(101)
@@ -45,7 +49,7 @@ func TestDispatchMessage_EmitOK_LeavesUpdateInFlight(t *testing.T) {
 	h := &fakeHost{decision: channel.GateInboundAllow, emitDrops: false}
 	c := makeChannel(h)
 	c.offTrk = newOffsetTracker(100)
-	c.msgToUpdate = map[int64]int64{}
+	c.msgToUpdate = map[int64][]int64{}
 
 	c.offTrk.Register(101)
 	c.dispatchMessage(101, textMsg("hi", 42), false, nil)
@@ -55,12 +59,157 @@ func TestDispatchMessage_EmitOK_LeavesUpdateInFlight(t *testing.T) {
 	if got := c.offTrk.Committed(); got != 100 {
 		t.Fatalf("a successfully-emitted (not-yet-persisted) update must keep the offset at 100; got %d", got)
 	}
-	// The seam must be staged for the persist callback to resolve.
+	// The seam must be staged (FIFO slice of one) for the persist callback to resolve.
 	c.mu.Lock()
-	uid, staged := c.msgToUpdate[textMsg("hi", 42).MessageId]
+	ids, staged := c.msgToUpdate[textMsg("hi", 42).MessageId]
 	c.mu.Unlock()
-	if !staged || uid != 101 {
-		t.Fatalf("msgToUpdate must stage msg→update (got staged=%v uid=%d) so the persist callback can MarkDone it", staged, uid)
+	if !staged || len(ids) != 1 || ids[0] != 101 {
+		t.Fatalf("msgToUpdate must stage msg→[update] (got staged=%v ids=%v) so the persist callback can MarkDone it", staged, ids)
+	}
+}
+
+// Item 2: two in-flight updates sharing a message_id (an original + an
+// edited_message arriving during the original's persist window) must BOTH mark
+// done, in FIFO stage order. The old scalar msgToUpdate overwrote the first —
+// wedging it (never marked done) and marking the possibly-unpersisted second.
+// The FIFO seam resolves the first-staged update on the first persist callback,
+// the second on the second.
+func TestSeam_TwoUpdatesSameMessageID_FIFOBothMarkDone(t *testing.T) {
+	c := &Channel{}
+	c.offTrk = newOffsetTracker(500)
+	c.msgToUpdate = map[int64][]int64{}
+
+	const msgID = 42
+	// Stage update 501, then edited_message 502 for the SAME message_id.
+	for _, uid := range []int64{501, 502} {
+		c.offTrk.Register(uid)
+		c.mu.Lock()
+		c.seamStageLocked(msgID, uid)
+		c.mu.Unlock()
+	}
+
+	// First persist callback resolves the FIRST-staged update (501).
+	c.onPersisted(&c3types.Inbound{MessageID: msgID})
+	if got := c.offTrk.Committed(); got != 501 {
+		t.Fatalf("first persist must MarkDone the first-staged update; committed=%d, want 501", got)
+	}
+	// Second persist callback resolves the second (502).
+	c.onPersisted(&c3types.Inbound{MessageID: msgID})
+	if got := c.offTrk.Committed(); got != 502 {
+		t.Fatalf("second persist must MarkDone the second-staged update; committed=%d, want 502", got)
+	}
+	// Seam fully drained (key removed) — no leak.
+	c.mu.Lock()
+	_, leaked := c.msgToUpdate[msgID]
+	c.mu.Unlock()
+	if leaked {
+		t.Fatal("seam must be empty after both updates resolved (no leak)")
+	}
+}
+
+// Item 2 (cleanup path): when a SECOND update sharing a message_id has its Emit
+// DROPPED, the cleanup must remove EXACTLY the entry it just staged — not the
+// front, which belongs to an earlier still-in-flight update on the same
+// message_id. It marks the dropped update done and leaves the earlier one staged.
+func TestSeam_EmitDropRemovesOnlyTheDroppedEntry(t *testing.T) {
+	h := &fakeHost{decision: channel.GateInboundAllow, emitDrops: true}
+	c := makeChannel(h)
+	c.offTrk = newOffsetTracker(500)
+	c.msgToUpdate = map[int64][]int64{}
+
+	const msgID = 100 // textMsg uses MessageId=100
+	// An earlier update 501 for this message_id is already staged + in-flight
+	// (Emitted OK previously, not yet persisted).
+	c.offTrk.Register(501)
+	c.mu.Lock()
+	c.seamStageLocked(msgID, 501)
+	c.mu.Unlock()
+
+	// A second update 502 (an edit) for the SAME message_id arrives; its Emit
+	// DROPS. The cleanup must remove EXACTLY 502 (just staged), not the front 501,
+	// and MarkDone 502.
+	c.offTrk.Register(502)
+	c.dispatchMessage(502, textMsg("edit", 42), true, nil)
+
+	c.mu.Lock()
+	ids := c.msgToUpdate[msgID]
+	c.mu.Unlock()
+	if len(ids) != 1 || ids[0] != 501 {
+		t.Fatalf("Emit-drop cleanup must leave the earlier in-flight 501 staged; seam=%v, want [501]", ids)
+	}
+	// 501 still in-flight blocks the prefix; 502 was marked done (dropped).
+	if got := c.offTrk.Committed(); got != 500 {
+		t.Fatalf("501 still in-flight must hold committed at 500; got %d", got)
+	}
+	// When 501 finally persists, committed jumps to 502 (502 already done).
+	c.onPersisted(&c3types.Inbound{MessageID: msgID})
+	if got := c.offTrk.Committed(); got != 502 {
+		t.Fatalf("after 501 persists, committed must jump to 502 (502 already done); got %d", got)
+	}
+}
+
+// Item 1: on a durable Append FAILURE, the persist-failure path (onPersistFailed)
+// must EVICT the update's poll-side dedup entry so the held-offset redelivery
+// genuinely re-dispatches, while HOLDING the offset (loss-free). Without the
+// eviction the redelivery is dedup-skipped and the "loss-free retry" never
+// actually retries.
+func TestDedupForget_AppendFailureReDispatchesAndHoldsOffset(t *testing.T) {
+	c := &Channel{}
+	c.offTrk = newOffsetTracker(600)
+	c.dedup = newUpdateDedup(2000, 5*time.Minute)
+	c.msgToUpdate = map[int64][]int64{}
+
+	// First dispatch of update 601 (message_id 100): the poll loop records it in
+	// the dedup, registers it in-flight, and dispatchMessage stages the seam.
+	u := gotgbot.Update{UpdateId: 601, Message: textMsg("hi", 42)}
+	if c.dedup.SeenOrAdd(&u) {
+		t.Fatal("first SeenOrAdd of a fresh update must be false (recorded, dispatched)")
+	}
+	c.offTrk.Register(601)
+	c.mu.Lock()
+	c.seamStageLocked(u.Message.MessageId, 601)
+	c.mu.Unlock()
+
+	// The worker's Append FAILS → onPersistFailed fires. It must (a) NOT advance
+	// the offset (loss-free hold) and (b) evict the poll-side dedup entry.
+	c.onPersistFailed(&c3types.Inbound{MessageID: u.Message.MessageId})
+
+	if got := c.offTrk.Committed(); got != 600 {
+		t.Fatalf("Append failure must HOLD the offset (loss-free); committed=%d, want 600", got)
+	}
+	// The redelivery of the SAME update must NOT be dedup-skipped now — the entry
+	// was forgotten, so SeenOrAdd returns false (genuine re-dispatch).
+	u2 := gotgbot.Update{UpdateId: 601, Message: textMsg("hi", 42)}
+	if c.dedup.SeenOrAdd(&u2) {
+		t.Fatal("after onPersistFailed the same update must re-dispatch (dedup evicted), not skip")
+	}
+	// Seam drained by the failure callback (the redelivery re-stages it fresh).
+	c.mu.Lock()
+	_, leaked := c.msgToUpdate[u.Message.MessageId]
+	c.mu.Unlock()
+	if leaked {
+		t.Fatal("onPersistFailed must pop the seam entry (redelivery re-stages fresh)")
+	}
+}
+
+// Item 1 (dedup unit): forget(update_id) evicts exactly that update's entry and
+// leaves others intact.
+func TestUpdateDedup_ForgetEvictsOnlyThatUpdate(t *testing.T) {
+	d := newUpdateDedup(2000, 5*time.Minute)
+	a := gotgbot.Update{UpdateId: 701, Message: textMsg("a", 42)}
+	b := gotgbot.Update{UpdateId: 702, Message: textMsg("b", 43)}
+	d.SeenOrAdd(&a)
+	d.SeenOrAdd(&b)
+
+	d.forget(701)
+
+	if d.SeenOrAdd(&a) {
+		t.Fatal("forgotten update 701 must re-dispatch (SeenOrAdd false)")
+	}
+	// 702 was never forgotten — still deduped.
+	b2 := gotgbot.Update{UpdateId: 702, Message: textMsg("b", 43)}
+	if !d.SeenOrAdd(&b2) {
+		t.Fatal("update 702 must still be deduped (forget(701) must not evict it)")
 	}
 }
 
@@ -74,7 +223,7 @@ func TestDispatchMessage_StatusFromStranger_DroppedNotAnswered(t *testing.T) {
 	h := &fakeHost{decision: channel.GateInboundDrop, cmdHandled: true}
 	c := makeChannel(h)
 	c.offTrk = newOffsetTracker(200)
-	c.msgToUpdate = map[int64]int64{}
+	c.msgToUpdate = map[int64][]int64{}
 
 	c.offTrk.Register(201)
 	// No recover needed: the gate drops before any SendReply, so the nil bot in
@@ -101,7 +250,7 @@ func TestDispatchMessage_StatusFromAllowlisted_StillAnswered(t *testing.T) {
 	h := &fakeHost{decision: channel.GateInboundAllow, cmdHandled: true}
 	c := makeChannel(h)
 	c.offTrk = newOffsetTracker(300)
-	c.msgToUpdate = map[int64]int64{}
+	c.msgToUpdate = map[int64][]int64{}
 
 	c.offTrk.Register(301)
 	func() {

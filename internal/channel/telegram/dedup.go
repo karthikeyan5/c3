@@ -29,6 +29,7 @@ type updateDedup struct {
 
 type dedupEntry struct {
 	key      string
+	updateID int64 // source update_id, so forget(update_id) can evict this entry
 	insertAt time.Time
 }
 
@@ -57,7 +58,7 @@ func (d *updateDedup) SeenOrAdd(u *gotgbot.Update) bool {
 	if _, ok := d.index[key]; ok {
 		return true
 	}
-	entry := &dedupEntry{key: key, insertAt: time.Now()}
+	entry := &dedupEntry{key: key, updateID: u.UpdateId, insertAt: time.Now()}
 	el := d.order.PushBack(entry)
 	d.index[key] = el
 	for d.order.Len() > d.capacity {
@@ -69,6 +70,29 @@ func (d *updateDedup) SeenOrAdd(u *gotgbot.Update) bool {
 		delete(d.index, front.Value.(*dedupEntry).key)
 	}
 	return false
+}
+
+// forget removes any dedup entry recorded for updateID, so a subsequent Telegram
+// redelivery of that same update is NOT dedup-suppressed and genuinely
+// re-dispatches. Used on a durable-Append FAILURE (worker → onPersistFailed): the
+// offset deliberately HOLDS the un-persisted update (loss-free), so Telegram
+// redelivers it — but the first dispatch already recorded it here (5-min TTL), so
+// without this eviction the redelivery spins as a dedup-skip and the "loss-free
+// retry" never actually retries the Append until the TTL lapses (or forever, on a
+// permanent failure). A no-op when no entry matches. update_ids are unique per
+// update, so at most one entry matches; we still scan (bounded by capacity) so a
+// stale duplicate can never survive.
+func (d *updateDedup) forget(updateID int64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for e := d.order.Front(); e != nil; {
+		next := e.Next()
+		if entry := e.Value.(*dedupEntry); entry.updateID == updateID {
+			d.order.Remove(e)
+			delete(d.index, entry.key)
+		}
+		e = next
+	}
 }
 
 // evictExpiredLocked walks from the oldest until it finds a non-expired

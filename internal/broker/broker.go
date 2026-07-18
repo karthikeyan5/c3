@@ -74,6 +74,11 @@ type Broker struct {
 	// nil ⇒ no-op (non-telegram / unit tests).
 	persistedMu sync.RWMutex
 	persistedCB func(in *c3types.Inbound)
+	// persistFailedCB mirrors persistedCB for the FAILURE case: invoked when an
+	// inbound's durable Append FAILED so the telegram channel can evict that
+	// update's poll-side dedup entry and let the held Telegram offset redeliver +
+	// genuinely retry (item 1). Guarded by the same persistedMu. nil ⇒ no-op.
+	persistFailedCB func(in *c3types.Inbound)
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -356,6 +361,26 @@ func (b *Broker) SetPersistedCallback(fn func(in *c3types.Inbound)) {
 func (b *Broker) notifyPersisted(in *c3types.Inbound) {
 	b.persistedMu.RLock()
 	fn := b.persistedCB
+	b.persistedMu.RUnlock()
+	if fn != nil {
+		fn(in)
+	}
+}
+
+// SetPersistFailedCallback registers the durable-persist-FAILURE notifier (the
+// telegram channel sets this to evict a poll-side dedup entry on Append failure
+// so the held offset's redelivery genuinely retries — item 1). Safe to call once
+// at channel start.
+func (b *Broker) SetPersistFailedCallback(fn func(in *c3types.Inbound)) {
+	b.persistedMu.Lock()
+	defer b.persistedMu.Unlock()
+	b.persistFailedCB = fn
+}
+
+// notifyPersistFailed invokes the registered persist-failure callback, if any.
+func (b *Broker) notifyPersistFailed(in *c3types.Inbound) {
+	b.persistedMu.RLock()
+	fn := b.persistFailedCB
 	b.persistedMu.RUnlock()
 	if fn != nil {
 		fn(in)

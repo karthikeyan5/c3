@@ -542,6 +542,14 @@ func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inboun
 				// persist (not dedup-suppressed and lost). markPersisted is
 				// deliberately NOT called either, so the offset holds and Telegram
 				// retains/redelivers (loss-free).
+				// Item 1: evict the poll-side dedup entry for this update so the
+				// held-offset redelivery genuinely RE-DISPATCHES + retries the
+				// Append, instead of spinning as a dedup-skip until the 5-min TTL
+				// lapses (or forever, on a permanent failure). markPersistFailed is
+				// symmetric with markPersisted: the channel resolves the update_id
+				// via its msgToUpdate seam and forgets that update's dedup entry.
+				// The offset still holds (markPersisted NOT called) — loss-free.
+				w.markPersistFailed(in)
 				// Best-effort Telegram notice (spec Error-handling: disk-full =
 				// persist failure → log + best-effort Telegram notice). Cooldown'd
 				// via the existing fallback tracker so a stuck disk doesn't spam.
@@ -556,6 +564,19 @@ func (w *RouteWorker) flushInbounds(ctx context.Context, batch []*c3types.Inboun
 			appended++
 			w.markPersisted(in)
 			w.evictIfOverCap(qrk)
+		}
+	} else if w.broker != nil {
+		// Item 3: durable queue disabled (init failed → "durable inbound hold
+		// DISABLED for this run", broker.go). We cannot persist, but the
+		// persisted-offset tracker is still live, so a ROUTED message must STILL be
+		// marked persisted — otherwise its source update_id wedges in-flight
+		// forever: the committed offset never advances, so EVERY inbound re-polls
+		// forever. Advancing the offset here matches the already-accepted
+		// in-memory-only degrade (non-durable hold). No Append happened, so this
+		// deliberately does NOT touch w.dedup. The loud DISABLED log fires once at
+		// queue init (broker.go); we don't re-log per message here to avoid spam.
+		for _, in := range batch {
+			w.markPersisted(in)
 		}
 	}
 
@@ -1053,6 +1074,19 @@ func (w *RouteWorker) markPersisted(in *c3types.Inbound) {
 		return
 	}
 	w.broker.notifyPersisted(in)
+}
+
+// markPersistFailed notifies the broker that an inbound's durable Append FAILED,
+// so the telegram channel can evict that update's poll-side dedup entry and let
+// the Telegram redelivery genuinely retry (item 1). Symmetric with markPersisted
+// but for the failure edge: the offset is NOT advanced (markPersisted is
+// deliberately not called), so Telegram retains + redelivers the update
+// (loss-free). A nil callback (unit tests / non-telegram) is a no-op.
+func (w *RouteWorker) markPersistFailed(in *c3types.Inbound) {
+	if w.broker == nil {
+		return
+	}
+	w.broker.notifyPersistFailed(in)
 }
 
 // notePersistFailure sends ONE best-effort, cooldown'd Telegram notice when a

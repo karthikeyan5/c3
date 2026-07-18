@@ -85,6 +85,14 @@ func (h *BrokerHost) SetPersistedCallback(fn func(in *c3types.Inbound)) {
 	h.broker.SetPersistedCallback(fn)
 }
 
+// SetPersistFailedCallback delegates to the broker so the telegram channel can be
+// notified when an inbound's durable Append FAILED (item 1: evict the poll-side
+// dedup entry so the held offset's redelivery genuinely retries). Discovered via
+// an interface type-assertion at Start, like SetPersistedCallback.
+func (h *BrokerHost) SetPersistFailedCallback(fn func(in *c3types.Inbound)) {
+	h.broker.SetPersistFailedCallback(fn)
+}
+
 // Done returns the broker's shutdown channel.
 func (h *BrokerHost) Done() <-chan struct{} {
 	return h.broker.ctx.Done()

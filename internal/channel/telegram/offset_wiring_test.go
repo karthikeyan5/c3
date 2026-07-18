@@ -15,27 +15,17 @@ import (
 func TestPollOffsetWiring_NoAdvancePastUnpersisted(t *testing.T) {
 	c := &Channel{}
 	c.offTrk = newOffsetTracker(100)
-	c.msgToUpdate = map[int64]int64{}
+	c.msgToUpdate = map[int64][]int64{}
 
-	// Simulate the persist callback the channel registers in Start.
-	persist := func(in *c3types.Inbound) {
-		c.mu.Lock()
-		uid, found := c.msgToUpdate[in.MessageID]
-		if found {
-			delete(c.msgToUpdate, in.MessageID)
-		}
-		c.mu.Unlock()
-		if found {
-			c.offTrk.MarkDone(uid)
-		}
-	}
+	// The real persist callback the channel registers in Start (onPersisted).
+	persist := c.onPersisted
 
-	// Batch of three accepted updates 101,102,103; record msg→update like
-	// dispatchMessage does before Emit.
+	// Batch of three accepted updates 101,102,103; stage msg→update like
+	// dispatchMessage does before Emit (FIFO seam).
 	for _, p := range []struct{ msg, upd int64 }{{1, 101}, {2, 102}, {3, 103}} {
 		c.offTrk.Register(p.upd)
 		c.mu.Lock()
-		c.msgToUpdate[p.msg] = p.upd
+		c.seamStageLocked(p.msg, p.upd)
 		c.mu.Unlock()
 	}
 	// 101 and 103 persist; 102 is still mid-STT/mid-Append (the "crash" point).

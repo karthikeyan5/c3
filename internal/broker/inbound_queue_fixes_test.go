@@ -210,6 +210,78 @@ func TestFlushInbounds_DedupSkipMarksPersisted(t *testing.T) {
 	}
 }
 
+// Item 1 (worker side): on a durable Append FAILURE, flushInbounds must fire the
+// persist-FAILED callback (so the telegram channel evicts the poll-side dedup and
+// the held offset's redelivery genuinely retries) and must NOT fire the persist
+// (success) callback (the offset must HOLD — loss-free).
+func TestFlushInbounds_AppendFailNotifiesPersistFailed(t *testing.T) {
+	t.Setenv("C3_QUEUE_DIR", t.TempDir())
+	b := brokerWithChannel(t, mfWithTelegram(), &fakeChannel{})
+	defer b.Shutdown()
+
+	tid := int64(914)
+	key := MakeRouteKey("telegram", -100, &tid)
+	w := newRouteWorker(context.Background(), key, time.Hour, b)
+	defer w.Stop()
+
+	var persisted, failed []int64
+	b.SetPersistedCallback(func(in *c3types.Inbound) { persisted = append(persisted, in.MessageID) })
+	b.SetPersistFailedCallback(func(in *c3types.Inbound) { failed = append(failed, in.MessageID) })
+
+	// Force the Append to fail: a store whose backing dir was removed.
+	brokenDir := t.TempDir()
+	brokenStore, err := queue.NewStore(brokenDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rmErr := os.RemoveAll(brokenDir); rmErr != nil {
+		t.Fatalf("setup: remove broken dir: %v", rmErr)
+	}
+	b.Queue = brokenStore
+
+	in := &c3types.Inbound{Channel: "telegram", ChatID: -100, TopicID: &tid, MessageID: 77, Text: "hi", Timestamp: time.Now()}
+	w.flushInbounds(context.Background(), []*c3types.Inbound{in})
+
+	if len(persisted) != 0 {
+		t.Fatalf("a failed Append must NOT fire the persist(success) callback; persisted=%v", persisted)
+	}
+	if len(failed) != 1 || failed[0] != 77 {
+		t.Fatalf("a failed Append must fire the persist-FAILED callback for msg 77; failed=%v", failed)
+	}
+}
+
+// Item 3: with the durable queue DISABLED (b.Queue == nil — init failed), a
+// ROUTED inbound must STILL fire the persist callback so its source update_id is
+// marked done and the offset advances. Otherwise every inbound wedges the
+// contiguous-prefix offset forever (no routed message ever marks done). The
+// in-memory-only degrade is accepted; the offset must not stall.
+func TestFlushInbounds_NilQueueStillMarksPersisted(t *testing.T) {
+	t.Setenv("C3_QUEUE_DIR", t.TempDir())
+	b := brokerWithChannel(t, mfWithTelegram(), &fakeChannel{})
+	defer b.Shutdown()
+
+	// Disable the durable queue (simulate the init-failed degrade).
+	b.Queue = nil
+
+	tid := int64(914)
+	key := MakeRouteKey("telegram", -100, &tid)
+	w := newRouteWorker(context.Background(), key, time.Hour, b)
+	defer w.Stop()
+
+	var marked []int64
+	b.SetPersistedCallback(func(in *c3types.Inbound) { marked = append(marked, in.MessageID) })
+
+	batch := []*c3types.Inbound{
+		{Channel: "telegram", ChatID: -100, TopicID: &tid, MessageID: 10, Text: "a", Timestamp: time.Now()},
+		{Channel: "telegram", ChatID: -100, TopicID: &tid, MessageID: 11, Text: "b", Timestamp: time.Now()},
+	}
+	w.flushInbounds(context.Background(), batch)
+
+	if len(marked) != 2 || marked[0] != 10 || marked[1] != 11 {
+		t.Fatalf("nil-Queue routed inbounds must STILL markPersisted (offset advances); marked=%v, want [10 11]", marked)
+	}
+}
+
 // I5: a batch mixing one NEW + one ALREADY-SEEN message must yield Covered=1
 // (only the new line was appended), not 2. The merged push's Covered is the count
 // of ACTUAL successful Appends — so the Claude ack consumes exactly 1.
