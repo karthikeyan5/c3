@@ -42,7 +42,7 @@ Open — minor / deferred:
 
 - [ ] Live-verify auto-attach-on-resume end-to-end (shipped in master, gated by `auto_attach_on_resume` in mappings.json, default OFF), then consider flipping the default
 - [ ] STT gemini provider: revive with a key, or redocument on the Sarvam default
-- [ ] `release <cwd>`: print the `/exit` workaround (the full IPC op is v2)
+- [x] `release <cwd>`: print the `/exit` workaround (the full IPC op is v2) — done: `runRelease` (cmd/c3-broker/status.go) prints the detach/steal guidance instead of failing opaquely
 
 ## Packaging
 

@@ -24,7 +24,7 @@ support.
 | `ping`          | `c3-broker ping` (CLI)            | pure shell    | Send a one-shot "this is me" message to the attached topic, identifying which CLI session currently owns it. Run in each candidate tab to find the owner before force-stealing. |
 | `sessions`      | `c3-broker sessions` (CLI)        | pure shell    | List every live Claude Code / Codex session the broker tracks — CWD, attached topic, and a "you are here" marker for the calling terminal. |
 | `attach`        | `attach(expr=…)` (MCP tool)       | LLM dispatch  | Attach this session's adapter to a Telegram topic. Broker parses `expr` and either claims an explicit target, resumes the session's own topic, or proposes a picker/confirmation. |
-| `detach`        | `detach()` (MCP tool)             | LLM dispatch  | Release the session's current claim (sends `OpRelease`). Claude + Grok; the Codex adapter has no `detach` tool yet. |
+| `detach`        | `detach()` (MCP tool)             | LLM dispatch  | Release the session's current claim (sends `OpRelease`). Claude + Codex + Grok. |
 | `release`       | `c3-broker release <cwd>` (CLI)   | pure shell    | **Stubbed in v1** — intended to drop a route claim by cwd without restarting the broker; returns 'not yet implemented' today; workaround is `/exit` the holding session. |
 
 ## MCP tools (agent-invoked)
@@ -161,7 +161,7 @@ from any shell — the shared broker logic is identical either way.
 | `ping`          | `/c3:ping` (`commands/ping.md`)                 | `c3-broker ping` (shell)                |
 | `sessions`      | `/c3:sessions` (`commands/sessions.md`)         | `c3-broker sessions` (shell)            |
 | `attach`        | `/c3:attach` + `attach` MCP tool                | `attach` MCP tool                       |
-| `detach`        | `/c3:detach` + `detach` MCP tool                | — (no `detach` tool yet)                |
+| `detach`        | `/c3:detach` + `detach` MCP tool                | `detach` MCP tool                       |
 | `update`        | `/c3:update` (`commands/update.md`)             | `c3-broker update [--check]` (shell)    |
 
 When adding a new verb:

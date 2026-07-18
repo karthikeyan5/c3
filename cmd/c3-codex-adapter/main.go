@@ -955,6 +955,14 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 		},
 		{
 			tool: &mcp.Tool{
+				Name:        "detach",
+				Description: "Release this session's current Telegram topic claim. After detach, inbound messages on that route fall through to the broker's fallback. No-op if not attached.",
+				InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
+			},
+			handler: a.toolDetach,
+		},
+		{
+			tool: &mcp.Tool{
 				Name:        "topics",
 				Description: "List known Telegram topics + claim state.",
 				InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
@@ -1196,6 +1204,28 @@ func (a *adapter) toolAttach(ctx context.Context, req *mcp.CallToolRequest) (*mc
 		}
 		return toolTextResult(text), nil
 	}
+}
+
+// toolDetach implements the `detach` tool: send OpRelease and forget the
+// last-attach replay. Mirrors the Claude adapter's toolDetach.
+func (a *adapter) toolDetach(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	conn := a.currentConn()
+	if conn == nil {
+		return toolErrorResult("broker not connected"), nil
+	}
+	if err := conn.WriteJSON(struct {
+		Op ipc.Op `json:"op"`
+	}{Op: ipc.OpRelease}); err != nil {
+		return toolErrorResult("broker write: " + err.Error()), nil
+	}
+	a.amu.Lock()
+	a.lastAttach = nil
+	a.attachedTopic = ""
+	a.amu.Unlock()
+	// Restore the terminal-emulator's default title — see the EmitAttach
+	// call-site comment in toolAttach for context.
+	termtitle.Clear()
+	return toolTextResult("detached"), nil
 }
 
 func (a *adapter) toolTopics(ctx context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
