@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/PaulSonOfLars/gotgbot/v2"
 )
@@ -303,8 +304,7 @@ func TestRenderReadback_ShortExact(t *testing.T) {
 	}
 	sents := splitSentences(in)
 	f3, l3, more := buildPreview(sents)
-	f3 = capUTF16(f3, readbackPreviewPartMaxU16) // no-op for 40-char sentences
-	l3 = capUTF16(l3, readbackPreviewPartMaxU16)
+	f3, l3 = capPreviewParts(f3, l3, more) // no-op for 40-char sentences
 	words := len(strings.Fields(in))
 	want := fmt.Sprintf("🎤 <b>Voice transcript</b> · ~%d words", words) + "\n" +
 		htmlEscape(f3) + "\n<i>" + fmt.Sprintf("✂️✂️ %d more sentences ✂️✂️", more) + "</i>\n" +
@@ -552,11 +552,14 @@ func TestRenderReadback_TinyLengthBoundary(t *testing.T) {
 	}
 }
 
-// TestRenderReadback_RamblyPreviewCapped is the BUG B regression: when the first
-// and last sentences are very long and rambly, the preview head (first 3) and tail
-// (last 3) must each be hard-capped at readbackPreviewPartMaxU16 UTF-16 units and
-// cut mid-sentence with a trailing '…', so the summary can't fill the screen. The
-// full uncapped head string must NOT appear in the rendered payload.
+// TestRenderReadback_RamblyPreviewCapped is the BUG B regression, updated for the
+// tail-keep fix: when the first and last sentences are very long and rambly, the
+// preview head (first 3) and tail (last 3) must each be hard-capped at
+// readbackPreviewPartMaxU16 UTF-16 units so the summary can't fill the screen — but
+// from OPPOSITE ends. The HEAD keeps its start and trails off with a trailing '…';
+// the TAIL (the preview's last visible line) keeps its END with a LEADING '…' and
+// must NOT end on a trailing '…'. The full uncapped head string must NOT appear in
+// the preview region.
 func TestRenderReadback_RamblyPreviewCapped(t *testing.T) {
 	rambly := strings.TrimSpace(strings.Repeat("word ", 120)) + " end." // one ~604-char sentence
 	var parts []string
@@ -573,30 +576,42 @@ func TestRenderReadback_RamblyPreviewCapped(t *testing.T) {
 	}
 
 	sents := splitSentences(in)
-	rawF3, rawL3, _ := buildPreview(sents)
+	rawF3, rawL3, more := buildPreview(sents)
 	if uint16Len(rawF3) <= readbackPreviewPartMaxU16 || uint16Len(rawL3) <= readbackPreviewPartMaxU16 {
 		t.Fatalf("fixture preview parts are not over the cap (head=%d tail=%d, cap=%d); nothing to elide",
 			uint16Len(rawF3), uint16Len(rawL3), readbackPreviewPartMaxU16)
 	}
-	capF3 := capUTF16(rawF3, readbackPreviewPartMaxU16)
-	capL3 := capUTF16(rawL3, readbackPreviewPartMaxU16)
+	capF3, capL3 := capPreviewParts(rawF3, rawL3, more)
 
 	for name, part := range map[string]string{"head": capF3, "tail": capL3} {
 		if u := uint16Len(part); u > readbackPreviewPartMaxU16+1 {
 			t.Errorf("preview %s is %d u16, exceeds cap %d(+1)", name, u, readbackPreviewPartMaxU16)
 		}
-		if !strings.HasSuffix(part, "…") {
-			t.Errorf("preview %s was cut but does not end with '…': %q", name, part)
-		}
 		if !strings.Contains(payload, htmlEscape(part)) {
 			t.Errorf("rendered payload is missing the capped %s preview", name)
 		}
 	}
+	// HEAD: keeps its start, trails off with a TRAILING '…' (never a leading one).
+	if !strings.HasSuffix(capF3, "…") {
+		t.Errorf("preview head was cut but does not end with a trailing '…': %q", capF3)
+	}
+	if strings.HasPrefix(capF3, "…") {
+		t.Errorf("preview head must not start with '…' (it keeps the START): %q", capF3)
+	}
+	// TAIL: keeps its END with a LEADING '…' and must NOT trail off — this is the fix.
+	if !strings.HasPrefix(capL3, "…") {
+		t.Errorf("preview tail was cut but does not start with a leading '…': %q", capL3)
+	}
+	if strings.HasSuffix(capL3, "…") {
+		t.Errorf("BUG: preview tail (last visible line) ends on a trailing '…' — chopped mid-sentence: %q", capL3)
+	}
+	if !strings.HasSuffix(capL3, "end.") {
+		t.Errorf("preview tail should keep the sentence's natural ending, got %q", capL3)
+	}
 	// The whole verbatim transcript (which necessarily contains the full head text)
 	// still lands in the expandable blockquote — the cap only bounds the SUMMARY. So
-	// scope the "uncapped head is gone" check to the PREVIEW region (everything before
-	// the Full Transcript heading), where the capped head must appear and the full one
-	// must not.
+	// scope the "uncapped head is gone" and "no trailing '…'" checks to the PREVIEW
+	// region (everything before the Full Transcript heading).
 	previewRegion := payload
 	if idx := strings.Index(payload, "<b>Full Transcript</b>"); idx >= 0 {
 		previewRegion = payload[:idx]
@@ -606,6 +621,9 @@ func TestRenderReadback_RamblyPreviewCapped(t *testing.T) {
 	}
 	if strings.Contains(previewRegion, htmlEscape(rawF3)) {
 		t.Error("BUG B: preview region still contains the full uncapped head")
+	}
+	if trimmed := strings.TrimRight(previewRegion, "\n "); strings.HasSuffix(trimmed, "…") {
+		t.Errorf("preview must not end on a trailing '…': %q", trimmed)
 	}
 }
 
@@ -678,5 +696,150 @@ func TestRenderReadback_FewButHuge_NoZeroElision(t *testing.T) {
 				t.Errorf("payload is %d bytes, over the %d rich budget", len(payload), readbackRichMaxBytes)
 			}
 		})
+	}
+}
+
+// TestCapUTF16Tail pins the tail-keeping cap used for the preview's last visible
+// line: a no-op when the input already fits, otherwise it keeps the END behind a
+// LEADING '…', stays within the UTF-16 budget, carries no trailing '…', and drops
+// astral runes whole — never splitting a multi-byte character / emoji surrogate pair.
+func TestCapUTF16Tail(t *testing.T) {
+	// No-op: already fits → unchanged, no leading '…'.
+	if got := capUTF16Tail("short tail.", 220); got != "short tail." {
+		t.Errorf("capUTF16Tail(fits) = %q; want unchanged", got)
+	}
+	// ASCII cut: keeps the END with a leading '…', ends on the original's last chars,
+	// within budget, no trailing '…'.
+	long := strings.Repeat("a", 300) + "END."
+	got := capUTF16Tail(long, 50)
+	if !strings.HasPrefix(got, "…") {
+		t.Errorf("cut result must start with a leading '…': %q", got)
+	}
+	if !strings.HasSuffix(got, "END.") {
+		t.Errorf("cut result must keep the tail (…END.): %q", got)
+	}
+	if strings.HasSuffix(got, "…") {
+		t.Errorf("cut result must not end on a trailing '…': %q", got)
+	}
+	if u := uint16Len(got); u > 50 {
+		t.Errorf("cut result is %d u16, over the %d budget", u, 50)
+	}
+	// Multi-byte / emoji safety: a tail of astral runes (🎤 = 2 UTF-16 units each) is
+	// cut on rune boundaries — within budget, valid UTF-8, keeping only WHOLE emoji.
+	emoji := strings.Repeat("x", 100) + strings.Repeat("🎤", 20)
+	e := capUTF16Tail(emoji, 21) // 1 for '…' + 10 whole 🎤 (20 u16)
+	if u := uint16Len(e); u > 21 {
+		t.Errorf("emoji cut is %d u16, over the %d budget", u, 21)
+	}
+	if !utf8.ValidString(e) {
+		t.Errorf("emoji cut produced invalid UTF-8: %q", e)
+	}
+	if !strings.HasPrefix(e, "…") || !strings.HasSuffix(e, "🎤") {
+		t.Errorf("emoji cut must be …<whole-emoji tail>, got %q", e)
+	}
+	// Every rune kept after the leading '…' must be a full 🎤 (no head 'x' leaked in,
+	// no split surrogate).
+	for _, r := range strings.TrimPrefix(e, "…") {
+		if r != '🎤' {
+			t.Errorf("emoji cut kept an unexpected rune %q in %q", r, e)
+		}
+	}
+}
+
+// TestRenderReadback_TailKeptNoTrailingEllipsis is the core fix regression: when the
+// preview's tail (last 3 sentences) is a single long sentence that must be shortened
+// to fit the per-part budget, the rendered preview keeps the sentence's END behind a
+// LEADING '…' and the visible preview never ends on a trailing '…' — it no longer
+// looks chopped mid-sentence.
+func TestRenderReadback_TailKeptNoTrailingEllipsis(t *testing.T) {
+	// 12 short sentences + one long (~1000 char) final sentence → 13 sentences (more =
+	// 7). The final sentence blows the tail's per-part cap, and the whole note is past
+	// readbackTinyMaxU16 so it lands in SHORT (not TINY).
+	long := strings.TrimSpace(strings.Repeat("blah ", 200)) + " naturalsentenceending."
+	var parts []string
+	for i := 0; i < 12; i++ {
+		parts = append(parts, "ok.")
+	}
+	parts = append(parts, long)
+	in := strings.Join(parts, " ")
+
+	method, payload, band := renderReadback(in)
+	if band != bandShort || method != "sendMessage" {
+		t.Fatalf("got method=%q band=%v; want sendMessage/short (fixture sanity)", method, band)
+	}
+
+	sents := splitSentences(in)
+	_, l3, more := buildPreview(sents)
+	if more <= 0 {
+		t.Fatalf("fixture more = %d, want > 0", more)
+	}
+	if uint16Len(l3) <= readbackPreviewPartMaxU16 {
+		t.Fatalf("fixture tail is %d u16, not over the %d cap — nothing to elide", uint16Len(l3), readbackPreviewPartMaxU16)
+	}
+	capL3 := capUTF16Tail(l3, readbackPreviewPartMaxU16)
+	if !strings.HasPrefix(capL3, "…") {
+		t.Errorf("tail preview must start with a leading '…': %q", capL3)
+	}
+	if strings.HasSuffix(capL3, "…") {
+		t.Errorf("tail preview must NOT end on a trailing '…': %q", capL3)
+	}
+	if !strings.HasSuffix(capL3, "naturalsentenceending.") {
+		t.Errorf("tail preview must keep the sentence's natural ending: %q", capL3)
+	}
+	if !strings.Contains(payload, htmlEscape(capL3)) {
+		t.Error("payload is missing the tail-kept preview line")
+	}
+	// The visible preview (everything before the Full Transcript heading) must not end
+	// on a trailing '…'. In SHORT the summary is plain text, so trimming trailing layout
+	// whitespace lands on the tail's final visible char.
+	region := payload
+	if idx := strings.Index(payload, "<b>Full Transcript</b>"); idx >= 0 {
+		region = payload[:idx]
+	}
+	if trimmed := strings.TrimRight(region, "\n "); strings.HasSuffix(trimmed, "…") {
+		t.Errorf("preview must not end on a trailing '…': %q", trimmed)
+	}
+}
+
+// TestRenderReadback_FewButHugeTailKept covers the more==0 fallthrough: a few very
+// long sentences (no elided middle, no separate tail) render f3 as the whole preview
+// AND its own last visible line, so it too keeps its END behind a leading '…' and
+// never trails off on a '…'.
+func TestRenderReadback_FewButHugeTailKept(t *testing.T) {
+	one := strings.Repeat("w", 1490) + " naturalsentenceending." // one long sentence
+	in := strings.TrimSpace(strings.Repeat(one+" ", 5))          // 5 sentences → deadzone, more==0
+	sents := splitSentences(in)
+	f3, l3, more := buildPreview(sents)
+	if more != 0 || l3 != "" {
+		t.Fatalf("fixture more=%d l3=%q, want more==0 and empty l3", more, l3)
+	}
+	if uint16Len(f3) <= readbackPreviewPartMaxU16 {
+		t.Fatalf("fixture head is %d u16, not over the %d cap", uint16Len(f3), readbackPreviewPartMaxU16)
+	}
+	capHead := capUTF16Tail(f3, readbackPreviewPartMaxU16)
+	if !strings.HasPrefix(capHead, "…") {
+		t.Errorf("more==0 preview must start with a leading '…': %q", capHead)
+	}
+	if strings.HasSuffix(capHead, "…") {
+		t.Errorf("more==0 preview must NOT end on a trailing '…': %q", capHead)
+	}
+	if !strings.HasSuffix(capHead, "naturalsentenceending.") {
+		t.Errorf("more==0 preview must keep the natural ending: %q", capHead)
+	}
+
+	method, payload, band := renderReadback(in)
+	if method != "sendRichMessage" {
+		t.Fatalf("got method=%q band=%v; want a rich band for the few-but-huge note", method, band)
+	}
+	if !strings.Contains(payload, htmlEscape(capHead)) {
+		t.Error("payload is missing the tail-kept more==0 preview")
+	}
+	// The f3 paragraph in the rich body must END with the tail-kept text (…</p>), never
+	// a trailing-'…' paragraph.
+	if !strings.Contains(payload, htmlEscape(capHead)+"</p>") {
+		t.Error("more==0 preview paragraph must end with the tail-kept head text")
+	}
+	if strings.Contains(payload, "✂️") {
+		t.Error("more==0 payload must carry no elision markers")
 	}
 }

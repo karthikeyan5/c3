@@ -89,8 +89,9 @@ const (
 	// elision, even when it has many short sentences. Tunable.
 	readbackTinyMaxU16 = 1000
 	// readbackPreviewPartMaxU16 — the per-part hard cap (UTF-16 units) on the preview
-	// head (first 3) and tail (last 3): a few very long, rambly sentences are cut
-	// mid-sentence with '…' so the summary can't fill the screen. Tunable.
+	// head (first 3) and tail (last 3): a few very long, rambly sentences are elided
+	// with '…' so the summary can't fill the screen — the head loses its END, the tail
+	// (last visible line) its START, so the preview never trails off. Tunable.
 	readbackPreviewPartMaxU16 = 220
 	// readbackShortMaxU16 — the SHORT band's DISPLAYED-length ceiling in UTF-16
 	// code units (Telegram's per-message cap). The measurement strips tags and
@@ -187,8 +188,9 @@ func htmlEscape(s string) string {
 }
 
 // capUTF16 truncates s to at most n UTF-16 code units on rune boundaries,
-// appending '…' when it cut. Used to keep the .txt caption preview under
-// Telegram's caption cap.
+// keeping the START and appending a trailing '…' when it cut. Used for the
+// preview HEAD (which reads as the start of the note trailing off) and to keep
+// the .txt caption preview under Telegram's caption cap.
 func capUTF16(s string, n int) string {
 	if uint16Len(s) <= n {
 		return s
@@ -198,6 +200,44 @@ func capUTF16(s string, n int) string {
 		runes = runes[:len(runes)-1]
 	}
 	return string(runes) + "…"
+}
+
+// capUTF16Tail truncates s to at most n UTF-16 code units on rune boundaries,
+// keeping the END (the tail) and prepending a LEADING '…' when it cut — the
+// mirror of capUTF16. Used for the preview's LAST visible line so it reads as
+// the natural end of the sentence and NEVER ends on a trailing '…' (an end-cut
+// there looked chopped mid-sentence). Rune-safe: an astral rune (surrogate pair)
+// is dropped whole, so this never splits a multi-byte character or emoji.
+func capUTF16Tail(s string, n int) string {
+	if uint16Len(s) <= n {
+		return s
+	}
+	runes := []rune(s)
+	for len(runes) > 0 && uint16Len(string(runes))+1 > n {
+		runes = runes[1:]
+	}
+	return "…" + string(runes)
+}
+
+// capPreviewParts hard-caps the preview head (f3) and tail (l3) at
+// readbackPreviewPartMaxU16 UTF-16 units so a few very long, rambly sentences
+// can't fill the screen (BUG B). The two parts are elided from OPPOSITE ends so
+// the summary reads naturally and its visible text never ends on a trailing '…':
+//   - f3 is the HEAD — elide its END (trailing '…'): it reads as the start of the
+//     note trailing off before the "✂️ N more sentences ✂️" gap.
+//   - l3 is the TAIL and the preview's LAST visible line — keep its END and elide
+//     its START (leading '…'): it reads as the natural end of that sentence.
+//
+// When more == 0 there is no elided middle or separate tail: f3 IS the whole
+// preview and its own last visible line, so it too keeps its END (leading '…')
+// rather than trailing off. Caps the UNescaped text so every assembly escapes
+// once (entity-safe, like the caption); capUTF16/capUTF16Tail are no-ops when a
+// part already fits, so this never double-elides.
+func capPreviewParts(f3, l3 string, more int) (string, string) {
+	if more == 0 {
+		return capUTF16Tail(f3, readbackPreviewPartMaxU16), l3
+	}
+	return capUTF16(f3, readbackPreviewPartMaxU16), capUTF16Tail(l3, readbackPreviewPartMaxU16)
 }
 
 // renderReadback chooses the band and builds the EXACT string to send for a
@@ -233,12 +273,13 @@ func renderReadback(transcript string) (method, payload string, band readbackBan
 
 	f3, l3, more := buildPreview(sents)
 	// BUG B: hard-cap each preview part so a few very long, rambly sentences can't fill
-	// the screen — cut mid-sentence with '…' at readbackPreviewPartMaxU16 UTF-16 units
-	// per part. Cap the UNescaped text then escape once (entity-safe, like the caption);
-	// every SHORT/DEADZONE/LONG assembly below reads the capped f3/l3, so the elided
-	// summary and its DISPLAYED-length measurement stay consistent.
-	f3 = capUTF16(f3, readbackPreviewPartMaxU16)
-	l3 = capUTF16(l3, readbackPreviewPartMaxU16)
+	// the screen — at readbackPreviewPartMaxU16 UTF-16 units per part. The head elides
+	// its END and the tail (last visible line) keeps its END with a leading '…', so the
+	// summary never ends chopped mid-sentence on a trailing '…' (see capPreviewParts).
+	// Cap the UNescaped text then escape once (entity-safe, like the caption); every
+	// SHORT/DEADZONE/LONG assembly below reads the capped f3/l3, so the elided summary
+	// and its DISPLAYED-length measurement stay consistent.
+	f3, l3 = capPreviewParts(f3, l3, more)
 	header := fmt.Sprintf("🎤 <b>Voice transcript</b> · ~%d words", words)
 
 	// Preview block: f3, plus the elision line + tail ONLY when there is an
@@ -312,10 +353,12 @@ func readbackCaption(transcript string) string {
 	words := len(strings.Fields(full))
 	f3, l3, more := buildPreview(sents)
 	// Match the message bands' per-part preview cap (BUG B) before the caption's own
-	// budget cap below, so the caption's head/tail are bounded the same way. capUTF16
-	// is a no-op when a part already fits, so this never double-elides.
-	f3 = capUTF16(f3, readbackPreviewPartMaxU16)
-	l3 = capUTF16(l3, readbackPreviewPartMaxU16)
+	// budget cap below, so the caption's head/tail are bounded the same way — head
+	// end-cut, tail (last visible line) start-cut with a leading '…'. No-op when a
+	// part already fits, so this never double-elides. (The caption's own whole-body
+	// budget cap below intentionally stays an END-cut: it keeps the head + the
+	// "N more sentences" marker when the .txt caption ceiling forces a further trim.)
+	f3, l3 = capPreviewParts(f3, l3, more)
 
 	header := fmt.Sprintf("🎤 <b>Voice transcript</b> · ~%d words", words)
 	body := f3
