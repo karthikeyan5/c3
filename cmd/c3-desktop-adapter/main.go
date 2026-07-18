@@ -302,6 +302,12 @@ func (a *adapter) brokerReader(ctx context.Context) {
 			if err := json.Unmarshal(raw, &msg); err == nil {
 				if msg.Inbound.Kind == c3types.InboundSystem {
 					a.handleSystemInbound(&msg.Inbound)
+				} else {
+					// Pull-only host: the broker still pushes synthesized channel
+					// EVENTS (poll_result/reaction/callback) live to a claimed
+					// holder, and events are never queued — so a dropped push is
+					// gone. Log it so the drop is visible in debugging.
+					log.Printf("desktop: dropped non-system inbound push (kind=%q message_id=%d) — this pull-only host cannot render channel-event pushes", msg.Inbound.Kind, msg.Inbound.MessageID)
 				}
 			}
 		case ipc.OpError:
@@ -1360,7 +1366,7 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 		{
 			tool: &mcp.Tool{
 				Name:        "stop_poll",
-				Description: "Force-close a poll you sent and read its final aggregate tally (counts per option + total voters). Pass the `message_id` returned when you sent the poll. Aggregate results also arrive automatically as a <channel> event when a poll closes; stop_poll is the deterministic early read.",
+				Description: "Force-close a poll you sent and read its final aggregate tally (counts per option + total voters). Pass the `message_id` returned when you sent the poll. This host is pull-only (it cannot render channel-event pushes), so the automatic poll-close event is NOT delivered here — poll results do NOT arrive on their own, and because channel events are never queued they are not recoverable via `fetch_queue` either. stop_poll is the reliable, deterministic way to read the tally.",
 				InputSchema: mcptools.StopPollToolSchema(),
 			},
 			handler: a.toolForward("stop_poll"),

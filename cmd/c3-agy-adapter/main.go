@@ -258,6 +258,16 @@ func (a *adapter) brokerReader(ctx context.Context) {
 			if err := json.Unmarshal(raw, &msg); err == nil {
 				if msg.Inbound.Kind == c3types.InboundSystem {
 					a.handleSystemInbound(&msg.Inbound)
+				} else {
+					// Agy is a pull-only host (CannotRenderChannels). The broker
+					// still pushes synthesized channel EVENTS (poll_result /
+					// reaction / callback) live to a claimed holder — see
+					// internal/broker/worker.go, where the held-in-queue path is
+					// gated to non-events — and events are NEVER queued, so they
+					// are not recoverable via fetch_queue. We do not render events
+					// here (this is not an event-rendering feature); log the drop
+					// so it is visible in debugging. Rare, so unrate-limited is fine.
+					log.Printf("agy: dropped non-system inbound push (kind=%q message_id=%d) — this pull-only host cannot render channel-event pushes", msg.Inbound.Kind, msg.Inbound.MessageID)
 				}
 			}
 		case ipc.OpError:
@@ -1061,7 +1071,7 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 		{
 			tool: &mcp.Tool{
 				Name:        "stop_poll",
-				Description: "Force-close a poll you sent and read its final aggregate tally (counts per option + total voters). Pass the `message_id` returned when you sent the poll. Aggregate results also arrive automatically as a <channel> event when a poll closes; stop_poll is the deterministic early read.",
+				Description: "Force-close a poll you sent and read its final aggregate tally (counts per option + total voters). Pass the `message_id` returned when you sent the poll. This host is pull-only (it cannot render channel-event pushes), so the automatic poll-close event is NOT delivered here — poll results do NOT arrive on their own, and because channel events are never queued they are not recoverable via `fetch_queue` either. stop_poll is the reliable, deterministic way to read the tally.",
 				InputSchema: mcptools.StopPollToolSchema(),
 			},
 			handler: a.toolForward("stop_poll"),
@@ -1094,14 +1104,43 @@ func (a *adapter) registerTools(srv *mcp.Server) {
 	}
 }
 
-func parseFetchLimit(val any) (int, bool) {
-	if s, ok := val.(string); ok && s == "all" {
-		return 0, true
+// parseFetchLimit normalizes the `limit` tool argument into (limit, all). The
+// agent may pass "all" (drain everything, case-insensitive), a JSON number, OR a
+// numeric STRING like "5" (some MCP clients serialize an integer field as a
+// string). A parseable numeric value is honored and clamped to [1,50]; "all"
+// sets All; anything unparseable (or absent) yields the spec default of 3. It
+// NEVER returns a negative Limit — the broker worker treats a negative limit as
+// the consume-ALL sentinel (internal/broker/queue_dispatch.go), so clamping here
+// is what protects the durable queue from a stray limit:-1 draining it. Pure +
+// unit-tested. (Parity with the Grok/Claude adapters' parseFetchLimit.)
+func parseFetchLimit(v any) (limit int, all bool) {
+	switch t := v.(type) {
+	case string:
+		if strings.EqualFold(t, "all") {
+			return 0, true
+		}
+		// A parseable numeric string ("5", "0", "999") is honored and clamped to
+		// [1,50]; an unparseable string leaves limit 0 so it falls back to the
+		// default below.
+		if n, err := strconv.Atoi(strings.TrimSpace(t)); err == nil {
+			if n < 1 {
+				n = 1
+			}
+			if n > 50 {
+				n = 50
+			}
+			return n, false
+		}
+	case float64:
+		limit = int(t)
 	}
-	if f, ok := val.(float64); ok {
-		return int(f), false
+	if limit <= 0 {
+		limit = 3 // spec default
 	}
-	return 3, false
+	if limit > 50 {
+		limit = 50
+	}
+	return limit, false
 }
 
 func renderBacklogSummary(count int, items []ipc.QueuedItem, route string) string {
@@ -1211,13 +1250,37 @@ func toolTextResult(text string) *mcp.CallToolResult {
 	}
 }
 
-func mapResult(m map[string]any) *mcp.CallToolResult {
-	content := []mcp.Content{}
-	if text, ok := m["text"].(string); ok {
-		content = append(content, &mcp.TextContent{Text: text})
-	} else {
-		data, _ := json.Marshal(m)
-		content = append(content, &mcp.TextContent{Text: string(data)})
+// mapResult converts a broker-returned result map into a CallToolResult. The
+// broker always returns the standard MCP shape
+// `{"content":[{"type":"text","text":…}]}` (internal/broker/dispatch.go mcpText)
+// — never a top-level "text" key — so we translate each content element into an
+// SDK text block. The JSON-encoded dump is kept ONLY as the true fallback for
+// when "content" is absent or malformed. (Parity with the Grok/Claude adapters'
+// toolResultFromMap.)
+func mapResult(result map[string]any) *mcp.CallToolResult {
+	if result == nil {
+		return toolTextResult("")
 	}
-	return &mcp.CallToolResult{Content: content}
+	if contentRaw, ok := result["content"]; ok {
+		if items, ok := contentRaw.([]any); ok {
+			var blocks []mcp.Content
+			for _, item := range items {
+				m, ok := item.(map[string]any)
+				if !ok {
+					continue
+				}
+				text, _ := m["text"].(string)
+				blocks = append(blocks, &mcp.TextContent{Text: text})
+			}
+			if len(blocks) > 0 {
+				return &mcp.CallToolResult{Content: blocks}
+			}
+		}
+	}
+	// Fallback: JSON-encode the whole result map.
+	enc, err := json.Marshal(result)
+	if err != nil {
+		return toolErrorResult("marshal result: " + err.Error())
+	}
+	return toolTextResult(string(enc))
 }
