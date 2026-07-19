@@ -519,8 +519,10 @@ func (c *Channel) dispatchGuarded(u *gotgbot.Update, richRaw json.RawMessage) {
 }
 
 // dispatchUpdate converts a single Update into an Inbound (or several) and
-// emits to the host. EditedMessage is treated like a fresh Message for v1 —
-// edits flow as new inbound. Plugins (future) can dedupe if needed.
+// emits to the host. EditedMessage flows as new inbound — a real edit is a
+// fresh message to the session — EXCEPT when its deliverable content is
+// unchanged from what was already dispatched (a reaction-triggered phantom
+// edited_message): dispatchMessage suppresses those via editSuppressor.
 func (c *Channel) dispatchUpdate(u *gotgbot.Update, richRaw json.RawMessage) {
 	switch {
 	case u.Message != nil:
@@ -1186,6 +1188,31 @@ func (c *Channel) dispatchMessage(updateID int64, msg *gotgbot.Message, edited b
 			c.markUpdateDone(updateID)
 			return
 		}
+	}
+	// Phantom-edit suppression. Telegram emits edited_message updates for
+	// non-content changes too — documented: "may at times be triggered by
+	// changes to message fields that are either unavailable or not actively
+	// used by your bot"; the live trigger is a REACTION on the message,
+	// including C3's own `react` tool. Re-dispatching one re-runs STT and
+	// delivers the same transcription again (2026-07-19 duplicate report), so
+	// an edit whose deliverable fingerprint is unchanged is dropped here. A
+	// same-update_id redelivery is exempt (the loss-free Append-retry path
+	// must re-dispatch). Runs AFTER the gate so non-allowlisted senders can
+	// never populate the baseline memory.
+	if c.editSupp != nil {
+		fp := editFingerprint(in, msg)
+		if edited && c.editSupp.shouldSuppress(msg.Chat.Id, msg.MessageId, updateID, fp) {
+			c.host.Logf("telegram: suppress phantom edit update=%d msg=%d chat=%d thread=%d kind=%s — deliverable content unchanged (reaction-triggered edited_message); not re-dispatched",
+				updateID, msg.MessageId, msg.Chat.Id, msg.MessageThreadId, kind)
+			c.markUpdateDone(updateID)
+			return
+		}
+		// Baseline the just-dispatched content (original OR real edit).
+		// Recorded before Emit: a capacity-dropped Emit leaves the baseline
+		// set, which at worst suppresses a later byte-identical edit of a
+		// message the session never saw — the same visibility loss as the
+		// drop itself, and the drop is already logged loudly.
+		c.editSupp.record(msg.Chat.Id, msg.MessageId, updateID, fp)
 	}
 	c.host.Logf("telegram: inbound update=%d msg=%d chat=%d thread=%d kind=%s edited=%v",
 		updateID, msg.MessageId, msg.Chat.Id, msg.MessageThreadId, kind, edited)

@@ -109,6 +109,7 @@ type Channel struct {
 	authBrk    *authBreaker
 	offsets    *offsetStore
 	dedup      *updateDedup
+	editSupp   *editSuppressor // phantom-edit (content-unchanged edited_message) suppression
 	rate       *rateLimiter
 	sentPolls  *sentPollMap // pollID → route+owner for poll-result routing (P4)
 	httpClient *http.Client // shared transport for non-gotgbot calls (file downloads)
@@ -325,6 +326,9 @@ func (c *Channel) Start(ctx context.Context, host channel.Host) error {
 	c.health = newFetchHealth()
 	c.reach = newReachability() // constructs its own owned outbound-health machine
 	c.dedup = newUpdateDedup(2000, 5*time.Minute)
+	// 48h = Telegram's user edit window; 8192 baselines ≈ a few weeks of dogfood
+	// traffic across every topic, bounded to ~1 MiB.
+	c.editSupp = newEditSuppressor(8192, 48*time.Hour)
 	c.rate = newRateLimiter()
 	c.sentPolls = newSentPollMap(2000)
 	if store, sErr := newOffsetStore(Name); sErr == nil {

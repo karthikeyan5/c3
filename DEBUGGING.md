@@ -37,6 +37,7 @@ Field order is stable so you can grep / awk.
 
 ```
 telegram: inbound update=12345 msg=914 chat=-1001234567890 thread=914 kind=text edited=false
+telegram: suppress phantom edit update=12346 msg=914 chat=-1001... thread=914 kind=voice — deliverable content unchanged (reaction-triggered edited_message); not re-dispatched
 emit DROP chan=telegram chat=-1001... topic=914 msg=914: worker queue full or stopped
 delivered chan=telegram chat=-1001... topic=914 msg=914 to cli=claude pid=1234 conn=2
 deliver FAIL chan=telegram chat=-1001... topic=914 msg=914 to cli=claude pid=1234: write: broken pipe
